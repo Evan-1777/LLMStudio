@@ -274,9 +274,104 @@ describe('McpPage and McpEditor', () => {
     });
     expect(state.updateBodies[1].body.args).toEqual(['--readonly']);
 
-    // Verify no runtime execution or tool endpoints were called.
+    // Verify no runtime execution or tool endpoints were called during CRUD test.
     expect(
       state.requestedUrls.every((u) => !u.includes('/tools') && !u.includes('/test')),
     ).toBe(true);
+  });
+
+  it('probes saved server tool catalog, distinguishes empty list from errors, and clears stale state on toggle', async () => {
+    const user = userEvent.setup();
+    let probeMode: 'ok' | 'empty' | 'error' = 'ok';
+    const state: McpMockState = {
+      servers: [
+        {
+          id: 'srv-probe',
+          name: 'docs-server',
+          transport: 'streamable-http',
+          endpoint: 'https://mcp.example.com/rpc',
+          args: [],
+          enabled: true,
+        },
+      ],
+      createBodies: [],
+      updateBodies: [],
+      requestedUrls: [],
+    };
+    const baseMock = makeFetchMock(state);
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/api/v1/mcp/servers/srv-probe/test')) {
+        if (probeMode === 'error') {
+          return new Response(
+            JSON.stringify({ code: 'UPSTREAM_ERROR', message: 'HTTP 401 unauthorized' }),
+            { status: 502 },
+          );
+        }
+        const tools =
+          probeMode === 'empty'
+            ? []
+            : [
+                {
+                  name: 'read_doc',
+                  description: 'Read documentation page',
+                  inputSchema: { type: 'object', properties: { slug: { type: 'string' } } },
+                  outputSchema: { type: 'object', properties: { text: { type: 'string' } } },
+                  annotations: { readOnlyHint: true },
+                },
+              ];
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            serverId: 'srv-probe',
+            toolCount: tools.length,
+            latencyMs: 12,
+            message: `连接正常（${tools.length} 个工具）`,
+            tools,
+          }),
+          { status: 200 },
+        );
+      }
+      return baseMock(input, init);
+    });
+
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter>
+          <McpPage />
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('docs-server')).toBeInTheDocument());
+
+    // 1. Probe with 1 tool shows schema and annotations.
+    await user.click(screen.getByRole('button', { name: '探测 docs-server' }));
+    await waitFor(() => expect(screen.getByText('read_doc')).toBeInTheDocument());
+    expect(screen.getByText('只读')).toBeInTheDocument();
+    expect(screen.getByText('参数 Schema')).toBeInTheDocument();
+    expect(screen.getByText('输出 Schema')).toBeInTheDocument();
+
+    // 2. Legitimate empty list shows 0 tools clearly without error.
+    probeMode = 'empty';
+    await user.click(screen.getByRole('button', { name: '探测 docs-server' }));
+    await waitFor(() =>
+      expect(screen.getByText(/服务器未声明工具/)).toBeInTheDocument(),
+    );
+    expect(screen.getByText(/已连通 · 0 个工具/)).toBeInTheDocument();
+
+    // 3. Real failure shows actual error and never pretends 0 tools.
+    probeMode = 'error';
+    await user.click(screen.getByRole('button', { name: '探测 docs-server' }));
+    await waitFor(() =>
+      expect(screen.getByText(/HTTP 401 unauthorized/)).toBeInTheDocument(),
+    );
+    expect(screen.getByText('探测失败')).toBeInTheDocument();
+
+    // 4. Toggling server clears stale probe state.
+    await user.click(screen.getByRole('switch', { name: '启用 docs-server' }));
+    await waitFor(() =>
+      expect(screen.queryByText(/HTTP 401 unauthorized/)).not.toBeInTheDocument(),
+    );
   });
 });

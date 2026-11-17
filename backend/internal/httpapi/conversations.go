@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"strings"
 
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/service"
@@ -18,7 +19,16 @@ func NewConversationHandler(svc *service.ConversationService) *ConversationHandl
 }
 
 func (h *ConversationHandler) List(w http.ResponseWriter, r *http.Request) {
-	convs, err := h.svc.List(r.Context())
+	assistantID := strings.TrimSpace(r.URL.Query().Get("assistantId"))
+	var (
+		convs []domain.Conversation
+		err   error
+	)
+	if assistantID != "" {
+		convs, err = h.svc.ListByAssistant(r.Context(), assistantID)
+	} else {
+		convs, err = h.svc.List(r.Context())
+	}
 	if err != nil {
 		writeServiceError(w, err)
 		return
@@ -126,4 +136,80 @@ func (h *ConversationHandler) BranchFromMessage(w http.ResponseWriter, r *http.R
 		return
 	}
 	WriteJSON(w, http.StatusCreated, detail)
+}
+
+func (h *ConversationHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
+	groups, err := h.svc.ListGroups(r.Context(), r.URL.Query().Get("assistantId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"groups": groups,
+	})
+}
+
+func (h *ConversationHandler) CreateGroup(w http.ResponseWriter, r *http.Request) {
+	var in service.CreateGroupInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	res, err := h.svc.CreateGroup(r.Context(), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusCreated, res)
+}
+
+func (h *ConversationHandler) RenameGroup(w http.ResponseWriter, r *http.Request) {
+	var in service.RenameGroupInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	res, err := h.svc.RenameGroup(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
+}
+
+func (h *ConversationHandler) DeleteGroup(w http.ResponseWriter, r *http.Request) {
+	res, err := h.svc.DeleteGroup(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
+}
+
+func (h *ConversationHandler) Batch(w http.ResponseWriter, r *http.Request) {
+	var in service.BatchConversationsInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	snap, err := h.svc.BatchConversations(r.Context(), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, snap)
+}
+
+func (h *ConversationHandler) Reorder(w http.ResponseWriter, r *http.Request) {
+	var in service.ReorderConversationsInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	snap, err := h.svc.ReorderConversations(r.Context(), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, snap)
 }

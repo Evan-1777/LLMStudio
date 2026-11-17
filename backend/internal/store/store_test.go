@@ -422,3 +422,183 @@ func TestLocalRequestAndNonDestructiveMessageOps(t *testing.T) {
 		t.Fatalf("unexpected order after ReplaceByID: %+v", orderedAfterReplace)
 	}
 }
+
+func TestMigration004OrganizationAndRankStability(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "v003.db")
+
+	// Construct a 003 database without 004 migration, with multi-assistant rows and identical updated_at ties.
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sqlite: %v", err)
+	}
+	for _, mig := range []string{"001_init.sql", "002_v1_1_upgrade.sql", "003_provider_local_request.sql"} {
+		sqlBytes, readErr := os.ReadFile(filepath.Join("migrations", mig))
+		if readErr != nil {
+			t.Fatalf("read %s: %v", mig, readErr)
+		}
+		if _, execErr := rawDB.ExecContext(ctx, string(sqlBytes)); execErr != nil {
+			t.Fatalf("exec %s: %v", mig, execErr)
+		}
+	}
+	if _, err := rawDB.ExecContext(ctx, `
+		CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+		INSERT INTO schema_migrations(version, applied_at) VALUES
+			('001_init.sql', '2026-11-17T00:00:00Z'),
+			('002_v1_1_upgrade.sql', '2026-11-17T00:00:00Z'),
+			('003_provider_local_request.sql', '2026-11-17T00:00:00Z');
+		INSERT INTO providers (id, name, adapter, base_url, auth_type, local_request, created_at, updated_at)
+			VALUES ('p-loc', 'Local', 'generic-http', 'http://127.0.0.1:11434/v1', 'none', 1, '2026-11-17T00:00:00Z', '2026-11-17T00:00:00Z');
+		INSERT INTO assistants (id, name, is_default, created_at, updated_at)
+			VALUES ('coder', 'Coder', 0, '2026-11-17T00:00:00Z', '2026-11-17T00:00:00Z');
+		-- Insert 3 rows for default assistant with identical updated_at; IDs intentionally out of alphabetical order vs rowid DESC.
+		INSERT INTO conversations (id, assistant_id, title, created_at, updated_at) VALUES
+			('id-z-first-inserted', 'default', 'C', '2026-11-17T08:00:00Z', '2026-11-17T09:00:00Z'),
+			('id-a-second-inserted', 'default', 'B', '2026-11-17T08:00:00Z', '2026-11-17T09:00:00Z'),
+			('id-m-last-inserted', 'default', 'A', '2026-11-17T08:00:00Z', '2026-11-17T09:00:00Z'),
+			('id-coder-1', 'coder', 'Coder 1', '2026-11-17T08:00:00Z', '2026-11-17T10:00:00Z');
+		INSERT INTO messages (id, conversation_id, role, blocks_json, created_at)
+			VALUES ('msg-keep', 'id-a-second-inserted', 'user', '[{"type":"text","text":"preserved"}]', '2026-11-17T09:00:00Z');
+	`); err != nil {
+		t.Fatalf("seed 003 db: %v", err)
+	}
+	_ = rawDB.Close()
+
+	// Upgrade via OpenSQLite and re-open to test idempotency.
+	db, err := OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite 003->004 failed: %v", err)
+	}
+	_ = db.Close()
+	db, err = OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("second OpenSQLite failed: %v", err)
+	}
+	defer db.Close()
+
+	convs := NewConversationStore(db)
+	msgs := NewMessageStore(db)
+	provs := NewProviderStore(db)
+	assistants := NewAssistantStore(db)
+
+	prov, err := provs.Get(ctx, "p-loc")
+	if err != nil || !prov.LocalRequest {
+		t.Fatalf("expected local_request preserved after 004 migration: err=%v prov=%+v", err, prov)
+	}
+	savedMsgs, err := msgs.ListByConversation(ctx, "id-a-second-inserted")
+	if err != nil || len(savedMsgs) != 1 || savedMsgs[0].Blocks[0].Text != "preserved" {
+		t.Fatalf("expected messages preserved: err=%v msgs=%+v", err, savedMsgs)
+	}
+
+	// Tie-breaker rowid DESC must preserve A (rowid 3) -> B (rowid 2) -> C (rowid 1), NOT alphabetical ID order.
+	defList, err := convs.ListByAssistant(ctx, "default")
+	if err != nil || len(defList) != 3 {
+		t.Fatalf("unexpected default list: err=%v list=%+v", err, defList)
+	}
+	if defList[0].Title != "A" || defList[1].Title != "B" || defList[2].Title != "C" {
+		t.Fatalf("expected A, B, C preserving rowid DESC tie-breaker, got %s, %s, %s", defList[0].Title, defList[1].Title, defList[2].Title)
+	}
+	origRankA, origRankB, origRankC := defList[0].SortOrder, defList[1].SortOrder, defList[2].SortOrder
+
+	// TouchUpdatedAt and Update on C must NOT change C's rank or bump C above A/B!
+	if err := convs.TouchUpdatedAt(ctx, defList[2].ID, time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatalf("TouchUpdatedAt failed: %v", err)
+	}
+	cFetched, _ := convs.Get(ctx, defList[2].ID)
+	cFetched.Title = "C Renamed"
+	cFetched.ModelID = "new-model"
+	if _, err := convs.Update(ctx, cFetched); err != nil {
+		t.Fatalf("Update failed: %v", err)
+	}
+
+	afterMeta, _ := convs.ListByAssistant(ctx, "default")
+	if afterMeta[0].ID != defList[0].ID || afterMeta[1].ID != defList[1].ID || afterMeta[2].ID != defList[2].ID {
+		t.Fatalf("expected order unchanged after touch/update, got %+v", afterMeta)
+	}
+	if afterMeta[0].SortOrder != origRankA || afterMeta[1].SortOrder != origRankB || afterMeta[2].SortOrder != origRankC {
+		t.Fatalf("expected existing ranks unchanged, got %d,%d,%d want %d,%d,%d",
+			afterMeta[0].SortOrder, afterMeta[1].SortOrder, afterMeta[2].SortOrder, origRankA, origRankB, origRankC)
+	}
+
+	// Create puts new conversation at head of ungrouped WITHOUT altering A/B/C ranks.
+	newConv, err := convs.Create(ctx, domain.Conversation{AssistantID: "default", Title: "D New"})
+	if err != nil {
+		t.Fatalf("Create failed: %v", err)
+	}
+	afterCreate, _ := convs.ListByAssistant(ctx, "default")
+	if len(afterCreate) != 4 || afterCreate[0].ID != newConv.ID ||
+		afterCreate[1].SortOrder != origRankA || afterCreate[2].SortOrder != origRankB || afterCreate[3].SortOrder != origRankC {
+		t.Fatalf("expected new item at head without mutating existing ranks: %+v", afterCreate)
+	}
+
+	// Delete custom assistant cleans up its groups and preserves conversations.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO conversation_groups (id, assistant_id, name, sort_order, created_at)
+		VALUES ('g-coder', 'coder', 'Coder Group', 1, '2026-11-17T08:00:00Z');
+		UPDATE conversations SET group_id = 'g-coder' WHERE id = 'id-coder-1';
+	`); err != nil {
+		t.Fatalf("seed coder group: %v", err)
+	}
+	if err := assistants.Delete(ctx, "coder"); err != nil {
+		t.Fatalf("delete assistant failed: %v", err)
+	}
+	var groupCount int
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM conversation_groups WHERE assistant_id = 'coder'`).Scan(&groupCount)
+	if groupCount != 0 {
+		t.Fatalf("expected coder groups cleaned up, got %d", groupCount)
+	}
+	reassignedCoder, err := convs.Get(ctx, "id-coder-1")
+	if err != nil || reassignedCoder.AssistantID != domain.DefaultAssistantID || reassignedCoder.GroupID != nil {
+		t.Fatalf("expected reassigned coder conversation in default ungrouped, got err=%v conv=%+v", err, reassignedCoder)
+	}
+}
+
+func TestMessageUsageCacheStatsAndLegacyJSONCompatibility(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer db.Close()
+
+	convs := NewConversationStore(db)
+	msgs := NewMessageStore(db)
+	conv, err := convs.Create(ctx, domain.Conversation{Title: "Usage Test"})
+	if err != nil {
+		t.Fatalf("create conv: %v", err)
+	}
+
+	// Legacy usage JSON without cacheReadInputTokens / cacheCreationInputTokens decodes cleanly.
+	if _, err := db.ExecContext(ctx, `
+		INSERT INTO messages (id, conversation_id, role, blocks_json, usage_json, stop_reason, created_at)
+		VALUES ('m-legacy', ?, 'assistant', '[{"type":"text","text":"old"}]', '{"inputTokens":12,"outputTokens":8,"totalTokens":20}', 'stop', '2026-11-17T08:00:00Z')
+	`, conv.ID); err != nil {
+		t.Fatalf("insert legacy msg: %v", err)
+	}
+	legacy, err := msgs.Get(ctx, "m-legacy")
+	if err != nil || legacy.Usage == nil || legacy.Usage.InputTokens != 12 || legacy.Usage.CacheReadInputTokens != 0 || legacy.Usage.CacheCreationInputTokens != 0 {
+		t.Fatalf("unexpected legacy usage decode: err=%v msg=%+v", err, legacy)
+	}
+
+	// Message with cache stats round-trips cleanly.
+	created, err := msgs.Create(ctx, domain.Message{
+		ConversationID: conv.ID,
+		Role:           domain.RoleAssistant,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "cached"}},
+		Usage: &domain.Usage{
+			InputTokens:              1000,
+			OutputTokens:             40,
+			CacheReadInputTokens:     750,
+			CacheCreationInputTokens: 200,
+			TotalTokens:              1040,
+		},
+		StopReason: domain.StopReasonStop,
+	})
+	if err != nil {
+		t.Fatalf("create cached msg: %v", err)
+	}
+	reloaded, err := msgs.Get(ctx, created.ID)
+	if err != nil || reloaded.Usage == nil || reloaded.Usage.CacheReadInputTokens != 750 || reloaded.Usage.CacheCreationInputTokens != 200 {
+		t.Fatalf("expected persisted cache usage, got err=%v msg=%+v", err, reloaded)
+	}
+}

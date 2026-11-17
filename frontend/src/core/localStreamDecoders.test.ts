@@ -363,4 +363,200 @@ describe('decodeUpstreamSseStream golden parity with Go formats', () => {
       totalTokens: 26,
     });
   });
+
+  it('decodes interleaved parallel tool calls, duplicate sequence/chunks, Responses completed fallback, and Gemini signatures identically to Go', async () => {
+    // 1. OpenAI Completions interleaved parallel tool calls
+    const oaiSse = [
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"toolA","arguments":"{\\"a\\":"}},{"index":1,"id":"c2","function":{"name":"toolB","arguments":"{\\"b\\":"}}]}}]}',
+      '',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}},{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n');
+    const oaiEvents: StreamEvent[] = [];
+    await decodeUpstreamSseStream(
+      'openai-completions',
+      sseStreamFromText(oaiSse),
+      meta,
+      (ev) => oaiEvents.push(ev),
+    );
+    expect(
+      oaiEvents.filter((e) => e.type === 'block_end').map((e) => e.block),
+    ).toEqual([
+      { type: 'toolCall', id: 'c1', name: 'toolA', arguments: { a: 1 } },
+      { type: 'toolCall', id: 'c2', name: 'toolB', arguments: { b: 2 } },
+    ]);
+
+    // 2. OpenAI Responses duplicate sequence + encrypted_content + response.completed output fallback
+    const respSse = [
+      'event: response.output_item.added',
+      'data: {"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":{"id":"rs_9","type":"reasoning"}}',
+      '',
+      'event: response.reasoning_summary_text.delta',
+      'data: {"type":"response.reasoning_summary_text.delta","sequence_number":2,"output_index":0,"delta":"step"}',
+      '',
+      'event: response.reasoning_summary_text.delta',
+      'data: {"type":"response.reasoning_summary_text.delta","sequence_number":2,"output_index":0,"delta":"step"}',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"rs_9","type":"reasoning","encrypted_content":"enc_blob_9"}}',
+      '',
+      'event: response.output_item.done',
+      'data: {"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":{"id":"rs_9","type":"reasoning","encrypted_content":"enc_blob_9"}}',
+      '',
+      'event: response.completed',
+      'data: {"type":"response.completed","sequence_number":4,"response":{"status":"completed","output":[{"id":"rs_9","type":"reasoning","encrypted_content":"enc_blob_9"},{"id":"fc_9","type":"function_call","call_id":"call_resp_9","name":"echo","arguments":"{\\"v\\":9}"}]}}',
+      '',
+    ].join('\n');
+    const respEvents: StreamEvent[] = [];
+    await decodeUpstreamSseStream(
+      'openai-responses',
+      sseStreamFromText(respSse),
+      meta,
+      (ev) => respEvents.push(ev),
+    );
+    expect(
+      respEvents.filter((e) => e.type === 'block_end').map((e) => e.block),
+    ).toEqual([
+      {
+        type: 'thinking',
+        thinking: 'step',
+        signature: 'enc_blob_9',
+        extra: {
+          providerFormat: 'openai-responses',
+          itemId: 'rs_9',
+          encryptedContent: 'enc_blob_9',
+        },
+      },
+      { type: 'toolCall', id: 'call_resp_9', name: 'echo', arguments: { v: 9 } },
+    ]);
+    expect(
+      respEvents.find((e) => e.type === 'message_delta')?.stopReason,
+    ).toBe('toolUse');
+
+    // 3. Google GenAI thoughtSignature + functionCall thoughtSignature + duplicate call ID
+    const gemSse = [
+      'data: {"candidates":[{"content":{"parts":[{"text":"hmm","thought":true},{"thought":true,"thoughtSignature":"sig_t1"}]}}]}',
+      '',
+      'data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"g_1","name":"toolA","args":{"k":1}},"thoughtSignature":"sig_fc1"}]}}]}',
+      '',
+      'data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"g_1","name":"toolA","args":{"k":1}},"thoughtSignature":"sig_fc1"}]},"finishReason":"STOP"}]}',
+      '',
+    ].join('\n');
+    const gemEvents: StreamEvent[] = [];
+    await decodeUpstreamSseStream(
+      'google-generative-ai',
+      sseStreamFromText(gemSse),
+      meta,
+      (ev) => gemEvents.push(ev),
+    );
+    expect(
+      gemEvents.filter((e) => e.type === 'block_end').map((e) => e.block),
+    ).toEqual([
+      {
+        type: 'thinking',
+        thinking: 'hmm',
+        signature: 'sig_t1',
+        extra: {
+          providerFormat: 'google-generative-ai',
+          thoughtSignature: 'sig_t1',
+        },
+      },
+      {
+        type: 'toolCall',
+        id: 'g_1',
+        name: 'toolA',
+        arguments: { k: 1 },
+        signature: 'sig_fc1',
+        extra: {
+          providerFormat: 'google-generative-ai',
+          thoughtSignature: 'sig_fc1',
+        },
+      },
+    ]);
+  });
+
+  it('normalizes cache read/creation tokens across all 4 formats identically to Go without fabricating missing values', async () => {
+    const collectUsage = async (apiFormat: string, sse: string) => {
+      const evs: StreamEvent[] = [];
+      await decodeUpstreamSseStream(apiFormat, sseStreamFromText(sse), meta, (ev) => evs.push(ev));
+      return evs.find((e) => e.type === 'message_delta')?.usage;
+    };
+
+    expect(
+      await collectUsage(
+        'openai-completions',
+        [
+          'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+          '',
+          'data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,"prompt_tokens_details":{"cached_tokens":800,"cache_write_tokens":120}}}',
+          '',
+          'data: [DONE]',
+          '',
+        ].join('\n'),
+      ),
+    ).toEqual({
+      inputTokens: 1000,
+      outputTokens: 50,
+      cacheReadInputTokens: 800,
+      cacheCreationInputTokens: 120,
+      totalTokens: 1050,
+    });
+
+    expect(
+      await collectUsage(
+        'openai-responses',
+        [
+          'event: response.completed',
+          'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":500,"output_tokens":30,"total_tokens":530,"input_tokens_details":{"cached_tokens":400,"cache_creation_tokens":60}}}}',
+          '',
+        ].join('\n'),
+      ),
+    ).toEqual({
+      inputTokens: 500,
+      outputTokens: 30,
+      cacheReadInputTokens: 400,
+      cacheCreationInputTokens: 60,
+      totalTokens: 530,
+    });
+
+    expect(
+      await collectUsage(
+        'anthropic-messages',
+        [
+          'event: message_start',
+          'data: {"type":"message_start","message":{"usage":{"input_tokens":50,"cache_creation_input_tokens":200,"cache_read_input_tokens":750,"output_tokens":0}}}',
+          '',
+          'event: message_delta',
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":40}}',
+          '',
+          'event: message_stop',
+          'data: {"type":"message_stop"}',
+          '',
+        ].join('\n'),
+      ),
+    ).toEqual({
+      inputTokens: 1000,
+      outputTokens: 40,
+      cacheReadInputTokens: 750,
+      cacheCreationInputTokens: 200,
+      totalTokens: 1040,
+    });
+
+    expect(
+      await collectUsage(
+        'google-generative-ai',
+        [
+          'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":900,"cachedContentTokenCount":700,"candidatesTokenCount":25,"totalTokenCount":925}}',
+          '',
+        ].join('\n'),
+      ),
+    ).toEqual({
+      inputTokens: 900,
+      outputTokens: 25,
+      cacheReadInputTokens: 700,
+      totalTokens: 925,
+    });
+  });
 });

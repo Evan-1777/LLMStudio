@@ -27,6 +27,8 @@ export type AuthType =
 
 export type MCPTransport = 'stdio' | 'sse' | 'streamable-http';
 
+export type CacheMode = 'auto' | 'implicit' | 'explicit' | 'disabled';
+
 export interface CompatConfig {
   maxTokensField?: string;
   supportsDeveloperRole?: boolean | null;
@@ -34,6 +36,7 @@ export interface CompatConfig {
   thinkingFormat?: string;
   reasoningEffortField?: string;
   pathOverride?: string;
+  cacheMode?: CacheMode | string;
   extraHeaders?: Record<string, string>;
   extraBody?: Record<string, unknown>;
 }
@@ -160,6 +163,7 @@ export interface ThinkingBlock {
   type: 'thinking';
   thinking: string;
   signature?: string;
+  extra?: Record<string, unknown> | unknown;
 }
 
 export interface ImageBlock {
@@ -174,6 +178,8 @@ export interface ToolCallBlock {
   id: string;
   name: string;
   arguments?: unknown;
+  signature?: string;
+  extra?: Record<string, unknown> | unknown;
 }
 
 export interface ToolResultBlock {
@@ -182,6 +188,7 @@ export interface ToolResultBlock {
   toolName?: string;
   content?: string;
   isError?: boolean;
+  extra?: Record<string, unknown> | unknown;
 }
 
 export interface WebSearchResultItem {
@@ -221,6 +228,8 @@ export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
   thinkingTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
   totalTokens: number;
 }
 
@@ -239,6 +248,14 @@ export interface Message {
   createdAt: string;
 }
 
+export interface ConversationGroup {
+  id: string;
+  assistantId: string;
+  name: string;
+  sortOrder: number;
+  createdAt: string;
+}
+
 export interface Conversation {
   id: string;
   assistantId: string;
@@ -247,6 +264,9 @@ export interface Conversation {
   modelId?: string;
   systemPrompt?: string;
   params: GenerationParams;
+  groupId?: string | null;
+  pinned?: boolean;
+  sortOrder?: number;
   syncEnabled: boolean;
   syncState: string;
   syncVersion: number;
@@ -254,6 +274,55 @@ export interface Conversation {
   createdAt: string;
   updatedAt: string;
 }
+
+export interface ConversationOrganizationSnapshot {
+  assistantId: string;
+  conversations: Conversation[];
+  groups: ConversationGroup[];
+  deletedIds?: string[];
+}
+
+export interface GroupMutationResult extends ConversationOrganizationSnapshot {
+  group: ConversationGroup;
+}
+
+export interface GroupDeleteResult extends ConversationOrganizationSnapshot {
+  deletedGroupId: string;
+}
+
+export type BatchConversationsInput =
+  | {
+      assistantId: string;
+      ids: string[];
+      operation: 'delete';
+    }
+  | {
+      assistantId: string;
+      ids: string[];
+      operation: 'move';
+      groupId: string | null;
+    }
+  | {
+      assistantId: string;
+      ids: string[];
+      operation: 'pin';
+      pinned: boolean;
+    };
+
+export type ReorderConversationsInput =
+  | {
+      assistantId: string;
+      ids: string[];
+      pinned: true;
+      beforeId?: string | null;
+    }
+  | {
+      assistantId: string;
+      ids: string[];
+      pinned: false;
+      groupId: string | null;
+      beforeId?: string | null;
+    };
 
 export interface CreateConversationInput {
   assistantId?: string;
@@ -344,6 +413,38 @@ export interface MCPServerInput {
   enabled?: boolean;
 }
 
+export interface MCPToolAnnotations {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+}
+
+export interface MCPToolDescriptor {
+  name: string;
+  title?: string;
+  description?: string;
+  inputSchema?: unknown;
+  outputSchema?: unknown;
+  annotations?: MCPToolAnnotations;
+}
+
+export interface MCPServerTestResult {
+  ok: boolean;
+  serverId: string;
+  toolCount: number;
+  latencyMs: number;
+  message: string;
+  tools: MCPToolDescriptor[];
+}
+
+export interface ToolCallExecutionInput {
+  id: string;
+  name: string;
+  arguments?: unknown;
+}
+
 export type StreamEventType =
   | 'message_start'
   | 'block_start'
@@ -381,6 +482,39 @@ export interface StreamEvent {
   error?: StreamError;
 }
 
+export interface PromptCacheState {
+  resourceName?: string;
+  prefixHash?: string;
+  prefixCount?: number;
+  toolsHash?: string;
+  systemHash?: string;
+  expireTime?: string;
+  unsupported?: boolean;
+  failedPrefixHash?: string;
+}
+
+export interface PreparedSearchInput {
+  block: ContentBlock | null;
+}
+
+export interface LocalCacheResultData {
+  name?: string;
+  expireTime?: string;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+export interface LocalCacheResolutionInput {
+  planKey: string;
+  status: number;
+  result: LocalCacheResultData;
+}
+
+export interface LocalContinuationInput {
+  userMessageId?: string;
+  blocks: ContentBlock[];
+}
+
 export interface StreamChatInput {
   blocks?: ContentBlock[];
   text?: string;
@@ -390,6 +524,11 @@ export interface StreamChatInput {
   regenerateMessageId?: string;
   webSearch?: boolean;
   searchEngineId?: string;
+  autoCreateCache?: boolean;
+  localContinuation?: LocalContinuationInput;
+  preparedSearch?: PreparedSearchInput;
+  cacheState?: PromptCacheState;
+  cacheResolution?: LocalCacheResolutionInput;
 }
 
 export interface CreateMessageInput {
@@ -409,6 +548,19 @@ export interface CreateMessageResult {
   conversation: Conversation;
 }
 
+export interface PreparedLocalHTTPRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: unknown;
+  authType: AuthType | string;
+}
+
+export interface PreparedLocalCacheStep {
+  request: PreparedLocalHTTPRequest;
+  planKey: string;
+}
+
 export interface PreparedLocalRequest {
   method: string;
   url: string;
@@ -418,6 +570,8 @@ export interface PreparedLocalRequest {
   webSearchBlock?: ContentBlock;
   replaceMessageId?: string;
   insertAfterMessageId?: string;
+  cacheStep?: PreparedLocalCacheStep;
+  cacheState?: PromptCacheState;
 }
 
 export interface HealthResponse {

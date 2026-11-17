@@ -2,13 +2,23 @@ import type { ReactNode } from 'react';
 import { Button } from './Button';
 import { Icon, type IconName } from './Icon';
 
-export function LoadingSpinner({ label }: { label?: string }) {
+export function LoadingSpinner({
+  label,
+  size = 'md',
+}: {
+  label?: string;
+  size?: 'sm' | 'md';
+}) {
   return (
     <span
       role="status"
+      aria-label={!label ? '加载中' : undefined}
       style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}
     >
-      <span className="ui-spinner" aria-hidden="true" />
+      <span
+        className={`ui-spinner ${size === 'sm' ? 'ui-spinner--sm' : ''}`.trim()}
+        aria-hidden="true"
+      />
       {label ? (
         <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>
           {label}

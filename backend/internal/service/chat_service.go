@@ -1,12 +1,10 @@
 package service
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -17,17 +15,50 @@ import (
 	"llmstudio/backend/internal/store"
 )
 
+// LocalContinuationInput supplies the saved anchor turn and in-progress assistant blocks
+// for stateless browser-direct MCP continuation rounds.
+type LocalContinuationInput struct {
+	UserMessageID string                `json:"userMessageId,omitempty"`
+	Blocks        []domain.ContentBlock `json:"blocks"`
+}
+
+// PreparedSearchInput distinguishes an omitted search step (nil) from an already-executed
+// search step (non-nil, including nil or error block) during stateless local continuations.
+type PreparedSearchInput struct {
+	Block *domain.ContentBlock `json:"block"`
+}
+
+// LocalCacheResultData carries only non-sensitive metadata from a browser-executed cache creation response.
+type LocalCacheResultData struct {
+	Name         string `json:"name,omitempty"`
+	ExpireTime   string `json:"expireTime,omitempty"`
+	ErrorCode    string `json:"errorCode,omitempty"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+}
+
+// LocalCacheResolutionInput supplies the browser-side cache pre-request outcome for stateless verification.
+type LocalCacheResolutionInput struct {
+	PlanKey string               `json:"planKey"`
+	Status  int                  `json:"status"`
+	Result  LocalCacheResultData `json:"result"`
+}
+
 // StreamChatInput defines the payload accepted by the streaming chat endpoint.
 type StreamChatInput struct {
-	ConversationID      string                  `json:"-"`
-	Blocks              []domain.ContentBlock   `json:"blocks"`
-	Text                string                  `json:"text"`
-	ProviderID          string                  `json:"providerId"`
-	ModelID             string                  `json:"modelId"`
-	Params              domain.GenerationParams `json:"params"`
-	RegenerateMessageID string                  `json:"regenerateMessageId"`
-	WebSearch           bool                    `json:"webSearch"`
-	SearchEngineID      string                  `json:"searchEngineId,omitempty"`
+	ConversationID      string                     `json:"-"`
+	Blocks              []domain.ContentBlock      `json:"blocks"`
+	Text                string                     `json:"text"`
+	ProviderID          string                     `json:"providerId"`
+	ModelID             string                     `json:"modelId"`
+	Params              domain.GenerationParams    `json:"params"`
+	RegenerateMessageID string                     `json:"regenerateMessageId"`
+	WebSearch           bool                       `json:"webSearch"`
+	SearchEngineID      string                     `json:"searchEngineId,omitempty"`
+	AutoCreateCache     bool                       `json:"autoCreateCache,omitempty"`
+	LocalContinuation   *LocalContinuationInput    `json:"localContinuation,omitempty"`
+	PreparedSearch      *PreparedSearchInput       `json:"preparedSearch,omitempty"`
+	CacheState          *plugin.PromptCacheState   `json:"cacheState,omitempty"`
+	CacheResolution     *LocalCacheResolutionInput `json:"cacheResolution,omitempty"`
 }
 
 // ChatService orchestrates upstream LLM requests, SSE normalization, cancellation, and persistence.
@@ -41,6 +72,9 @@ type ChatService struct {
 	assistants  *store.AssistantStore
 	searchReg   *plugin.SearchRegistry
 	searchStore *store.SearchConfigStore
+	mcpStore    *store.MCPServerStore
+	mcpClient   plugin.MCPClientBoundary
+	cacheStore  *promptCacheStore
 }
 
 // NewChatService constructs a ChatService. If httpClient is nil, a default client with no overall request timeout is used.
@@ -62,6 +96,7 @@ func NewChatService(
 		formats:    formats,
 		adapters:   adapters,
 		httpClient: httpClient,
+		cacheStore: newPromptCacheStore(defaultPromptCacheMaxEntries),
 	}
 }
 
@@ -78,6 +113,13 @@ func (s *ChatService) WithSearch(searchReg *plugin.SearchRegistry, searchStore *
 	return s
 }
 
+// WithMCP injects MCP server metadata and runtime boundary for tool discovery and execution.
+func (s *ChatService) WithMCP(mcpStore *store.MCPServerStore, mcpClient plugin.MCPClientBoundary) *ChatService {
+	s.mcpStore = mcpStore
+	s.mcpClient = mcpClient
+	return s
+}
+
 // PreparedStream holds a validated, open upstream HTTP response ready to stream SSE events to the client.
 type PreparedStream struct {
 	service              *ChatService
@@ -85,69 +127,113 @@ type PreparedStream struct {
 	provider             domain.ProviderConfig
 	model                domain.ModelConfig
 	apiFormat            plugin.APIFormat
+	adapter              plugin.ProviderAdapter
 	resp                 *http.Response
+	history              []domain.Message
+	systemPrompt         string
+	params               domain.GenerationParams
+	compat               domain.CompatConfig
+	tools                []plugin.ChatTool
+	toolBindings         map[string]mcpToolBinding
 	webSearchBlock       *domain.ContentBlock
 	replaceMessageID     string
 	insertAfterMessageID string
+	autoCreateCache      bool
+	cacheScope           plugin.PromptCacheScope
+}
+
+// PreparedLocalHTTPRequest describes a pre-encoded HTTP request without server-stored secrets.
+type PreparedLocalHTTPRequest struct {
+	Method   string            `json:"method"`
+	URL      string            `json:"url"`
+	Headers  map[string]string `json:"headers"`
+	Body     json.RawMessage   `json:"body"`
+	AuthType string            `json:"authType"`
+}
+
+// PreparedLocalCacheStep describes an optional explicit cache creation step to run before the main request.
+type PreparedLocalCacheStep struct {
+	Request PreparedLocalHTTPRequest `json:"request"`
+	PlanKey string                   `json:"planKey"`
 }
 
 // PreparedLocalRequest holds a pre-encoded upstream request for browser-direct execution.
 // Server-stored API keys are never included in URL or Headers.
 type PreparedLocalRequest struct {
-	Method               string               `json:"method"`
-	URL                  string               `json:"url"`
-	Headers              map[string]string    `json:"headers"`
-	Body                 json.RawMessage      `json:"body"`
-	AuthType             string               `json:"authType"`
-	WebSearchBlock       *domain.ContentBlock `json:"webSearchBlock,omitempty"`
-	ReplaceMessageID     string               `json:"replaceMessageId,omitempty"`
-	InsertAfterMessageID string               `json:"insertAfterMessageId,omitempty"`
+	Method               string                   `json:"method"`
+	URL                  string                   `json:"url"`
+	Headers              map[string]string        `json:"headers"`
+	Body                 json.RawMessage          `json:"body"`
+	AuthType             string                   `json:"authType"`
+	WebSearchBlock       *domain.ContentBlock     `json:"webSearchBlock,omitempty"`
+	ReplaceMessageID     string                   `json:"replaceMessageId,omitempty"`
+	InsertAfterMessageID string                   `json:"insertAfterMessageId,omitempty"`
+	CacheStep            *PreparedLocalCacheStep  `json:"cacheStep,omitempty"`
+	CacheState           *plugin.PromptCacheState `json:"cacheState,omitempty"`
 }
 
 type preparedUpstream struct {
 	conversation         domain.Conversation
 	provider             domain.ProviderConfig
+	resolveProv          domain.ProviderConfig
 	model                domain.ModelConfig
 	apiFormat            plugin.APIFormat
-	encoded              plugin.EncodedRequest
-	endpoint             plugin.ResolvedEndpoint
+	adapter              plugin.ProviderAdapter
+	history              []domain.Message
+	systemPrompt         string
+	params               domain.GenerationParams
+	compat               domain.CompatConfig
+	tools                []plugin.ChatTool
+	toolBindings         map[string]mcpToolBinding
 	webSearchBlock       *domain.ContentBlock
 	isRegen              bool
 	userBlocks           []domain.ContentBlock
 	historyLen           int
 	replaceMessageID     string
 	insertAfterMessageID string
+	autoCreateCache      bool
+	cacheScope           plugin.PromptCacheScope
+	chatInput            plugin.ChatInput
 }
 
-// Prepare validates inputs, encodes the upstream payload, opens the upstream HTTP connection,
-// and persists any new user prompt BEFORE SSE headers are sent.
+// Prepare validates inputs, runs optional cache planning, encodes the upstream payload,
+// opens the upstream HTTP connection, and persists any new user prompt BEFORE SSE headers are sent.
 func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*PreparedStream, error) {
 	prep, err := s.prepareUpstream(ctx, in, false)
 	if err != nil {
 		return nil, err
 	}
 
-	upReq, err := http.NewRequestWithContext(ctx, prep.encoded.Method, prep.endpoint.URL, bytes.NewReader(prep.encoded.Body))
-	if err != nil {
-		return nil, domain.NewError(domain.ErrCodeInternalError, "construct upstream request failed", err)
+	chatInput := prep.chatInput
+	var usedInlineCache bool
+	if prep.autoCreateCache {
+		currentCache := s.cacheStore.Get(prep.cacheScope)
+		activeCache, plan, planErr := s.executeCachePlan(
+			ctx,
+			chatInput,
+			prep.apiFormat,
+			prep.adapter,
+			prep.cacheScope,
+			currentCache,
+		)
+		if planErr != nil {
+			return nil, planErr
+		}
+		chatInput.PromptCache = activeCache
+		usedInlineCache = plan.InlineCache
 	}
-	upReq.Header = mergeRequestHeaders(prep.encoded.Headers, prep.endpoint.Headers)
 
-	resp, err := s.httpClient.Do(upReq)
+	resp, _, err := s.encodeAndOpenMainRequest(
+		ctx,
+		chatInput,
+		prep.apiFormat,
+		prep.adapter,
+		prep.cacheScope,
+		usedInlineCache,
+		true,
+	)
 	if err != nil {
-		if ctx.Err() != nil {
-			return nil, domain.NewError(domain.ErrCodeUpstreamError, "request canceled", ctx.Err())
-		}
-		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream request failed: %v", err), err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		bodySnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-		msg := strings.TrimSpace(string(bodySnippet))
-		if msg == "" {
-			msg = resp.Status
-		}
-		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream returned HTTP %d: %s", resp.StatusCode, msg), nil)
+		return nil, err
 	}
 
 	conv := prep.conversation
@@ -178,31 +264,28 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		provider:             prep.provider,
 		model:                prep.model,
 		apiFormat:            prep.apiFormat,
+		adapter:              prep.adapter,
 		resp:                 resp,
+		history:              prep.history,
+		systemPrompt:         prep.systemPrompt,
+		params:               prep.params,
+		compat:               prep.compat,
+		tools:                prep.tools,
+		toolBindings:         prep.toolBindings,
 		webSearchBlock:       prep.webSearchBlock,
 		replaceMessageID:     prep.replaceMessageID,
 		insertAfterMessageID: prep.insertAfterMessageID,
+		autoCreateCache:      prep.autoCreateCache,
+		cacheScope:           prep.cacheScope,
 	}, nil
 }
 
-// PrepareLocal validates inputs, runs optional web search, and encodes the upstream request
-// without mutating SQLite or emitting server-stored API keys.
+// PrepareLocal validates inputs, runs optional web search, plans stateless explicit cache steps,
+// and encodes the upstream request without mutating SQLite or emitting server-stored API keys.
 func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (PreparedLocalRequest, error) {
 	prep, err := s.prepareUpstream(ctx, in, true)
 	if err != nil {
 		return PreparedLocalRequest{}, err
-	}
-
-	merged := mergeRequestHeaders(prep.encoded.Headers, prep.endpoint.Headers)
-	headers := make(map[string]string, len(merged))
-	for k, vals := range merged {
-		if len(vals) > 0 {
-			headers[k] = strings.Join(vals, ", ")
-		}
-	}
-	body := json.RawMessage(prep.encoded.Body)
-	if len(body) == 0 {
-		body = json.RawMessage("{}")
 	}
 
 	authType := strings.TrimSpace(prep.provider.AuthType)
@@ -210,15 +293,100 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 		authType = domain.AuthTypeBearer
 	}
 
+	chatInput := prep.chatInput
+	var (
+		cacheStep     *PreparedLocalCacheStep
+		outCacheState *plugin.PromptCacheState
+	)
+
+	if prep.autoCreateCache {
+		if planner, ok := prep.apiFormat.(plugin.PromptCachePlanner); ok {
+			plan, planErr := planner.PlanCache(ctx, chatInput, in.CacheState)
+			if planErr != nil {
+				return PreparedLocalRequest{}, planErr
+			}
+			fullPlanKey := ""
+			if plan.PlanKey != "" {
+				fullPlanKey = buildLocalPlanKey(prep.cacheScope, prep.systemPrompt, prep.tools, plan.PlanKey)
+			}
+
+			if in.CacheResolution != nil {
+				if plan.CreateRequest != nil && fullPlanKey != "" && in.CacheResolution.PlanKey == fullPlanKey {
+					resBody := sanitizeLocalCacheResolutionBody(*in.CacheResolution)
+					res, resErr := planner.ResolveCache(ctx, chatInput, plan, plugin.CacheResolutionInput{
+						StatusCode: in.CacheResolution.Status,
+						Body:       resBody,
+						PlanKey:    plan.PlanKey,
+					})
+					if resErr != nil {
+						return PreparedLocalRequest{}, resErr
+					}
+					if res.HardError != nil {
+						return PreparedLocalRequest{}, res.HardError
+					}
+					outCacheState = res.State
+					chatInput.PromptCache = res.State
+				} else if plan.CreateRequest == nil && plan.ReuseState != nil {
+					outCacheState = plan.ReuseState
+					chatInput.PromptCache = plan.ReuseState
+				}
+			} else if plan.CreateRequest != nil {
+				createEndpoint, epErr := resolveEndpointForCacheCreate(
+					prep.adapter,
+					prep.resolveProv,
+					prep.model,
+					*plan.CreateRequest,
+					prep.compat,
+				)
+				if epErr != nil {
+					return PreparedLocalRequest{}, epErr
+				}
+				createBody := json.RawMessage(plan.CreateRequest.Body)
+				if len(createBody) == 0 {
+					createBody = json.RawMessage("{}")
+				}
+				cacheStep = &PreparedLocalCacheStep{
+					PlanKey: fullPlanKey,
+					Request: PreparedLocalHTTPRequest{
+						Method:   plan.CreateRequest.Method,
+						URL:      createEndpoint.URL,
+						Headers:  headersToStringMap(mergeRequestHeaders(plan.CreateRequest.Headers, createEndpoint.Headers)),
+						Body:     createBody,
+						AuthType: authType,
+					},
+				}
+			} else {
+				outCacheState = plan.ReuseState
+				chatInput.PromptCache = plan.ReuseState
+			}
+		}
+	}
+
+	encoded, encErr := prep.apiFormat.EncodeRequest(ctx, chatInput)
+	if encErr != nil {
+		return PreparedLocalRequest{}, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", encErr)
+	}
+	endpoint, epErr := prep.adapter.ResolveEndpoint(prep.resolveProv, prep.model, encoded.DefaultPath, encoded.Query, prep.compat)
+	if epErr != nil {
+		return PreparedLocalRequest{}, epErr
+	}
+
+	body := json.RawMessage(encoded.Body)
+	if len(body) == 0 {
+		body = json.RawMessage("{}")
+	}
+
 	return PreparedLocalRequest{
-		Method:               prep.encoded.Method,
-		URL:                  prep.endpoint.URL,
-		Headers:              headers,
+		Method:               encoded.Method,
+		URL:                  endpoint.URL,
+		Headers:              headersToStringMap(mergeRequestHeaders(encoded.Headers, endpoint.Headers)),
 		Body:                 body,
 		AuthType:             authType,
 		WebSearchBlock:       prep.webSearchBlock,
 		ReplaceMessageID:     prep.replaceMessageID,
 		InsertAfterMessageID: prep.insertAfterMessageID,
+		CacheStep:            cacheStep,
+		CacheState:           outCacheState,
 	}, nil
 }
 
@@ -262,8 +430,39 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	}
 
 	isRegen := strings.TrimSpace(in.RegenerateMessageID) != ""
+	isLocalCont := in.LocalContinuation != nil
+	if !allowMissingLocalKey && (in.PreparedSearch != nil || in.CacheState != nil || in.CacheResolution != nil) {
+		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, "preparedSearch/cacheState/cacheResolution are only supported by prepare-local", nil)
+	}
+	if isLocalCont {
+		if !allowMissingLocalKey {
+			return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, "localContinuation is only supported by prepare-local", nil)
+		}
+		if len(in.LocalContinuation.Blocks) == 0 {
+			return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, "localContinuation.blocks are required", nil)
+		}
+	}
+
 	var userBlocks []domain.ContentBlock
-	if !isRegen {
+	if isLocalCont {
+		if isRegen {
+			if _, err := s.msgs.Get(ctx, in.RegenerateMessageID); err != nil {
+				return preparedUpstream{}, err
+			}
+		} else {
+			anchorID := strings.TrimSpace(in.LocalContinuation.UserMessageID)
+			if anchorID == "" {
+				return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, "localContinuation.userMessageId or regenerateMessageId is required", nil)
+			}
+			anchorMsg, err := s.msgs.Get(ctx, anchorID)
+			if err != nil {
+				return preparedUpstream{}, err
+			}
+			if anchorMsg.ConversationID != conv.ID || anchorMsg.Role != domain.RoleUser {
+				return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, "localContinuation.userMessageId does not belong to a user message in this conversation", nil)
+			}
+		}
+	} else if !isRegen {
 		userBlocks = in.Blocks
 		if len(userBlocks) == 0 && strings.TrimSpace(in.Text) != "" {
 			userBlocks = []domain.ContentBlock{{
@@ -310,6 +509,34 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 			replaceMessageID = history[targetIdx].ID
 			history = history[:targetIdx]
 		}
+		if isLocalCont {
+			history = append(history, domain.Message{
+				ConversationID: conv.ID,
+				Role:           domain.RoleAssistant,
+				Blocks:         filterBlocksForModelHistory(in.LocalContinuation.Blocks),
+				ProviderID:     prov.ID,
+				ModelID:        model.ID,
+			})
+		}
+	} else if isLocalCont {
+		anchorID := strings.TrimSpace(in.LocalContinuation.UserMessageID)
+		anchorIdx := -1
+		for i, m := range history {
+			if m.ID == anchorID {
+				anchorIdx = i
+				break
+			}
+		}
+		if anchorIdx < 0 || history[anchorIdx].Role != domain.RoleUser {
+			return preparedUpstream{}, domain.NewError(domain.ErrCodeNotFound, "anchor user message not found in conversation", nil)
+		}
+		history = append(history[:anchorIdx+1], domain.Message{
+			ConversationID: conv.ID,
+			Role:           domain.RoleAssistant,
+			Blocks:         filterBlocksForModelHistory(in.LocalContinuation.Blocks),
+			ProviderID:     prov.ID,
+			ModelID:        model.ID,
+		})
 	} else {
 		history = append(history, domain.Message{
 			ConversationID: conv.ID,
@@ -337,30 +564,55 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 
 	var webSearchBlock *domain.ContentBlock
 	if in.WebSearch {
-		block, searchPrompt := s.runWebSearch(ctx, in.SearchEngineID, latestUserQuery(history))
-		webSearchBlock = block
-		if searchPrompt != "" {
-			if strings.TrimSpace(effectiveSystemPrompt) == "" {
-				effectiveSystemPrompt = searchPrompt
-			} else {
-				effectiveSystemPrompt = effectiveSystemPrompt + "\n\n" + searchPrompt
+		if in.PreparedSearch != nil {
+			if in.PreparedSearch.Block != nil {
+				if searchPrompt := rebuildSearchPromptFromBlock(*in.PreparedSearch.Block); searchPrompt != "" {
+					if strings.TrimSpace(effectiveSystemPrompt) == "" {
+						effectiveSystemPrompt = searchPrompt
+					} else {
+						effectiveSystemPrompt = effectiveSystemPrompt + "\n\n" + searchPrompt
+					}
+				}
+			}
+		} else if isLocalCont {
+			if searchPrompt := rebuildSearchPromptFromBlocks(in.LocalContinuation.Blocks); searchPrompt != "" {
+				if strings.TrimSpace(effectiveSystemPrompt) == "" {
+					effectiveSystemPrompt = searchPrompt
+				} else {
+					effectiveSystemPrompt = effectiveSystemPrompt + "\n\n" + searchPrompt
+				}
+			}
+		} else {
+			block, searchPrompt := s.runWebSearch(ctx, in.SearchEngineID, latestUserQuery(history))
+			webSearchBlock = block
+			if searchPrompt != "" {
+				if strings.TrimSpace(effectiveSystemPrompt) == "" {
+					effectiveSystemPrompt = searchPrompt
+				} else {
+					effectiveSystemPrompt = effectiveSystemPrompt + "\n\n" + searchPrompt
+				}
 			}
 		}
 	}
 
-	mergedCompat := format.MergeCompat(apiFormat.DefaultCompat(), model.Compat)
-	encoded, err := apiFormat.EncodeRequest(ctx, plugin.ChatInput{
-		ConversationID: conv.ID,
-		Provider:       prov,
-		Model:          model,
-		SystemPrompt:   effectiveSystemPrompt,
-		Messages:       history,
-		Params:         effectiveParams,
-		Compat:         mergedCompat,
-	})
+	tools, toolBindings, err := s.discoverActiveTools(ctx)
 	if err != nil {
-		return preparedUpstream{}, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", err)
+		return preparedUpstream{}, err
 	}
+
+	mergedCompat := format.MergeCompat(apiFormat.DefaultCompat(), model.Compat)
+	chatInput := plugin.ChatInput{
+		ConversationID:  conv.ID,
+		Provider:        prov,
+		Model:           model,
+		SystemPrompt:    effectiveSystemPrompt,
+		Messages:        history,
+		Params:          effectiveParams,
+		Compat:          mergedCompat,
+		Tools:           tools,
+		AutoCreateCache: in.AutoCreateCache,
+	}
+	cacheScope := buildPromptCacheScope(prov, model, apiFormat.ID(), mergedCompat)
 
 	resolveProv := prov
 	if allowMissingLocalKey {
@@ -380,24 +632,28 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		resolveProv.APIKey = ""
 	}
 
-	endpoint, err := adapter.ResolveEndpoint(resolveProv, model, encoded.DefaultPath, encoded.Query, mergedCompat)
-	if err != nil {
-		return preparedUpstream{}, err
-	}
-
 	return preparedUpstream{
 		conversation:         conv,
 		provider:             prov,
+		resolveProv:          resolveProv,
 		model:                model,
 		apiFormat:            apiFormat,
-		encoded:              encoded,
-		endpoint:             endpoint,
+		adapter:              adapter,
+		history:              history,
+		systemPrompt:         effectiveSystemPrompt,
+		params:               effectiveParams,
+		compat:               mergedCompat,
+		tools:                tools,
+		toolBindings:         toolBindings,
 		webSearchBlock:       webSearchBlock,
 		isRegen:              isRegen,
 		userBlocks:           userBlocks,
 		historyLen:           len(history),
 		replaceMessageID:     replaceMessageID,
 		insertAfterMessageID: insertAfterMessageID,
+		autoCreateCache:      in.AutoCreateCache,
+		cacheScope:           cacheScope,
+		chatInput:            chatInput,
 	}, nil
 }
 
@@ -417,11 +673,9 @@ func mergeRequestHeaders(encodedHeaders, endpointHeaders http.Header) http.Heade
 	return merged
 }
 
-// Stream consumes the upstream response body, translates events via emit, handles cancellation,
-// and persists the resulting assistant message (complete, aborted, or error).
+// Stream consumes upstream response bodies across tool-use rounds, translates events via emit,
+// handles cancellation, and persists the single resulting assistant message.
 func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEvent) error) error {
-	defer p.resp.Body.Close()
-
 	assistantID := domain.NewUUID()
 	acc := newStreamAccumulator()
 
@@ -433,7 +687,8 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		ModelID:        p.model.ID,
 	}
 	if err := emit(startEvent); err != nil {
-		p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+		_ = p.resp.Body.Close()
+		_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
 		return err
 	}
 
@@ -452,7 +707,8 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		}
 		acc.apply(wsStart)
 		if err := emit(wsStart); err != nil {
-			p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			_ = p.resp.Body.Close()
+			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
 			return err
 		}
 
@@ -468,44 +724,161 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		}
 		acc.apply(wsEnd)
 		if err := emit(wsEnd); err != nil {
-			p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			_ = p.resp.Body.Close()
+			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
 			return err
 		}
 		indexOffset = 1
 	}
 
-	var streamErrMsg string
-	decodeErr := p.apiFormat.DecodeStream(ctx, p.resp.Body, func(ev domain.StreamEvent) error {
-		ev.ConversationID = p.conversation.ID
-		ev.MessageID = assistantID
-		ev.ProviderID = p.provider.ID
-		ev.ModelID = p.model.ID
-		if indexOffset > 0 && ev.Index != nil {
-			shifted := *ev.Index + indexOffset
-			ev.Index = &shifted
+	seenCallIDs := make(map[string]struct{})
+	var cumulativeUsage *domain.Usage
+	finalStopReason := domain.StopReasonStop
+	resp := p.resp
+
+	for round := 0; ; round++ {
+		var (
+			streamErrMsg   string
+			roundUsage     *domain.Usage
+			roundStop      string
+			roundCalls     []domain.ContentBlock
+			roundCallIDs   = make(map[int]string)
+			maxSeenIdx     = indexOffset - 1
+		)
+
+		decodeErr := p.apiFormat.DecodeStream(ctx, resp.Body, func(ev domain.StreamEvent) error {
+			ev.ConversationID = p.conversation.ID
+			ev.MessageID = assistantID
+			ev.ProviderID = p.provider.ID
+			ev.ModelID = p.model.ID
+			if ev.Index != nil {
+				shifted := *ev.Index + indexOffset
+				ev.Index = &shifted
+				if shifted > maxSeenIdx {
+					maxSeenIdx = shifted
+				}
+			}
+
+			if ev.Block != nil && ev.Block.Type == domain.BlockTypeToolCall && ev.Index != nil {
+				bCopy := *ev.Block
+				idx := *ev.Index
+				switch ev.Type {
+				case domain.StreamEventBlockStart:
+					id := strings.TrimSpace(bCopy.ID)
+					if id == "" {
+						id = fmt.Sprintf("call_r%d_%d", round+1, idx)
+					}
+					if _, exists := seenCallIDs[id]; exists {
+						base := fmt.Sprintf("call_r%d_%d", round+1, idx)
+						id = base
+						for suffix := 2; ; suffix++ {
+							if _, clash := seenCallIDs[id]; !clash {
+								break
+							}
+							id = fmt.Sprintf("%s_%d", base, suffix)
+						}
+					}
+					seenCallIDs[id] = struct{}{}
+					roundCallIDs[idx] = id
+					bCopy.ID = id
+					ev.Block = &bCopy
+				case domain.StreamEventBlockEnd:
+					id, ok := roundCallIDs[idx]
+					if !ok {
+						id = strings.TrimSpace(bCopy.ID)
+						if id == "" {
+							id = fmt.Sprintf("call_r%d_%d", round+1, idx)
+						}
+						if _, exists := seenCallIDs[id]; exists {
+							base := fmt.Sprintf("call_r%d_%d", round+1, idx)
+							id = base
+							for suffix := 2; ; suffix++ {
+								if _, clash := seenCallIDs[id]; !clash {
+									break
+								}
+								id = fmt.Sprintf("%s_%d", base, suffix)
+							}
+						}
+						seenCallIDs[id] = struct{}{}
+						roundCallIDs[idx] = id
+					}
+					bCopy.ID = id
+					ev.Block = &bCopy
+					roundCalls = append(roundCalls, bCopy)
+				}
+			}
+
+			if ev.Type == domain.StreamEventMessageDelta {
+				if ev.Usage != nil {
+					u := *ev.Usage
+					roundUsage = &u
+					ev.Usage = addUsage(addUsage(nil, cumulativeUsage), roundUsage)
+				}
+				if ev.StopReason != "" {
+					roundStop = ev.StopReason
+				}
+			}
+
+			acc.apply(ev)
+			if ev.Type == domain.StreamEventError && ev.Error != nil {
+				streamErrMsg = ev.Error.Message
+			}
+			return emit(ev)
+		})
+		_ = resp.Body.Close()
+
+		if ctx.Err() != nil || errors.Is(decodeErr, context.Canceled) {
+			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			return nil
 		}
 
-		acc.apply(ev)
-		if ev.Type == domain.StreamEventError && ev.Error != nil {
-			streamErrMsg = ev.Error.Message
+		if decodeErr != nil || streamErrMsg != "" {
+			errMsg := streamErrMsg
+			if errMsg == "" && decodeErr != nil {
+				errMsg = decodeErr.Error()
+			}
+			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, errMsg)
+			if streamErrMsg == "" {
+				_ = emit(domain.StreamEvent{
+					Type:           domain.StreamEventError,
+					ConversationID: p.conversation.ID,
+					MessageID:      assistantID,
+					ProviderID:     p.provider.ID,
+					ModelID:        p.model.ID,
+					Error: &domain.StreamError{
+						Code:    domain.ErrCodeUpstreamError,
+						Message: errMsg,
+					},
+				})
+			}
+			return nil
 		}
-		return emit(ev)
-	})
 
-	// Aborted by caller context cancellation (client disconnect or abort trigger).
-	if ctx.Err() != nil || errors.Is(decodeErr, context.Canceled) {
-		p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
-		return nil
-	}
+		cumulativeUsage = addUsage(cumulativeUsage, roundUsage)
+		acc.usage = cumulativeUsage
+		indexOffset = maxSeenIdx + 1
 
-	// Stream failed mid-flight or emitted an upstream error event.
-	if decodeErr != nil || streamErrMsg != "" {
-		errMsg := streamErrMsg
-		if errMsg == "" && decodeErr != nil {
-			errMsg = decodeErr.Error()
+		effectiveStop := roundStop
+		if effectiveStop == "" {
+			if len(roundCalls) > 0 {
+				effectiveStop = domain.StopReasonToolUse
+			} else {
+				effectiveStop = domain.StopReasonStop
+			}
 		}
-		p.persistResult(ctx, assistantID, acc, domain.StopReasonError, errMsg)
-		if streamErrMsg == "" {
+
+		if effectiveStop != domain.StopReasonToolUse || len(roundCalls) == 0 {
+			finalStopReason = effectiveStop
+			break
+		}
+		if len(p.tools) == 0 && p.service.mcpClient == nil {
+			finalStopReason = effectiveStop
+			break
+		}
+
+		if round >= MCPRoundLimit {
+			limitMsg := fmt.Sprintf("达到最大工具调用轮数上限（%d 轮）", MCPRoundLimit)
+			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, limitMsg)
 			_ = emit(domain.StreamEvent{
 				Type:           domain.StreamEventError,
 				ConversationID: p.conversation.ID,
@@ -513,19 +886,159 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 				ProviderID:     p.provider.ID,
 				ModelID:        p.model.ID,
 				Error: &domain.StreamError{
-					Code:    domain.ErrCodeUpstreamError,
-					Message: errMsg,
+					Code:    "MCP_ROUND_LIMIT",
+					Message: limitMsg,
 				},
 			})
+			return nil
 		}
-		return nil
+
+		for _, tc := range roundCalls {
+			if ctx.Err() != nil {
+				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+				return nil
+			}
+			trBlock, execErr := p.service.executeToolCall(ctx, p.toolBindings, tc)
+			if execErr != nil || ctx.Err() != nil {
+				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+				return nil
+			}
+			resIdx := indexOffset
+			indexOffset++
+			trCopy := trBlock
+			evStart := domain.StreamEvent{
+				Type:           domain.StreamEventBlockStart,
+				ConversationID: p.conversation.ID,
+				MessageID:      assistantID,
+				ProviderID:     p.provider.ID,
+				ModelID:        p.model.ID,
+				Index:          domain.IntPtr(resIdx),
+				BlockType:      domain.BlockTypeToolResult,
+				Block:          &trCopy,
+			}
+			acc.apply(evStart)
+			if err := emit(evStart); err != nil {
+				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+				return err
+			}
+			evEnd := domain.StreamEvent{
+				Type:           domain.StreamEventBlockEnd,
+				ConversationID: p.conversation.ID,
+				MessageID:      assistantID,
+				ProviderID:     p.provider.ID,
+				ModelID:        p.model.ID,
+				Index:          domain.IntPtr(resIdx),
+				BlockType:      domain.BlockTypeToolResult,
+				Block:          &trCopy,
+			}
+			acc.apply(evEnd)
+			if err := emit(evEnd); err != nil {
+				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+				return err
+			}
+		}
+
+		if ctx.Err() != nil {
+			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			return nil
+		}
+
+		nextHistory := make([]domain.Message, len(p.history)+1)
+		copy(nextHistory, p.history)
+		nextHistory[len(p.history)] = domain.Message{
+			ConversationID: p.conversation.ID,
+			Role:           domain.RoleAssistant,
+			Blocks:         filterBlocksForModelHistory(acc.blocksSlice()),
+			ProviderID:     p.provider.ID,
+			ModelID:        p.model.ID,
+		}
+		activeTools := p.service.filterEnabledTools(ctx, p.tools)
+		nextInput := plugin.ChatInput{
+			ConversationID:  p.conversation.ID,
+			Provider:        p.provider,
+			Model:           p.model,
+			SystemPrompt:    p.systemPrompt,
+			Messages:        nextHistory,
+			Params:          p.params,
+			Compat:          p.compat,
+			Tools:           activeTools,
+			AutoCreateCache: p.autoCreateCache,
+		}
+		var usedInlineCache bool
+		if p.autoCreateCache {
+			curCache := p.service.cacheStore.Get(p.cacheScope)
+			activeCache, nextPlan, planErr := p.service.executeCachePlan(
+				ctx,
+				nextInput,
+				p.apiFormat,
+				p.adapter,
+				p.cacheScope,
+				curCache,
+			)
+			if planErr != nil {
+				if ctx.Err() != nil {
+					_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+					return nil
+				}
+				errMsg := planErr.Error()
+				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, errMsg)
+				_ = emit(domain.StreamEvent{
+					Type:           domain.StreamEventError,
+					ConversationID: p.conversation.ID,
+					MessageID:      assistantID,
+					ProviderID:     p.provider.ID,
+					ModelID:        p.model.ID,
+					Error:          &domain.StreamError{Code: domain.ErrCodeUpstreamError, Message: errMsg},
+				})
+				return nil
+			}
+			nextInput.PromptCache = activeCache
+			usedInlineCache = nextPlan.InlineCache
+		}
+		nextResp, _, openErr := p.service.encodeAndOpenMainRequest(
+			ctx,
+			nextInput,
+			p.apiFormat,
+			p.adapter,
+			p.cacheScope,
+			usedInlineCache,
+			true,
+		)
+		if openErr != nil {
+			if ctx.Err() != nil {
+				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+				return nil
+			}
+			errMsg := openErr.Error()
+			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, errMsg)
+			_ = emit(domain.StreamEvent{
+				Type:           domain.StreamEventError,
+				ConversationID: p.conversation.ID,
+				MessageID:      assistantID,
+				ProviderID:     p.provider.ID,
+				ModelID:        p.model.ID,
+				Error:          &domain.StreamError{Code: domain.ErrCodeUpstreamError, Message: errMsg},
+			})
+			return nil
+		}
+		resp = nextResp
 	}
 
-	stopReason := acc.stopReason
-	if stopReason == "" {
-		stopReason = domain.StopReasonStop
+	saved, persistErr := p.persistResult(ctx, assistantID, acc, finalStopReason, "")
+	if persistErr != nil {
+		_ = emit(domain.StreamEvent{
+			Type:           domain.StreamEventError,
+			ConversationID: p.conversation.ID,
+			MessageID:      assistantID,
+			ProviderID:     p.provider.ID,
+			ModelID:        p.model.ID,
+			Error: &domain.StreamError{
+				Code:    "PERSIST_FAILED",
+				Message: fmt.Sprintf("保存消息失败: %v", persistErr),
+			},
+		})
+		return nil
 	}
-	saved := p.persistResult(ctx, assistantID, acc, stopReason, "")
 	return emit(domain.StreamEvent{
 		Type:           domain.StreamEventMessageEnd,
 		ConversationID: p.conversation.ID,
@@ -542,7 +1055,7 @@ func (p *PreparedStream) persistResult(
 	acc *streamAccumulator,
 	stopReason string,
 	errMsg string,
-) domain.Message {
+) (domain.Message, error) {
 	// Detach from canceled request context so partial responses persist reliably on abort.
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
@@ -573,10 +1086,10 @@ func (p *PreparedStream) persistResult(
 		saved, err = p.service.msgs.Create(persistCtx, msg)
 	}
 	if err != nil {
-		return msg
+		return domain.Message{}, err
 	}
 	_ = p.service.convs.TouchUpdatedAt(persistCtx, p.conversation.ID, time.Now().UTC())
-	return saved
+	return saved, nil
 }
 
 type blockAccum struct {
@@ -855,14 +1368,5 @@ func (s *ChatService) runWebSearch(ctx context.Context, requestedEngineID, query
 		Extra: raw,
 	}
 
-	var sb strings.Builder
-	sb.WriteString("[联网搜索结果]\n")
-	for i, r := range results {
-		fmt.Fprintf(&sb, "%d. %s (%s)\n", i+1, r.Title, r.URL)
-		if r.Snippet != "" {
-			fmt.Fprintf(&sb, "   %s\n", r.Snippet)
-		}
-	}
-	sb.WriteString("请结合以上联网搜索结果回答用户问题，并在合适位置引用来源链接。")
-	return block, sb.String()
+	return block, formatSearchResultsPrompt(results)
 }

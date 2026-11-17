@@ -321,3 +321,204 @@ func TestAssistantBranchingDeleteAndUserRetryWithSearch(t *testing.T) {
 		t.Fatalf("expected webSearch error block persisted, got %+v", endMsg)
 	}
 }
+
+func TestConversationGroupsBatchAndReorder(t *testing.T) {
+	ctx := context.Background()
+	_, assistSvc, convSvc, _, _, msgStore := setupServiceTestEnv(t)
+
+	otherAssist, err := assistSvc.Create(ctx, AssistantInput{Name: "Other"})
+	if err != nil {
+		t.Fatalf("create other assistant: %v", err)
+	}
+	otherConv, err := convSvc.Create(ctx, CreateConversationInput{AssistantID: otherAssist.ID, Title: "Other Conv"})
+	if err != nil {
+		t.Fatalf("create other conv: %v", err)
+	}
+	otherGroupRes, err := convSvc.CreateGroup(ctx, CreateGroupInput{AssistantID: otherAssist.ID, Name: "Other Group"})
+	if err != nil {
+		t.Fatalf("create other group: %v", err)
+	}
+
+	c1, _ := convSvc.Create(ctx, CreateConversationInput{AssistantID: domain.DefaultAssistantID, Title: "C1"})
+	c2, _ := convSvc.Create(ctx, CreateConversationInput{AssistantID: domain.DefaultAssistantID, Title: "C2"})
+	c3, _ := convSvc.Create(ctx, CreateConversationInput{AssistantID: domain.DefaultAssistantID, Title: "C3"})
+	c4, _ := convSvc.Create(ctx, CreateConversationInput{AssistantID: domain.DefaultAssistantID, Title: "C4"})
+	_, _ = msgStore.Create(ctx, domain.Message{ConversationID: c1.ID, Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "m1"}}})
+	_, _ = msgStore.Create(ctx, domain.Message{ConversationID: c2.ID, Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "m2"}}})
+
+	// Empty group name rejected.
+	if _, err := convSvc.CreateGroup(ctx, CreateGroupInput{AssistantID: domain.DefaultAssistantID, Name: "   "}); err == nil {
+		t.Fatal("expected empty group name to fail")
+	}
+	g1Res, err := convSvc.CreateGroup(ctx, CreateGroupInput{AssistantID: domain.DefaultAssistantID, Name: " Work "})
+	if err != nil || g1Res.Group.Name != "Work" {
+		t.Fatalf("create g1 failed: err=%v res=%+v", err, g1Res)
+	}
+	g2Res, err := convSvc.CreateGroup(ctx, CreateGroupInput{AssistantID: domain.DefaultAssistantID, Name: "Notes"})
+	if err != nil {
+		t.Fatalf("create g2 failed: %v", err)
+	}
+	renamedG1, err := convSvc.RenameGroup(ctx, g1Res.Group.ID, RenameGroupInput{Name: " Projects "})
+	if err != nil || renamedG1.Group.ID != g1Res.Group.ID || renamedG1.Group.Name != "Projects" {
+		t.Fatalf("rename g1 failed: err=%v res=%+v", err, renamedG1)
+	}
+
+	// Atomic batch delete: 2 valid + 1 cross-assistant ID must delete NOTHING.
+	if _, err := convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c1.ID, c2.ID, otherConv.ID},
+		Operation:   "delete",
+	}); err == nil {
+		t.Fatal("expected cross-assistant batch delete to fail")
+	}
+	if list, _ := convSvc.ListByAssistant(ctx, domain.DefaultAssistantID); len(list) != 4 {
+		t.Fatalf("expected all 4 conversations preserved on failed batch delete, got %d", len(list))
+	}
+
+	// Move validation: omitted groupId, empty string groupId, cross-assistant groupId must fail.
+	if _, err := convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c1.ID},
+		Operation:   "move",
+	}); err == nil {
+		t.Fatal("expected move without groupId to fail")
+	}
+	if _, err := convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c1.ID},
+		Operation:   "move",
+		GroupID:     PatchField[string]{Set: true, Value: " "},
+	}); err == nil {
+		t.Fatal("expected move with empty groupId to fail")
+	}
+	if _, err := convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c1.ID},
+		Operation:   "move",
+		GroupID:     PatchField[string]{Set: true, Value: otherGroupRes.Group.ID},
+	}); err == nil {
+		t.Fatal("expected cross-assistant groupId move to fail")
+	}
+	if _, err := convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c1.ID},
+		Operation:   "pin",
+	}); err == nil {
+		t.Fatal("expected pin without boolean to fail")
+	}
+
+	// Move C4, C2 (in canonical ungrouped order C4, C3, C2, C1) to g1 and deduplicate IDs.
+	snap, err := convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c4.ID, c2.ID, c4.ID},
+		Operation:   "move",
+		GroupID:     PatchField[string]{Set: true, Value: g1Res.Group.ID},
+	})
+	if err != nil {
+		t.Fatalf("batch move to g1 failed: %v", err)
+	}
+	// Canonical order: g1 (C4, C2), then ungrouped (C3, C1).
+	if snap.Conversations[0].ID != c4.ID || snap.Conversations[1].ID != c2.ID ||
+		snap.Conversations[2].ID != c3.ID || snap.Conversations[3].ID != c1.ID {
+		t.Fatalf("unexpected order after move to g1: %+v", snap.Conversations)
+	}
+
+	// Pin C2 -> enters pinned bucket at top while keeping GroupID=g1; unpin restores to tail of g1.
+	snap, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c2.ID},
+		Operation:   "pin",
+		Pinned:      PatchField[bool]{Set: true, Value: true},
+	})
+	if err != nil {
+		t.Fatalf("pin c2 failed: %v", err)
+	}
+	if !snap.Conversations[0].Pinned || snap.Conversations[0].ID != c2.ID ||
+		snap.Conversations[0].GroupID == nil || *snap.Conversations[0].GroupID != g1Res.Group.ID {
+		t.Fatalf("expected C2 pinned with GroupID preserved: %+v", snap.Conversations[0])
+	}
+
+	// Reorder C3 into pinned bucket before C2 (must omit groupId when pinned=true), verify C3 keeps GroupID=nil.
+	snap, err = convSvc.ReorderConversations(ctx, ReorderConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c3.ID},
+		Pinned:      PatchField[bool]{Set: true, Value: true},
+		BeforeID:    PatchField[string]{Set: true, Value: c2.ID},
+	})
+	if err != nil {
+		t.Fatalf("reorder into pinned bucket failed: %v", err)
+	}
+	if snap.Conversations[0].ID != c3.ID || !snap.Conversations[0].Pinned || snap.Conversations[0].GroupID != nil ||
+		snap.Conversations[1].ID != c2.ID || !snap.Conversations[1].Pinned || *snap.Conversations[1].GroupID != g1Res.Group.ID {
+		t.Fatalf("unexpected pinned order after reorder: %+v", snap.Conversations[:2])
+	}
+
+	// Unpin C2 -> returns to g1 after C4; delete g1 -> C4, C2 append to ungrouped tail after C1!
+	snap, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c2.ID},
+		Operation:   "pin",
+		Pinned:      PatchField[bool]{Set: true, Value: false},
+	})
+	if err != nil {
+		t.Fatalf("unpin c2 failed: %v", err)
+	}
+	// Canonical: pinned (C3), g1 (C4, C2), ungrouped (C1).
+	if snap.Conversations[0].ID != c3.ID || snap.Conversations[1].ID != c4.ID ||
+		snap.Conversations[2].ID != c2.ID || snap.Conversations[3].ID != c1.ID {
+		t.Fatalf("unexpected order after unpin c2: %+v", snap.Conversations)
+	}
+
+	// Move C2 to ungrouped explicitly with groupId: null, placed after C1.
+	snap, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c2.ID},
+		Operation:   "move",
+		GroupID:     PatchField[string]{Set: true, Null: true},
+	})
+	if err != nil {
+		t.Fatalf("batch move to ungrouped failed: %v", err)
+	}
+	if snap.Conversations[2].ID != c1.ID || snap.Conversations[3].ID != c2.ID || snap.Conversations[3].GroupID != nil {
+		t.Fatalf("expected C2 moved to ungrouped tail: %+v", snap.Conversations)
+	}
+
+	// Move C1 into g1 before C4 via reorder, then delete g1 -> C1, C4 move to ungrouped tail after C2!
+	snap, err = convSvc.ReorderConversations(ctx, ReorderConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c1.ID},
+		Pinned:      PatchField[bool]{Set: true, Value: false},
+		GroupID:     PatchField[string]{Set: true, Value: g1Res.Group.ID},
+		BeforeID:    PatchField[string]{Set: true, Value: c4.ID},
+	})
+	if err != nil {
+		t.Fatalf("reorder c1 before c4 in g1 failed: %v", err)
+	}
+	delGroupRes, err := convSvc.DeleteGroup(ctx, g1Res.Group.ID)
+	if err != nil {
+		t.Fatalf("delete g1 failed: %v", err)
+	}
+	// Pinned: C3; Ungrouped: C2, C1, C4.
+	if len(delGroupRes.Conversations) != 4 ||
+		delGroupRes.Conversations[0].ID != c3.ID ||
+		delGroupRes.Conversations[1].ID != c2.ID ||
+		delGroupRes.Conversations[2].ID != c1.ID ||
+		delGroupRes.Conversations[3].ID != c4.ID {
+		t.Fatalf("unexpected order after DeleteGroup: %+v", delGroupRes.Conversations)
+	}
+	// Messages in C1 survived move & group deletion.
+	if msgs, _ := msgStore.ListByConversation(ctx, c1.ID); len(msgs) != 1 {
+		t.Fatalf("expected c1 message preserved, got %d", len(msgs))
+	}
+
+	// Valid batch delete removes C1 and C4 only.
+	snap, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c1.ID, c4.ID},
+		Operation:   "delete",
+	})
+	if err != nil || len(snap.Conversations) != 2 || len(snap.DeletedIDs) != 2 {
+		t.Fatalf("batch delete failed: err=%v snap=%+v", err, snap)
+	}
+	_ = g2Res
+}

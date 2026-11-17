@@ -90,4 +90,48 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     }));
     expect(overflow.scrollW).toBeLessThanOrEqual(overflow.innerW);
   });
+
+  test('bounds long thinking container height with internal scrolling across desktop, tablet, and mobile viewports', async ({
+    appUrl,
+    upstream,
+    page,
+  }) => {
+    await seedMockProviderViaApi(appUrl, upstream.url);
+    await connectWithToken(page, appUrl);
+
+    await page.getByRole('button', { name: '选择模型' }).click();
+    await page.getByRole('option', { name: /Mock Chat/ }).click();
+
+    await page.getByLabel('消息输入框').fill('[LONG_THINKING]');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await expect(page.getByText('Done thinking.')).toBeVisible();
+
+    // Auto-collapsed on completion; open it to inspect height limits & internal scrolling.
+    await page.getByRole('button', { name: /思考过程/ }).click();
+    const thinkingBody = page.locator('.thinking-body').first();
+    await expect(thinkingBody).toBeVisible();
+
+    for (const vp of [
+      { width: 1280, height: 800, maxH: 320 },
+      { width: 768, height: 1024, maxH: 320 },
+      { width: 375, height: 812, maxH: 240 },
+    ]) {
+      await page.setViewportSize({ width: vp.width, height: vp.height });
+      const metrics = await thinkingBody.evaluate((el) => {
+        const rect = el.getBoundingClientRect();
+        return {
+          height: rect.height,
+          scrollHeight: el.scrollHeight,
+          clientHeight: el.clientHeight,
+          overflowY: getComputedStyle(el).overflowY,
+          pageOverflow:
+            document.documentElement.scrollWidth > window.innerWidth,
+        };
+      });
+      expect(metrics.overflowY).toBe('auto');
+      expect(metrics.height).toBeLessThanOrEqual(vp.maxH + 1);
+      expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
+      expect(metrics.pageOverflow).toBe(false);
+    }
+  });
 });

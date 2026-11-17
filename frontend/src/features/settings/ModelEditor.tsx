@@ -43,10 +43,11 @@ function hasCompatOverrides(compat?: CompatConfig): boolean {
       compat.thinkingFormat ||
       compat.reasoningEffortField ||
       compat.pathOverride ||
-      compat.supportsDeveloperRole !== undefined &&
-        compat.supportsDeveloperRole !== null ||
-      compat.supportsStreamOptions !== undefined &&
-        compat.supportsStreamOptions !== null ||
+      compat.cacheMode ||
+      (compat.supportsDeveloperRole !== undefined &&
+        compat.supportsDeveloperRole !== null) ||
+      (compat.supportsStreamOptions !== undefined &&
+        compat.supportsStreamOptions !== null) ||
       (compat.extraHeaders && Object.keys(compat.extraHeaders).length > 0) ||
       (compat.extraBody && Object.keys(compat.extraBody).length > 0),
   );
@@ -107,6 +108,7 @@ export function ModelEditor({
   const [thinkingFormat, setThinkingFormat] = useState('');
   const [reasoningEffortField, setReasoningEffortField] = useState('');
   const [pathOverride, setPathOverride] = useState('');
+  const [cacheMode, setCacheMode] = useState('');
   const [supportsDeveloperRole, setSupportsDeveloperRole] = useState<TriState>('');
   const [supportsStreamOptions, setSupportsStreamOptions] = useState<TriState>('');
   const [extraHeadersText, setExtraHeadersText] = useState('');
@@ -154,6 +156,7 @@ export function ModelEditor({
     setThinkingFormat(existing?.compat?.thinkingFormat ?? '');
     setReasoningEffortField(existing?.compat?.reasoningEffortField ?? '');
     setPathOverride(existing?.compat?.pathOverride ?? '');
+    setCacheMode(existing?.compat?.cacheMode ?? '');
     setSupportsDeveloperRole(toTriState(existing?.compat?.supportsDeveloperRole));
     setSupportsStreamOptions(toTriState(existing?.compat?.supportsStreamOptions));
     setExtraHeadersText(
@@ -270,6 +273,7 @@ export function ModelEditor({
       compat.reasoningEffortField = reasoningEffortField.trim();
     }
     if (pathOverride.trim()) compat.pathOverride = pathOverride.trim();
+    if (cacheMode.trim()) compat.cacheMode = cacheMode.trim();
     const devRole = fromTriState(supportsDeveloperRole);
     if (devRole !== undefined) compat.supportsDeveloperRole = devRole;
     const streamOpts = fromTriState(supportsStreamOptions);
@@ -596,6 +600,21 @@ export function ModelEditor({
                 </Select>
               </Field>
             </div>
+
+            <Field label="cacheMode" htmlFor="compat-cache-mode">
+              <Select
+                id="compat-cache-mode"
+                compact
+                value={cacheMode}
+                onChange={(e) => setCacheMode(e.target.value)}
+              >
+                <option value="">继承</option>
+                <option value="auto">auto</option>
+                <option value="implicit">implicit</option>
+                <option value="explicit">explicit</option>
+                <option value="disabled">disabled</option>
+              </Select>
+            </Field>
 
             <Field
               label="extraHeaders (JSON)"

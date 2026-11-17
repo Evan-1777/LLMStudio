@@ -28,8 +28,6 @@ function WorkbenchInner() {
 
   const {
     gateway,
-    settings,
-    updateSettings,
     connectionState,
     connectionEpoch,
     resources,
@@ -41,6 +39,7 @@ function WorkbenchInner() {
     state: chatState,
     isBusy,
     setReasoningEffort,
+    updateConversationMeta,
     clearSession,
     loadConversation,
     reloadCurrentConversation,
@@ -57,6 +56,7 @@ function WorkbenchInner() {
   const [leftDrawerOpen, setLeftDrawerOpen] = useState(false);
   const [rightDrawerOpen, setRightDrawerOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [sidebarManageMode, setSidebarManageMode] = useState(false);
 
   const [selectedAssistantId, setSelectedAssistantId] = useState('default');
   const [draftModel, setDraftModel] = useState<{
@@ -74,6 +74,12 @@ function WorkbenchInner() {
   const leftToggleRef = useRef<HTMLButtonElement | null>(null);
   const rightToggleRef = useRef<HTMLButtonElement | null>(null);
   const skipNextLoadIdRef = useRef<string | null>(null);
+  const activeConvIdRef = useRef<string | undefined>(conversationId);
+  activeConvIdRef.current = conversationId;
+  const activeConnEpochRef = useRef<number>(connectionEpoch);
+  activeConnEpochRef.current = connectionEpoch;
+  const [savingModelKey, setSavingModelKey] = useState<string | null>(null);
+  const modelSaveLockRef = useRef<string | null>(null);
 
   const assistants = useMemo(
     () =>
@@ -143,6 +149,14 @@ function WorkbenchInner() {
         (c) => (c.assistantId || 'default') === activeAssistant.id,
       ),
     [activeAssistant.id, resources.conversations],
+  );
+
+  const scopedGroups = useMemo(
+    () =>
+      resources.conversationGroups.filter(
+        (g) => g.assistantId === activeAssistant.id,
+      ),
+    [activeAssistant.id, resources.conversationGroups],
   );
 
   const currentConversation = useMemo(() => {
@@ -232,6 +246,11 @@ function WorkbenchInner() {
         if (hasOpenLayer) {
           return;
         }
+        if (sidebarManageMode) {
+          e.preventDefault();
+          setSidebarManageMode(false);
+          return;
+        }
         if (leftDrawerOpen || rightDrawerOpen) {
           e.preventDefault();
           closeDrawers(leftDrawerOpen ? 'left' : 'right');
@@ -257,6 +276,7 @@ function WorkbenchInner() {
     isBusy,
     leftDrawerOpen,
     rightDrawerOpen,
+    sidebarManageMode,
     stopStreaming,
   ]);
 
@@ -291,18 +311,49 @@ function WorkbenchInner() {
     }
   };
 
+  const currentModelScopeKey = currentConversation
+    ? `${connectionEpoch}:${currentConversation.id}`
+    : null;
+  const isSavingModel =
+    currentModelScopeKey !== null && savingModelKey === currentModelScopeKey;
+
   const handleSelectModel = async (providerId: string, modelId: string) => {
-    setDraftModel({ providerId, modelId });
-    if (!currentConversation || isBusy) return;
+    if (!currentConversation) {
+      setDraftModel({ providerId, modelId });
+      return;
+    }
+    const targetConvId = currentConversation.id;
+    const startEpoch = connectionEpoch;
+    const scopeKey = `${startEpoch}:${targetConvId}`;
+    if (isBusy || modelSaveLockRef.current === scopeKey) return;
+
+    modelSaveLockRef.current = scopeKey;
+    setSavingModelKey(scopeKey);
     try {
-      const updated = await gateway.patchConversation(currentConversation.id, {
+      const updated = await gateway.patchConversation(targetConvId, {
         providerId,
         modelId,
       });
+      if (
+        activeConnEpochRef.current !== startEpoch ||
+        activeConvIdRef.current !== targetConvId
+      ) {
+        return;
+      }
       upsertLocalConversation(updated);
-      await loadConversation(currentConversation.id);
+      updateConversationMeta(updated);
     } catch {
-      toast('切换模型失败', 'error');
+      if (
+        activeConnEpochRef.current === startEpoch &&
+        activeConvIdRef.current === targetConvId
+      ) {
+        toast('切换模型失败', 'error');
+      }
+    } finally {
+      if (modelSaveLockRef.current === scopeKey) {
+        modelSaveLockRef.current = null;
+      }
+      setSavingModelKey((prev) => (prev === scopeKey ? null : prev));
     }
   };
 
@@ -471,26 +522,12 @@ function WorkbenchInner() {
             selectedProviderId={selectedProviderId}
             selectedModelId={selectedModelId}
             disabled={isBusy}
+            busy={isSavingModel}
             onSelect={(pId, mId) => void handleSelectModel(pId, mId)}
           />
 
           <div className="wb-toolbar__spacer" />
 
-          <IconButton
-            icon={
-              settings.chatDisplayMode === 'feed'
-                ? 'layoutStream'
-                : 'messageSquare'
-            }
-            label="切换消息显示模式"
-            active={settings.chatDisplayMode === 'feed'}
-            onClick={() =>
-              updateSettings({
-                chatDisplayMode:
-                  settings.chatDisplayMode === 'feed' ? 'bubble' : 'feed',
-              })
-            }
-          />
           <IconButton
             icon="sliders"
             label="话题参数"
@@ -531,13 +568,17 @@ function WorkbenchInner() {
       </main>
 
       <ConversationSidebar
+        assistantId={activeAssistant.id}
         conversations={scopedConversations}
+        groups={scopedGroups}
         activeConversationId={conversationId ?? null}
         activeConversation={currentConversation}
         draftSessionParams={draftSessionParams}
         inspectorOpen={inspectorOpen}
         drawerOpen={rightDrawerOpen}
+        manageMode={sidebarManageMode}
         isBusy={isBusy}
+        onManageModeChange={setSidebarManageMode}
         onSelectConversation={handleSelectConversation}
         onNewConversation={handleStartNewTopic}
         onCloseInspector={() => {
@@ -549,12 +590,13 @@ function WorkbenchInner() {
         onCloseDrawer={() => closeDrawers('right')}
         onConversationPatched={(updated) => {
           if (chatState.conversation?.id === updated.id) {
-            void reloadCurrentConversation();
+            updateConversationMeta(updated);
           }
         }}
-        onConversationDeleted={(deletedId) => {
-          if (deletedId === conversationId) {
-            const next = scopedConversations.find((c) => c.id !== deletedId);
+        onConversationsDeleted={(deletedIds, remaining) => {
+          if (conversationId && deletedIds.includes(conversationId)) {
+            stopStreaming();
+            const next = remaining[0];
             if (next) {
               navigate(`/chat/${encodeURIComponent(next.id)}`, {
                 replace: true,
@@ -574,6 +616,8 @@ function WorkbenchInner() {
       <button
         type="button"
         aria-label="关闭侧栏"
+        aria-hidden={!(leftDrawerOpen || rightDrawerOpen) || undefined}
+        tabIndex={leftDrawerOpen || rightDrawerOpen ? 0 : -1}
         className={`wb-scrim ${
           leftDrawerOpen || rightDrawerOpen ? 'wb-scrim--open' : ''
         }`.trim()}

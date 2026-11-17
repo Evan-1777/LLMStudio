@@ -345,4 +345,87 @@ func TestRouterEndpointsAndStreamCancellation(t *testing.T) {
 	if mcpRec.Code != http.StatusCreated {
 		t.Fatalf("POST /mcp/servers status=%d body=%s", mcpRec.Code, mcpRec.Body.String())
 	}
+
+	// 9. Conversation groups, batch, reorder endpoints + auth enforcement + rank stability across TouchUpdatedAt.
+	unauthRec := doJSONReq(t, router, http.MethodGet, "/api/v1/conversation-groups?assistantId=default", "", nil)
+	if unauthRec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated group list, got %d", unauthRec.Code)
+	}
+
+	grpRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversation-groups", tok, map[string]any{
+		"assistantId": "default",
+		"name":        "Research",
+	})
+	if grpRec.Code != http.StatusCreated {
+		t.Fatalf("POST /conversation-groups status=%d body=%s", grpRec.Code, grpRec.Body.String())
+	}
+	var grpOut struct {
+		Group domain.ConversationGroup `json:"group"`
+	}
+	_ = json.Unmarshal(grpRec.Body.Bytes(), &grpOut)
+
+	badMoveRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/batch", tok, map[string]any{
+		"assistantId": "default",
+		"ids":         []string{convID},
+		"operation":   "move",
+	})
+	if badMoveRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for move omitting groupId, got %d", badMoveRec.Code)
+	}
+
+	goodMoveRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/batch", tok, map[string]any{
+		"assistantId": "default",
+		"ids":         []string{convID},
+		"operation":   "move",
+		"groupId":     grpOut.Group.ID,
+	})
+	if goodMoveRec.Code != http.StatusOK {
+		t.Fatalf("move to group status=%d body=%s", goodMoveRec.Code, goodMoveRec.Body.String())
+	}
+
+	badPinnedReorder := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/reorder", tok, map[string]any{
+		"assistantId": "default",
+		"ids":         []string{convID},
+		"pinned":      true,
+		"groupId":     nil,
+	})
+	if badPinnedReorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when pinned=true includes groupId, got %d", badPinnedReorder.Code)
+	}
+
+	// Reorder convID and branched conversation inside ungrouped, then send a message on second item and verify order doesn't revert.
+	unpinRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/reorder", tok, map[string]any{
+		"assistantId": "default",
+		"ids":         []string{convID},
+		"pinned":      false,
+		"groupId":     nil,
+	})
+	if unpinRec.Code != http.StatusOK {
+		t.Fatalf("reorder ungrouped status=%d body=%s", unpinRec.Code, unpinRec.Body.String())
+	}
+	var snap struct {
+		Conversations []domain.Conversation `json:"conversations"`
+	}
+	_ = json.Unmarshal(unpinRec.Body.Bytes(), &snap)
+	if len(snap.Conversations) != 2 || snap.Conversations[0].ID != branched.Conversation.ID || snap.Conversations[1].ID != convID {
+		t.Fatalf("expected [branched, convID], got %+v", snap.Conversations)
+	}
+	// Create a message on the second item (convID) -> TouchUpdatedAt must NOT pull convID ahead of branched!
+	msgCreateRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/"+convID+"/messages", tok, map[string]any{
+		"role":   "user",
+		"blocks": []map[string]any{{"type": "text", "text": "keep order"}},
+	})
+	if msgCreateRec.Code != http.StatusCreated {
+		t.Fatalf("create message status=%d body=%s", msgCreateRec.Code, msgCreateRec.Body.String())
+	}
+	listAfterMsgRec := doJSONReq(t, router, http.MethodGet, "/api/v1/conversations?assistantId=default", tok, nil)
+	_ = json.Unmarshal(listAfterMsgRec.Body.Bytes(), &snap)
+	if snap.Conversations[0].ID != branched.Conversation.ID || snap.Conversations[1].ID != convID {
+		t.Fatalf("expected order preserved after message touch, got %+v", snap.Conversations)
+	}
+
+	delGrpRec := doJSONReq(t, router, http.MethodDelete, "/api/v1/conversation-groups/"+grpOut.Group.ID, tok, nil)
+	if delGrpRec.Code != http.StatusOK {
+		t.Fatalf("DELETE /conversation-groups status=%d body=%s", delGrpRec.Code, delGrpRec.Body.String())
+	}
 }

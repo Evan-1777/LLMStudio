@@ -173,6 +173,11 @@ async function decodeOpenAICompletions(
         prompt_tokens?: number;
         completion_tokens?: number;
         total_tokens?: number;
+        prompt_tokens_details?: {
+          cached_tokens?: number;
+          cache_write_tokens?: number;
+          cache_creation_tokens?: number;
+        };
         completion_tokens_details?: { reasoning_tokens?: number };
       };
       error?: { message?: string };
@@ -195,13 +200,27 @@ async function decodeOpenAICompletions(
     }
 
     if (chunk.usage) {
+      const inputTokens = chunk.usage.prompt_tokens ?? 0;
+      const outputTokens = chunk.usage.completion_tokens ?? 0;
+      const totalTokens =
+        chunk.usage.total_tokens && chunk.usage.total_tokens > 0
+          ? chunk.usage.total_tokens
+          : inputTokens + outputTokens;
       const thinkingTokens =
         chunk.usage.completion_tokens_details?.reasoning_tokens ?? 0;
+      const cacheReadInputTokens =
+        chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
+      const cacheCreationInputTokens =
+        (chunk.usage.prompt_tokens_details?.cache_write_tokens ?? 0) > 0
+          ? (chunk.usage.prompt_tokens_details?.cache_write_tokens ?? 0)
+          : (chunk.usage.prompt_tokens_details?.cache_creation_tokens ?? 0);
       finalUsage = {
-        inputTokens: chunk.usage.prompt_tokens ?? 0,
-        outputTokens: chunk.usage.completion_tokens ?? 0,
-        totalTokens: chunk.usage.total_tokens ?? 0,
+        inputTokens,
+        outputTokens,
+        totalTokens,
         ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
+        ...(cacheReadInputTokens > 0 ? { cacheReadInputTokens } : {}),
+        ...(cacheCreationInputTokens > 0 ? { cacheCreationInputTokens } : {}),
       };
     }
 
@@ -263,6 +282,25 @@ async function decodeOpenAICompletions(
       closeText();
       const tcIdx = tc.index ?? 0;
       let st = toolStates.get(tcIdx);
+      if (st && tc.id && st.id && tc.id !== st.id) {
+        if (!st.closed) {
+          st.closed = true;
+          emit(
+            withMeta(meta, {
+              type: 'block_end',
+              index: st.blockIdx,
+              blockType: 'toolCall',
+              block: {
+                type: 'toolCall',
+                id: st.id,
+                name: st.name,
+                arguments: parseToolArguments(st.args),
+              },
+            }),
+          );
+        }
+        st = undefined;
+      }
       if (!st) {
         st = {
           blockIdx: nextBlockIdx++,
@@ -320,8 +358,10 @@ async function decodeOpenAIResponses(
   interface ItemState {
     blockIdx: number;
     blockType: string;
+    itemId: string;
     callId: string;
     name: string;
+    encryptedContent: string;
     buf: string;
     closed: boolean;
   }
@@ -329,6 +369,7 @@ async function decodeOpenAIResponses(
   let nextBlockIdx = 0;
   const items = new Map<number, ItemState>();
   const itemOrder: number[] = [];
+  const seenSeq = new Set<number>();
   let hasToolCall = false;
   let emittedEnd = false;
   let emittedError = false;
@@ -348,8 +389,10 @@ async function decodeOpenAIResponses(
     const st: ItemState = {
       blockIdx: nextBlockIdx++,
       blockType,
+      itemId: '',
       callId,
       name,
+      encryptedContent: '',
       buf: '',
       closed: false,
     };
@@ -371,12 +414,58 @@ async function decodeOpenAIResponses(
     return st;
   };
 
+  interface ResponsesItemPayload {
+    id?: string;
+    type?: string;
+    call_id?: string;
+    name?: string;
+    arguments?: string;
+    encrypted_content?: string;
+    summary?: Array<{ text?: string }>;
+    content?: Array<{ text?: string }>;
+  }
+
+  const applyItemSnapshot = (
+    st: ItemState | undefined,
+    item: ResponsesItemPayload | undefined,
+  ) => {
+    if (!st || !item) return;
+    if (item.id && !st.itemId) st.itemId = item.id;
+    if (item.encrypted_content) st.encryptedContent = item.encrypted_content;
+    if (st.blockType === 'toolCall') {
+      if (item.call_id) st.callId = item.call_id;
+      if (item.name) st.name = item.name;
+      if (!st.buf && item.arguments) st.buf = item.arguments;
+    } else if (st.blockType === 'thinking') {
+      if (!st.buf && item.summary?.length) {
+        st.buf = item.summary.map((s) => s.text ?? '').join('');
+      }
+    } else {
+      if (!st.buf && item.content?.length) {
+        st.buf = item.content.map((c) => c.text ?? '').join('');
+      }
+    }
+  };
+
   const closeItem = (st: ItemState | undefined) => {
     if (!st || st.closed) return;
     st.closed = true;
     let block: ContentBlock;
     if (st.blockType === 'thinking') {
-      block = { type: 'thinking', thinking: st.buf };
+      block = {
+        type: 'thinking',
+        thinking: st.buf,
+        ...(st.encryptedContent
+          ? {
+              signature: st.encryptedContent,
+              extra: {
+                providerFormat: 'openai-responses',
+                ...(st.itemId ? { itemId: st.itemId } : {}),
+                encryptedContent: st.encryptedContent,
+              },
+            }
+          : {}),
+      };
     } else if (st.blockType === 'toolCall') {
       block = {
         type: 'toolCall',
@@ -409,23 +498,26 @@ async function decodeOpenAIResponses(
 
     let payload: {
       type?: string;
+      sequence_number?: number;
       output_index?: number;
       item_id?: string;
       delta?: string;
-      item?: {
-        id?: string;
-        type?: string;
-        call_id?: string;
-        name?: string;
-        arguments?: string;
-      };
+      text?: string;
+      arguments?: string;
+      item?: ResponsesItemPayload;
       response?: {
         status?: string;
+        output?: ResponsesItemPayload[];
         error?: { message?: string };
         usage?: {
           input_tokens?: number;
           output_tokens?: number;
           total_tokens?: number;
+          input_tokens_details?: {
+            cached_tokens?: number;
+            cache_write_tokens?: number;
+            cache_creation_tokens?: number;
+          };
           output_tokens_details?: { reasoning_tokens?: number };
         };
       };
@@ -437,6 +529,11 @@ async function decodeOpenAIResponses(
       continue;
     }
 
+    if (payload.sequence_number !== undefined) {
+      if (seenSeq.has(payload.sequence_number)) continue;
+      seenSeq.add(payload.sequence_number);
+    }
+
     const evType = payload.type || frame.event;
     const outputIdx = payload.output_index ?? 0;
 
@@ -444,18 +541,23 @@ async function decodeOpenAIResponses(
       case 'response.output_item.added': {
         const item = payload.item;
         if (!item) break;
+        let blockType = '';
+        let callId = '';
+        let name = '';
         if (item.type === 'reasoning') {
-          ensureItem(outputIdx, 'thinking', '', '');
+          blockType = 'thinking';
         } else if (item.type === 'message') {
-          ensureItem(outputIdx, 'text', '', '');
+          blockType = 'text';
         } else if (item.type === 'function_call') {
-          ensureItem(
-            outputIdx,
-            'toolCall',
-            item.call_id || item.id || '',
-            item.name || '',
-          );
+          blockType = 'toolCall';
+          callId = item.call_id || item.id || '';
+          name = item.name || '';
+        } else {
+          break;
         }
+        const st = ensureItem(outputIdx, blockType, callId, name);
+        if (item.id) st.itemId = item.id;
+        if (item.encrypted_content) st.encryptedContent = item.encrypted_content;
         break;
       }
 
@@ -475,6 +577,12 @@ async function decodeOpenAIResponses(
         break;
       }
 
+      case 'response.output_text.done': {
+        const st = items.get(outputIdx);
+        if (st && !st.buf && payload.text) st.buf = payload.text;
+        break;
+      }
+
       case 'response.reasoning_summary_text.delta':
       case 'response.reasoning_text.delta': {
         if (!payload.delta) break;
@@ -489,6 +597,13 @@ async function decodeOpenAIResponses(
             delta: payload.delta,
           }),
         );
+        break;
+      }
+
+      case 'response.reasoning_summary_text.done':
+      case 'response.reasoning_text.done': {
+        const st = items.get(outputIdx);
+        if (st && !st.buf && payload.text) st.buf = payload.text;
         break;
       }
 
@@ -513,16 +628,31 @@ async function decodeOpenAIResponses(
         break;
       }
 
-      case 'response.output_item.done': {
+      case 'response.function_call_arguments.done': {
         const st = items.get(outputIdx);
-        if (!st) break;
-        if (payload.item && st.blockType === 'toolCall') {
-          if (payload.item.call_id) st.callId = payload.item.call_id;
-          if (payload.item.name) st.name = payload.item.name;
-          if (!st.buf && payload.item.arguments) {
-            st.buf = payload.item.arguments;
+        if (st && !st.buf && payload.arguments) st.buf = payload.arguments;
+        break;
+      }
+
+      case 'response.output_item.done': {
+        let st = items.get(outputIdx);
+        if (!st && payload.item) {
+          const item = payload.item;
+          if (item.type === 'reasoning') {
+            st = ensureItem(outputIdx, 'thinking', '', '');
+          } else if (item.type === 'message') {
+            st = ensureItem(outputIdx, 'text', '', '');
+          } else if (item.type === 'function_call') {
+            st = ensureItem(
+              outputIdx,
+              'toolCall',
+              item.call_id || item.id || '',
+              item.name || '',
+            );
           }
         }
+        if (!st) break;
+        applyItemSnapshot(st, payload.item);
         closeItem(st);
         break;
       }
@@ -531,6 +661,26 @@ async function decodeOpenAIResponses(
       case 'response.incomplete': {
         if (emittedEnd) break;
         emittedEnd = true;
+        if (payload.response?.output?.length) {
+          payload.response.output.forEach((item, outIdx) => {
+            let st = items.get(outIdx);
+            if (!st) {
+              if (item.type === 'reasoning') {
+                st = ensureItem(outIdx, 'thinking', '', '');
+              } else if (item.type === 'message') {
+                st = ensureItem(outIdx, 'text', '', '');
+              } else if (item.type === 'function_call') {
+                st = ensureItem(
+                  outIdx,
+                  'toolCall',
+                  item.call_id || item.id || '',
+                  item.name || '',
+                );
+              }
+            }
+            applyItemSnapshot(st, item);
+          });
+        }
         closeRemaining();
         let stopReason = 'stop';
         if (
@@ -544,13 +694,29 @@ async function decodeOpenAIResponses(
         let usage: TokenUsage | undefined;
         const rawUsage = payload.response?.usage;
         if (rawUsage) {
+          const inputTokens = rawUsage.input_tokens ?? 0;
+          const outputTokens = rawUsage.output_tokens ?? 0;
+          const totalTokens =
+            rawUsage.total_tokens && rawUsage.total_tokens > 0
+              ? rawUsage.total_tokens
+              : inputTokens + outputTokens;
           const thinkingTokens =
             rawUsage.output_tokens_details?.reasoning_tokens ?? 0;
+          const cacheReadInputTokens =
+            rawUsage.input_tokens_details?.cached_tokens ?? 0;
+          const cacheCreationInputTokens =
+            (rawUsage.input_tokens_details?.cache_write_tokens ?? 0) > 0
+              ? (rawUsage.input_tokens_details?.cache_write_tokens ?? 0)
+              : (rawUsage.input_tokens_details?.cache_creation_tokens ?? 0);
           usage = {
-            inputTokens: rawUsage.input_tokens ?? 0,
-            outputTokens: rawUsage.output_tokens ?? 0,
-            totalTokens: rawUsage.total_tokens ?? 0,
+            inputTokens,
+            outputTokens,
+            totalTokens,
             ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
+            ...(cacheReadInputTokens > 0 ? { cacheReadInputTokens } : {}),
+            ...(cacheCreationInputTokens > 0
+              ? { cacheCreationInputTokens }
+              : {}),
           };
         }
         emit(
@@ -602,6 +768,8 @@ async function decodeAnthropicMessages(
     blockType: string;
     id: string;
     name: string;
+    redactedData: string;
+    fallbackArgs: string;
     buf: string;
     signature: string;
     closed: boolean;
@@ -626,13 +794,21 @@ async function decodeAnthropicMessages(
         type: 'thinking',
         thinking: st.buf,
         ...(st.signature ? { signature: st.signature } : {}),
+        ...(st.redactedData
+          ? {
+              extra: {
+                providerFormat: 'anthropic-messages',
+                anthropicRedactedThinking: st.redactedData,
+              },
+            }
+          : {}),
       };
     } else if (st.blockType === 'toolCall') {
       block = {
         type: 'toolCall',
         id: st.id,
         name: st.name,
-        arguments: parseToolArguments(st.buf),
+        arguments: parseToolArguments(st.buf || st.fallbackArgs),
       };
     } else {
       block = { type: 'text', text: st.buf };
@@ -659,6 +835,12 @@ async function decodeAnthropicMessages(
       outUsage = {
         inputTokens: usage.inputTokens,
         outputTokens: usage.outputTokens,
+        ...(usage.cacheReadInputTokens && usage.cacheReadInputTokens > 0
+          ? { cacheReadInputTokens: usage.cacheReadInputTokens }
+          : {}),
+        ...(usage.cacheCreationInputTokens && usage.cacheCreationInputTokens > 0
+          ? { cacheCreationInputTokens: usage.cacheCreationInputTokens }
+          : {}),
         totalTokens: usage.inputTokens + usage.outputTokens,
       };
     }
@@ -686,7 +868,16 @@ async function decodeAnthropicMessages(
           output_tokens?: number;
         };
       };
-      content_block?: { type?: string; id?: string; name?: string };
+      content_block?: {
+        type?: string;
+        id?: string;
+        name?: string;
+        text?: string;
+        thinking?: string;
+        signature?: string;
+        data?: string;
+        input?: Record<string, unknown>;
+      };
       delta?: {
         type?: string;
         text?: string;
@@ -695,7 +886,12 @@ async function decodeAnthropicMessages(
         partial_json?: string;
         stop_reason?: string;
       };
-      usage?: { output_tokens?: number };
+      usage?: {
+        input_tokens?: number;
+        cache_creation_input_tokens?: number;
+        cache_read_input_tokens?: number;
+        output_tokens?: number;
+      };
       error?: { message?: string };
     };
     try {
@@ -715,6 +911,8 @@ async function decodeAnthropicMessages(
             (u.input_tokens ?? 0) +
             (u.cache_creation_input_tokens ?? 0) +
             (u.cache_read_input_tokens ?? 0);
+          usage.cacheCreationInputTokens = u.cache_creation_input_tokens ?? 0;
+          usage.cacheReadInputTokens = u.cache_read_input_tokens ?? 0;
           usage.outputTokens = u.output_tokens ?? 0;
           hasUsage = true;
         }
@@ -726,24 +924,40 @@ async function decodeAnthropicMessages(
         if (!cb) break;
         let blockType = 'text';
         let initBlock: ContentBlock | undefined;
+        let buf = '';
+        let signature = '';
+        let redactedData = '';
+        let fallbackArgs = '';
         if (cb.type === 'thinking') {
           blockType = 'thinking';
+          if (cb.thinking) buf = cb.thinking;
+          if (cb.signature) signature = cb.signature;
+        } else if (cb.type === 'redacted_thinking') {
+          blockType = 'thinking';
+          if (cb.data) redactedData = cb.data;
         } else if (cb.type === 'tool_use') {
           blockType = 'toolCall';
           hasToolCall = true;
+          if (cb.input && Object.keys(cb.input).length > 0) {
+            fallbackArgs = JSON.stringify(cb.input);
+          }
           initBlock = {
             type: 'toolCall',
             id: cb.id ?? '',
             name: cb.name ?? '',
           };
+        } else if (cb.text) {
+          buf = cb.text;
         }
         const st: BlockState = {
           blockIdx: nextBlockIdx++,
           blockType,
           id: cb.id ?? '',
           name: cb.name ?? '',
-          buf: '',
-          signature: '',
+          redactedData,
+          fallbackArgs,
+          buf,
+          signature,
           closed: false,
         };
         blocks.set(rawIdx, st);
@@ -819,8 +1033,23 @@ async function decodeAnthropicMessages(
         if (ev.delta?.stop_reason) {
           stopReason = mapAnthropicStopReason(ev.delta.stop_reason);
         }
-        if (ev.usage && ev.usage.output_tokens !== undefined) {
-          usage.outputTokens = ev.usage.output_tokens;
+        if (ev.usage) {
+          if (
+            (ev.usage.input_tokens ?? 0) > 0 ||
+            (ev.usage.cache_creation_input_tokens ?? 0) > 0 ||
+            (ev.usage.cache_read_input_tokens ?? 0) > 0
+          ) {
+            usage.inputTokens =
+              (ev.usage.input_tokens ?? 0) +
+              (ev.usage.cache_creation_input_tokens ?? 0) +
+              (ev.usage.cache_read_input_tokens ?? 0);
+            usage.cacheCreationInputTokens =
+              ev.usage.cache_creation_input_tokens ?? 0;
+            usage.cacheReadInputTokens = ev.usage.cache_read_input_tokens ?? 0;
+          }
+          if (ev.usage.output_tokens !== undefined) {
+            usage.outputTokens = ev.usage.output_tokens;
+          }
           hasUsage = true;
         }
         break;
@@ -858,26 +1087,42 @@ async function decodeGoogleGenAI(
   let nextBlockIdx = 0;
   let activeThinkIdx = -1;
   let thinkBuf = '';
+  let thinkSig = '';
   let activeTextIdx = -1;
   let textBuf = '';
   let hasToolCall = false;
   let toolCounter = 0;
+  const seenCallIds = new Set<string>();
   let finalUsage: TokenUsage | undefined;
   let stopReason = '';
   let emittedError = false;
 
   const closeThinking = () => {
     if (activeThinkIdx < 0) return;
+    const block: ContentBlock = {
+      type: 'thinking',
+      thinking: thinkBuf,
+      ...(thinkSig
+        ? {
+            signature: thinkSig,
+            extra: {
+              providerFormat: 'google-generative-ai',
+              thoughtSignature: thinkSig,
+            },
+          }
+        : {}),
+    };
     emit(
       withMeta(meta, {
         type: 'block_end',
         index: activeThinkIdx,
         blockType: 'thinking',
-        block: { type: 'thinking', thinking: thinkBuf },
+        block,
       }),
     );
     activeThinkIdx = -1;
     thinkBuf = '';
+    thinkSig = '';
   };
 
   const closeText = () => {
@@ -904,6 +1149,7 @@ async function decodeGoogleGenAI(
           parts?: Array<{
             text?: string;
             thought?: boolean;
+            thoughtSignature?: string;
             functionCall?: {
               id?: string;
               name?: string;
@@ -915,6 +1161,7 @@ async function decodeGoogleGenAI(
       }>;
       usageMetadata?: {
         promptTokenCount?: number;
+        cachedContentTokenCount?: number;
         candidatesTokenCount?: number;
         thoughtsTokenCount?: number;
         totalTokenCount?: number;
@@ -943,6 +1190,7 @@ async function decodeGoogleGenAI(
       const inputTokens = u.promptTokenCount ?? 0;
       const outputTokens = u.candidatesTokenCount ?? 0;
       const thinkingTokens = u.thoughtsTokenCount ?? 0;
+      const cacheReadInputTokens = u.cachedContentTokenCount ?? 0;
       const totalTokens =
         u.totalTokenCount && u.totalTokenCount > 0
           ? u.totalTokenCount
@@ -951,6 +1199,7 @@ async function decodeGoogleGenAI(
         inputTokens,
         outputTokens,
         ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
+        ...(cacheReadInputTokens > 0 ? { cacheReadInputTokens } : {}),
         totalTokens,
       };
     }
@@ -959,7 +1208,7 @@ async function decodeGoogleGenAI(
     if (!cand) continue;
 
     for (const part of cand.content?.parts ?? []) {
-      if (part.thought && part.text) {
+      if (part.thought && (part.text || part.thoughtSignature)) {
         closeText();
         if (activeThinkIdx < 0) {
           activeThinkIdx = nextBlockIdx++;
@@ -971,16 +1220,30 @@ async function decodeGoogleGenAI(
             }),
           );
         }
-        thinkBuf += part.text;
-        emit(
-          withMeta(meta, {
-            type: 'block_delta',
-            index: activeThinkIdx,
-            blockType: 'thinking',
-            deltaType: 'thinking_delta',
-            delta: part.text,
-          }),
-        );
+        if (part.text) {
+          thinkBuf += part.text;
+          emit(
+            withMeta(meta, {
+              type: 'block_delta',
+              index: activeThinkIdx,
+              blockType: 'thinking',
+              deltaType: 'thinking_delta',
+              delta: part.text,
+            }),
+          );
+        }
+        if (part.thoughtSignature) {
+          thinkSig = part.thoughtSignature;
+          emit(
+            withMeta(meta, {
+              type: 'block_delta',
+              index: activeThinkIdx,
+              blockType: 'thinking',
+              deltaType: 'signature_delta',
+              delta: part.thoughtSignature,
+            }),
+          );
+        }
         continue;
       }
 
@@ -1011,6 +1274,10 @@ async function decodeGoogleGenAI(
       if (part.functionCall) {
         closeThinking();
         closeText();
+        if (part.functionCall.id) {
+          if (seenCallIds.has(part.functionCall.id)) continue;
+          seenCallIds.add(part.functionCall.id);
+        }
         hasToolCall = true;
         toolCounter += 1;
         const callId = part.functionCall.id || `call_${toolCounter}`;
@@ -1018,13 +1285,22 @@ async function decodeGoogleGenAI(
         const args = part.functionCall.args ?? {};
         const argsStr = JSON.stringify(args);
         const idx = nextBlockIdx++;
+        const sigExtra = part.thoughtSignature
+          ? {
+              signature: part.thoughtSignature,
+              extra: {
+                providerFormat: 'google-generative-ai',
+                thoughtSignature: part.thoughtSignature,
+              },
+            }
+          : {};
 
         emit(
           withMeta(meta, {
             type: 'block_start',
             index: idx,
             blockType: 'toolCall',
-            block: { type: 'toolCall', id: callId, name },
+            block: { type: 'toolCall', id: callId, name, ...sigExtra },
           }),
         );
         emit(
@@ -1046,6 +1322,7 @@ async function decodeGoogleGenAI(
               id: callId,
               name,
               arguments: args,
+              ...sigExtra,
             },
           }),
         );

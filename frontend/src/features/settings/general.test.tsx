@@ -108,6 +108,26 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
       expect(screen.getByText('网关已连接')).toBeInTheDocument();
     });
 
+    // Toggling autoCreateCache persists without triggering bootstrapConnection or dirtying URL/token form.
+    const healthCallsBeforeToggle = fetchMock.mock.calls.filter(([input]) =>
+      String(input).endsWith('/healthz'),
+    ).length;
+    const cacheSwitch = screen.getByRole('switch', { name: '自动创建缓存' });
+    expect(cacheSwitch).not.toBeChecked();
+    await user.click(cacheSwitch);
+    expect(cacheSwitch).toBeChecked();
+    expect(
+      JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}').autoCreateCache,
+    ).toBe(true);
+    const healthCallsAfterToggle = fetchMock.mock.calls.filter(([input]) =>
+      String(input).endsWith('/healthz'),
+    ).length;
+    expect(healthCallsAfterToggle).toBe(healthCallsBeforeToggle);
+    // Navigating away without editing URL/token must NOT trigger dirty prompt.
+    await user.click(screen.getByRole('button', { name: '关于' }));
+    expect(screen.queryByText('放弃未保存的更改？')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '连接' }));
+
     // Test connection with unsaved URL & token without overwriting saved settings.
     const gwInput = screen.getByLabelText('网关地址');
     const tokenInput = screen.getByLabelText('访问令牌');
@@ -119,7 +139,9 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
     await waitFor(() => {
       expect(screen.getByText('invalid token')).toBeInTheDocument();
     });
-    expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).toBeNull();
+    expect(
+      JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}').gatewayBaseUrl,
+    ).toBe('/');
 
     // Dirty guard triggers when leaving ConnectionPage with unsaved edits.
     await user.click(screen.getByRole('button', { name: '关于' }));
@@ -167,6 +189,8 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
     await user.click(screen.getByRole('switch', { name: 'Enter 发送' }));
     await user.click(screen.getByRole('switch', { name: '可视化功能渲染' }));
     await user.click(screen.getByRole('switch', { name: 'HTML 代码块预览' }));
+    await user.click(screen.getByRole('switch', { name: '思考完成后自动折叠' }));
+    await user.click(screen.getByRole('switch', { name: '工具执行完成后自动折叠' }));
 
     const lineInput = screen.getByLabelText('行数阈值');
     await user.clear(lineInput);
@@ -191,6 +215,8 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
       enterToSend: false,
       visualHtmlRender: false,
       defaultHtmlPreview: true,
+      autoCollapseThinkingOnComplete: false,
+      autoCollapseToolsOnComplete: false,
       collapseLineThreshold: 48,
       collapseCharThreshold: 2400,
     });

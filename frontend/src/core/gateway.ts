@@ -2,17 +2,24 @@ import {
   MAX_GATEWAY_BODY_BYTES,
   type Assistant,
   type AssistantUpsertPayload,
+  type BatchConversationsInput,
   type ContentBlock,
   type Conversation,
   type ConversationDetail,
+  type ConversationGroup,
+  type ConversationOrganizationSnapshot,
   type CreateConversationInput,
   type CreateMessageInput,
   type CreateMessageResult,
   type DiscoveredModel,
   type FormatInfo,
+  type GroupDeleteResult,
+  type GroupMutationResult,
   type HealthResponse,
   type MCPServerConfig,
   type MCPServerInput,
+  type MCPServerTestResult,
+  type MCPToolDescriptor,
   type Message,
   type ModelConfig,
   type PatchConversationInput,
@@ -22,11 +29,13 @@ import {
   type ProviderConnectionResult,
   type ProviderProbeInput,
   type ProviderUpsertPayload,
+  type ReorderConversationsInput,
   type SearchEngineTestInput,
   type SearchEngineTestResult,
   type SearchEngineUpdateInput,
   type SearchEngineView,
   type StreamChatInput,
+  type ToolCallExecutionInput,
 } from './types';
 
 export class GatewayError extends Error {
@@ -125,6 +134,9 @@ function sanitizeModel(model: ModelConfig): ModelConfig {
     }
     if (model.compat.pathOverride) {
       compat.pathOverride = model.compat.pathOverride;
+    }
+    if (model.compat.cacheMode) {
+      compat.cacheMode = model.compat.cacheMode;
     }
     if (
       model.compat.extraHeaders &&
@@ -285,6 +297,28 @@ function buildStreamChatPayload(input: StreamChatInput): Record<string, unknown>
   }
   if (input.searchEngineId) {
     payload.searchEngineId = input.searchEngineId;
+  }
+  if (input.autoCreateCache) {
+    payload.autoCreateCache = true;
+  }
+  if (input.preparedSearch !== undefined) {
+    payload.preparedSearch = {
+      block: input.preparedSearch.block ?? null,
+    };
+  }
+  if (input.cacheState) {
+    payload.cacheState = input.cacheState;
+  }
+  if (input.cacheResolution) {
+    payload.cacheResolution = input.cacheResolution;
+  }
+  if (input.localContinuation) {
+    payload.localContinuation = {
+      ...(input.localContinuation.userMessageId
+        ? { userMessageId: input.localContinuation.userMessageId }
+        : {}),
+      blocks: input.localContinuation.blocks,
+    };
   }
   return payload;
 }
@@ -562,6 +596,97 @@ export class GatewayClient {
     );
   }
 
+  listConversationGroups(
+    assistantId?: string,
+    signal?: AbortSignal,
+  ): Promise<ConversationGroup[]> {
+    const query = assistantId
+      ? `?assistantId=${encodeURIComponent(assistantId)}`
+      : '';
+    return this.requestJson<{ groups?: ConversationGroup[] }>(
+      'GET',
+      `/api/v1/conversation-groups${query}`,
+      { signal },
+    ).then((res) => res.groups ?? []);
+  }
+
+  createConversationGroup(
+    input: { assistantId: string; name: string },
+    signal?: AbortSignal,
+  ): Promise<GroupMutationResult> {
+    return this.requestJson<GroupMutationResult>(
+      'POST',
+      '/api/v1/conversation-groups',
+      { body: input, signal },
+    );
+  }
+
+  renameConversationGroup(
+    id: string,
+    input: { name: string },
+    signal?: AbortSignal,
+  ): Promise<GroupMutationResult> {
+    return this.requestJson<GroupMutationResult>(
+      'PATCH',
+      `/api/v1/conversation-groups/${encodeURIComponent(id)}`,
+      { body: input, signal },
+    );
+  }
+
+  deleteConversationGroup(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<GroupDeleteResult> {
+    return this.requestJson<GroupDeleteResult>(
+      'DELETE',
+      `/api/v1/conversation-groups/${encodeURIComponent(id)}`,
+      { signal },
+    );
+  }
+
+  batchConversations(
+    input: BatchConversationsInput,
+    signal?: AbortSignal,
+  ): Promise<ConversationOrganizationSnapshot> {
+    const body: Record<string, unknown> = {
+      assistantId: input.assistantId,
+      ids: input.ids,
+      operation: input.operation,
+    };
+    if (input.operation === 'move') {
+      body.groupId = input.groupId ?? null;
+    } else if (input.operation === 'pin') {
+      body.pinned = input.pinned;
+    }
+    return this.requestJson<ConversationOrganizationSnapshot>(
+      'POST',
+      '/api/v1/conversations/batch',
+      { body, signal },
+    );
+  }
+
+  reorderConversations(
+    input: ReorderConversationsInput,
+    signal?: AbortSignal,
+  ): Promise<ConversationOrganizationSnapshot> {
+    const body: Record<string, unknown> = {
+      assistantId: input.assistantId,
+      ids: input.ids,
+      pinned: input.pinned,
+    };
+    if (!input.pinned) {
+      body.groupId = input.groupId ?? null;
+    }
+    if (input.beforeId !== undefined) {
+      body.beforeId = input.beforeId ?? null;
+    }
+    return this.requestJson<ConversationOrganizationSnapshot>(
+      'POST',
+      '/api/v1/conversations/reorder',
+      { body, signal },
+    );
+  }
+
   deleteMessage(
     conversationId: string,
     messageId: string,
@@ -692,6 +817,68 @@ export class GatewayClient {
       `/api/v1/mcp/servers/${encodeURIComponent(id)}`,
       { signal },
     );
+  }
+
+  listMcpServerTools(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<MCPToolDescriptor[]> {
+    return this.requestJson<{ tools?: MCPToolDescriptor[] }>(
+      'GET',
+      `/api/v1/mcp/servers/${encodeURIComponent(id)}/tools`,
+      { signal },
+    ).then((res) => res.tools ?? []);
+  }
+
+  testMcpServer(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<MCPServerTestResult> {
+    return this.requestJson<MCPServerTestResult>(
+      'POST',
+      `/api/v1/mcp/servers/${encodeURIComponent(id)}/test`,
+      { body: {}, signal },
+    );
+  }
+
+  async openToolExecutionStream(
+    conversationId: string,
+    calls: ToolCallExecutionInput[],
+    signal?: AbortSignal,
+  ): Promise<Response> {
+    const serialized = this.serializeBody({ calls });
+    const url = resolveGatewayUrl(
+      this.baseUrl,
+      `/api/v1/conversations/${encodeURIComponent(conversationId)}/tools/execute`,
+    );
+
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: 'POST',
+        headers: this.buildHeaders(true, true, { Accept: 'text/event-stream' }),
+        body: serialized,
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw err;
+      }
+      throw new GatewayError(
+        'NETWORK_ERROR',
+        err instanceof Error ? err.message : '工具执行连接失败',
+      );
+    }
+
+    if (!response.ok) {
+      const rawText = await response.text();
+      const env = parseErrorEnvelope(rawText, response.status);
+      throw new GatewayError(env.code, env.message, response.status);
+    }
+    return response;
   }
 
   async openChatStream(

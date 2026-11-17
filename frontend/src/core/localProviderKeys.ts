@@ -1,5 +1,15 @@
 export const LOCAL_PROVIDER_KEYS_STORAGE_KEY = 'llmstudio.localProviderKeys.v1';
 
+const localKeyVersions = new Map<string, number>();
+
+export function getLocalProviderKeyVersion(providerId: string): number {
+  return localKeyVersions.get(providerId) ?? 0;
+}
+
+function bumpLocalKeyVersion(providerId: string): void {
+  localKeyVersions.set(providerId, (localKeyVersions.get(providerId) ?? 0) + 1);
+}
+
 function getSafeStorage(explicit?: Storage | null): Storage | null {
   if (explicit !== undefined) return explicit;
   try {
@@ -77,7 +87,11 @@ export function setLocalProviderKey(
   } else {
     map[providerId] = trimmed;
   }
-  return writeKeyMap(storage, map);
+  const ok = writeKeyMap(storage, map);
+  if (ok) {
+    bumpLocalKeyVersion(providerId);
+  }
+  return ok;
 }
 
 export function removeLocalProviderKey(
@@ -89,5 +103,9 @@ export function removeLocalProviderKey(
   const map = readKeyMap(storage);
   if (!(providerId in map)) return true;
   delete map[providerId];
-  return writeKeyMap(storage, map);
+  const ok = writeKeyMap(storage, map);
+  if (ok) {
+    bumpLocalKeyVersion(providerId);
+  }
+  return ok;
 }

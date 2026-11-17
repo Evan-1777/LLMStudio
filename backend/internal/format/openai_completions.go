@@ -32,14 +32,37 @@ func (f *OpenAICompletionsFormat) DefaultCompat() domain.CompatConfig {
 		SupportsStreamOptions: domain.BoolPtr(true),
 		ThinkingFormat:        "openai",
 		ReasoningEffortField:  "reasoning_effort",
+		CacheMode:             domain.CacheModeAuto,
 	}
+}
+
+func (f *OpenAICompletionsFormat) PlanCache(_ context.Context, input plugin.ChatInput, current *plugin.PromptCacheState) (plugin.CachePlan, error) {
+	compat := MergeCompat(f.DefaultCompat(), input.Compat)
+	inline := shouldApplyInlineCache(input, compat, false)
+	if current != nil && current.Unsupported {
+		inline = false
+	}
+	return plugin.CachePlan{
+		ReuseState:  current,
+		InlineCache: inline,
+	}, nil
+}
+
+func (f *OpenAICompletionsFormat) ResolveCache(_ context.Context, _ plugin.ChatInput, _ plugin.CachePlan, _ plugin.CacheResolutionInput) (plugin.CacheResolutionResult, error) {
+	return plugin.CacheResolutionResult{}, nil
+}
+
+func (f *OpenAICompletionsFormat) ClassifyCacheError(statusCode int, body []byte, _ *plugin.PromptCacheState) plugin.CacheFailureAction {
+	return classifyInlineCacheError(statusCode, body, "prompt_cache_options", "prompt_cache_breakpoint", "prompt_cache")
 }
 
 func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.ChatInput) (plugin.EncodedRequest, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
 	params := resolveGenerationParams(input.Model, input.Params)
+	inlineExplicit := shouldApplyInlineCache(input, compat, false)
 
 	messages := make([]map[string]any, 0, len(input.Messages)+1)
+	hasSystem := false
 	if strings.TrimSpace(input.SystemPrompt) != "" {
 		sysRole := "system"
 		if compat.DeveloperRoleSupported() {
@@ -49,6 +72,7 @@ func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.
 			"role":    sysRole,
 			"content": input.SystemPrompt,
 		})
+		hasSystem = true
 	}
 
 	for _, msg := range input.Messages {
@@ -61,9 +85,7 @@ func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.
 				messages = append(messages, tr)
 			}
 		case domain.RoleAssistant:
-			if encoded, ok := encodeOpenAIAssistantMessage(msg.Blocks); ok {
-				messages = append(messages, encoded)
-			}
+			messages = append(messages, encodeOpenAIAssistantTurns(msg.Blocks)...)
 		case domain.RoleToolResult:
 			for _, tr := range extractToolResults(msg.Blocks) {
 				messages = append(messages, tr)
@@ -96,6 +118,31 @@ func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.
 		}
 		setNestedField(body, effortField, effort)
 	}
+	if len(input.Tools) > 0 {
+		encodedTools := make([]map[string]any, 0, len(input.Tools))
+		for _, t := range input.Tools {
+			fn := map[string]any{
+				"name":       t.Alias,
+				"parameters": plugin.NormalizeToolSchema(t.InputSchema),
+			}
+			if desc := strings.TrimSpace(t.Description); desc != "" {
+				fn["description"] = desc
+			}
+			encodedTools = append(encodedTools, map[string]any{
+				"type":     "function",
+				"function": fn,
+			})
+		}
+		body["tools"] = encodedTools
+	}
+	if inlineExplicit {
+		if !hasExtraBodyKey(compat.ExtraBody, "prompt_cache_options") {
+			body["prompt_cache_options"] = map[string]any{"mode": "explicit"}
+		}
+		if !hasExtraBodyKey(compat.ExtraBody, "messages") {
+			applyOpenAICompletionsCacheBreakpoints(messages, hasSystem)
+		}
+	}
 	if len(compat.ExtraBody) > 0 {
 		MergeBodyMap(body, compat.ExtraBody)
 	}
@@ -112,6 +159,47 @@ func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.
 		Headers:     headers,
 		Body:        payload,
 	}, nil
+}
+
+func applyOpenAICompletionsCacheBreakpoints(messages []map[string]any, hasSystem bool) {
+	if len(messages) == 0 {
+		return
+	}
+	attach := func(msg map[string]any) bool {
+		switch c := msg["content"].(type) {
+		case string:
+			if strings.TrimSpace(c) == "" {
+				return false
+			}
+			msg["content"] = []map[string]any{{
+				"type":                    "text",
+				"text":                    c,
+				"prompt_cache_breakpoint": map[string]any{"mode": "explicit"},
+			}}
+			return true
+		case []map[string]any:
+			if len(c) == 0 {
+				return false
+			}
+			if _, exists := c[len(c)-1]["prompt_cache_breakpoint"]; !exists {
+				c[len(c)-1]["prompt_cache_breakpoint"] = map[string]any{"mode": "explicit"}
+			}
+			return true
+		default:
+			return false
+		}
+	}
+
+	startIdx := 0
+	if hasSystem {
+		attach(messages[0])
+		startIdx = 1
+	}
+	for i := len(messages) - 2; i >= startIdx; i-- {
+		if attach(messages[i]) {
+			return
+		}
+	}
 }
 
 func encodeOpenAIUserMessage(blocks []domain.ContentBlock) (map[string]any, bool) {
@@ -148,9 +236,29 @@ func encodeOpenAIUserMessage(blocks []domain.ContentBlock) (map[string]any, bool
 	}, true
 }
 
-func encodeOpenAIAssistantMessage(blocks []domain.ContentBlock) (map[string]any, bool) {
+func encodeOpenAIAssistantTurns(blocks []domain.ContentBlock) []map[string]any {
+	var out []map[string]any
 	var textBuilder strings.Builder
 	var toolCalls []map[string]any
+
+	flushAssistant := func() {
+		if textBuilder.Len() == 0 && len(toolCalls) == 0 {
+			return
+		}
+		msg := map[string]any{"role": "assistant"}
+		if textBuilder.Len() > 0 {
+			msg["content"] = textBuilder.String()
+		} else {
+			msg["content"] = nil
+		}
+		if len(toolCalls) > 0 {
+			msg["tool_calls"] = toolCalls
+		}
+		out = append(out, msg)
+		textBuilder.Reset()
+		toolCalls = nil
+	}
+
 	for _, b := range blocks {
 		switch b.Type {
 		case domain.BlockTypeText:
@@ -164,21 +272,17 @@ func encodeOpenAIAssistantMessage(blocks []domain.ContentBlock) (map[string]any,
 					"arguments": rawArgumentsString(b.Arguments),
 				},
 			})
+		case domain.BlockTypeToolResult:
+			flushAssistant()
+			out = append(out, map[string]any{
+				"role":         "tool",
+				"tool_call_id": b.ToolCallID,
+				"content":      formatToolResultContent(b),
+			})
 		}
 	}
-	if textBuilder.Len() == 0 && len(toolCalls) == 0 {
-		return nil, false
-	}
-	msg := map[string]any{"role": "assistant"}
-	if textBuilder.Len() > 0 {
-		msg["content"] = textBuilder.String()
-	} else {
-		msg["content"] = nil
-	}
-	if len(toolCalls) > 0 {
-		msg["tool_calls"] = toolCalls
-	}
-	return msg, true
+	flushAssistant()
+	return out
 }
 
 func extractToolResults(blocks []domain.ContentBlock) []map[string]any {
@@ -190,7 +294,7 @@ func extractToolResults(blocks []domain.ContentBlock) []map[string]any {
 		out = append(out, map[string]any{
 			"role":         "tool",
 			"tool_call_id": b.ToolCallID,
-			"content":      b.Content,
+			"content":      formatToolResultContent(b),
 		})
 	}
 	return out
@@ -218,6 +322,11 @@ type openAICompletionsChunk struct {
 		PromptTokens            int `json:"prompt_tokens"`
 		CompletionTokens        int `json:"completion_tokens"`
 		TotalTokens             int `json:"total_tokens"`
+		PromptTokensDetails     *struct {
+			CachedTokens        int `json:"cached_tokens"`
+			CacheWriteTokens    int `json:"cache_write_tokens"`
+			CacheCreationTokens int `json:"cache_creation_tokens"`
+		} `json:"prompt_tokens_details"`
 		CompletionTokensDetails *struct {
 			ReasoningTokens int `json:"reasoning_tokens"`
 		} `json:"completion_tokens_details"`
@@ -347,10 +456,22 @@ func (f *OpenAICompletionsFormat) DecodeStream(ctx context.Context, body io.Read
 		}
 
 		if chunk.Usage != nil {
+			total := chunk.Usage.TotalTokens
+			if total == 0 {
+				total = chunk.Usage.PromptTokens + chunk.Usage.CompletionTokens
+			}
 			u := &domain.Usage{
 				InputTokens:  chunk.Usage.PromptTokens,
 				OutputTokens: chunk.Usage.CompletionTokens,
-				TotalTokens:  chunk.Usage.TotalTokens,
+				TotalTokens:  total,
+			}
+			if chunk.Usage.PromptTokensDetails != nil {
+				u.CacheReadInputTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+				if chunk.Usage.PromptTokensDetails.CacheWriteTokens > 0 {
+					u.CacheCreationInputTokens = chunk.Usage.PromptTokensDetails.CacheWriteTokens
+				} else {
+					u.CacheCreationInputTokens = chunk.Usage.PromptTokensDetails.CacheCreationTokens
+				}
 			}
 			if chunk.Usage.CompletionTokensDetails != nil {
 				u.ThinkingTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens
@@ -417,6 +538,21 @@ func (f *OpenAICompletionsFormat) DecodeStream(ctx context.Context, body io.Read
 				return err
 			}
 			st, exists := toolStates[tc.Index]
+			if exists && tc.ID != "" && st.id != "" && tc.ID != st.id {
+				// Broken proxy reused tool index for a brand-new call id: close prior slot cleanly.
+				if !st.closed {
+					st.closed = true
+					if err := emitBlockEnd(emit, st.blockIdx, domain.ContentBlock{
+						Type:      domain.BlockTypeToolCall,
+						ID:        st.id,
+						Name:      st.name,
+						Arguments: rawArgumentsJSON(st.args.String()),
+					}); err != nil {
+						return err
+					}
+				}
+				exists = false
+			}
 			if !exists {
 				st = &toolBlockState{
 					blockIdx: nextBlockIdx,

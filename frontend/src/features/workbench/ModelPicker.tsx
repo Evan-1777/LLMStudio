@@ -44,12 +44,14 @@ export function ModelPicker({
   selectedProviderId,
   selectedModelId,
   disabled = false,
+  busy = false,
   onSelect,
 }: {
   providers: ProviderConfig[];
   selectedProviderId: string;
   selectedModelId: string;
   disabled?: boolean;
+  busy?: boolean;
   onSelect: (providerId: string, modelId: string) => void;
 }) {
   const location = useLocation();
@@ -89,7 +91,7 @@ export function ModelPicker({
     <Popover
       open={open}
       onOpenChange={(next) => {
-        if (disabled) return;
+        if (disabled || busy) return;
         setOpen(next);
         if (!next) setQuery('');
       }}
@@ -98,9 +100,18 @@ export function ModelPicker({
           type="button"
           className="wb-model-btn"
           aria-label="选择模型"
-          disabled={disabled}
+          aria-busy={busy || undefined}
+          disabled={disabled || busy}
         >
-          <Icon name="cpu" size={14} />
+          {busy ? (
+            <span
+              className="ui-spinner"
+              style={{ width: 13, height: 13 }}
+              aria-hidden="true"
+            />
+          ) : (
+            <Icon name="cpu" size={14} />
+          )}
           <span className="wb-model-btn__name">
             {current ? current.model.name : '选择模型'}
           </span>

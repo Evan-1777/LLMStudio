@@ -141,4 +141,210 @@ describe('GatewayClient', () => {
     });
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
+
+  it('serializes conversation groups, batch move with explicit groupId:null, and reorder omitting groupId when pinned', async () => {
+    const calls: Array<{ method: string; url: string; body: unknown }> = [];
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const body =
+        typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
+      calls.push({ method, url, body });
+
+      if (url.includes('/api/v1/conversation-groups?assistantId=coder')) {
+        return new Response(
+          JSON.stringify({
+            groups: [
+              {
+                id: 'g1',
+                assistantId: 'coder',
+                name: 'Work',
+                sortOrder: 1,
+                createdAt: '2026-11-17T00:00:00Z',
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          assistantId: 'coder',
+          conversations: [],
+          groups: [],
+          deletedIds: ['c1'],
+        }),
+        { status: 200 },
+      );
+    });
+
+    const client = new GatewayClient({
+      baseUrl: 'https://gw.test',
+      accessToken: 'tok',
+      fetchImpl: fetchMock,
+    });
+
+    const groups = await client.listConversationGroups('coder');
+    expect(groups).toHaveLength(1);
+    expect(groups[0].name).toBe('Work');
+
+    await client.batchConversations({
+      assistantId: 'coder',
+      ids: ['c1', 'c2'],
+      operation: 'move',
+      groupId: null,
+    });
+    expect(calls[1]).toEqual({
+      method: 'POST',
+      url: 'https://gw.test/api/v1/conversations/batch',
+      body: {
+        assistantId: 'coder',
+        ids: ['c1', 'c2'],
+        operation: 'move',
+        groupId: null,
+      },
+    });
+    expect('groupId' in (calls[1].body as Record<string, unknown>)).toBe(true);
+
+    await client.reorderConversations({
+      assistantId: 'coder',
+      ids: ['c1'],
+      pinned: true,
+      beforeId: 'c2',
+    });
+    expect(calls[2].body).toEqual({
+      assistantId: 'coder',
+      ids: ['c1'],
+      pinned: true,
+      beforeId: 'c2',
+    });
+    expect('groupId' in (calls[2].body as Record<string, unknown>)).toBe(false);
+
+    await client.reorderConversations({
+      assistantId: 'coder',
+      ids: ['c1'],
+      pinned: false,
+      groupId: null,
+      beforeId: null,
+    });
+    expect(calls[3].body).toEqual({
+      assistantId: 'coder',
+      ids: ['c1'],
+      pinned: false,
+      groupId: null,
+      beforeId: null,
+    });
+  });
+
+  it('whitelists localContinuation on prepareLocalChat and exposes MCP probe/execute endpoints', async () => {
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ method, url, body });
+      if (url.endsWith('/tools/execute')) {
+        return new Response('event: block_start\ndata: {}\n\n', { status: 200 });
+      }
+      if (url.endsWith('/mcp/servers/s1/test')) {
+        return new Response(
+          JSON.stringify({ ok: true, serverId: 's1', toolCount: 0, latencyMs: 5, message: 'ok', tools: [] }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/mcp/servers/s1/tools')) {
+        return new Response(JSON.stringify({ tools: [{ name: 't1' }] }), { status: 200 });
+      }
+      return new Response(
+        JSON.stringify({ method: 'POST', url: 'https://up', headers: {}, body: {}, authType: 'bearer' }),
+        { status: 200 },
+      );
+    });
+
+    const client = new GatewayClient({
+      baseUrl: 'https://gw.test',
+      accessToken: 'tok',
+      fetchImpl: fetchMock,
+    });
+
+    await client.prepareLocalChat('c1', {
+      providerId: 'p1',
+      modelId: 'm1',
+      localContinuation: {
+        userMessageId: 'u1',
+        blocks: [{ type: 'toolCall', id: 'tc1', name: 't1', arguments: {} }],
+      },
+    });
+    expect(calls[0].body).toEqual({
+      providerId: 'p1',
+      modelId: 'm1',
+      localContinuation: {
+        userMessageId: 'u1',
+        blocks: [{ type: 'toolCall', id: 'tc1', name: 't1', arguments: {} }],
+      },
+    });
+
+    await client.openToolExecutionStream('c1', [{ id: 'tc1', name: 't1', arguments: { x: 1 } }]);
+    expect(calls[1].url).toBe('https://gw.test/api/v1/conversations/c1/tools/execute');
+    expect(calls[1].body).toEqual({ calls: [{ id: 'tc1', name: 't1', arguments: { x: 1 } }] });
+
+    const tools = await client.listMcpServerTools('s1');
+    expect(tools).toEqual([{ name: 't1' }]);
+    const probe = await client.testMcpServer('s1');
+    expect(probe.ok).toBe(true);
+    expect(probe.tools).toEqual([]);
+
+    await client.updateProvider('p1', {
+      name: 'OpenAI',
+      adapter: 'generic-http',
+      baseURL: 'https://api.openai.com/v1',
+      authType: 'bearer',
+      models: [
+        { id: 'm-explicit', name: 'M Explicit', apiFormat: 'openai-completions', compat: { cacheMode: 'explicit' } },
+        { id: 'm-auto', name: 'M Auto', apiFormat: 'openai-completions', compat: { cacheMode: 'auto' } },
+        { id: 'm-unset', name: 'M Unset', apiFormat: 'openai-completions' },
+      ],
+    });
+    const provSent = JSON.parse(String(calls[4].body ? JSON.stringify(calls[4].body) : '{}'));
+    expect(provSent.models[0].compat.cacheMode).toBe('explicit');
+    expect(provSent.models[1].compat.cacheMode).toBe('auto');
+    expect(provSent.models[2].compat).toBeUndefined();
+
+    await client.openChatStream('c1', {
+      providerId: 'p1',
+      modelId: 'm-explicit',
+      text: 'hi',
+      autoCreateCache: true,
+    });
+    expect(calls[5].body).toMatchObject({
+      providerId: 'p1',
+      modelId: 'm-explicit',
+      text: 'hi',
+      autoCreateCache: true,
+    });
+
+    await client.prepareLocalChat('c1', {
+      providerId: 'p1',
+      modelId: 'm-explicit',
+      text: 'hi',
+      autoCreateCache: true,
+      preparedSearch: { block: null },
+      cacheState: { resourceName: 'cachedContents/1', prefixCount: 0 },
+      cacheResolution: {
+        planKey: 'pk-1',
+        status: 200,
+        result: { name: 'cachedContents/1' },
+      },
+    });
+    expect(calls[6].body).toMatchObject({
+      autoCreateCache: true,
+      preparedSearch: { block: null },
+      cacheState: { resourceName: 'cachedContents/1', prefixCount: 0 },
+      cacheResolution: {
+        planKey: 'pk-1',
+        status: 200,
+        result: { name: 'cachedContents/1' },
+      },
+    });
+  });
 });

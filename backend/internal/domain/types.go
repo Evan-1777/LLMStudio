@@ -93,6 +93,14 @@ func BoolPtr(v bool) *bool {
 	return &v
 }
 
+// Prompt cache modes for CompatConfig.CacheMode.
+const (
+	CacheModeAuto     = "auto"
+	CacheModeImplicit = "implicit"
+	CacheModeExplicit = "explicit"
+	CacheModeDisabled = "disabled"
+)
+
 // CompatConfig holds declarative protocol compatibility overrides for providers and models.
 type CompatConfig struct {
 	MaxTokensField        string            `json:"maxTokensField,omitempty"`
@@ -101,6 +109,7 @@ type CompatConfig struct {
 	ThinkingFormat        string            `json:"thinkingFormat,omitempty"`
 	ReasoningEffortField  string            `json:"reasoningEffortField,omitempty"`
 	PathOverride          string            `json:"pathOverride,omitempty"`
+	CacheMode             string            `json:"cacheMode,omitempty"`
 	ExtraHeaders          map[string]string `json:"extraHeaders,omitempty"`
 	ExtraBody             map[string]any    `json:"extraBody,omitempty"`
 }
@@ -240,10 +249,12 @@ type ContentBlock struct {
 
 // Usage tracks token consumption for a message.
 type Usage struct {
-	InputTokens    int `json:"inputTokens"`
-	OutputTokens   int `json:"outputTokens"`
-	ThinkingTokens int `json:"thinkingTokens,omitempty"`
-	TotalTokens    int `json:"totalTokens"`
+	InputTokens              int `json:"inputTokens"`
+	OutputTokens             int `json:"outputTokens"`
+	ThinkingTokens           int `json:"thinkingTokens,omitempty"`
+	CacheReadInputTokens     int `json:"cacheReadInputTokens,omitempty"`
+	CacheCreationInputTokens int `json:"cacheCreationInputTokens,omitempty"`
+	TotalTokens              int `json:"totalTokens"`
 }
 
 // Message represents a persisted turn in a conversation.
@@ -337,6 +348,15 @@ type DiscoveredModel struct {
 	InputModalities []string `json:"inputModalities,omitempty"`
 }
 
+// ConversationGroup represents a single-level folder organizing conversations within an assistant.
+type ConversationGroup struct {
+	ID          string    `json:"id"`
+	AssistantID string    `json:"assistantId"`
+	Name        string    `json:"name"`
+	SortOrder   int       `json:"sortOrder"`
+	CreatedAt   time.Time `json:"createdAt"`
+}
+
 // Conversation represents a chat session with reserved selective sync metadata.
 type Conversation struct {
 	ID           string           `json:"id"`
@@ -346,6 +366,9 @@ type Conversation struct {
 	ModelID      string           `json:"modelId,omitempty"`
 	SystemPrompt string           `json:"systemPrompt,omitempty"`
 	Params       GenerationParams `json:"params"`
+	GroupID      *string          `json:"groupId"`
+	Pinned       bool             `json:"pinned"`
+	SortOrder    int              `json:"sortOrder"`
 	SyncEnabled  bool             `json:"syncEnabled"`
 	SyncState    string           `json:"syncState"`
 	SyncVersion  int64            `json:"syncVersion"`

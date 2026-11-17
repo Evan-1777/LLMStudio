@@ -107,3 +107,25 @@ func (h *PluginHandler) DeleteMCPServer(w http.ResponseWriter, r *http.Request) 
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func (h *PluginHandler) ListMCPServerTools(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	tools, err := h.svc.ListMCPServerTools(r.Context(), id)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"serverId": id,
+		"tools":    tools,
+	})
+}
+
+func (h *PluginHandler) TestMCPServer(w http.ResponseWriter, r *http.Request) {
+	res, err := h.svc.TestMCPServer(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
+}

@@ -69,3 +69,53 @@ func (h *ChatHandler) PrepareLocal(w http.ResponseWriter, r *http.Request) {
 	}
 	WriteJSON(w, http.StatusOK, prepared)
 }
+
+func (h *ChatHandler) ExecuteTools(w http.ResponseWriter, r *http.Request) {
+	var in service.ExecuteToolsInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	in.ConversationID = r.PathValue("id")
+
+	rc := http.NewResponseController(w)
+	headersSent := false
+	sendEvent := func(ev domain.StreamEvent) error {
+		if !headersSent {
+			headersSent = true
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.WriteHeader(http.StatusOK)
+			_ = rc.Flush()
+		}
+		payload, err := json.Marshal(ev)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, payload); err != nil {
+			return err
+		}
+		return rc.Flush()
+	}
+
+	if err := h.svc.ExecuteTools(r.Context(), in, sendEvent); err != nil {
+		if !headersSent {
+			writeServiceError(w, err)
+			return
+		}
+		_ = sendEvent(domain.StreamEvent{
+			Type:           domain.StreamEventError,
+			ConversationID: in.ConversationID,
+			Error: &domain.StreamError{
+				Code:    domain.ErrCodeInternalError,
+				Message: err.Error(),
+			},
+		})
+	} else if !headersSent {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_ = rc.Flush()
+	}
+}

@@ -51,8 +51,14 @@ func NewRouter(deps RouterDeps) http.Handler {
 	}
 	if deps.ConversationService != nil {
 		ch := NewConversationHandler(deps.ConversationService)
+		mux.HandleFunc("GET /api/v1/conversation-groups", ch.ListGroups)
+		mux.HandleFunc("POST /api/v1/conversation-groups", ch.CreateGroup)
+		mux.HandleFunc("PATCH /api/v1/conversation-groups/{id}", ch.RenameGroup)
+		mux.HandleFunc("DELETE /api/v1/conversation-groups/{id}", ch.DeleteGroup)
 		mux.HandleFunc("GET /api/v1/conversations", ch.List)
 		mux.HandleFunc("POST /api/v1/conversations", ch.Create)
+		mux.HandleFunc("POST /api/v1/conversations/batch", ch.Batch)
+		mux.HandleFunc("POST /api/v1/conversations/reorder", ch.Reorder)
 		mux.HandleFunc("GET /api/v1/conversations/{id}", ch.GetDetail)
 		mux.HandleFunc("PATCH /api/v1/conversations/{id}", ch.Patch)
 		mux.HandleFunc("DELETE /api/v1/conversations/{id}", ch.Delete)
@@ -70,11 +76,14 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("POST /api/v1/mcp/servers", plh.CreateMCPServer)
 		mux.HandleFunc("PUT /api/v1/mcp/servers/{id}", plh.UpdateMCPServer)
 		mux.HandleFunc("DELETE /api/v1/mcp/servers/{id}", plh.DeleteMCPServer)
+		mux.HandleFunc("GET /api/v1/mcp/servers/{id}/tools", plh.ListMCPServerTools)
+		mux.HandleFunc("POST /api/v1/mcp/servers/{id}/test", plh.TestMCPServer)
 	}
 	if deps.ChatService != nil {
 		chatHandler := NewChatHandler(deps.ChatService)
 		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/stream", chatHandler.Stream)
 		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/prepare-local", chatHandler.PrepareLocal)
+		mux.HandleFunc("POST /api/v1/conversations/{id}/tools/execute", chatHandler.ExecuteTools)
 	}
 
 	if deps.Config.StaticDir != "" {

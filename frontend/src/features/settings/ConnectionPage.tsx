@@ -6,6 +6,7 @@ import {
   Field,
   IconButton,
   Input,
+  Switch,
 } from '../../components/ui';
 import { validateGatewayUrl } from '../../core/gateway';
 
@@ -14,6 +15,7 @@ export function ConnectionPage() {
     settings,
     settingsNotice,
     dismissSettingsNotice,
+    updateSettings,
     connectionState,
     connectionError,
     saveConnection,
@@ -206,6 +208,22 @@ export function ConnectionPage() {
             </Button>
           </div>
         </form>
+
+        <section>
+          <h3 className="st-subhead">请求缓存</h3>
+          <div className="st-group">
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">自动创建缓存</span>
+              <Switch
+                checked={settings.autoCreateCache}
+                label="自动创建缓存"
+                onCheckedChange={(autoCreateCache) =>
+                  updateSettings({ autoCreateCache })
+                }
+              />
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   );

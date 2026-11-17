@@ -107,6 +107,8 @@ export function ChatCanvas({
   const location = useLocation();
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const programmaticTopRef = useRef<number | null>(null);
+  const scrollRafRef = useRef<number | null>(null);
   const [showScrollBottom, setShowScrollBottom] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState('');
@@ -123,8 +125,16 @@ export function ChatCanvas({
     );
   }, [state.conversation, state.messages, state.streaming]);
 
+  const streamingBlockCompleted = useMemo(() => {
+    if (!state.streaming) return undefined;
+    return state.streaming.blockOrder.map((idx) =>
+      Boolean(state.streaming!.blocksByIndex[idx]?.completed),
+    );
+  }, [state.streaming]);
+
   useEffect(() => {
     stickToBottomRef.current = true;
+    programmaticTopRef.current = null;
     setShowScrollBottom(false);
     setEditingMessageId(null);
     setEditingText('');
@@ -133,6 +143,14 @@ export function ChatCanvas({
   const handleScroll = () => {
     const el = scrollRef.current;
     if (!el) return;
+    const applied = programmaticTopRef.current;
+    if (applied !== null && Math.abs(el.scrollTop - applied) <= 2) {
+      programmaticTopRef.current = null;
+      stickToBottomRef.current = true;
+      setShowScrollBottom(false);
+      return;
+    }
+    programmaticTopRef.current = null;
     const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
     const isNearBottom = distanceFromBottom < 72;
     stickToBottomRef.current = isNearBottom;
@@ -146,14 +164,33 @@ export function ChatCanvas({
       state.streaming.insertIndex === undefined ||
       state.streaming.insertIndex >= state.messages.length;
     if (!el || !stickToBottomRef.current || !isAppendingToEnd) return;
-    el.scrollTop = el.scrollHeight;
+    if (scrollRafRef.current !== null) return;
+    scrollRafRef.current = window.requestAnimationFrame(() => {
+      scrollRafRef.current = null;
+      const target = scrollRef.current;
+      if (!target || !stickToBottomRef.current) return;
+      target.scrollTop = target.scrollHeight;
+      programmaticTopRef.current = target.scrollTop;
+    });
   }, [visibleMessages, state.streaming, state.runState, state.messages.length]);
+
+  useEffect(() => {
+    return () => {
+      if (scrollRafRef.current !== null) {
+        window.cancelAnimationFrame(scrollRafRef.current);
+      }
+    };
+  }, []);
 
   const scrollToBottom = () => {
     const el = scrollRef.current;
     if (!el) return;
     stickToBottomRef.current = true;
-    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+    const reduceMotion =
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    el.scrollTo({ top: el.scrollHeight, behavior: reduceMotion ? 'auto' : 'smooth' });
     setShowScrollBottom(false);
   };
 
@@ -238,6 +275,11 @@ export function ChatCanvas({
       onScroll={handleScroll}
     >
       <div className="wb-chat-inner" data-display-mode={displayMode}>
+        {state.runState === 'loading' && visibleMessages.length > 0 ? (
+          <div className="wb-refresh-status">
+            <LoadingSpinner size="sm" label="正在刷新" />
+          </div>
+        ) : null}
         {state.runState === 'loading' && visibleMessages.length === 0 ? (
           <div style={{ padding: '48px 0', display: 'flex', justifyContent: 'center' }}>
             <LoadingSpinner label="正在加载" />
@@ -268,6 +310,7 @@ export function ChatCanvas({
         ) : (
           <CollapseStateProvider>
             {visibleMessages.map((msg) => {
+              const uiKey = state.uiKeyByMsgId[msg.id] ?? msg.id;
               const isStreamingThis =
                 Boolean(state.streaming) &&
                 msg.id === state.streaming?.messageId;
@@ -284,7 +327,7 @@ export function ChatCanvas({
 
                 return (
                   <article
-                    key={msg.id}
+                    key={uiKey}
                     className={`wb-feed-msg ${
                       isUser ? 'wb-feed-msg--user' : 'wb-feed-msg--asst'
                     }`.trim()}
@@ -314,8 +357,13 @@ export function ChatCanvas({
                       ) : (
                         <ContentRenderer
                           messageId={msg.id}
+                          collapsePrefix={uiKey}
                           blocks={msg.blocks}
                           isStreaming={isStreamingThis}
+                          blockCompleted={
+                            isStreamingThis ? streamingBlockCompleted : undefined
+                          }
+                          stopReason={msg.stopReason}
                           isUser={isUser}
                         />
                       )}
@@ -362,7 +410,7 @@ export function ChatCanvas({
 
               if (msg.role === 'user') {
                 return (
-                  <div key={msg.id} className="wb-user-msg">
+                  <div key={uiKey} className="wb-user-msg">
                     {isEditingThis ? (
                       renderInlineEditor(msg)
                     ) : (
@@ -370,6 +418,7 @@ export function ChatCanvas({
                         <div className="wb-user-bubble">
                           <ContentRenderer
                             messageId={msg.id}
+                            collapsePrefix={uiKey}
                             blocks={msg.blocks}
                             isUser
                           />
@@ -388,7 +437,7 @@ export function ChatCanvas({
               }
 
               return (
-                <article key={msg.id} className="wb-asst-msg">
+                <article key={uiKey} className="wb-asst-msg">
                   <div className="wb-asst-head">
                     <span className="wb-asst-avatar" aria-hidden="true">
                       <Icon name="bot" size={13} />
@@ -406,8 +455,13 @@ export function ChatCanvas({
                   ) : (
                     <ContentRenderer
                       messageId={msg.id}
+                      collapsePrefix={uiKey}
                       blocks={msg.blocks}
                       isStreaming={isStreamingThis}
+                      blockCompleted={
+                        isStreamingThis ? streamingBlockCompleted : undefined
+                      }
+                      stopReason={msg.stopReason}
                     />
                   )}
 
@@ -456,6 +510,11 @@ export function ChatCanvas({
         state.errorMessage ? (
           <ErrorBanner
             message={state.errorMessage}
+            onRetry={
+              hasConversationId && state.errorCode !== 'UNAUTHORIZED'
+                ? () => void onReloadConversation()
+                : undefined
+            }
             action={
               state.errorCode === 'UNAUTHORIZED' ? (
                 <Link

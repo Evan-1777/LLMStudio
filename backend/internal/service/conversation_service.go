@@ -84,9 +84,14 @@ func (s *ConversationService) WithAssistants(assistants *store.AssistantStore) *
 	return s
 }
 
-// List returns all conversations sorted by update time descending.
+// List returns all conversations sorted by organization order.
 func (s *ConversationService) List(ctx context.Context) ([]domain.Conversation, error) {
 	return s.convs.List(ctx)
+}
+
+// ListByAssistant returns conversations scoped to assistantID in canonical organization order.
+func (s *ConversationService) ListByAssistant(ctx context.Context, assistantID string) ([]domain.Conversation, error) {
+	return s.convs.ListByAssistant(ctx, assistantID)
 }
 
 // Create persists a new conversation, inheriting default provider/model from its assistant when omitted.
@@ -147,6 +152,7 @@ func (s *ConversationService) Patch(ctx context.Context, id string, in PatchConv
 	if err != nil {
 		return domain.Conversation{}, err
 	}
+	prevAssistantID := conv.AssistantID
 
 	if in.AssistantID.Set {
 		if in.AssistantID.Null || strings.TrimSpace(in.AssistantID.Value) == "" {
@@ -200,7 +206,17 @@ func (s *ConversationService) Patch(ctx context.Context, id string, in PatchConv
 		}
 	}
 
-	return s.convs.Update(ctx, conv)
+	updated, err := s.convs.Update(ctx, conv)
+	if err != nil {
+		return domain.Conversation{}, err
+	}
+	if updated.AssistantID != prevAssistantID {
+		if err := s.convs.MoveToAssistantUngroupedHead(ctx, updated.ID, updated.AssistantID); err != nil {
+			return domain.Conversation{}, err
+		}
+		return s.convs.Get(ctx, updated.ID)
+	}
+	return updated, nil
 }
 
 func applyPatchParams(dst *domain.GenerationParams, patch PatchParamsInput) {
@@ -425,4 +441,274 @@ func (s *ConversationService) BranchFromMessage(ctx context.Context, conversatio
 		Conversation: branched,
 		Messages:     cloned,
 	}, nil
+}
+
+// OrganizationSnapshot returns authoritative conversations and groups for an assistant scope.
+type OrganizationSnapshot struct {
+	AssistantID   string                     `json:"assistantId"`
+	Conversations []domain.Conversation      `json:"conversations"`
+	Groups        []domain.ConversationGroup `json:"groups"`
+	DeletedIDs    []string                   `json:"deletedIds,omitempty"`
+}
+
+// GroupMutationResult returns a mutated group alongside the updated assistant snapshot.
+type GroupMutationResult struct {
+	Group         domain.ConversationGroup   `json:"group"`
+	AssistantID   string                     `json:"assistantId"`
+	Conversations []domain.Conversation      `json:"conversations"`
+	Groups        []domain.ConversationGroup `json:"groups"`
+}
+
+// GroupDeleteResult returns the deleted group ID alongside the updated assistant snapshot.
+type GroupDeleteResult struct {
+	DeletedGroupID string                     `json:"deletedGroupId"`
+	AssistantID    string                     `json:"assistantId"`
+	Conversations  []domain.Conversation      `json:"conversations"`
+	Groups         []domain.ConversationGroup `json:"groups"`
+}
+
+// CreateGroupInput describes payload fields for creating a conversation group.
+type CreateGroupInput struct {
+	AssistantID string `json:"assistantId"`
+	Name        string `json:"name"`
+}
+
+// RenameGroupInput describes payload fields for renaming a conversation group.
+type RenameGroupInput struct {
+	Name string `json:"name"`
+}
+
+// BatchConversationsInput defines discriminated batch operations over assistant-scoped conversations.
+type BatchConversationsInput struct {
+	AssistantID string             `json:"assistantId"`
+	IDs         []string           `json:"ids"`
+	Operation   string             `json:"operation"`
+	GroupID     PatchField[string] `json:"groupId"`
+	Pinned      PatchField[bool]   `json:"pinned"`
+}
+
+// ReorderConversationsInput defines relative bucket placement for assistant-scoped conversations.
+type ReorderConversationsInput struct {
+	AssistantID string             `json:"assistantId"`
+	IDs         []string           `json:"ids"`
+	Pinned      PatchField[bool]   `json:"pinned"`
+	GroupID     PatchField[string] `json:"groupId"`
+	BeforeID    PatchField[string] `json:"beforeId"`
+}
+
+func (s *ConversationService) requireAssistantExists(ctx context.Context, rawAssistantID string) (string, error) {
+	aid := strings.TrimSpace(rawAssistantID)
+	if aid == "" {
+		return "", domain.NewError(domain.ErrCodeInvalidArgument, "assistantId is required", nil)
+	}
+	if s.assistants != nil && aid != domain.DefaultAssistantID {
+		if _, err := s.assistants.Get(ctx, aid); err != nil {
+			return "", err
+		}
+	}
+	return aid, nil
+}
+
+func deduplicateIDs(raw []string) ([]string, error) {
+	seen := make(map[string]bool, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, id := range raw {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			return nil, domain.NewError(domain.ErrCodeInvalidArgument, "conversation id must not be empty", nil)
+		}
+		if !seen[trimmed] {
+			seen[trimmed] = true
+			out = append(out, trimmed)
+		}
+	}
+	if len(out) == 0 {
+		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "ids must not be empty", nil)
+	}
+	return out, nil
+}
+
+func (s *ConversationService) snapshot(ctx context.Context, assistantID string, deletedIDs []string) (OrganizationSnapshot, error) {
+	convs, err := s.convs.ListByAssistant(ctx, assistantID)
+	if err != nil {
+		return OrganizationSnapshot{}, err
+	}
+	groups, err := s.convs.ListGroups(ctx, assistantID)
+	if err != nil {
+		return OrganizationSnapshot{}, err
+	}
+	return OrganizationSnapshot{
+		AssistantID:   assistantID,
+		Conversations: convs,
+		Groups:        groups,
+		DeletedIDs:    deletedIDs,
+	}, nil
+}
+
+// ListGroups returns conversation groups, optionally filtered by assistantID.
+func (s *ConversationService) ListGroups(ctx context.Context, assistantID string) ([]domain.ConversationGroup, error) {
+	return s.convs.ListGroups(ctx, strings.TrimSpace(assistantID))
+}
+
+// CreateGroup validates and persists a new conversation group for an assistant.
+func (s *ConversationService) CreateGroup(ctx context.Context, in CreateGroupInput) (GroupMutationResult, error) {
+	aid, err := s.requireAssistantExists(ctx, in.AssistantID)
+	if err != nil {
+		return GroupMutationResult{}, err
+	}
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return GroupMutationResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "group name is required", nil)
+	}
+	group, err := s.convs.CreateGroup(ctx, aid, name)
+	if err != nil {
+		return GroupMutationResult{}, err
+	}
+	snap, err := s.snapshot(ctx, aid, nil)
+	if err != nil {
+		return GroupMutationResult{}, err
+	}
+	return GroupMutationResult{
+		Group:         group,
+		AssistantID:   aid,
+		Conversations: snap.Conversations,
+		Groups:        snap.Groups,
+	}, nil
+}
+
+// RenameGroup validates and updates a conversation group's name.
+func (s *ConversationService) RenameGroup(ctx context.Context, id string, in RenameGroupInput) (GroupMutationResult, error) {
+	name := strings.TrimSpace(in.Name)
+	if name == "" {
+		return GroupMutationResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "group name is required", nil)
+	}
+	group, err := s.convs.RenameGroup(ctx, strings.TrimSpace(id), name)
+	if err != nil {
+		return GroupMutationResult{}, err
+	}
+	snap, err := s.snapshot(ctx, group.AssistantID, nil)
+	if err != nil {
+		return GroupMutationResult{}, err
+	}
+	return GroupMutationResult{
+		Group:         group,
+		AssistantID:   group.AssistantID,
+		Conversations: snap.Conversations,
+		Groups:        snap.Groups,
+	}, nil
+}
+
+// DeleteGroup removes a conversation group while preserving conversations and messages.
+func (s *ConversationService) DeleteGroup(ctx context.Context, id string) (GroupDeleteResult, error) {
+	gid := strings.TrimSpace(id)
+	aid, err := s.convs.DeleteGroup(ctx, gid)
+	if err != nil {
+		return GroupDeleteResult{}, err
+	}
+	snap, err := s.snapshot(ctx, aid, nil)
+	if err != nil {
+		return GroupDeleteResult{}, err
+	}
+	return GroupDeleteResult{
+		DeletedGroupID: gid,
+		AssistantID:    aid,
+		Conversations:  snap.Conversations,
+		Groups:         snap.Groups,
+	}, nil
+}
+
+// BatchConversations executes an atomic batch delete, move, or pin operation for an assistant.
+func (s *ConversationService) BatchConversations(ctx context.Context, in BatchConversationsInput) (OrganizationSnapshot, error) {
+	aid, err := s.requireAssistantExists(ctx, in.AssistantID)
+	if err != nil {
+		return OrganizationSnapshot{}, err
+	}
+	ids, err := deduplicateIDs(in.IDs)
+	if err != nil {
+		return OrganizationSnapshot{}, err
+	}
+
+	switch strings.TrimSpace(in.Operation) {
+	case "delete":
+		if err := s.convs.BatchDelete(ctx, aid, ids); err != nil {
+			return OrganizationSnapshot{}, err
+		}
+		return s.snapshot(ctx, aid, ids)
+
+	case "move":
+		if !in.GroupID.Set {
+			return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "groupId is required for move operation (use null for ungrouped)", nil)
+		}
+		var targetGroupID *string
+		if !in.GroupID.Null {
+			trimmed := strings.TrimSpace(in.GroupID.Value)
+			if trimmed == "" {
+				return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "groupId must not be an empty string", nil)
+			}
+			targetGroupID = &trimmed
+		}
+		if err := s.convs.BatchMove(ctx, aid, ids, targetGroupID); err != nil {
+			return OrganizationSnapshot{}, err
+		}
+		return s.snapshot(ctx, aid, nil)
+
+	case "pin":
+		if !in.Pinned.Set || in.Pinned.Null {
+			return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "pinned boolean is required for pin operation", nil)
+		}
+		if err := s.convs.BatchPin(ctx, aid, ids, in.Pinned.Value); err != nil {
+			return OrganizationSnapshot{}, err
+		}
+		return s.snapshot(ctx, aid, nil)
+
+	default:
+		return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "unsupported batch operation", nil)
+	}
+}
+
+// ReorderConversations places selected conversations before an optional bucket anchor atomically.
+func (s *ConversationService) ReorderConversations(ctx context.Context, in ReorderConversationsInput) (OrganizationSnapshot, error) {
+	aid, err := s.requireAssistantExists(ctx, in.AssistantID)
+	if err != nil {
+		return OrganizationSnapshot{}, err
+	}
+	ids, err := deduplicateIDs(in.IDs)
+	if err != nil {
+		return OrganizationSnapshot{}, err
+	}
+	if !in.Pinned.Set || in.Pinned.Null {
+		return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "pinned boolean is required", nil)
+	}
+
+	var targetGroupID *string
+	if in.Pinned.Value {
+		if in.GroupID.Set {
+			return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "groupId must be omitted when pinned is true", nil)
+		}
+	} else {
+		if !in.GroupID.Set {
+			return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "groupId is required when pinned is false (use null for ungrouped)", nil)
+		}
+		if !in.GroupID.Null {
+			trimmed := strings.TrimSpace(in.GroupID.Value)
+			if trimmed == "" {
+				return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "groupId must not be an empty string", nil)
+			}
+			targetGroupID = &trimmed
+		}
+	}
+
+	var beforeID *string
+	if in.BeforeID.Set && !in.BeforeID.Null {
+		trimmed := strings.TrimSpace(in.BeforeID.Value)
+		if trimmed == "" {
+			return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "beforeId must not be an empty string", nil)
+		}
+		beforeID = &trimmed
+	}
+
+	if err := s.convs.Reorder(ctx, aid, ids, in.Pinned.Value, targetGroupID, beforeID); err != nil {
+		return OrganizationSnapshot{}, err
+	}
+	return s.snapshot(ctx, aid, nil)
 }

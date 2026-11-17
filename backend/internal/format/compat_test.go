@@ -12,6 +12,7 @@ func TestMergeCompat(t *testing.T) {
 		SupportsDeveloperRole: domain.BoolPtr(true),
 		SupportsStreamOptions: domain.BoolPtr(true),
 		ThinkingFormat:        "openai",
+		CacheMode:             domain.CacheModeExplicit,
 		ExtraHeaders:          map[string]string{"X-Base": "1", "X-Shared": "base"},
 		ExtraBody: map[string]any{
 			"top_p": 0.9,
@@ -46,6 +47,9 @@ func TestMergeCompat(t *testing.T) {
 	if merged.ThinkingFormat != "openai" {
 		t.Fatalf("expected inherited ThinkingFormat, got %q", merged.ThinkingFormat)
 	}
+	if merged.CacheMode != domain.CacheModeExplicit {
+		t.Fatalf("expected unset CacheMode to inherit %q, got %q", domain.CacheModeExplicit, merged.CacheMode)
+	}
 	if merged.ExtraHeaders["X-Base"] != "1" || merged.ExtraHeaders["X-Shared"] != "override" || merged.ExtraHeaders["X-New"] != "3" {
 		t.Fatalf("unexpected merged ExtraHeaders: %v", merged.ExtraHeaders)
 	}
@@ -56,5 +60,16 @@ func TestMergeCompat(t *testing.T) {
 	// Ensure base map was not mutated.
 	if base.ExtraBody["nested"].(map[string]any)["b"] != 2 {
 		t.Fatal("MergeCompat mutated base ExtraBody")
+	}
+
+	// Explicit "auto" overrides base non-auto mode, as do "disabled" and "implicit".
+	if got := MergeCompat(base, domain.CompatConfig{CacheMode: domain.CacheModeAuto}); got.CacheMode != domain.CacheModeAuto {
+		t.Fatalf("expected explicit auto override, got %q", got.CacheMode)
+	}
+	if got := MergeCompat(base, domain.CompatConfig{CacheMode: domain.CacheModeDisabled}); got.CacheMode != domain.CacheModeDisabled {
+		t.Fatalf("expected disabled override, got %q", got.CacheMode)
+	}
+	if got := MergeCompat(base, domain.CompatConfig{CacheMode: domain.CacheModeImplicit}); got.CacheMode != domain.CacheModeImplicit {
+		t.Fatalf("expected implicit override, got %q", got.CacheMode)
 	}
 }

@@ -11,7 +11,10 @@ import {
 import { useApp } from '../../app/AppProvider';
 import { GatewayError } from '../../core/gateway';
 import { applyLocalAuth } from '../../core/localProvider';
-import { getLocalProviderKey } from '../../core/localProviderKeys';
+import {
+  getLocalProviderKey,
+  getLocalProviderKeyVersion,
+} from '../../core/localProviderKeys';
 import { decodeUpstreamSseStream } from '../../core/localStreamDecoders';
 import { decodeSseByteStream, parseStreamEventFrame } from '../../core/sse';
 import type {
@@ -19,11 +22,19 @@ import type {
   Conversation,
   ConversationDetail,
   GenerationParams,
+  LocalCacheResultData,
   Message,
+  ModelConfig,
+  PreparedLocalHTTPRequest,
   PreparedLocalRequest,
+  PreparedSearchInput,
+  PromptCacheState,
+  ProviderConfig,
   ReasoningEffort,
+  StreamChatInput,
   StreamEvent,
   TokenUsage,
+  ToolCallBlock,
 } from '../../core/types';
 import {
   bufferToBlock,
@@ -60,6 +71,7 @@ export interface ChatContextValue {
   state: ChatState;
   isBusy: boolean;
   setReasoningEffort: (effort: ReasoningEffort) => void;
+  updateConversationMeta: (conversation: Conversation) => void;
   clearSession: () => void;
   loadConversation: (conversationId: string) => Promise<ConversationDetail | null>;
   reloadCurrentConversation: () => Promise<void>;
@@ -91,9 +103,139 @@ function formatError(err: unknown): { code: string; message: string } {
   return { code: 'NETWORK_ERROR', message: '请求失败' };
 }
 
+function hashInMemoryString(input: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function buildLocalCacheKey(
+  connectionEpoch: number,
+  provider: ProviderConfig | undefined,
+  providerId: string,
+  model: ModelConfig | undefined,
+  modelId: string,
+): string {
+  const keyVer = getLocalProviderKeyVersion(providerId);
+  const keyDigest = hashInMemoryString(getLocalProviderKey(providerId));
+  const hdrs = provider?.headers
+    ? Object.entries(provider.headers)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => `${k}:${v}`)
+        .join(';')
+    : '';
+  return [
+    connectionEpoch,
+    providerId,
+    provider?.baseURL ?? '',
+    provider?.authType ?? '',
+    hdrs,
+    keyVer,
+    keyDigest,
+    model?.apiFormat ?? '',
+    modelId,
+    model?.compat?.pathOverride ?? '',
+    model?.compat?.cacheMode ?? '',
+  ].join('|');
+}
+
+function extractSafeCacheResult(
+  status: number,
+  rawText: string,
+): LocalCacheResultData {
+  const out: LocalCacheResultData = {};
+  try {
+    const parsed = JSON.parse(rawText) as {
+      name?: unknown;
+      expireTime?: unknown;
+      error?: { code?: unknown; status?: unknown; message?: unknown };
+      message?: unknown;
+    };
+    if (status >= 200 && status < 300) {
+      if (typeof parsed.name === 'string' && parsed.name.trim()) {
+        out.name = parsed.name.trim();
+      }
+      if (typeof parsed.expireTime === 'string' && parsed.expireTime.trim()) {
+        out.expireTime = parsed.expireTime.trim();
+      }
+      return out;
+    }
+    const errObj = parsed.error;
+    if (errObj && typeof errObj === 'object') {
+      if (typeof errObj.status === 'string' && errObj.status) {
+        out.errorCode = errObj.status;
+      } else if (
+        typeof errObj.code === 'number' ||
+        typeof errObj.code === 'string'
+      ) {
+        out.errorCode = String(errObj.code);
+      }
+      if (typeof errObj.message === 'string' && errObj.message) {
+        out.errorMessage = errObj.message.slice(0, 500);
+      }
+    } else if (typeof parsed.message === 'string' && parsed.message) {
+      out.errorMessage = parsed.message.slice(0, 500);
+    }
+  } catch {
+    if (status >= 400 && rawText.trim()) {
+      out.errorMessage = rawText.trim().slice(0, 500);
+    }
+  }
+  return out;
+}
+
+function classifyLocalMainCacheError(
+  status: number,
+  bodyText: string,
+  hadCachedRef: boolean,
+): 'none' | 'unsupported' | 'expired' {
+  const lower = bodyText.toLowerCase();
+  if (
+    lower.includes('api key') ||
+    lower.includes('api_key') ||
+    lower.includes('invalid key')
+  ) {
+    return 'none';
+  }
+  if (status === 400 || status === 422) {
+    const hasInlineKw =
+      lower.includes('cache_control') ||
+      lower.includes('prompt_cache_options') ||
+      lower.includes('prompt_cache_breakpoint') ||
+      lower.includes('ephemeral');
+    const hasReject =
+      lower.includes('unsupported') ||
+      lower.includes('not supported') ||
+      lower.includes('unknown') ||
+      lower.includes('unrecognized') ||
+      lower.includes('invalid') ||
+      lower.includes('unexpected') ||
+      lower.includes('not permitted');
+    if (hasInlineKw && hasReject) {
+      return 'unsupported';
+    }
+  }
+  if (
+    hadCachedRef &&
+    (status === 404 || status === 400 || status === 403) &&
+    (lower.includes('cachedcontent') ||
+      lower.includes('cached_content') ||
+      lower.includes('not found') ||
+      lower.includes('expired') ||
+      lower.includes('does not exist'))
+  ) {
+    return lower.includes('unsupported') ? 'unsupported' : 'expired';
+  }
+  return 'none';
+}
+
 export function ChatProvider({ children }: { children: ReactNode }) {
   const {
     gateway,
+    settings,
     resources,
     connectionEpoch,
     upsertLocalConversation,
@@ -109,6 +251,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const activeAbortRef = useRef<AbortController | null>(null);
   const manualAbortRef = useRef(false);
   const sendingRef = useRef(false);
+  const localCacheRef = useRef<Map<string, PromptCacheState>>(new Map());
 
   const cancelActiveStream = useCallback((quiet: boolean) => {
     epochRef.current += 1;
@@ -123,6 +266,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (prevConnectionEpochRef.current === connectionEpoch) return;
     prevConnectionEpochRef.current = connectionEpoch;
+    localCacheRef.current.clear();
     cancelActiveStream(true);
     dispatch({ type: 'CLEAR_SESSION' });
   }, [connectionEpoch, cancelActiveStream]);
@@ -140,6 +284,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     dispatch({ type: 'SET_EFFORT', effort });
   }, []);
 
+  const updateConversationMeta = useCallback((conversation: Conversation) => {
+    if (stateRef.current.conversation?.id !== conversation.id) {
+      return;
+    }
+    dispatch({ type: 'UPDATE_CONVERSATION_META', conversation });
+  }, []);
+
   const clearSession = useCallback(() => {
     cancelActiveStream(true);
     dispatch({ type: 'CLEAR_SESSION' });
@@ -151,7 +302,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const epoch = ++epochRef.current;
       const ctrl = new AbortController();
       activeAbortRef.current = ctrl;
-      dispatch({ type: 'LOAD_START' });
+      dispatch({ type: 'LOAD_START', conversationId });
       try {
         const detail = await gateway.getConversationDetail(
           conversationId,
@@ -244,6 +395,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         regenerateMessageId?: string;
         webSearch?: boolean;
         searchEngineId?: string;
+        autoCreateCache?: boolean;
       };
       optimisticUserId?: string;
       regenerateTargetId?: string;
@@ -405,6 +557,184 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [gateway, reconcileAfterStream],
   );
 
+  const sendLocalHttpFetch = useCallback(
+    async (
+      preparedReq: PreparedLocalHTTPRequest,
+      provider: ProviderConfig | undefined,
+      providerId: string,
+      signal: AbortSignal,
+    ): Promise<Response> => {
+      const localApiKey = getLocalProviderKey(providerId);
+      const authed = applyLocalAuth(
+        preparedReq.url,
+        preparedReq.headers ?? {},
+        preparedReq.authType,
+        localApiKey,
+        provider?.headers,
+      );
+      const serializedBody =
+        typeof preparedReq.body === 'string'
+          ? preparedReq.body
+          : JSON.stringify(preparedReq.body ?? {});
+
+      try {
+        return await gateway.fetchImpl(authed.url, {
+          method: preparedReq.method || 'POST',
+          headers: authed.headers,
+          body: serializedBody,
+          signal,
+        });
+      } catch (fetchErr) {
+        if (isAbortError(fetchErr)) throw fetchErr;
+        if (fetchErr instanceof TypeError) {
+          throw new GatewayError(
+            'LOCAL_NETWORK_ERROR',
+            '无法直连本地模型服务，请检查服务是否启动并已开启 CORS 跨域支持',
+          );
+        }
+        throw fetchErr;
+      }
+    },
+    [gateway],
+  );
+
+  const prepareAndOpenLocalUpstream = useCallback(
+    async (
+      conversationId: string,
+      baseInput: StreamChatInput,
+      provider: ProviderConfig | undefined,
+      providerId: string,
+      model: ModelConfig | undefined,
+      modelId: string,
+      searchTracker: { settled: boolean; block: ContentBlock | null },
+      signal: AbortSignal,
+    ): Promise<{ prepared: PreparedLocalRequest; response: Response }> => {
+      const cacheKey = buildLocalCacheKey(
+        connectionEpoch,
+        provider,
+        providerId,
+        model,
+        modelId,
+      );
+      let currentCache = localCacheRef.current.get(cacheKey);
+      if (currentCache?.expireTime) {
+        const expMs = Date.parse(currentCache.expireTime);
+        if (Number.isFinite(expMs) && expMs <= Date.now()) {
+          localCacheRef.current.delete(cacheKey);
+          currentCache = undefined;
+        }
+      }
+
+      const buildInput = (extra?: Partial<StreamChatInput>): StreamChatInput => ({
+        ...baseInput,
+        ...(searchTracker.settled
+          ? { preparedSearch: { block: searchTracker.block } satisfies PreparedSearchInput }
+          : {}),
+        ...(currentCache ? { cacheState: currentCache } : {}),
+        ...extra,
+      });
+
+      let prepared = await gateway.prepareLocalChat(
+        conversationId,
+        buildInput(),
+        signal,
+      );
+      if (!searchTracker.settled) {
+        searchTracker.settled = true;
+        searchTracker.block = prepared.webSearchBlock ?? null;
+      }
+
+      const hadCacheStep = Boolean(prepared.cacheStep);
+      if (prepared.cacheStep) {
+        const cacheRes = await sendLocalHttpFetch(
+          prepared.cacheStep.request,
+          provider,
+          providerId,
+          signal,
+        );
+        const rawText = await cacheRes.text().catch(() => '');
+        const safeResult = extractSafeCacheResult(cacheRes.status, rawText);
+        prepared = await gateway.prepareLocalChat(
+          conversationId,
+          buildInput({
+            cacheResolution: {
+              planKey: prepared.cacheStep.planKey,
+              status: cacheRes.status,
+              result: safeResult,
+            },
+          }),
+          signal,
+        );
+      }
+
+      if (prepared.cacheState) {
+        localCacheRef.current.set(cacheKey, prepared.cacheState);
+      } else if (hadCacheStep) {
+        localCacheRef.current.delete(cacheKey);
+      }
+
+      let mainRes = await sendLocalHttpFetch(
+        prepared,
+        provider,
+        providerId,
+        signal,
+      );
+      if (!mainRes.ok) {
+        const snippet = await mainRes.text().catch(() => '');
+        const errKind = classifyLocalMainCacheError(
+          mainRes.status,
+          snippet,
+          Boolean(prepared.cacheState?.resourceName),
+        );
+        if (errKind !== 'none') {
+          const fallbackState: PromptCacheState = { unsupported: true };
+          if (errKind === 'unsupported') {
+            localCacheRef.current.set(cacheKey, fallbackState);
+          } else {
+            localCacheRef.current.delete(cacheKey);
+          }
+          prepared = await gateway.prepareLocalChat(
+            conversationId,
+            {
+              ...baseInput,
+              ...(searchTracker.settled
+                ? { preparedSearch: { block: searchTracker.block } }
+                : {}),
+              cacheState: fallbackState,
+            },
+            signal,
+          );
+          mainRes = await sendLocalHttpFetch(
+            prepared,
+            provider,
+            providerId,
+            signal,
+          );
+          if (!mainRes.ok) {
+            const retrySnippet = await mainRes.text().catch(() => '');
+            throw new GatewayError(
+              `HTTP_${mainRes.status}`,
+              retrySnippet.trim()
+                ? `上游返回 HTTP ${mainRes.status}: ${retrySnippet.trim().slice(0, 300)}`
+                : `上游返回 HTTP ${mainRes.status}`,
+              mainRes.status,
+            );
+          }
+          return { prepared, response: mainRes };
+        }
+        throw new GatewayError(
+          `HTTP_${mainRes.status}`,
+          snippet.trim()
+            ? `上游返回 HTTP ${mainRes.status}: ${snippet.trim().slice(0, 300)}`
+            : `上游返回 HTTP ${mainRes.status}`,
+          mainRes.status,
+        );
+      }
+      return { prepared, response: mainRes };
+    },
+    [connectionEpoch, gateway, sendLocalHttpFetch],
+  );
+
   const executeLocalStream = useCallback(
     async (opts: {
       conversationId: string;
@@ -417,6 +747,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         regenerateMessageId?: string;
         webSearch?: boolean;
         searchEngineId?: string;
+        autoCreateCache?: boolean;
       };
       optimisticUserId?: string;
       regenerateTargetId?: string;
@@ -436,56 +767,23 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const model = provider?.models.find((m) => m.id === opts.input.modelId);
       const apiFormat = model?.apiFormat || 'openai-completions';
 
+      const searchTracker = { settled: false, block: null as ContentBlock | null };
       let prepared: PreparedLocalRequest;
       let response: Response;
 
       try {
-        prepared = await gateway.prepareLocalChat(
+        const opened = await prepareAndOpenLocalUpstream(
           opts.conversationId,
           opts.input,
+          provider,
+          opts.input.providerId,
+          model,
+          opts.input.modelId,
+          searchTracker,
           ctrl.signal,
         );
-        const localApiKey = getLocalProviderKey(opts.input.providerId);
-        const authed = applyLocalAuth(
-          prepared.url,
-          prepared.headers ?? {},
-          prepared.authType,
-          localApiKey,
-          provider?.headers,
-        );
-        const serializedBody =
-          typeof prepared.body === 'string'
-            ? prepared.body
-            : JSON.stringify(prepared.body ?? {});
-
-        try {
-          response = await gateway.fetchImpl(authed.url, {
-            method: prepared.method || 'POST',
-            headers: authed.headers,
-            body: serializedBody,
-            signal: ctrl.signal,
-          });
-        } catch (fetchErr) {
-          if (isAbortError(fetchErr)) throw fetchErr;
-          if (fetchErr instanceof TypeError) {
-            throw new GatewayError(
-              'LOCAL_NETWORK_ERROR',
-              '无法直连本地模型服务，请检查服务是否启动并已开启 CORS 跨域支持',
-            );
-          }
-          throw fetchErr;
-        }
-
-        if (!response.ok) {
-          const snippet = await response.text().catch(() => '');
-          throw new GatewayError(
-            `HTTP_${response.status}`,
-            snippet.trim()
-              ? `上游返回 HTTP ${response.status}: ${snippet.trim().slice(0, 300)}`
-              : `上游返回 HTTP ${response.status}`,
-            response.status,
-          );
-        }
+        prepared = opened.prepared;
+        response = opened.response;
       } catch (err) {
         sendingRef.current = false;
         if (activeAbortRef.current === ctrl) activeAbortRef.current = null;
@@ -529,6 +827,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return false;
       }
 
+      let persistedUserMessageId = '';
       if (opts.optimisticUserId) {
         const userBlocks: ContentBlock[] =
           opts.input.blocks && opts.input.blocks.length > 0
@@ -544,6 +843,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             sendingRef.current = false;
             return false;
           }
+          persistedUserMessageId = savedUser.message.id;
           upsertLocalConversation(savedUser.conversation);
           dispatch({
             type: 'UPDATE_CONVERSATION_META',
@@ -654,13 +954,36 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         });
       };
 
+      const sumTokenUsage = (
+        acc: TokenUsage | undefined,
+        round: TokenUsage | undefined,
+      ): TokenUsage | undefined => {
+        if (!round) return acc;
+        if (!acc) return { ...round };
+        const thinkingTokens =
+          (acc.thinkingTokens ?? 0) + (round.thinkingTokens ?? 0);
+        const cacheReadInputTokens =
+          (acc.cacheReadInputTokens ?? 0) + (round.cacheReadInputTokens ?? 0);
+        const cacheCreationInputTokens =
+          (acc.cacheCreationInputTokens ?? 0) +
+          (round.cacheCreationInputTokens ?? 0);
+        return {
+          inputTokens: acc.inputTokens + round.inputTokens,
+          outputTokens: acc.outputTokens + round.outputTokens,
+          ...(thinkingTokens > 0 ? { thinkingTokens } : {}),
+          ...(cacheReadInputTokens > 0 ? { cacheReadInputTokens } : {}),
+          ...(cacheCreationInputTokens > 0 ? { cacheCreationInputTokens } : {}),
+          totalTokens: acc.totalTokens + round.totalTokens,
+        };
+      };
+
+      const LOCAL_MCP_ROUND_LIMIT = 8;
       let caughtDecodeErr: unknown = null;
+      const seenCallIds = new Set<string>();
+      let cumulativeUsage: TokenUsage | undefined;
+      let finalStopReason = 'stop';
 
       try {
-        if (!response.body) {
-          throw new GatewayError('STREAM_EMPTY', '上游未返回事件流');
-        }
-
         emitEvent({
           type: 'message_start',
           conversationId: opts.conversationId,
@@ -670,7 +993,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         });
 
         let indexOffset = 0;
-        if (prepared.webSearchBlock) {
+        const initialWebSearchBlock = searchTracker.block ?? prepared.webSearchBlock;
+        if (initialWebSearchBlock) {
           emitEvent({
             type: 'block_start',
             conversationId: opts.conversationId,
@@ -679,7 +1003,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             modelId: opts.input.modelId,
             index: 0,
             blockType: 'webSearch',
-            block: prepared.webSearchBlock,
+            block: initialWebSearchBlock,
           });
           emitEvent({
             type: 'block_end',
@@ -689,32 +1013,222 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             modelId: opts.input.modelId,
             index: 0,
             blockType: 'webSearch',
-            block: prepared.webSearchBlock,
+            block: initialWebSearchBlock,
           });
           indexOffset = 1;
         }
 
-        await decodeUpstreamSseStream(
-          apiFormat,
-          response.body,
-          {
-            conversationId: opts.conversationId,
-            messageId: localAssistantId,
-            providerId: opts.input.providerId,
-            modelId: opts.input.modelId,
-          },
-          (rawEv) => {
-            if (epoch !== epochRef.current || manualAbortRef.current) return;
-            const shiftedEv: StreamEvent =
-              indexOffset > 0 && rawEv.index !== undefined
-                ? { ...rawEv, index: rawEv.index + indexOffset }
-                : rawEv;
-            if (shiftedEv.type === 'error') {
-              streamErrorMsg = shiftedEv.error?.message || '流式生成失败';
+        let roundResp = response;
+        for (let round = 0; ; round++) {
+          if (!roundResp.body) {
+            throw new GatewayError('STREAM_EMPTY', '上游未返回事件流');
+          }
+
+          let roundUsage: TokenUsage | undefined;
+          let roundStopReason = '';
+          const roundCalls: ToolCallBlock[] = [];
+          const roundCallIds = new Map<number, string>();
+          let maxSeenIdx = indexOffset - 1;
+
+          await decodeUpstreamSseStream(
+            apiFormat,
+            roundResp.body,
+            {
+              conversationId: opts.conversationId,
+              messageId: localAssistantId,
+              providerId: opts.input.providerId,
+              modelId: opts.input.modelId,
+            },
+            (rawEv) => {
+              if (epoch !== epochRef.current || manualAbortRef.current) return;
+              const shiftedIdx =
+                rawEv.index !== undefined
+                  ? rawEv.index + indexOffset
+                  : undefined;
+              if (shiftedIdx !== undefined && shiftedIdx > maxSeenIdx) {
+                maxSeenIdx = shiftedIdx;
+              }
+              let nextEv: StreamEvent =
+                shiftedIdx !== undefined ? { ...rawEv, index: shiftedIdx } : rawEv;
+
+              if (
+                nextEv.block &&
+                nextEv.block.type === 'toolCall' &&
+                shiftedIdx !== undefined
+              ) {
+                const rawTool = nextEv.block as ToolCallBlock;
+                const b: ToolCallBlock = {
+                  ...rawTool,
+                  id: String(rawTool.id ?? ''),
+                  name: String(rawTool.name ?? ''),
+                };
+                if (nextEv.type === 'block_start') {
+                  let id = b.id.trim();
+                  if (!id || seenCallIds.has(id)) {
+                    const base = `call_r${round + 1}_${shiftedIdx}`;
+                    id = base;
+                    for (let suffix = 2; seenCallIds.has(id); suffix++) {
+                      id = `${base}_${suffix}`;
+                    }
+                  }
+                  seenCallIds.add(id);
+                  roundCallIds.set(shiftedIdx, id);
+                  b.id = id;
+                  nextEv = { ...nextEv, block: b };
+                } else if (nextEv.type === 'block_end') {
+                  let id = roundCallIds.get(shiftedIdx);
+                  if (!id) {
+                    id = b.id.trim();
+                    if (!id || seenCallIds.has(id)) {
+                      const base = `call_r${round + 1}_${shiftedIdx}`;
+                      id = base;
+                      for (let suffix = 2; seenCallIds.has(id); suffix++) {
+                        id = `${base}_${suffix}`;
+                      }
+                    }
+                    seenCallIds.add(id);
+                    roundCallIds.set(shiftedIdx, id);
+                  }
+                  b.id = id;
+                  nextEv = { ...nextEv, block: b };
+                  roundCalls.push(b);
+                }
+              }
+
+              if (nextEv.type === 'message_delta') {
+                if (nextEv.usage) {
+                  roundUsage = nextEv.usage;
+                  nextEv = {
+                    ...nextEv,
+                    usage: sumTokenUsage(cumulativeUsage, roundUsage),
+                  };
+                }
+                if (nextEv.stopReason) {
+                  roundStopReason = nextEv.stopReason;
+                }
+              }
+
+              if (nextEv.type === 'error') {
+                streamErrorMsg = nextEv.error?.message || '流式生成失败';
+              }
+              emitEvent(nextEv);
+            },
+          );
+
+          if (
+            epoch !== epochRef.current ||
+            manualAbortRef.current ||
+            ctrl.signal.aborted ||
+            streamErrorMsg
+          ) {
+            break;
+          }
+
+          cumulativeUsage = sumTokenUsage(cumulativeUsage, roundUsage);
+          accUsage = cumulativeUsage;
+          indexOffset = maxSeenIdx + 1;
+
+          const effectiveStop =
+            roundStopReason || (roundCalls.length > 0 ? 'toolUse' : 'stop');
+          if (effectiveStop !== 'toolUse' || roundCalls.length === 0) {
+            finalStopReason = effectiveStop;
+            break;
+          }
+
+          if (round >= LOCAL_MCP_ROUND_LIMIT) {
+            streamErrorMsg = `达到最大工具调用轮数上限（${LOCAL_MCP_ROUND_LIMIT} 轮）`;
+            emitEvent({
+              type: 'error',
+              conversationId: opts.conversationId,
+              messageId: localAssistantId,
+              providerId: opts.input.providerId,
+              modelId: opts.input.modelId,
+              error: {
+                code: 'MCP_ROUND_LIMIT',
+                message: streamErrorMsg,
+              },
+            });
+            break;
+          }
+
+          const execResp = await gateway.openToolExecutionStream(
+            opts.conversationId,
+            roundCalls.map((c) => ({
+              id: c.id,
+              name: c.name,
+              arguments: c.arguments ?? {},
+            })),
+            ctrl.signal,
+          );
+          if (!execResp.body) {
+            throw new GatewayError('STREAM_EMPTY', '工具执行未返回事件流');
+          }
+
+          const toolIdxMap = new Map<number, number>();
+          for await (const frame of decodeSseByteStream(execResp.body)) {
+            if (
+              epoch !== epochRef.current ||
+              manualAbortRef.current ||
+              ctrl.signal.aborted
+            ) {
+              break;
             }
-            emitEvent(shiftedEv);
-          },
-        );
+            const parsed = parseStreamEventFrame(frame);
+            if (!parsed) continue;
+            if (parsed.type === 'error') {
+              throw new GatewayError(
+                parsed.error?.code || 'TOOL_EXEC_FAILED',
+                parsed.error?.message || '工具执行失败',
+              );
+            }
+            if (parsed.index !== undefined) {
+              let mappedIdx = toolIdxMap.get(parsed.index);
+              if (mappedIdx === undefined) {
+                mappedIdx = indexOffset++;
+                toolIdxMap.set(parsed.index, mappedIdx);
+              }
+              emitEvent({
+                ...parsed,
+                conversationId: opts.conversationId,
+                messageId: localAssistantId,
+                providerId: opts.input.providerId,
+                modelId: opts.input.modelId,
+                index: mappedIdx,
+              });
+            }
+          }
+
+          if (
+            epoch !== epochRef.current ||
+            manualAbortRef.current ||
+            ctrl.signal.aborted
+          ) {
+            break;
+          }
+
+          const currentBlocks = accOrder.map((idx) =>
+            bufferToBlock(accBlocks[idx]),
+          );
+          const nextOpened = await prepareAndOpenLocalUpstream(
+            opts.conversationId,
+            {
+              ...opts.input,
+              localContinuation: {
+                ...(persistedUserMessageId
+                  ? { userMessageId: persistedUserMessageId }
+                  : {}),
+                blocks: currentBlocks,
+              },
+            },
+            provider,
+            opts.input.providerId,
+            model,
+            opts.input.modelId,
+            searchTracker,
+            ctrl.signal,
+          );
+          roundResp = nextOpened.response;
+        }
       } catch (err) {
         caughtDecodeErr = err;
       } finally {
@@ -727,7 +1241,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       if (epoch !== epochRef.current) return false;
 
       const finalBlocks = accOrder.map((idx) => bufferToBlock(accBlocks[idx]));
-      let stopReason = accStopReason || 'stop';
+      let stopReason = finalStopReason || accStopReason || 'stop';
       let errMsg = '';
 
       if (manualAbortRef.current || isAbortError(caughtDecodeErr)) {
@@ -789,6 +1303,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             : {}),
         });
         if (epoch !== epochRef.current) return false;
+        dispatch({
+          type: 'REPLACE_MESSAGE_BY_ID',
+          targetId: localAssistantId,
+          message: saved.message,
+        });
         upsertLocalConversation(saved.conversation);
         await reconcileAfterStream(opts.conversationId, epoch, {
           isAbort: stopReason === 'aborted',
@@ -807,6 +1326,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     },
     [
       gateway,
+      prepareAndOpenLocalUpstream,
       reconcileAfterStream,
       resources.providers,
       toast,
@@ -859,13 +1379,19 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           params: mergedParams,
           webSearch: opts.webSearch,
           searchEngineId: opts.searchEngineId,
+          autoCreateCache: settings.autoCreateCache,
         },
         optimisticUserId: optimisticId,
         expectedCountOnAbort: expectedAfterAbort,
         onStreamAccepted: opts.onStreamAccepted,
       });
     },
-    [executeLocalStream, executeStream, resources.providers],
+    [
+      executeLocalStream,
+      executeStream,
+      resources.providers,
+      settings.autoCreateCache,
+    ],
   );
 
   const regenerateMessage = useCallback(
@@ -909,12 +1435,19 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           regenerateMessageId: opts.targetMessageId,
           webSearch: opts.webSearch,
           searchEngineId: opts.searchEngineId,
+          autoCreateCache: settings.autoCreateCache,
         },
         regenerateTargetId: opts.targetMessageId,
         expectedCountOnAbort,
       });
     },
-    [executeLocalStream, executeStream, resources.providers, toast],
+    [
+      executeLocalStream,
+      executeStream,
+      resources.providers,
+      settings.autoCreateCache,
+      toast,
+    ],
   );
 
   const stopStreaming = useCallback(() => {
@@ -1017,6 +1550,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       state,
       isBusy,
       setReasoningEffort,
+      updateConversationMeta,
       clearSession,
       loadConversation,
       reloadCurrentConversation,
@@ -1032,6 +1566,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       state,
       isBusy,
       setReasoningEffort,
+      updateConversationMeta,
       clearSession,
       loadConversation,
       reloadCurrentConversation,

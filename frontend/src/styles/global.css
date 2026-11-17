@@ -324,7 +324,14 @@ a {
   backdrop-filter: blur(4px);
   -webkit-backdrop-filter: blur(4px);
   z-index: var(--z-modal);
+}
+
+.ui-dialog-overlay[data-state='open'] {
   animation: fadeIn var(--duration-fast) var(--ease-apple);
+}
+
+.ui-dialog-overlay[data-state='closed'] {
+  animation: fadeOut var(--duration-fast) var(--ease-apple) forwards;
 }
 
 .ui-dialog-content {
@@ -342,7 +349,14 @@ a {
   box-shadow: var(--shadow-lg);
   z-index: var(--z-modal);
   overflow: hidden;
+}
+
+.ui-dialog-content[data-state='open'] {
   animation: dialogIn var(--duration-normal) var(--ease-apple);
+}
+
+.ui-dialog-content[data-state='closed'] {
+  animation: dialogOut var(--duration-fast) var(--ease-apple) forwards;
 }
 
 .ui-dialog-content--wide {
@@ -396,7 +410,17 @@ a {
   box-shadow: var(--shadow-md);
   padding: 4px;
   z-index: var(--z-popover);
-  animation: fadeIn var(--duration-fast) var(--ease-apple);
+  transform-origin: var(--radix-popover-content-transform-origin, top center);
+}
+
+.ui-popover-content[data-state='open'],
+.ui-menu-content[data-state='open'] {
+  animation: popoverIn var(--duration-fast) var(--ease-apple);
+}
+
+.ui-popover-content[data-state='closed'],
+.ui-menu-content[data-state='closed'] {
+  animation: popoverOut var(--duration-fast) var(--ease-apple) forwards;
 }
 
 .ui-menu-item {
@@ -488,6 +512,12 @@ a {
   flex: none;
 }
 
+.ui-spinner--sm {
+  width: 12px;
+  height: 12px;
+  border-width: 1.5px;
+}
+
 /* Connection Gate */
 .gate-shell {
   min-height: 100dvh;
@@ -575,6 +605,11 @@ a {
   to { opacity: 1; }
 }
 
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
 @keyframes dialogIn {
   from {
     opacity: 0;
@@ -583,6 +618,39 @@ a {
   to {
     opacity: 1;
     transform: translate(-50%, -50%) scale(1);
+  }
+}
+
+@keyframes dialogOut {
+  from {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translate(-50%, -48%) scale(0.98);
+  }
+}
+
+@keyframes popoverIn {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes popoverOut {
+  from {
+    opacity: 1;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.97);
   }
 }
 
@@ -603,13 +671,27 @@ a {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .ui-spinner {
+  .ui-spinner,
+  .ui-spinner--sm {
     animation: none;
   }
   .ui-dialog-overlay,
   .ui-dialog-content,
   .ui-popover-content,
   .ui-menu-content {
-    animation: none;
+    animation: none !important;
+  }
+  .ui-icon-btn:active:not(:disabled) {
+    transform: none;
+  }
+  .ui-icon-btn,
+  .ui-btn,
+  .ui-input,
+  .ui-select,
+  .ui-textarea,
+  .ui-switch,
+  .ui-switch__thumb,
+  .ui-segmented__item {
+    transition: none;
   }
 }

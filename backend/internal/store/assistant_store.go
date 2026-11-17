@@ -136,10 +136,18 @@ func (s *AssistantStore) Delete(ctx context.Context, id string) error {
 
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE conversations
-		SET assistant_id = ?
+		SET assistant_id = ?,
+			group_id = NULL,
+			sort_order = sort_order + COALESCE((
+				SELECT MAX(d.sort_order) FROM conversations d WHERE d.assistant_id = ?
+			), 0) + 1000
 		WHERE assistant_id = ?
-	`, domain.DefaultAssistantID, id); err != nil {
+	`, domain.DefaultAssistantID, domain.DefaultAssistantID, id); err != nil {
 		return fmt.Errorf("reassign conversations for assistant %s: %w", id, err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM conversation_groups WHERE assistant_id = ?`, id); err != nil {
+		return fmt.Errorf("delete conversation groups for assistant %s: %w", id, err)
 	}
 
 	res, err := tx.ExecContext(ctx, `DELETE FROM assistants WHERE id = ?`, id)

@@ -43,6 +43,9 @@ describe('settings storage and migration', () => {
       defaultHtmlPreview: false,
       chatDisplayMode: 'bubble',
       autoCollapseEnabled: false,
+      autoCollapseThinkingOnComplete: true,
+      autoCollapseToolsOnComplete: true,
+      autoCreateCache: false,
       collapseLineThreshold: 200,
       collapseCharThreshold: 120,
     });
@@ -51,6 +54,9 @@ describe('settings storage and migration', () => {
       visualHtmlRender: true,
       defaultHtmlPreview: false,
       chatDisplayMode: 'bubble',
+      autoCollapseThinkingOnComplete: true,
+      autoCollapseToolsOnComplete: true,
+      autoCreateCache: false,
     });
 
     expect(localStorage.getItem(LEGACY_FLUTTER_SETTINGS_KEY)).toBe(doubleEncoded);
@@ -76,6 +82,7 @@ describe('settings storage and migration', () => {
         visualHtmlRender: false,
         defaultHtmlPreview: true,
         chatDisplayMode: 'feed',
+        autoCollapseThinkingOnComplete: false,
       }),
     );
 
@@ -85,6 +92,8 @@ describe('settings storage and migration', () => {
     expect(res.settings.visualHtmlRender).toBe(false);
     expect(res.settings.defaultHtmlPreview).toBe(true);
     expect(res.settings.chatDisplayMode).toBe('feed');
+    expect(res.settings.autoCollapseThinkingOnComplete).toBe(false);
+    expect(res.settings.autoCollapseToolsOnComplete).toBe(true);
     expect(res.migratedFromLegacy).toBe(false);
   });
 

@@ -33,12 +33,34 @@ func (f *AnthropicMessagesFormat) DefaultCompat() domain.CompatConfig {
 	return domain.CompatConfig{
 		MaxTokensField: "max_tokens",
 		ThinkingFormat: "anthropic",
+		CacheMode:      domain.CacheModeAuto,
 	}
+}
+
+func (f *AnthropicMessagesFormat) PlanCache(_ context.Context, input plugin.ChatInput, current *plugin.PromptCacheState) (plugin.CachePlan, error) {
+	compat := MergeCompat(f.DefaultCompat(), input.Compat)
+	inline := shouldApplyInlineCache(input, compat, true)
+	if current != nil && current.Unsupported {
+		inline = false
+	}
+	return plugin.CachePlan{
+		ReuseState:  current,
+		InlineCache: inline,
+	}, nil
+}
+
+func (f *AnthropicMessagesFormat) ResolveCache(_ context.Context, _ plugin.ChatInput, _ plugin.CachePlan, _ plugin.CacheResolutionInput) (plugin.CacheResolutionResult, error) {
+	return plugin.CacheResolutionResult{}, nil
+}
+
+func (f *AnthropicMessagesFormat) ClassifyCacheError(statusCode int, body []byte, _ *plugin.PromptCacheState) plugin.CacheFailureAction {
+	return classifyInlineCacheError(statusCode, body, "cache_control", "ephemeral", "prompt caching")
 }
 
 func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.ChatInput) (plugin.EncodedRequest, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
 	params := resolveGenerationParams(input.Model, input.Params)
+	inlineCache := shouldApplyInlineCache(input, compat, true)
 
 	maxTokens := defaultAnthropicMaxTokens
 	if params.MaxTokens != nil && *params.MaxTokens > 0 {
@@ -80,36 +102,57 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 			appendMsg("user", parts)
 
 		case domain.RoleAssistant:
-			var parts []map[string]any
+			var assistantParts []map[string]any
+			var toolResultParts []map[string]any
+			flushAssistant := func() {
+				if len(assistantParts) > 0 {
+					appendMsg("assistant", assistantParts)
+					assistantParts = nil
+				}
+			}
+			flushToolResults := func() {
+				if len(toolResultParts) > 0 {
+					appendMsg("user", toolResultParts)
+					toolResultParts = nil
+				}
+			}
 			for _, b := range msg.Blocks {
 				switch b.Type {
 				case domain.BlockTypeThinking:
-					if b.Thinking != "" {
-						part := map[string]any{
-							"type":     "thinking",
-							"thinking": b.Thinking,
-						}
-						if b.Signature != "" {
-							part["signature"] = b.Signature
-						}
-						parts = append(parts, part)
+					flushToolResults()
+					prov := parseBlockProvenance(b.Extra)
+					if prov.AnthropicRedactedThinking != "" && (prov.ProviderFormat == "" || prov.ProviderFormat == FormatIDAnthropicMessages) {
+						assistantParts = append(assistantParts, map[string]any{
+							"type": "redacted_thinking",
+							"data": prov.AnthropicRedactedThinking,
+						})
+					} else if sig := extractThoughtSignature(b, FormatIDAnthropicMessages); sig != "" && b.Thinking != "" {
+						assistantParts = append(assistantParts, map[string]any{
+							"type":      "thinking",
+							"thinking":  b.Thinking,
+							"signature": sig,
+						})
 					}
 				case domain.BlockTypeText:
-					parts = append(parts, map[string]any{"type": "text", "text": b.Text})
-				case domain.BlockTypeToolCall:
-					var argsObj any = map[string]any{}
-					if len(b.Arguments) > 0 {
-						_ = json.Unmarshal(b.Arguments, &argsObj)
+					flushToolResults()
+					if b.Text != "" {
+						assistantParts = append(assistantParts, map[string]any{"type": "text", "text": b.Text})
 					}
-					parts = append(parts, map[string]any{
+				case domain.BlockTypeToolCall:
+					flushToolResults()
+					assistantParts = append(assistantParts, map[string]any{
 						"type":  "tool_use",
 						"id":    b.ID,
 						"name":  b.Name,
-						"input": argsObj,
+						"input": toolArgsObject(b.Arguments),
 					})
+				case domain.BlockTypeToolResult:
+					flushAssistant()
+					toolResultParts = append(toolResultParts, encodeAnthropicToolResult(b))
 				}
 			}
-			appendMsg("assistant", parts)
+			flushAssistant()
+			flushToolResults()
 
 		case domain.RoleToolResult:
 			var parts []map[string]any
@@ -127,8 +170,18 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 		"messages": encodedMsgs,
 		"stream":   true,
 	}
+	usedBreakpoints := 0
 	if strings.TrimSpace(input.SystemPrompt) != "" {
-		body["system"] = input.SystemPrompt
+		if inlineCache && !hasExtraBodyKey(compat.ExtraBody, "system") {
+			body["system"] = []map[string]any{{
+				"type":          "text",
+				"text":          input.SystemPrompt,
+				"cache_control": map[string]any{"type": "ephemeral"},
+			}}
+			usedBreakpoints++
+		} else {
+			body["system"] = input.SystemPrompt
+		}
 	}
 
 	effort := strings.ToLower(strings.TrimSpace(params.ReasoningEffort))
@@ -154,6 +207,27 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 	if params.Temperature != nil && !thinkingEnabled {
 		body["temperature"] = *params.Temperature
 	}
+	if len(input.Tools) > 0 {
+		encodedTools := make([]map[string]any, 0, len(input.Tools))
+		for _, t := range input.Tools {
+			toolObj := map[string]any{
+				"name":         t.Alias,
+				"input_schema": plugin.NormalizeToolSchema(t.InputSchema),
+			}
+			if desc := strings.TrimSpace(t.Description); desc != "" {
+				toolObj["description"] = desc
+			}
+			encodedTools = append(encodedTools, toolObj)
+		}
+		if inlineCache && !hasExtraBodyKey(compat.ExtraBody, "tools") && usedBreakpoints < 4 && len(encodedTools) > 0 {
+			encodedTools[len(encodedTools)-1]["cache_control"] = map[string]any{"type": "ephemeral"}
+			usedBreakpoints++
+		}
+		body["tools"] = encodedTools
+	}
+	if inlineCache && !hasExtraBodyKey(compat.ExtraBody, "messages") && usedBreakpoints < 4 && len(encodedMsgs) >= 2 {
+		applyAnthropicMessageCacheBreakpoint(encodedMsgs)
+	}
 	if len(compat.ExtraBody) > 0 {
 		MergeBodyMap(body, compat.ExtraBody)
 	}
@@ -171,6 +245,31 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 		Headers:     headers,
 		Body:        payload,
 	}, nil
+}
+
+func applyAnthropicMessageCacheBreakpoint(encodedMsgs []map[string]any) {
+	for i := len(encodedMsgs) - 2; i >= 0; i-- {
+		parts, ok := encodedMsgs[i]["content"].([]map[string]any)
+		if !ok {
+			continue
+		}
+		for j := len(parts) - 1; j >= 0; j-- {
+			partType, _ := parts[j]["type"].(string)
+			if partType == "thinking" || partType == "redacted_thinking" {
+				continue
+			}
+			if partType == "text" {
+				txt, _ := parts[j]["text"].(string)
+				if strings.TrimSpace(txt) == "" {
+					continue
+				}
+			}
+			if _, exists := parts[j]["cache_control"]; !exists {
+				parts[j]["cache_control"] = map[string]any{"type": "ephemeral"}
+			}
+			return
+		}
+	}
 }
 
 func encodeAnthropicImage(b domain.ContentBlock) (map[string]any, bool) {
@@ -204,7 +303,7 @@ func encodeAnthropicToolResult(b domain.ContentBlock) map[string]any {
 	part := map[string]any{
 		"type":        "tool_result",
 		"tool_use_id": b.ToolCallID,
-		"content":     b.Content,
+		"content":     formatToolResultContent(b),
 	}
 	if b.IsError {
 		part["is_error"] = true
@@ -239,9 +338,14 @@ type anthropicStreamEvent struct {
 		} `json:"usage"`
 	} `json:"message"`
 	ContentBlock *struct {
-		Type string `json:"type"`
-		ID   string `json:"id"`
-		Name string `json:"name"`
+		Type      string          `json:"type"`
+		ID        string          `json:"id"`
+		Name      string          `json:"name"`
+		Text      string          `json:"text"`
+		Thinking  string          `json:"thinking"`
+		Signature string          `json:"signature"`
+		Data      string          `json:"data"`
+		Input     json.RawMessage `json:"input"`
 	} `json:"content_block"`
 	Delta *struct {
 		Type        string `json:"type"`
@@ -252,7 +356,10 @@ type anthropicStreamEvent struct {
 		StopReason  string `json:"stop_reason"`
 	} `json:"delta"`
 	Usage *struct {
-		OutputTokens int `json:"output_tokens"`
+		InputTokens              int `json:"input_tokens"`
+		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+		OutputTokens             int `json:"output_tokens"`
 	} `json:"usage"`
 	Error *struct {
 		Type    string `json:"type"`
@@ -262,13 +369,15 @@ type anthropicStreamEvent struct {
 
 func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Reader, emit func(domain.StreamEvent) error) error {
 	type blockState struct {
-		blockIdx  int
-		blockType string
-		id        string
-		name      string
-		buf       strings.Builder
-		signature strings.Builder
-		closed    bool
+		blockIdx     int
+		blockType    string
+		id           string
+		name         string
+		redactedData string
+		fallbackArgs string
+		buf          strings.Builder
+		signature    strings.Builder
+		closed       bool
 	}
 
 	var (
@@ -296,12 +405,21 @@ func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Read
 				Thinking:  st.buf.String(),
 				Signature: st.signature.String(),
 			}
+			if st.redactedData != "" {
+				b.Extra = makeProviderExtra(FormatIDAnthropicMessages, map[string]any{
+					"anthropicRedactedThinking": st.redactedData,
+				})
+			}
 		case domain.BlockTypeToolCall:
+			argsRaw := st.buf.String()
+			if argsRaw == "" {
+				argsRaw = st.fallbackArgs
+			}
 			b = domain.ContentBlock{
 				Type:      domain.BlockTypeToolCall,
 				ID:        st.id,
 				Name:      st.name,
-				Arguments: rawArgumentsJSON(st.buf.String()),
+				Arguments: rawArgumentsJSON(argsRaw),
 			}
 		default:
 			b = domain.ContentBlock{
@@ -360,6 +478,8 @@ func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Read
 			if ev.Message != nil && ev.Message.Usage != nil {
 				u := ev.Message.Usage
 				usage.InputTokens = u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+				usage.CacheCreationInputTokens = u.CacheCreationInputTokens
+				usage.CacheReadInputTokens = u.CacheReadInputTokens
 				usage.OutputTokens = u.OutputTokens
 				hasUsage = true
 			}
@@ -370,12 +490,30 @@ func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Read
 			}
 			var blockType string
 			var initBlock *domain.ContentBlock
+			st := &blockState{
+				blockIdx: nextBlockIdx,
+				id:       ev.ContentBlock.ID,
+				name:     ev.ContentBlock.Name,
+			}
 			switch ev.ContentBlock.Type {
 			case "thinking":
 				blockType = domain.BlockTypeThinking
+				if ev.ContentBlock.Thinking != "" {
+					st.buf.WriteString(ev.ContentBlock.Thinking)
+				}
+				if ev.ContentBlock.Signature != "" {
+					st.signature.WriteString(ev.ContentBlock.Signature)
+				}
+			case "redacted_thinking":
+				blockType = domain.BlockTypeThinking
+				st.redactedData = ev.ContentBlock.Data
 			case "tool_use":
 				blockType = domain.BlockTypeToolCall
 				hasToolCall = true
+				trimmedInput := strings.TrimSpace(string(ev.ContentBlock.Input))
+				if trimmedInput != "" && trimmedInput != "{}" && trimmedInput != "null" {
+					st.fallbackArgs = trimmedInput
+				}
 				initBlock = &domain.ContentBlock{
 					Type: domain.BlockTypeToolCall,
 					ID:   ev.ContentBlock.ID,
@@ -383,13 +521,11 @@ func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Read
 				}
 			default:
 				blockType = domain.BlockTypeText
+				if ev.ContentBlock.Text != "" {
+					st.buf.WriteString(ev.ContentBlock.Text)
+				}
 			}
-			st := &blockState{
-				blockIdx:  nextBlockIdx,
-				blockType: blockType,
-				id:        ev.ContentBlock.ID,
-				name:      ev.ContentBlock.Name,
-			}
+			st.blockType = blockType
 			nextBlockIdx++
 			blocks[ev.Index] = st
 			blockOrder = append(blockOrder, ev.Index)
@@ -438,6 +574,11 @@ func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Read
 				stopReason = mapAnthropicStopReason(ev.Delta.StopReason)
 			}
 			if ev.Usage != nil {
+				if ev.Usage.InputTokens > 0 || ev.Usage.CacheCreationInputTokens > 0 || ev.Usage.CacheReadInputTokens > 0 {
+					usage.InputTokens = ev.Usage.InputTokens + ev.Usage.CacheCreationInputTokens + ev.Usage.CacheReadInputTokens
+					usage.CacheCreationInputTokens = ev.Usage.CacheCreationInputTokens
+					usage.CacheReadInputTokens = ev.Usage.CacheReadInputTokens
+				}
 				usage.OutputTokens = ev.Usage.OutputTokens
 				hasUsage = true
 			}

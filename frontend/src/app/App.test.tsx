@@ -6,7 +6,8 @@ import { MemoryRouter } from 'react-router-dom';
 import { AppProvider, useApp } from './AppProvider';
 import { ConnectionGate } from './ConnectionGate';
 import { AppRoutes } from './routes';
-import { Modal } from '../components/ui';
+import { Modal, ConfirmDialog } from '../components/ui';
+import { chatReducer, initialChatState } from '../features/chat/chatReducer';
 
 describe('AppProvider, ConnectionGate, and Routing', () => {
   beforeEach(() => {
@@ -239,6 +240,103 @@ describe('AppProvider, ConnectionGate, and Routing', () => {
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
       expect(trigger).toHaveFocus();
     });
+  });
+
+  it('guards Modal and ConfirmDialog against Esc during pending action, displays busy state, and restores focus on close', async () => {
+    function BusyConfirmHarness() {
+      const [open, setOpen] = useState(false);
+      const [busy, setBusy] = useState(false);
+      const [err, setErr] = useState(false);
+      return (
+        <div>
+          <button type="button" onClick={() => setOpen(true)}>
+            触发确认
+          </button>
+          {err ? <span role="alert">操作失败</span> : null}
+          <ConfirmDialog
+            open={open}
+            onOpenChange={setOpen}
+            title="删除确认"
+            message="确认执行？"
+            confirmLabel="执行"
+            busy={busy}
+            onConfirm={async () => {
+              setBusy(true);
+              await new Promise((r) => setTimeout(r, 30));
+              setBusy(false);
+              setErr(true);
+            }}
+          />
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(<BusyConfirmHarness />);
+    const trigger = screen.getByRole('button', { name: '触发确认' });
+    await user.click(trigger);
+
+    const confirmBtn = screen.getByRole('button', { name: '执行' });
+    await user.click(confirmBtn);
+    expect(confirmBtn).toBeDisabled();
+    expect(confirmBtn).toHaveAttribute('aria-busy', 'true');
+    expect(screen.getByRole('dialog')).toHaveAttribute('aria-busy', 'true');
+
+    // Escape cannot dismiss while busy
+    await user.keyboard('{Escape}');
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    // After failure finishes, busy clears -> Escape dismisses and returns focus
+    await waitFor(() => {
+      expect(confirmBtn).not.toBeDisabled();
+      expect(screen.getByText('操作失败')).toBeInTheDocument();
+    });
+    await user.keyboard('{Escape}');
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(trigger).toHaveFocus();
+    });
+  });
+
+  it('preserves loaded messages on same-conversation reload instead of wiping the canvas', () => {
+    const conv = {
+      id: 'conv-same',
+      assistantId: 'default',
+      title: '同会话',
+      providerId: 'p1',
+      modelId: 'm1',
+      params: {},
+      syncEnabled: false,
+      syncState: 'local_only' as const,
+      syncVersion: 0,
+      createdAt: '2026-11-17T08:00:00Z',
+      updatedAt: '2026-11-17T08:00:00Z',
+    };
+    const msg = {
+      id: 'm1',
+      conversationId: 'conv-same',
+      role: 'assistant' as const,
+      blocks: [{ type: 'text' as const, text: '已有消息' }],
+      createdAt: '2026-11-17T08:00:01Z',
+    };
+    const loaded = chatReducer(initialChatState, {
+      type: 'LOAD_SUCCESS',
+      conversation: conv,
+      messages: [msg],
+    });
+    const reloadingSame = chatReducer(loaded, {
+      type: 'LOAD_START',
+      conversationId: 'conv-same',
+    });
+    expect(reloadingSame.runState).toBe('loading');
+    expect(reloadingSame.messages).toHaveLength(1);
+
+    const switchingConv = chatReducer(loaded, {
+      type: 'LOAD_START',
+      conversationId: 'conv-other',
+    });
+    expect(switchingConv.runState).toBe('loading');
+    expect(switchingConv.messages).toHaveLength(0);
   });
 
   it('preserves conversation return path across Settings hops and guards dirty plugin edits', async () => {

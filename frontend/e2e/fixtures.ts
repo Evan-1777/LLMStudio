@@ -237,6 +237,24 @@ async function startMockUpstream(): Promise<{
         return;
       }
 
+      if (prompt.includes('[LONG_THINKING]')) {
+        const longLines = Array.from(
+          { length: 40 },
+          (_, i) => `Thinking step line ${i + 1}: analyzing details and constraints.`,
+        );
+        for (const line of longLines) {
+          writeChunk({ choices: [{ delta: { reasoning_content: `${line}\n` } }] });
+        }
+        writeChunk({ choices: [{ delta: { content: 'Done thinking.' } }] });
+        writeChunk({
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 30, total_tokens: 40 },
+        });
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
       if (prompt.includes('[RAW_HTML_VISUAL]')) {
         const rawHtmlReply =
           '前置说明\n\n<div id="raw-visual-card" style="padding:8px;border:1px solid #007aff;">Raw Seamless Visual Content</div>\n\n后置说明';
@@ -373,6 +391,7 @@ interface GoInstance {
 
 export const test = base.extend<
   {
+    browser: Browser;
     goInstance: GoInstance;
     appUrl: string;
     dbPath: string;
@@ -486,6 +505,10 @@ export const test = base.extend<
   upstream: async ({ workerShared }, use) => {
     workerShared.upstream.reset();
     await use(workerShared.upstream);
+  },
+
+  browser: async ({ workerShared }, use) => {
+    await use(workerShared.browser);
   },
 
   context: async ({ workerShared }, use) => {

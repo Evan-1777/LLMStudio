@@ -233,6 +233,28 @@ export function AppearancePage() {
             </div>
 
             <div className="st-row--inline">
+              <span className="st-row__label--plain">思考完成后自动折叠</span>
+              <Switch
+                checked={settings.autoCollapseThinkingOnComplete}
+                label="思考完成后自动折叠"
+                onCheckedChange={(autoCollapseThinkingOnComplete) =>
+                  updateSettings({ autoCollapseThinkingOnComplete })
+                }
+              />
+            </div>
+
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">工具执行完成后自动折叠</span>
+              <Switch
+                checked={settings.autoCollapseToolsOnComplete}
+                label="工具执行完成后自动折叠"
+                onCheckedChange={(autoCollapseToolsOnComplete) =>
+                  updateSettings({ autoCollapseToolsOnComplete })
+                }
+              />
+            </div>
+
+            <div className="st-row--inline">
               <span className="st-row__label--plain">自动折叠长内容</span>
               <Switch
                 checked={settings.autoCollapseEnabled}

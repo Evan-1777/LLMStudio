@@ -31,6 +31,9 @@ export interface AppSettings {
   defaultHtmlPreview: boolean;
   chatDisplayMode: ChatDisplayMode;
   autoCollapseEnabled: boolean;
+  autoCollapseThinkingOnComplete: boolean;
+  autoCollapseToolsOnComplete: boolean;
+  autoCreateCache: boolean;
   collapseLineThreshold: number;
   collapseCharThreshold: number;
 }
@@ -59,6 +62,9 @@ export function defaultSettings(): AppSettings {
     defaultHtmlPreview: false,
     chatDisplayMode: 'bubble',
     autoCollapseEnabled: true,
+    autoCollapseThinkingOnComplete: true,
+    autoCollapseToolsOnComplete: true,
+    autoCreateCache: false,
     collapseLineThreshold: 24,
     collapseCharThreshold: 1200,
   };
@@ -126,6 +132,18 @@ export function normalizeSettings(raw: unknown): AppSettings {
       typeof obj.autoCollapseEnabled === 'boolean'
         ? obj.autoCollapseEnabled
         : defaults.autoCollapseEnabled,
+    autoCollapseThinkingOnComplete:
+      typeof obj.autoCollapseThinkingOnComplete === 'boolean'
+        ? obj.autoCollapseThinkingOnComplete
+        : defaults.autoCollapseThinkingOnComplete,
+    autoCollapseToolsOnComplete:
+      typeof obj.autoCollapseToolsOnComplete === 'boolean'
+        ? obj.autoCollapseToolsOnComplete
+        : defaults.autoCollapseToolsOnComplete,
+    autoCreateCache:
+      typeof obj.autoCreateCache === 'boolean'
+        ? obj.autoCreateCache
+        : defaults.autoCreateCache,
     collapseLineThreshold: clampInt(
       obj.collapseLineThreshold,
       4,

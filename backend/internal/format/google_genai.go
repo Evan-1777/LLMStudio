@@ -2,18 +2,24 @@ package format
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/plugin"
 )
 
-const FormatIDGoogleGenAI = "google-generative-ai"
+const (
+	FormatIDGoogleGenAI     = "google-generative-ai"
+	geminiCachedContentsPath = "/v1beta/cachedContents"
+)
 
 // GoogleGenAIFormat implements the Google Generative AI (Gemini streamGenerateContent) protocol.
 type GoogleGenAIFormat struct{}
@@ -34,15 +40,332 @@ func (f *GoogleGenAIFormat) DefaultCompat() domain.CompatConfig {
 		MaxTokensField:       "maxOutputTokens",
 		ThinkingFormat:       "gemini",
 		ReasoningEffortField: "thinkingConfig",
+		CacheMode:            domain.CacheModeAuto,
 	}
 }
 
-func (f *GoogleGenAIFormat) EncodeRequest(_ context.Context, input plugin.ChatInput) (plugin.EncodedRequest, error) {
-	compat := MergeCompat(f.DefaultCompat(), input.Compat)
-	params := resolveGenerationParams(input.Model, input.Params)
+func isGeminiExplicitCacheEnabled(input plugin.ChatInput, compat domain.CompatConfig) bool {
+	if !input.AutoCreateCache {
+		return false
+	}
+	mode := strings.ToLower(strings.TrimSpace(compat.CacheMode))
+	switch mode {
+	case domain.CacheModeDisabled, domain.CacheModeImplicit:
+		return false
+	case "", domain.CacheModeAuto, domain.CacheModeExplicit:
+		return true
+	default:
+		return false
+	}
+}
 
-	contents := make([]map[string]any, 0, len(input.Messages))
-	for _, msg := range input.Messages {
+type geminiCacheInputs struct {
+	contents    []map[string]any
+	systemObj   map[string]any
+	toolsObj    []map[string]any
+	toolConfig  any
+	systemHash  string
+	toolsHash   string
+	prefixCount int
+	prefixHash  string
+	planKey     string
+}
+
+func hashCanonicalJSON(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+func prepareGeminiCacheInputs(input plugin.ChatInput, compat domain.CompatConfig) geminiCacheInputs {
+	contents := buildGeminiContents(input.Messages)
+	systemObj := buildGeminiSystem(input.SystemPrompt)
+	toolsObj := buildGeminiTools(input.Tools)
+	var toolConfig any
+	if len(compat.ExtraBody) > 0 {
+		if tc, ok := compat.ExtraBody["toolConfig"]; ok {
+			toolConfig = tc
+		}
+	}
+	systemHash := hashCanonicalJSON(struct {
+		System     map[string]any `json:"system,omitempty"`
+		ToolConfig any            `json:"toolConfig,omitempty"`
+	}{System: systemObj, ToolConfig: toolConfig})
+	toolsHash := hashCanonicalJSON(toolsObj)
+
+	prefixCount := -1
+	if len(contents) >= 2 {
+		prefixCount = len(contents) - 1
+	} else if len(contents) == 1 && (systemObj != nil || len(toolsObj) > 0 || toolConfig != nil) {
+		prefixCount = 0
+	}
+
+	var prefixHash, planKey string
+	if prefixCount >= 0 {
+		prefixHash = hashCanonicalJSON(contents[:prefixCount])
+		planKey = hashCanonicalJSON(struct {
+			Model       string `json:"model"`
+			SystemHash  string `json:"systemHash"`
+			ToolsHash   string `json:"toolsHash"`
+			PrefixHash  string `json:"prefixHash"`
+			PrefixCount int    `json:"prefixCount"`
+		}{
+			Model:       input.Model.ID,
+			SystemHash:  systemHash,
+			ToolsHash:   toolsHash,
+			PrefixHash:  prefixHash,
+			PrefixCount: prefixCount,
+		})
+	}
+	return geminiCacheInputs{
+		contents:    contents,
+		systemObj:   systemObj,
+		toolsObj:    toolsObj,
+		toolConfig:  toolConfig,
+		systemHash:  systemHash,
+		toolsHash:   toolsHash,
+		prefixCount: prefixCount,
+		prefixHash:  prefixHash,
+		planKey:     planKey,
+	}
+}
+
+func (f *GoogleGenAIFormat) PlanCache(_ context.Context, input plugin.ChatInput, current *plugin.PromptCacheState) (plugin.CachePlan, error) {
+	compat := MergeCompat(f.DefaultCompat(), input.Compat)
+	if !isGeminiExplicitCacheEnabled(input, compat) {
+		return plugin.CachePlan{}, nil
+	}
+	if hasExtraBodyKey(compat.ExtraBody, "cachedContent") {
+		return plugin.CachePlan{}, nil
+	}
+	if current != nil && current.Unsupported {
+		return plugin.CachePlan{ReuseState: current}, nil
+	}
+
+	prep := prepareGeminiCacheInputs(input, compat)
+	if len(prep.contents) == 0 {
+		return plugin.CachePlan{}, nil
+	}
+
+	// Prefer reusing any non-expired cache whose exact prefix matches current context.
+	if current != nil && current.ResourceName != "" {
+		expired := !current.ExpireTime.IsZero() && !time.Now().UTC().Before(current.ExpireTime)
+		if !expired &&
+			current.SystemHash == prep.systemHash &&
+			current.ToolsHash == prep.toolsHash &&
+			current.PrefixCount >= 0 &&
+			current.PrefixCount < len(prep.contents) &&
+			hashCanonicalJSON(prep.contents[:current.PrefixCount]) == current.PrefixHash {
+			return plugin.CachePlan{ReuseState: current}, nil
+		}
+	}
+
+	if prep.prefixCount < 0 {
+		return plugin.CachePlan{}, nil
+	}
+	if current != nil && current.FailedPrefixHash != "" && current.FailedPrefixHash == prep.planKey {
+		return plugin.CachePlan{ReuseState: current}, nil
+	}
+
+	modelName := strings.TrimSpace(input.Model.ID)
+	if !strings.HasPrefix(modelName, "models/") && !strings.HasPrefix(modelName, "tunedModels/") {
+		modelName = "models/" + modelName
+	}
+	createBody := map[string]any{
+		"model": modelName,
+	}
+	if prep.systemObj != nil {
+		createBody["systemInstruction"] = prep.systemObj
+	}
+	if len(prep.toolsObj) > 0 {
+		createBody["tools"] = prep.toolsObj
+	}
+	if prep.toolConfig != nil {
+		createBody["toolConfig"] = prep.toolConfig
+	}
+	if prep.prefixCount > 0 {
+		createBody["contents"] = prep.contents[:prep.prefixCount]
+	}
+
+	payload, err := json.Marshal(createBody)
+	if err != nil {
+		return plugin.CachePlan{}, err
+	}
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	return plugin.CachePlan{
+		PlanKey: prep.planKey,
+		CreateRequest: &plugin.EncodedRequest{
+			Method:      http.MethodPost,
+			DefaultPath: geminiCachedContentsPath,
+			Headers:     headers,
+			Body:        payload,
+		},
+	}, nil
+}
+
+func (f *GoogleGenAIFormat) ResolveCache(_ context.Context, input plugin.ChatInput, plan plugin.CachePlan, res plugin.CacheResolutionInput) (plugin.CacheResolutionResult, error) {
+	compat := MergeCompat(f.DefaultCompat(), input.Compat)
+	prep := prepareGeminiCacheInputs(input, compat)
+
+	if res.StatusCode >= 200 && res.StatusCode < 300 {
+		var created struct {
+			Name       string `json:"name"`
+			ExpireTime string `json:"expireTime"`
+		}
+		if err := json.Unmarshal(res.Body, &created); err != nil || strings.TrimSpace(created.Name) == "" {
+			return plugin.CacheResolutionResult{
+				Degrade: true,
+				State:   &plugin.PromptCacheState{FailedPrefixHash: prep.planKey},
+			}, nil
+		}
+		var exp time.Time
+		if ts := strings.TrimSpace(created.ExpireTime); ts != "" {
+			if parsed, pErr := time.Parse(time.RFC3339Nano, ts); pErr == nil {
+				exp = parsed.UTC()
+			}
+		}
+		return plugin.CacheResolutionResult{
+			State: &plugin.PromptCacheState{
+				ResourceName: strings.TrimSpace(created.Name),
+				PrefixHash:   prep.prefixHash,
+				PrefixCount:  prep.prefixCount,
+				ToolsHash:    prep.toolsHash,
+				SystemHash:   prep.systemHash,
+				ExpireTime:   exp,
+			},
+		}, nil
+	}
+
+	msg := extractGeminiErrorMsg(res.StatusCode, res.Body)
+	lower := strings.ToLower(msg)
+	if res.StatusCode == http.StatusUnauthorized ||
+		res.StatusCode == http.StatusForbidden ||
+		res.StatusCode == http.StatusTooManyRequests ||
+		strings.Contains(lower, "api key") ||
+		strings.Contains(lower, "api_key") ||
+		strings.Contains(lower, "permission") ||
+		strings.Contains(lower, "rate limit") ||
+		strings.Contains(lower, "quota") {
+		return plugin.CacheResolutionResult{
+			HardError: domain.NewError(domain.ErrCodeUpstreamError, msg, nil),
+		}, nil
+	}
+
+	if res.StatusCode == http.StatusBadRequest ||
+		res.StatusCode == http.StatusNotFound ||
+		res.StatusCode == http.StatusUnprocessableEntity ||
+		res.StatusCode == http.StatusNotImplemented {
+		if isGeminiSmallPrefixError(lower) {
+			return plugin.CacheResolutionResult{
+				Degrade: true,
+				State:   &plugin.PromptCacheState{FailedPrefixHash: prep.planKey},
+			}, nil
+		}
+		return plugin.CacheResolutionResult{
+			Degrade: true,
+			State:   &plugin.PromptCacheState{Unsupported: true},
+		}, nil
+	}
+
+	return plugin.CacheResolutionResult{
+		HardError: domain.NewError(domain.ErrCodeUpstreamError, msg, nil),
+	}, nil
+}
+
+func (f *GoogleGenAIFormat) ClassifyCacheError(statusCode int, body []byte, used *plugin.PromptCacheState) plugin.CacheFailureAction {
+	if used == nil || used.ResourceName == "" {
+		return plugin.CacheFailureAction{}
+	}
+	if statusCode != http.StatusNotFound && statusCode != http.StatusBadRequest && statusCode != http.StatusForbidden {
+		return plugin.CacheFailureAction{}
+	}
+	lower := strings.ToLower(string(body))
+	if strings.Contains(lower, "api key") || strings.Contains(lower, "api_key") || strings.Contains(lower, "invalid key") {
+		return plugin.CacheFailureAction{}
+	}
+	if strings.Contains(lower, "cachedcontent") ||
+		strings.Contains(lower, "cached_content") ||
+		strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "expired") ||
+		strings.Contains(lower, "does not exist") {
+		if strings.Contains(lower, "unsupported") || strings.Contains(lower, "not supported") {
+			return plugin.CacheFailureAction{MarkUnsupported: true, RetryWithoutCache: true}
+		}
+		return plugin.CacheFailureAction{InvalidateScope: true, ReplanCache: true}
+	}
+	return plugin.CacheFailureAction{}
+}
+
+func isGeminiSmallPrefixError(lower string) bool {
+	for _, kw := range []string{
+		"too small",
+		"too short",
+		"minimum",
+		"min_tokens",
+		"less than",
+		"at least",
+		"token count",
+		"total_token_count",
+	} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractGeminiErrorMsg(statusCode int, body []byte) string {
+	var env struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err == nil && env.Error != nil && strings.TrimSpace(env.Error.Message) != "" {
+		return fmt.Sprintf("upstream returned HTTP %d: %s", statusCode, strings.TrimSpace(env.Error.Message))
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		trimmed = http.StatusText(statusCode)
+	}
+	return fmt.Sprintf("upstream returned HTTP %d: %s", statusCode, trimmed)
+}
+
+func buildGeminiSystem(systemPrompt string) map[string]any {
+	if strings.TrimSpace(systemPrompt) == "" {
+		return nil
+	}
+	return map[string]any{
+		"parts": []map[string]any{
+			{"text": systemPrompt},
+		},
+	}
+}
+
+func buildGeminiTools(tools []plugin.ChatTool) []map[string]any {
+	if len(tools) == 0 {
+		return nil
+	}
+	decls := make([]map[string]any, 0, len(tools))
+	for _, t := range tools {
+		decl := map[string]any{
+			"name":       t.Alias,
+			"parameters": plugin.NormalizeToolSchema(t.InputSchema),
+		}
+		if desc := strings.TrimSpace(t.Description); desc != "" {
+			decl["description"] = desc
+		}
+		decls = append(decls, decl)
+	}
+	return []map[string]any{{"functionDeclarations": decls}}
+}
+
+func buildGeminiContents(messages []domain.Message) []map[string]any {
+	contents := make([]map[string]any, 0, len(messages))
+	for _, msg := range messages {
 		switch msg.Role {
 		case domain.RoleUser:
 			var parts []map[string]any
@@ -66,30 +389,66 @@ func (f *GoogleGenAIFormat) EncodeRequest(_ context.Context, input plugin.ChatIn
 			}
 
 		case domain.RoleAssistant:
-			var parts []map[string]any
-			for _, b := range msg.Blocks {
-				switch b.Type {
-				case domain.BlockTypeText:
-					parts = append(parts, map[string]any{"text": b.Text})
-				case domain.BlockTypeToolCall:
-					var argsObj any = map[string]any{}
-					if len(b.Arguments) > 0 {
-						_ = json.Unmarshal(b.Arguments, &argsObj)
-					}
-					parts = append(parts, map[string]any{
-						"functionCall": map[string]any{
-							"name": b.Name,
-							"args": argsObj,
-						},
+			var modelParts []map[string]any
+			var toolParts []map[string]any
+			flushModel := func() {
+				if len(modelParts) > 0 {
+					contents = append(contents, map[string]any{
+						"role":  "model",
+						"parts": modelParts,
 					})
+					modelParts = nil
 				}
 			}
-			if len(parts) > 0 {
-				contents = append(contents, map[string]any{
-					"role":  "model",
-					"parts": parts,
-				})
+			flushToolResults := func() {
+				if len(toolParts) > 0 {
+					contents = append(contents, map[string]any{
+						"role":  "user",
+						"parts": toolParts,
+					})
+					toolParts = nil
+				}
 			}
+			for _, b := range msg.Blocks {
+				switch b.Type {
+				case domain.BlockTypeThinking:
+					if sig := extractThoughtSignature(b, FormatIDGoogleGenAI); sig != "" {
+						flushToolResults()
+						part := map[string]any{
+							"thought":          true,
+							"thoughtSignature": sig,
+						}
+						if b.Thinking != "" {
+							part["text"] = b.Thinking
+						}
+						modelParts = append(modelParts, part)
+					}
+				case domain.BlockTypeText:
+					if b.Text != "" {
+						flushToolResults()
+						modelParts = append(modelParts, map[string]any{"text": b.Text})
+					}
+				case domain.BlockTypeToolCall:
+					flushToolResults()
+					fnCall := map[string]any{
+						"name": b.Name,
+						"args": toolArgsObject(b.Arguments),
+					}
+					if b.ID != "" {
+						fnCall["id"] = b.ID
+					}
+					part := map[string]any{"functionCall": fnCall}
+					if sig := extractThoughtSignature(b, FormatIDGoogleGenAI); sig != "" {
+						part["thoughtSignature"] = sig
+					}
+					modelParts = append(modelParts, part)
+				case domain.BlockTypeToolResult:
+					flushModel()
+					toolParts = append(toolParts, encodeGeminiFunctionResponse(b))
+				}
+			}
+			flushModel()
+			flushToolResults()
 
 		case domain.RoleToolResult:
 			var parts []map[string]any
@@ -106,15 +465,29 @@ func (f *GoogleGenAIFormat) EncodeRequest(_ context.Context, input plugin.ChatIn
 			}
 		}
 	}
+	return contents
+}
 
-	body := map[string]any{
-		"contents": contents,
-	}
-	if strings.TrimSpace(input.SystemPrompt) != "" {
-		body["systemInstruction"] = map[string]any{
-			"parts": []map[string]any{
-				{"text": input.SystemPrompt},
-			},
+func (f *GoogleGenAIFormat) EncodeRequest(_ context.Context, input plugin.ChatInput) (plugin.EncodedRequest, error) {
+	compat := MergeCompat(f.DefaultCompat(), input.Compat)
+	params := resolveGenerationParams(input.Model, input.Params)
+
+	contents := buildGeminiContents(input.Messages)
+	usingCachedContent := isGeminiExplicitCacheEnabled(input, compat) &&
+		input.PromptCache != nil &&
+		!input.PromptCache.Unsupported &&
+		input.PromptCache.ResourceName != "" &&
+		input.PromptCache.PrefixCount >= 0 &&
+		input.PromptCache.PrefixCount < len(contents)
+
+	body := map[string]any{}
+	if usingCachedContent {
+		body["cachedContent"] = input.PromptCache.ResourceName
+		body["contents"] = contents[input.PromptCache.PrefixCount:]
+	} else {
+		body["contents"] = contents
+		if sys := buildGeminiSystem(input.SystemPrompt); sys != nil {
+			body["systemInstruction"] = sys
 		}
 	}
 
@@ -153,8 +526,26 @@ func (f *GoogleGenAIFormat) EncodeRequest(_ context.Context, input plugin.ChatIn
 	if len(genConfig) > 0 {
 		body["generationConfig"] = genConfig
 	}
+	if !usingCachedContent {
+		if toolsObj := buildGeminiTools(input.Tools); len(toolsObj) > 0 {
+			body["tools"] = toolsObj
+		}
+	}
 	if len(compat.ExtraBody) > 0 {
-		MergeBodyMap(body, compat.ExtraBody)
+		if usingCachedContent {
+			filteredExtra := make(map[string]any, len(compat.ExtraBody))
+			for k, v := range compat.ExtraBody {
+				if k == "systemInstruction" || k == "tools" || k == "toolConfig" {
+					continue
+				}
+				filteredExtra[k] = v
+			}
+			if len(filteredExtra) > 0 {
+				MergeBodyMap(body, filteredExtra)
+			}
+		} else {
+			MergeBodyMap(body, compat.ExtraBody)
+		}
 	}
 
 	payload, err := json.Marshal(body)
@@ -206,13 +597,22 @@ func encodeGeminiFunctionResponse(b domain.ContentBlock) map[string]any {
 	if name == "" {
 		name = "tool"
 	}
+	text := formatToolResultContent(b)
+	respPayload := map[string]any{}
+	if b.IsError {
+		respPayload["error"] = text
+	} else {
+		respPayload["content"] = text
+	}
+	fnResp := map[string]any{
+		"name":     name,
+		"response": respPayload,
+	}
+	if b.ToolCallID != "" {
+		fnResp["id"] = b.ToolCallID
+	}
 	return map[string]any{
-		"functionResponse": map[string]any{
-			"name": name,
-			"response": map[string]any{
-				"content": b.Content,
-			},
-		},
+		"functionResponse": fnResp,
 	}
 }
 
@@ -235,9 +635,10 @@ type geminiStreamChunk struct {
 	Candidates []struct {
 		Content struct {
 			Parts []struct {
-				Text         string `json:"text"`
-				Thought      bool   `json:"thought"`
-				FunctionCall *struct {
+				Text             string `json:"text"`
+				Thought          bool   `json:"thought"`
+				ThoughtSignature string `json:"thoughtSignature"`
+				FunctionCall     *struct {
 					ID   string          `json:"id"`
 					Name string          `json:"name"`
 					Args json.RawMessage `json:"args"`
@@ -247,10 +648,11 @@ type geminiStreamChunk struct {
 		FinishReason string `json:"finishReason"`
 	} `json:"candidates"`
 	UsageMetadata *struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
+		PromptTokenCount        int `json:"promptTokenCount"`
+		CachedContentTokenCount int `json:"cachedContentTokenCount"`
+		CandidatesTokenCount    int `json:"candidatesTokenCount"`
+		ThoughtsTokenCount      int `json:"thoughtsTokenCount"`
+		TotalTokenCount         int `json:"totalTokenCount"`
 	} `json:"usageMetadata"`
 	Error *struct {
 		Code    int    `json:"code"`
@@ -263,10 +665,12 @@ func (f *GoogleGenAIFormat) DecodeStream(ctx context.Context, body io.Reader, em
 		nextBlockIdx  int
 		activeThink   = -1
 		thinkBuf      strings.Builder
+		thinkSig      strings.Builder
 		activeTextIdx = -1
 		textBuf       strings.Builder
 		hasToolCall   bool
 		toolCounter   int
+		seenCallIDs   = make(map[string]struct{})
 		finalUsage    *domain.Usage
 		stopReason    string
 		emittedError  bool
@@ -276,12 +680,20 @@ func (f *GoogleGenAIFormat) DecodeStream(ctx context.Context, body io.Reader, em
 		if activeThink < 0 {
 			return nil
 		}
-		err := emitBlockEnd(emit, activeThink, domain.ContentBlock{
+		block := domain.ContentBlock{
 			Type:     domain.BlockTypeThinking,
 			Thinking: thinkBuf.String(),
-		})
+		}
+		if sig := thinkSig.String(); sig != "" {
+			block.Signature = sig
+			block.Extra = makeProviderExtra(FormatIDGoogleGenAI, map[string]any{
+				"thoughtSignature": sig,
+			})
+		}
+		err := emitBlockEnd(emit, activeThink, block)
 		activeThink = -1
 		thinkBuf.Reset()
+		thinkSig.Reset()
 		return err
 	}
 
@@ -325,10 +737,11 @@ func (f *GoogleGenAIFormat) DecodeStream(ctx context.Context, body io.Reader, em
 				total = u.PromptTokenCount + u.CandidatesTokenCount + u.ThoughtsTokenCount
 			}
 			finalUsage = &domain.Usage{
-				InputTokens:    u.PromptTokenCount,
-				OutputTokens:   u.CandidatesTokenCount,
-				ThinkingTokens: u.ThoughtsTokenCount,
-				TotalTokens:    total,
+				InputTokens:          u.PromptTokenCount,
+				OutputTokens:         u.CandidatesTokenCount,
+				ThinkingTokens:       u.ThoughtsTokenCount,
+				CacheReadInputTokens: u.CachedContentTokenCount,
+				TotalTokens:          total,
 			}
 		}
 
@@ -338,7 +751,7 @@ func (f *GoogleGenAIFormat) DecodeStream(ctx context.Context, body io.Reader, em
 		cand := chunk.Candidates[0]
 
 		for _, part := range cand.Content.Parts {
-			if part.Thought && part.Text != "" {
+			if part.Thought && (part.Text != "" || part.ThoughtSignature != "") {
 				if err := closeText(); err != nil {
 					return err
 				}
@@ -353,9 +766,18 @@ func (f *GoogleGenAIFormat) DecodeStream(ctx context.Context, body io.Reader, em
 						return err
 					}
 				}
-				thinkBuf.WriteString(part.Text)
-				if err := emitBlockDelta(emit, activeThink, domain.BlockTypeThinking, domain.DeltaTypeThinking, part.Text); err != nil {
-					return err
+				if part.Text != "" {
+					thinkBuf.WriteString(part.Text)
+					if err := emitBlockDelta(emit, activeThink, domain.BlockTypeThinking, domain.DeltaTypeThinking, part.Text); err != nil {
+						return err
+					}
+				}
+				if part.ThoughtSignature != "" {
+					thinkSig.Reset()
+					thinkSig.WriteString(part.ThoughtSignature)
+					if err := emitBlockDelta(emit, activeThink, domain.BlockTypeThinking, domain.DeltaTypeSignature, part.ThoughtSignature); err != nil {
+						return err
+					}
 				}
 				continue
 			}
@@ -388,6 +810,12 @@ func (f *GoogleGenAIFormat) DecodeStream(ctx context.Context, body io.Reader, em
 				if err := closeText(); err != nil {
 					return err
 				}
+				if part.FunctionCall.ID != "" {
+					if _, dup := seenCallIDs[part.FunctionCall.ID]; dup {
+						continue
+					}
+					seenCallIDs[part.FunctionCall.ID] = struct{}{}
+				}
 				hasToolCall = true
 				toolCounter++
 				callID := part.FunctionCall.ID
@@ -400,27 +828,38 @@ func (f *GoogleGenAIFormat) DecodeStream(ctx context.Context, body io.Reader, em
 				if len(argsRaw) == 0 {
 					argsRaw = json.RawMessage(`{}`)
 				}
+				startBlock := &domain.ContentBlock{
+					Type: domain.BlockTypeToolCall,
+					ID:   callID,
+					Name: part.FunctionCall.Name,
+				}
+				endBlock := domain.ContentBlock{
+					Type:      domain.BlockTypeToolCall,
+					ID:        callID,
+					Name:      part.FunctionCall.Name,
+					Arguments: argsRaw,
+				}
+				if part.ThoughtSignature != "" {
+					startBlock.Signature = part.ThoughtSignature
+					endBlock.Signature = part.ThoughtSignature
+					extra := makeProviderExtra(FormatIDGoogleGenAI, map[string]any{
+						"thoughtSignature": part.ThoughtSignature,
+					})
+					startBlock.Extra = extra
+					endBlock.Extra = extra
+				}
 				if err := emit(domain.StreamEvent{
 					Type:      domain.StreamEventBlockStart,
 					Index:     domain.IntPtr(idx),
 					BlockType: domain.BlockTypeToolCall,
-					Block: &domain.ContentBlock{
-						Type: domain.BlockTypeToolCall,
-						ID:   callID,
-						Name: part.FunctionCall.Name,
-					},
+					Block:     startBlock,
 				}); err != nil {
 					return err
 				}
 				if err := emitBlockDelta(emit, idx, domain.BlockTypeToolCall, domain.DeltaTypeToolCallArgs, string(argsRaw)); err != nil {
 					return err
 				}
-				if err := emitBlockEnd(emit, idx, domain.ContentBlock{
-					Type:      domain.BlockTypeToolCall,
-					ID:        callID,
-					Name:      part.FunctionCall.Name,
-					Arguments: argsRaw,
-				}); err != nil {
+				if err := emitBlockEnd(emit, idx, endBlock); err != nil {
 					return err
 				}
 			}

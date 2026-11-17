@@ -21,14 +21,30 @@ func NewConversationStore(db *sql.DB) *ConversationStore {
 	return &ConversationStore{db: db}
 }
 
-// List returns all conversations sorted by most recently updated first.
+const conversationSelectCols = `
+	c.id, c.assistant_id, c.title, c.provider_id, c.model_id, c.system_prompt, c.params_json,
+	c.sync_enabled, c.sync_state, c.sync_version, c.last_synced_at, c.created_at, c.updated_at,
+	c.group_id, c.pinned, c.sort_order
+`
+
+const conversationOrderByClause = `
+	ORDER BY
+		c.pinned DESC,
+		CASE WHEN c.pinned = 1 THEN 0 WHEN c.group_id IS NULL OR g.id IS NULL THEN 1 ELSE 0 END ASC,
+		CASE WHEN c.pinned = 1 THEN 0 ELSE COALESCE(g.sort_order, 0) END ASC,
+		CASE WHEN c.pinned = 1 THEN '' ELSE COALESCE(g.created_at, '') END ASC,
+		CASE WHEN c.pinned = 1 THEN '' ELSE COALESCE(c.group_id, '') END ASC,
+		c.sort_order ASC,
+		c.id ASC
+`
+
+// List returns all conversations sorted by pinned bucket, group order, ungrouped bucket, and manual sort_order.
 func (s *ConversationStore) List(ctx context.Context) ([]domain.Conversation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
-		       sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at
-		FROM conversations
-		ORDER BY updated_at DESC, rowid DESC
-	`)
+		SELECT `+conversationSelectCols+`
+		FROM conversations c
+		LEFT JOIN conversation_groups g ON c.group_id = g.id
+	`+conversationOrderByClause)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations: %w", err)
 	}
@@ -48,13 +64,39 @@ func (s *ConversationStore) List(ctx context.Context) ([]domain.Conversation, er
 	return convs, nil
 }
 
+// ListByAssistant returns conversations belonging to assistantID in canonical organization order.
+func (s *ConversationStore) ListByAssistant(ctx context.Context, assistantID string) ([]domain.Conversation, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT `+conversationSelectCols+`
+		FROM conversations c
+		LEFT JOIN conversation_groups g ON c.group_id = g.id
+		WHERE c.assistant_id = ?
+	`+conversationOrderByClause, assistantID)
+	if err != nil {
+		return nil, fmt.Errorf("list conversations by assistant %s: %w", assistantID, err)
+	}
+	defer rows.Close()
+
+	convs := make([]domain.Conversation, 0)
+	for rows.Next() {
+		c, err := scanConversation(rows)
+		if err != nil {
+			return nil, err
+		}
+		convs = append(convs, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate conversations by assistant %s: %w", assistantID, err)
+	}
+	return convs, nil
+}
+
 // Get fetches a conversation by ID.
 func (s *ConversationStore) Get(ctx context.Context, id string) (domain.Conversation, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
-		       sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at
-		FROM conversations
-		WHERE id = ?
+		SELECT `+conversationSelectCols+`
+		FROM conversations c
+		WHERE c.id = ?
 	`, id)
 	c, err := scanConversation(row)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -66,7 +108,7 @@ func (s *ConversationStore) Get(ctx context.Context, id string) (domain.Conversa
 	return c, nil
 }
 
-// Create persists a new conversation with canonical sync defaults.
+// Create persists a new conversation at the head of its target bucket (ungrouped head by default).
 func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (domain.Conversation, error) {
 	now := time.Now().UTC()
 	if c.ID == "" {
@@ -89,15 +131,54 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 		lastSynced = sql.NullString{String: formatTime(*c.LastSyncedAt), Valid: true}
 	}
 
-	_, err = s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Conversation{}, fmt.Errorf("begin create conversation tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var groupID sql.NullString
+	if c.GroupID != nil && *c.GroupID != "" {
+		groupID = sql.NullString{String: *c.GroupID, Valid: true}
+	}
+
+	var nextHead int
+	switch {
+	case c.Pinned:
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 1
+		`, c.AssistantID).Scan(&nextHead); err != nil {
+			return domain.Conversation{}, fmt.Errorf("compute pinned head sort_order: %w", err)
+		}
+	case groupID.Valid:
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 0 AND group_id = ?
+		`, c.AssistantID, groupID.String).Scan(&nextHead); err != nil {
+			return domain.Conversation{}, fmt.Errorf("compute group head sort_order: %w", err)
+		}
+	default:
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 0 AND group_id IS NULL
+		`, c.AssistantID).Scan(&nextHead); err != nil {
+			return domain.Conversation{}, fmt.Errorf("compute ungrouped head sort_order: %w", err)
+		}
+	}
+	c.SortOrder = nextHead
+
+	_, err = tx.ExecContext(ctx, `
 		INSERT INTO conversations (
 			id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
-			sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at,
+			group_id, pinned, sort_order
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, c.ID, c.AssistantID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes),
-		boolToInt(c.SyncEnabled), c.SyncState, c.SyncVersion, lastSynced, formatTime(c.CreatedAt), formatTime(c.UpdatedAt))
+		boolToInt(c.SyncEnabled), c.SyncState, c.SyncVersion, lastSynced, formatTime(c.CreatedAt), formatTime(c.UpdatedAt),
+		groupID, boolToInt(c.Pinned), c.SortOrder)
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("create conversation: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Conversation{}, fmt.Errorf("commit create conversation tx: %w", err)
 	}
 	return s.Get(ctx, c.ID)
 }
@@ -162,21 +243,29 @@ func (s *ConversationStore) Delete(ctx context.Context, id string) error {
 
 func scanConversation(row rowScanner) (domain.Conversation, error) {
 	var (
-		c            domain.Conversation
-		paramsJSON   string
-		syncEnabled  int
-		lastSynced   sql.NullString
-		createdRaw   string
-		updatedRaw   string
+		c           domain.Conversation
+		paramsJSON  string
+		syncEnabled int
+		lastSynced  sql.NullString
+		createdRaw  string
+		updatedRaw  string
+		groupID     sql.NullString
+		pinnedInt   int
 	)
 	if err := row.Scan(
 		&c.ID, &c.AssistantID, &c.Title, &c.ProviderID, &c.ModelID, &c.SystemPrompt, &paramsJSON,
 		&syncEnabled, &c.SyncState, &c.SyncVersion, &lastSynced, &createdRaw, &updatedRaw,
+		&groupID, &pinnedInt, &c.SortOrder,
 	); err != nil {
 		return domain.Conversation{}, err
 	}
 	domain.NewConversationDefaults(&c)
 	c.SyncEnabled = syncEnabled != 0
+	c.Pinned = pinnedInt != 0
+	if groupID.Valid && groupID.String != "" {
+		gid := groupID.String
+		c.GroupID = &gid
+	}
 	if paramsJSON != "" && paramsJSON != "{}" {
 		if err := json.Unmarshal([]byte(paramsJSON), &c.Params); err != nil {
 			return domain.Conversation{}, fmt.Errorf("decode conversation params: %w", err)

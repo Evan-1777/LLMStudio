@@ -115,6 +115,9 @@ function makeWorkbenchFetch() {
     if (url.endsWith('/api/v1/conversations') && method === 'GET') {
       return new Response(JSON.stringify({ conversations }), { status: 200 });
     }
+    if (url.endsWith('/api/v1/conversation-groups') && method === 'GET') {
+      return new Response(JSON.stringify({ groups: [] }), { status: 200 });
+    }
     if (url.endsWith('/api/v1/conversations') && method === 'POST') {
       return new Response(
         JSON.stringify({ code: 'UPSTREAM_ERROR', message: 'create failed' }),
@@ -195,6 +198,7 @@ describe('Workbench flows and attachments', () => {
     await waitFor(() => {
       expect(screen.getByText('代码审查话题')).toBeInTheDocument();
     });
+    expect(screen.queryByRole('button', { name: '切换消息显示模式' })).not.toBeInTheDocument();
 
     // Click c1 via default assistant first -> switch assistant to default
     await user.click(screen.getByRole('button', { name: '默认助手' }));
@@ -349,7 +353,10 @@ describe('Workbench flows and attachments', () => {
           { status: 400 },
         );
       }
-      if (url.endsWith('/api/v1/conversations/c1') && method === 'DELETE') {
+      if (
+        (url.endsWith('/api/v1/conversations/c1') && method === 'DELETE') ||
+        (url.endsWith('/api/v1/conversations/batch') && method === 'POST')
+      ) {
         return new Response(
           JSON.stringify({ code: 'UPSTREAM_ERROR', message: '删除拒绝' }),
           { status: 500 },
@@ -416,7 +423,8 @@ describe('Workbench flows and attachments', () => {
       expect(screen.getByText('第一个话题')).toBeInTheDocument();
     });
 
-    await user.click(screen.getByRole('button', { name: '重命名 第一个话题' }));
+    await user.click(screen.getByRole('button', { name: '更多操作 第一个话题' }));
+    await user.click(screen.getByRole('menuitem', { name: '重命名' }));
     const renameInput = screen.getByLabelText('标题');
     await user.clear(renameInput);
     await user.type(renameInput, '新标题');
@@ -427,7 +435,8 @@ describe('Workbench flows and attachments', () => {
     await user.click(screen.getByRole('button', { name: '取消' }));
     expect(screen.getByText('第一个话题')).toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: '删除 第一个话题' }));
+    await user.click(screen.getByRole('button', { name: '更多操作 第一个话题' }));
+    await user.click(screen.getByRole('menuitem', { name: '删除' }));
     await user.click(screen.getByRole('button', { name: '删除' }));
     await waitFor(() => {
       expect(screen.getByText('第一个话题')).toBeInTheDocument();
@@ -551,5 +560,421 @@ describe('Workbench flows and attachments', () => {
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: '默认助手' })).toBeInTheDocument();
     });
+  });
+
+  it('switches model via PATCH without GET detail reload, preserves topic order/DOM/draft, and isolates slow PATCH across topic switches', async () => {
+    localStorage.clear();
+    const convA = {
+      id: 'cA',
+      assistantId: 'default',
+      title: 'Topic A',
+      providerId: 'openai',
+      modelId: 'gpt-4.1',
+      systemPrompt: '',
+      params: {},
+      syncEnabled: false,
+      syncState: 'local_only' as const,
+      syncVersion: 0,
+      createdAt: '2026-11-17T08:00:00Z',
+      updatedAt: '2026-11-17T08:00:00Z',
+    };
+    const convB = { ...convA, id: 'cB', title: 'Topic B', updatedAt: '2026-11-17T07:00:00Z' };
+    const convC = { ...convA, id: 'cC', title: 'Topic C', updatedAt: '2026-11-17T06:00:00Z' };
+    const convStore: Record<string, typeof convA> = { cA: { ...convA }, cB: { ...convB }, cC: { ...convC } };
+
+    let getDetailCountA = 0;
+    const streamBodies: Array<{ modelId?: string }> = [];
+    let holdPatch = false;
+    let releasePatch!: (res: Response) => void;
+    let failPatch = false;
+
+    const customFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const bodyStr = typeof init?.body === 'string' ? init.body : undefined;
+
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.3.0', authRequired: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(
+          JSON.stringify({
+            providers: [
+              {
+                id: 'openai',
+                name: 'OpenAI',
+                adapter: 'generic-http',
+                baseURL: 'https://api.openai.com/v1',
+                authType: 'bearer',
+                apiKeyMasked: 'sk-1...89',
+                apiKeySet: true,
+                models: [
+                  { id: 'gpt-4.1', name: 'GPT-4.1', apiFormat: 'openai-responses' },
+                  { id: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', apiFormat: 'openai-responses' },
+                ],
+                enabled: true,
+                builtIn: true,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return new Response(
+          JSON.stringify({ assistants: [{ id: 'default', name: '默认助手', params: {}, isDefault: true }] }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations') && method === 'GET') {
+        return new Response(JSON.stringify({ conversations: [convStore.cA, convStore.cB, convStore.cC] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/plugins/search')) {
+        return new Response(JSON.stringify({ engines: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ servers: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/cA') && method === 'GET') {
+        getDetailCountA++;
+        return new Response(
+          JSON.stringify({
+            conversation: convStore.cA,
+            messages: [
+              { id: 'ma1', conversationId: 'cA', role: 'assistant', providerId: 'openai', modelId: 'gpt-4.1', blocks: [{ type: 'text', text: 'History reply' }], stopReason: 'stop', createdAt: '2026-11-17T08:00:00Z' },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/cC') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: convStore.cC, messages: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/cA') && method === 'PATCH') {
+        const patch = JSON.parse(bodyStr ?? '{}') as Partial<typeof convA>;
+        if (holdPatch) {
+          holdPatch = false;
+          return new Promise<Response>((resolve) => {
+            releasePatch = resolve;
+          });
+        }
+        if (failPatch) {
+          return new Response(JSON.stringify({ code: 'UPSTREAM_ERROR', message: 'fail patch' }), { status: 500 });
+        }
+        convStore.cA = { ...convStore.cA, ...patch };
+        return new Response(JSON.stringify({ conversation: convStore.cA }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/cA/messages/stream') && method === 'POST') {
+        streamBodies.push(JSON.parse(bodyStr ?? '{}'));
+        const encoder = new TextEncoder();
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(encoder.encode('data: {"type":"message_start","messageId":"ma2"}\n\n'));
+            c.enqueue(encoder.encode('data: {"type":"message_end","message":{"id":"ma2","conversationId":"cA","role":"assistant","blocks":[{"type":"text","text":"ok"}],"stopReason":"stop","createdAt":"2026-11-17T08:01:00Z"}}\n\n'));
+            c.close();
+          },
+        });
+        return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={customFetch}>
+        <MemoryRouter initialEntries={['/chat/cC']}>
+          <Routes>
+            <Route path="/chat" element={<WorkbenchPage />} />
+            <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('Topic C')).toBeInTheDocument();
+    });
+
+    // Open topic drawer (jsdom default width 1024 < 1200) and enter cA.
+    await user.click(screen.getByRole('button', { name: '切换话题栏' }));
+    await user.click(screen.getByRole('button', { name: /^Topic A/ }));
+    await waitFor(() => {
+      expect(screen.getByText('History reply')).toBeInTheDocument();
+    });
+    expect(getDetailCountA).toBe(1);
+
+    const historyElBefore = screen.getByText('History reply');
+    const draftBox = screen.getByLabelText('消息输入框');
+    await user.type(draftBox, '保持草稿不丢');
+
+    // Switch model to GPT-4.1 Mini -> only PATCH, zero extra GET detail, DOM node and draft preserved.
+    await user.click(screen.getByRole('button', { name: '选择模型' }));
+    await user.click(screen.getByRole('option', { name: /GPT-4\.1 Mini/ }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-4.1 Mini');
+    });
+    expect(getDetailCountA).toBe(1);
+    expect(screen.getByText('History reply')).toBe(historyElBefore);
+    expect(draftBox).toHaveValue('保持草稿不丢');
+    // Historical assistant message retains original modelId tag.
+    expect(screen.getByText('gpt-4.1')).toBeInTheDocument();
+
+    // Order in sidebar remains Topic A, Topic B, Topic C.
+    const titles = Array.from(document.querySelectorAll('.wb-topic-row__title')).map((el) => el.textContent);
+    expect(titles).toEqual(['Topic A', 'Topic B', 'Topic C']);
+
+    // Next send uses newly saved modelId.
+    fireEvent.keyDown(draftBox, { key: 'Enter' });
+    await waitFor(() => expect(streamBodies).toHaveLength(1));
+    expect(streamBodies[0].modelId).toBe('gpt-4.1-mini');
+
+    // Failed PATCH keeps old selection and draft.
+    failPatch = true;
+    await user.type(draftBox, '失败保留');
+    await user.click(screen.getByRole('button', { name: '选择模型' }));
+    await user.click(screen.getAllByRole('option')[0]);
+    await waitFor(() => {
+      expect(screen.getByText('切换模型失败')).toBeInTheDocument();
+    });
+    expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-4.1 Mini');
+    expect(draftBox).toHaveValue('失败保留');
+
+    // Slow PATCH on cA disables picker locally, and switching to cC isolates cC when slow PATCH settles.
+    failPatch = false;
+    holdPatch = true;
+    await user.click(screen.getByRole('button', { name: '选择模型' }));
+    await user.click(screen.getAllByRole('option')[0]);
+    expect(screen.getByRole('button', { name: '选择模型' })).toBeDisabled();
+
+    // Open drawer and switch to cC (whose model is gpt-4.1); cC's picker is enabled even while cA's PATCH is pending.
+    await user.click(screen.getByRole('button', { name: '切换话题栏' }));
+    await user.click(screen.getByRole('button', { name: /^Topic C/ }));
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-4.1');
+    });
+    expect(screen.getByRole('button', { name: '选择模型' })).not.toBeDisabled();
+
+    // Resolve cA's slow PATCH returning gpt-4.1-mini -> must NOT pollute cC!
+    releasePatch(
+      new Response(
+        JSON.stringify({ conversation: { ...convStore.cA, modelId: 'gpt-4.1-mini' } }),
+        { status: 200 },
+      ),
+    );
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-4.1');
+    });
+  });
+
+  it('supports topic groups, pin, manage mode filtered select-all, batch delete/move, and Escape priority', async () => {
+    localStorage.clear();
+    type OrgConv = {
+      id: string;
+      assistantId: string;
+      title: string;
+      providerId: string;
+      modelId: string;
+      systemPrompt: string;
+      params: Record<string, unknown>;
+      groupId: string | null;
+      pinned: boolean;
+      sortOrder: number;
+      syncEnabled: boolean;
+      syncState: string;
+      syncVersion: number;
+      createdAt: string;
+      updatedAt: string;
+    };
+    type OrgGroup = {
+      id: string;
+      assistantId: string;
+      name: string;
+      sortOrder: number;
+      createdAt: string;
+    };
+
+    let orgConvs: OrgConv[] = [
+      {
+        id: 't1',
+        assistantId: 'default',
+        title: 'Alpha Plan',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: '',
+        params: {},
+        groupId: null,
+        pinned: false,
+        sortOrder: 1,
+        syncEnabled: false,
+        syncState: 'local_only',
+        syncVersion: 0,
+        createdAt: '2026-11-17T08:00:00Z',
+        updatedAt: '2026-11-17T08:00:00Z',
+      },
+      {
+        id: 't2',
+        assistantId: 'default',
+        title: 'Alpha Review',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: '',
+        params: {},
+        groupId: null,
+        pinned: false,
+        sortOrder: 2,
+        syncEnabled: false,
+        syncState: 'local_only',
+        syncVersion: 0,
+        createdAt: '2026-11-17T07:00:00Z',
+        updatedAt: '2026-11-17T07:00:00Z',
+      },
+      {
+        id: 't3',
+        assistantId: 'default',
+        title: 'Beta Note',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: '',
+        params: {},
+        groupId: null,
+        pinned: false,
+        sortOrder: 3,
+        syncEnabled: false,
+        syncState: 'local_only',
+        syncVersion: 0,
+        createdAt: '2026-11-17T06:00:00Z',
+        updatedAt: '2026-11-17T06:00:00Z',
+      },
+    ];
+    let orgGroups: OrgGroup[] = [];
+    const batchCalls: Array<Record<string, unknown>> = [];
+    let failNextBatch = false;
+
+    const { fetchMock } = makeWorkbenchFetch();
+    const orgFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const bodyStr = typeof init?.body === 'string' ? init.body : undefined;
+
+      if (url.endsWith('/api/v1/conversations') && method === 'GET') {
+        return new Response(JSON.stringify({ conversations: orgConvs }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversation-groups') && method === 'GET') {
+        return new Response(JSON.stringify({ groups: orgGroups }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversation-groups') && method === 'POST') {
+        const body = JSON.parse(bodyStr ?? '{}') as { assistantId: string; name: string };
+        const grp: OrgGroup = {
+          id: 'g-work',
+          assistantId: body.assistantId,
+          name: body.name,
+          sortOrder: 1,
+          createdAt: '2026-11-17T09:00:00Z',
+        };
+        orgGroups = [grp];
+        return new Response(
+          JSON.stringify({ group: grp, assistantId: 'default', conversations: orgConvs, groups: orgGroups }),
+          { status: 201 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/batch') && method === 'POST') {
+        const body = JSON.parse(bodyStr ?? '{}') as {
+          assistantId: string;
+          ids: string[];
+          operation: 'delete' | 'move' | 'pin';
+          groupId?: string | null;
+          pinned?: boolean;
+        };
+        batchCalls.push(body);
+        if (failNextBatch) {
+          failNextBatch = false;
+          return new Response(JSON.stringify({ code: 'UPSTREAM_ERROR', message: '批次拒绝' }), { status: 500 });
+        }
+        if (body.operation === 'move') {
+          orgConvs = orgConvs.map((c) =>
+            body.ids.includes(c.id) ? { ...c, groupId: body.groupId ?? null } : c,
+          );
+        } else if (body.operation === 'pin') {
+          orgConvs = orgConvs.map((c) =>
+            body.ids.includes(c.id) ? { ...c, pinned: Boolean(body.pinned) } : c,
+          );
+        } else if (body.operation === 'delete') {
+          orgConvs = orgConvs.filter((c) => !body.ids.includes(c.id));
+        }
+        return new Response(
+          JSON.stringify({
+            assistantId: 'default',
+            conversations: orgConvs,
+            groups: orgGroups,
+            deletedIds: body.operation === 'delete' ? body.ids : undefined,
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/t1') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: orgConvs[0], messages: [] }), { status: 200 });
+      }
+      return fetchMock(input, init);
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={orgFetch}>
+        <MemoryRouter initialEntries={['/chat/t1']}>
+          <Routes>
+            <Route path="/chat" element={<WorkbenchPage />} />
+            <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('Alpha Plan')).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: '切换话题栏' }));
+
+    // Create group 'Work'
+    await user.click(screen.getByRole('button', { name: '新建分组' }));
+    await user.type(screen.getByLabelText('分组名称'), 'Work');
+    await user.click(screen.getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: /^Work/ })).toBeInTheDocument());
+
+    // Enter manage mode, filter by 'Alpha', select all filtered (t1, t2 only, NOT t3).
+    const draftBox = screen.getByLabelText('消息输入框');
+    await user.type(draftBox, '保留当前草稿');
+
+    await user.click(screen.getByRole('button', { name: '管理话题' }));
+    await user.type(screen.getByLabelText('搜索话题'), 'Alpha');
+    await user.click(screen.getByRole('button', { name: '全选' }));
+    expect(screen.getByText('已选 2 项')).toBeInTheDocument();
+
+    // Move selected to 'Work'
+    await user.click(screen.getByRole('button', { name: '移至分组' }));
+    await user.click(screen.getByRole('radio', { name: 'Work' }));
+    await user.click(screen.getByRole('button', { name: '确定' }));
+    await waitFor(() => {
+      expect(batchCalls.some((c) => c.operation === 'move' && c.groupId === 'g-work')).toBe(true);
+    });
+
+    // Clear search, select only t2 & t3, fail delete keeps selection & current topic t1 & draft!
+    await user.clear(screen.getByLabelText('搜索话题'));
+    await user.click(screen.getByRole('checkbox', { name: '选择 Alpha Plan' })); // uncheck t1
+    await user.click(screen.getByRole('checkbox', { name: '选择 Beta Note' })); // check t3 (now t2 + t3)
+    expect(screen.getByText('已选 2 项')).toBeInTheDocument();
+
+    failNextBatch = true;
+    await user.click(screen.getByRole('button', { name: '删除 (2)' }));
+    await user.click(screen.getByRole('button', { name: '删除' }));
+    await waitFor(() => expect(screen.getByText('批次拒绝')).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: '取消' }));
+    expect(screen.getByText('已选 2 项')).toBeInTheDocument();
+    expect(draftBox).toHaveValue('保留当前草稿');
+
+    // Escape exits manage mode first without closing drawer.
+    fireEvent.keyDown(window, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('region', { name: '批量管理' })).not.toBeInTheDocument());
+    expect(screen.getByRole('button', { name: '管理话题' })).toBeVisible();
   });
 });

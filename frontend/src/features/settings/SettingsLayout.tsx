@@ -215,14 +215,14 @@ export function SettingsLayout({
         {children ?? renderSectionContent(activeSection)}
       </div>
 
-      {drawerOpen ? (
-        <button
-          type="button"
-          className="st-scrim st-scrim--open"
-          aria-label="关闭设置导航"
-          onClick={() => closeDrawer(true)}
-        />
-      ) : null}
+      <button
+        type="button"
+        className={`st-scrim ${drawerOpen ? 'st-scrim--open' : ''}`.trim()}
+        aria-label="关闭设置导航"
+        aria-hidden={!drawerOpen || undefined}
+        tabIndex={drawerOpen ? 0 : -1}
+        onClick={() => closeDrawer(true)}
+      />
     </div>
   );
 }

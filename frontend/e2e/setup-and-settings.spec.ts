@@ -80,6 +80,7 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     const importDialog2 = page.getByRole('dialog');
     await importDialog2.getByRole('checkbox', { name: /Mock Chat/ }).check();
     await importDialog2.getByRole('button', { name: '导入 (1)' }).click();
+    await expect(importDialog2).toBeHidden();
     await expect(page.getByText('Mock Chat')).toBeVisible();
 
     // Edit provider name without re-entering API key -> secret must remain intact on backend.
@@ -106,15 +107,15 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await searxForm.getByRole('button', { name: '设为默认' }).click();
     await expect(searxForm.getByText('默认')).toBeVisible();
 
-    // 5. MCP configuration CRUD (no runtime execution controls).
+    // 5. MCP configuration CRUD and reload persistence.
     await page.getByRole('button', { name: 'MCP 配置' }).click();
-    await expect(page.getByRole('button', { name: /测试/ })).toHaveCount(0);
     await page.getByRole('button', { name: '添加配置' }).click();
     const mcpDialog = page.getByRole('dialog');
     await mcpDialog.getByLabel('名称').fill('local-fs');
     await mcpDialog.getByLabel('启动命令').fill('npx');
     await mcpDialog.getByRole('button', { name: '保存' }).click();
     await expect(page.getByText('local-fs')).toBeVisible();
+    await expect(page.getByRole('button', { name: '探测 local-fs' })).toBeVisible();
 
     // 6. Appearance & About.
     await page.getByRole('button', { name: '外观与显示' }).click();
@@ -135,6 +136,11 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
 
     await page.getByRole('button', { name: 'MCP 配置' }).click();
     await expect(page.getByText('local-fs')).toBeVisible();
+    // Disable the placeholder npx server before unrelated chat tests below.
+    await page.getByRole('switch', { name: '启用 local-fs' }).click();
+    await expect(
+      page.getByRole('switch', { name: '启用 local-fs' }),
+    ).not.toBeChecked();
 
     // 7. Create a localRequest provider, verify browser-direct probe/fetch/chat with CORS preflight, and verify Feed mode UI.
     await page.getByRole('button', { name: '模型服务' }).click();
@@ -158,6 +164,7 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     const localImportDialog = page.getByRole('dialog');
     await localImportDialog.getByRole('checkbox', { name: /Mock Chat/ }).check();
     await localImportDialog.getByRole('button', { name: '导入 (1)' }).click();
+    await expect(localImportDialog).toBeHidden();
     await expect(page.getByText('Mock Chat')).toBeVisible();
 
     await page.getByRole('button', { name: '返回工作台' }).click();
@@ -176,8 +183,14 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await directChatReqPromise;
     await expect(page.getByText(/to: Direct browser chat/)).toBeVisible();
 
-    // Switch to Feed display mode via toolbar button and verify author/provider header & Token summary.
-    await page.getByRole('button', { name: '切换消息显示模式' }).click();
+    // Toolbar no longer exposes display mode toggle; switch to Feed mode via Settings -> Appearance.
+    await expect(
+      page.getByRole('button', { name: '切换消息显示模式' }),
+    ).toHaveCount(0);
+    await page.getByRole('link', { name: '设置' }).click();
+    await page.getByRole('button', { name: '外观与显示' }).click();
+    await page.getByRole('radio', { name: '信息流模式' }).click();
+    await page.getByRole('button', { name: '返回工作台' }).click();
     await expect(page.locator('.wb-feed-author', { hasText: '用户' })).toBeVisible();
     await expect(
       page.locator('.wb-feed-author', { hasText: 'Mock Chat | Direct Local' }),

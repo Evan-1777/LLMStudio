@@ -54,6 +54,16 @@ type SearchEngineTestResult struct {
 	Results     []plugin.SearchResult `json:"results,omitempty"`
 }
 
+// MCPServerTestResult summarizes a connectivity and tool discovery probe against a saved MCP server.
+type MCPServerTestResult struct {
+	OK        bool                       `json:"ok"`
+	ServerID  string                     `json:"serverId"`
+	ToolCount int                        `json:"toolCount"`
+	LatencyMs int64                      `json:"latencyMs"`
+	Message   string                     `json:"message"`
+	Tools     []plugin.MCPToolDescriptor `json:"tools"`
+}
+
 // MCPServerInput defines create or update fields for an MCP server configuration.
 type MCPServerInput struct {
 	ID        string            `json:"id,omitempty"`
@@ -72,6 +82,7 @@ type PluginService struct {
 	searchReg   *plugin.SearchRegistry
 	searchStore *store.SearchConfigStore
 	mcpStore    *store.MCPServerStore
+	mcpClient   plugin.MCPClientBoundary
 }
 
 // NewPluginService constructs a PluginService.
@@ -85,6 +96,12 @@ func NewPluginService(
 		searchStore: searchStore,
 		mcpStore:    mcpStore,
 	}
+}
+
+// WithMCPClient attaches the shared MCP client runtime used for tool discovery and invalidation.
+func (s *PluginService) WithMCPClient(client plugin.MCPClientBoundary) *PluginService {
+	s.mcpClient = client
+	return s
 }
 
 // ListSearchEngines returns all registered search engines merged with persisted settings.
@@ -326,12 +343,79 @@ func (s *PluginService) UpdateMCPServer(ctx context.Context, id string, in MCPSe
 	if err := validateMCPServer(&existing); err != nil {
 		return domain.MCPServerConfig{}, err
 	}
-	return s.mcpStore.Update(ctx, existing)
+	updated, err := s.mcpStore.Update(ctx, existing)
+	if err != nil {
+		return domain.MCPServerConfig{}, err
+	}
+	if s.mcpClient != nil {
+		_ = s.mcpClient.CloseServer(id)
+	}
+	return updated, nil
 }
 
 // DeleteMCPServer removes an MCP server configuration by ID.
 func (s *PluginService) DeleteMCPServer(ctx context.Context, id string) error {
-	return s.mcpStore.Delete(ctx, id)
+	if err := s.mcpStore.Delete(ctx, id); err != nil {
+		return err
+	}
+	if s.mcpClient != nil {
+		_ = s.mcpClient.CloseServer(id)
+	}
+	return nil
+}
+
+// ListMCPServerTools discovers tools exposed by the saved MCP server configuration.
+func (s *PluginService) ListMCPServerTools(ctx context.Context, id string) ([]plugin.MCPToolDescriptor, error) {
+	if s.mcpClient == nil {
+		return nil, domain.NewError(domain.ErrCodeInternalError, "MCP runtime is not configured", nil)
+	}
+	srv, err := s.mcpStore.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	tools, err := s.mcpClient.ListTools(ctx, srv)
+	if err != nil {
+		return nil, err
+	}
+	if tools == nil {
+		tools = []plugin.MCPToolDescriptor{}
+	}
+	return tools, nil
+}
+
+// TestMCPServer probes initialize and tools/list against the currently saved server configuration.
+func (s *PluginService) TestMCPServer(ctx context.Context, id string) (MCPServerTestResult, error) {
+	if s.mcpClient == nil {
+		return MCPServerTestResult{}, domain.NewError(domain.ErrCodeInternalError, "MCP runtime is not configured", nil)
+	}
+	srv, err := s.mcpStore.Get(ctx, id)
+	if err != nil {
+		return MCPServerTestResult{}, err
+	}
+
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	// Force a live handshake + list probe instead of returning a cached catalog.
+	_ = s.mcpClient.CloseServer(id)
+
+	start := time.Now()
+	tools, err := s.mcpClient.ListTools(probeCtx, srv)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		return MCPServerTestResult{}, err
+	}
+	if tools == nil {
+		tools = []plugin.MCPToolDescriptor{}
+	}
+	return MCPServerTestResult{
+		OK:        true,
+		ServerID:  id,
+		ToolCount: len(tools),
+		LatencyMs: latency,
+		Message:   fmt.Sprintf("连接正常（%d 个工具）", len(tools)),
+		Tools:     tools,
+	}, nil
 }
 
 func validateMCPServer(srv *domain.MCPServerConfig) error {

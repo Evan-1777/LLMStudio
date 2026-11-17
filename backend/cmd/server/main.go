@@ -13,6 +13,7 @@ import (
 	"llmstudio/backend/internal/config"
 	"llmstudio/backend/internal/format"
 	"llmstudio/backend/internal/httpapi"
+	"llmstudio/backend/internal/mcp"
 	"llmstudio/backend/internal/plugin"
 	"llmstudio/backend/internal/provider"
 	"llmstudio/backend/internal/search"
@@ -57,13 +58,17 @@ func main() {
 	searchEngines.MustRegister(search.NewTavilyEngine(nil))
 	searchEngines.MustRegister(search.NewSearXNGEngine(nil))
 
+	mcpRuntime := mcp.NewRuntime()
+	defer mcpRuntime.Close()
+
 	providerSvc := service.NewProviderService(providerStore, formats, adapters)
 	assistantSvc := service.NewAssistantService(assistantStore)
 	convSvc := service.NewConversationService(convStore, msgStore).WithAssistants(assistantStore)
-	pluginSvc := service.NewPluginService(searchEngines, searchStore, mcpStore)
+	pluginSvc := service.NewPluginService(searchEngines, searchStore, mcpStore).WithMCPClient(mcpRuntime)
 	chatSvc := service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithAssistants(assistantStore).
-		WithSearch(searchEngines, searchStore)
+		WithSearch(searchEngines, searchStore).
+		WithMCP(mcpStore, mcpRuntime)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Config:              cfg,
@@ -97,5 +102,8 @@ func main() {
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("server shutdown error: %v", err)
+	}
+	if err := mcpRuntime.Close(); err != nil {
+		log.Printf("mcp runtime shutdown error: %v", err)
 	}
 }

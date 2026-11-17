@@ -22,6 +22,7 @@ export interface StreamingBlockBuffer {
   name: string;
   text: string;
   signature: string;
+  completed?: boolean;
   finalized?: ContentBlock;
 }
 
@@ -46,6 +47,7 @@ export interface ChatState {
   needsReloadAfterAbort: boolean;
   pendingInsertIndex: number | null;
   streaming: StreamingDraft | null;
+  uiKeyByMsgId: Record<string, string>;
 }
 
 export const initialChatState: ChatState = {
@@ -58,6 +60,7 @@ export const initialChatState: ChatState = {
   needsReloadAfterAbort: false,
   pendingInsertIndex: null,
   streaming: null,
+  uiKeyByMsgId: {},
 };
 
 export function insertMessageAt(
@@ -160,7 +163,7 @@ export function materializeStreamingMessage(
 
 export type ChatAction =
   | { type: 'CLEAR_SESSION' }
-  | { type: 'LOAD_START' }
+  | { type: 'LOAD_START'; conversationId?: string }
   | { type: 'LOAD_SUCCESS'; conversation: Conversation; messages: Message[] }
   | { type: 'LOAD_ERROR'; code: string; message: string }
   | { type: 'SET_EFFORT'; effort: ReasoningEffort }
@@ -187,17 +190,23 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ...initialChatState,
       };
 
-    case 'LOAD_START':
+    case 'LOAD_START': {
+      const sameConversation =
+        Boolean(action.conversationId) &&
+        state.conversation?.id === action.conversationId &&
+        state.messages.length > 0;
       return {
         ...state,
-        messages: [],
+        messages: sameConversation ? state.messages : [],
         runState: 'loading',
         errorCode: null,
         errorMessage: null,
         needsReloadAfterAbort: false,
         pendingInsertIndex: null,
         streaming: null,
+        uiKeyByMsgId: sameConversation ? state.uiKeyByMsgId : {},
       };
+    }
 
     case 'LOAD_SUCCESS': {
       const convEffort = action.conversation.params?.reasoningEffort;
@@ -218,6 +227,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         needsReloadAfterAbort: false,
         pendingInsertIndex: null,
         streaming: null,
+        uiKeyByMsgId: {},
       };
     }
 
@@ -284,6 +294,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (target.role === 'user') {
         const nextMsg = state.messages[idx + 1];
         if (nextMsg && nextMsg.role === 'assistant') {
+          const nextKeys = { ...state.uiKeyByMsgId };
+          delete nextKeys[nextMsg.id];
           return {
             ...state,
             messages: [
@@ -291,6 +303,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
               ...state.messages.slice(idx + 2),
             ],
             pendingInsertIndex: idx + 1,
+            uiKeyByMsgId: nextKeys,
           };
         }
         return {
@@ -298,6 +311,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           pendingInsertIndex: idx + 1,
         };
       }
+      const nextKeys = { ...state.uiKeyByMsgId };
+      delete nextKeys[target.id];
       return {
         ...state,
         messages: [
@@ -305,6 +320,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ...state.messages.slice(idx + 1),
         ],
         pendingInsertIndex: idx,
+        uiKeyByMsgId: nextKeys,
       };
     }
 
@@ -365,6 +381,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           name: initialTool ? String(initialTool.name ?? '') : '',
           text: '',
           signature: '',
+          completed: false,
           finalized: ev.block,
         };
         return {
@@ -411,22 +428,39 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
       if (ev.type === 'block_end') {
         const draft = ensureDraft();
-        if (ev.index === undefined || ev.index === null || !ev.block) {
+        if (ev.index === undefined || ev.index === null) {
           return { ...state, runState: 'streaming', streaming: draft };
         }
         const idx = ev.index;
         const existing = draft.blocksByIndex[idx];
+        if (!ev.block) {
+          if (!existing) {
+            return { ...state, runState: 'streaming', streaming: draft };
+          }
+          return {
+            ...state,
+            runState: 'streaming',
+            streaming: {
+              ...draft,
+              blocksByIndex: {
+                ...draft.blocksByIndex,
+                [idx]: { ...existing, completed: true },
+              },
+            },
+          };
+        }
         const nextOrder = existing
           ? draft.blockOrder
           : [...draft.blockOrder, idx];
         const updated: StreamingBlockBuffer = existing
-          ? { ...existing, finalized: ev.block }
+          ? { ...existing, finalized: ev.block, completed: true }
           : {
               blockType: ev.block.type,
               id: '',
               name: '',
               text: '',
               signature: '',
+              completed: true,
               finalized: ev.block,
             };
         return {
@@ -465,6 +499,17 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           ? insertMessageAt(state.messages, finalMsg, slotIndex)
           : state.messages;
         const rest = deriveRestState(nextMessages);
+        let nextKeys = state.uiKeyByMsgId;
+        if (
+          state.streaming &&
+          finalMsg &&
+          finalMsg.id !== state.streaming.messageId
+        ) {
+          const uiKey =
+            state.uiKeyByMsgId[state.streaming.messageId] ??
+            state.streaming.messageId;
+          nextKeys = { ...state.uiKeyByMsgId, [finalMsg.id]: uiKey };
+        }
         return {
           ...state,
           messages: nextMessages,
@@ -474,6 +519,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           errorCode: rest.errorCode,
           errorMessage: rest.errorMessage,
           needsReloadAfterAbort: false,
+          uiKeyByMsgId: nextKeys,
         };
       }
 
@@ -570,6 +616,22 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'RECONCILE_DETAIL': {
       const rest = deriveRestState(action.messages);
+      let nextKeys = state.uiKeyByMsgId;
+      if (state.messages.length === action.messages.length) {
+        for (let i = 0; i < state.messages.length; i++) {
+          const prevMsg = state.messages[i];
+          const nextMsg = action.messages[i];
+          if (
+            prevMsg.id !== nextMsg.id &&
+            prevMsg.role === 'assistant' &&
+            nextMsg.role === 'assistant' &&
+            isLocalMessageId(prevMsg.id)
+          ) {
+            const uiKey = state.uiKeyByMsgId[prevMsg.id] ?? prevMsg.id;
+            nextKeys = { ...nextKeys, [nextMsg.id]: uiKey };
+          }
+        }
+      }
       return {
         ...state,
         conversation: action.conversation,
@@ -580,6 +642,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         needsReloadAfterAbort: action.markReloadNeeded ?? false,
         pendingInsertIndex: null,
         streaming: null,
+        uiKeyByMsgId: nextKeys,
       };
     }
 
@@ -597,13 +660,20 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         ),
       };
 
-    case 'REPLACE_MESSAGE_BY_ID':
+    case 'REPLACE_MESSAGE_BY_ID': {
+      let nextKeys = state.uiKeyByMsgId;
+      if (action.targetId !== action.message.id) {
+        const uiKey = state.uiKeyByMsgId[action.targetId] ?? action.targetId;
+        nextKeys = { ...state.uiKeyByMsgId, [action.message.id]: uiKey };
+      }
       return {
         ...state,
         messages: state.messages.map((m) =>
           m.id === action.targetId ? action.message : m,
         ),
+        uiKeyByMsgId: nextKeys,
       };
+    }
 
     case 'REMOVE_MESSAGE': {
       const next = state.messages.filter((m) => m.id !== action.messageId);

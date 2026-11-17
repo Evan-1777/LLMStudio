@@ -19,6 +19,7 @@ import {
 import type {
   Assistant,
   Conversation,
+  ConversationGroup,
   FormatInfo,
   HealthResponse,
   MCPServerConfig,
@@ -36,6 +37,7 @@ export interface AppResources {
   adapters: ProviderAdapterInfo[];
   assistants: Assistant[];
   conversations: Conversation[];
+  conversationGroups: ConversationGroup[];
   searchEngines: SearchEngineView[];
   mcpServers: MCPServerConfig[];
   loading: {
@@ -89,6 +91,10 @@ export interface AppContextValue {
   refreshAll: () => Promise<void>;
   upsertLocalConversation: (conv: Conversation) => void;
   removeLocalConversation: (id: string) => void;
+  applyConversationOrganizationSnapshot: (
+    assistantId: string,
+    snapshot: { conversations: Conversation[]; groups: ConversationGroup[] },
+  ) => void;
   upsertLocalAssistant: (assistant: Assistant) => void;
   removeLocalAssistant: (id: string) => void;
   upsertLocalProvider: (provider: ProviderConfig) => void;
@@ -110,6 +116,7 @@ function emptyResources(): AppResources {
     adapters: [],
     assistants: [],
     conversations: [],
+    conversationGroups: [],
     searchEngines: [],
     mcpServers: [],
     loading: {
@@ -127,6 +134,43 @@ function emptyResources(): AppResources {
   };
 }
 
+export function sortConversationsByOrg(
+  conversations: readonly Conversation[],
+  groups: readonly ConversationGroup[],
+): Conversation[] {
+  const groupById = new Map<string, ConversationGroup>();
+  for (const g of groups) {
+    groupById.set(g.id, g);
+  }
+  return [...conversations].sort((a, b) => {
+    const aPinned = Boolean(a.pinned);
+    const bPinned = Boolean(b.pinned);
+    if (aPinned !== bPinned) {
+      return aPinned ? -1 : 1;
+    }
+    if (!aPinned) {
+      const gA = a.groupId ? groupById.get(a.groupId) : undefined;
+      const gB = b.groupId ? groupById.get(b.groupId) : undefined;
+      if (Boolean(gA) !== Boolean(gB)) {
+        return gA ? -1 : 1;
+      }
+      if (gA && gB && gA.id !== gB.id) {
+        if (gA.sortOrder !== gB.sortOrder) {
+          return gA.sortOrder - gB.sortOrder;
+        }
+        const createdCmp = gA.createdAt.localeCompare(gB.createdAt);
+        if (createdCmp !== 0) return createdCmp;
+        return gA.id.localeCompare(gB.id);
+      }
+    }
+    if (a.sortOrder !== undefined || b.sortOrder !== undefined) {
+      const diff = (a.sortOrder ?? 0) - (b.sortOrder ?? 0);
+      if (diff !== 0) return diff;
+      return a.id.localeCompare(b.id);
+    }
+    return 0;
+  });
+}
 function getSystemPrefersDark(): boolean {
   if (typeof window === 'undefined' || !window.matchMedia) {
     return false;
@@ -359,11 +403,15 @@ export function AppProvider({
       error: { ...prev.error, conversations: null },
     }));
     try {
-      const conversations = await gateway.listConversations(signal);
+      const [conversations, conversationGroups] = await Promise.all([
+        gateway.listConversations(signal),
+        gateway.listConversationGroups(undefined, signal),
+      ]);
       if (epoch !== epochRef.current) return;
       setResources((prev) => ({
         ...prev,
         conversations,
+        conversationGroups,
         loading: { ...prev.loading, conversations: false },
       }));
     } catch (err) {
@@ -552,13 +600,17 @@ export function AppProvider({
   }, [bootstrapConnection, settings.accessToken, settings.gatewayBaseUrl]);
 
   const upsertLocalConversation = useCallback((conv: Conversation) => {
-    setResources((prev) => ({
-      ...prev,
-      conversations: [
-        conv,
-        ...prev.conversations.filter((c) => c.id !== conv.id),
-      ],
-    }));
+    setResources((prev) => {
+      const idx = prev.conversations.findIndex((c) => c.id === conv.id);
+      const next =
+        idx >= 0
+          ? prev.conversations.map((c, i) => (i === idx ? conv : c))
+          : [conv, ...prev.conversations];
+      return {
+        ...prev,
+        conversations: sortConversationsByOrg(next, prev.conversationGroups),
+      };
+    });
   }, []);
 
   const removeLocalConversation = useCallback((id: string) => {
@@ -567,6 +619,33 @@ export function AppProvider({
       conversations: prev.conversations.filter((c) => c.id !== id),
     }));
   }, []);
+
+  const applyConversationOrganizationSnapshot = useCallback(
+    (
+      assistantId: string,
+      snapshot: { conversations: Conversation[]; groups: ConversationGroup[] },
+    ) => {
+      setResources((prev) => {
+        const otherConvs = prev.conversations.filter(
+          (c) => (c.assistantId || 'default') !== assistantId,
+        );
+        const otherGroups = prev.conversationGroups.filter(
+          (g) => g.assistantId !== assistantId,
+        );
+        const nextGroups = [...otherGroups, ...snapshot.groups];
+        const nextConvs = sortConversationsByOrg(
+          [...otherConvs, ...snapshot.conversations],
+          nextGroups,
+        );
+        return {
+          ...prev,
+          conversations: nextConvs,
+          conversationGroups: nextGroups,
+        };
+      });
+    },
+    [],
+  );
 
   const upsertLocalAssistant = useCallback((assistant: Assistant) => {
     setResources((prev) => {
@@ -680,6 +759,7 @@ export function AppProvider({
       refreshAll,
       upsertLocalConversation,
       removeLocalConversation,
+      applyConversationOrganizationSnapshot,
       upsertLocalAssistant,
       removeLocalAssistant,
       upsertLocalProvider,
@@ -712,6 +792,7 @@ export function AppProvider({
       refreshAll,
       upsertLocalConversation,
       removeLocalConversation,
+      applyConversationOrganizationSnapshot,
       upsertLocalAssistant,
       removeLocalAssistant,
       upsertLocalProvider,

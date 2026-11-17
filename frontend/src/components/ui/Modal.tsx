@@ -8,6 +8,7 @@ export interface ModalProps {
   onOpenChange: (open: boolean) => void;
   title: string;
   wide?: boolean;
+  busy?: boolean;
   children: ReactNode;
   footer?: ReactNode;
   description?: string;
@@ -18,6 +19,7 @@ export function Modal({
   onOpenChange,
   title,
   wide = false,
+  busy = false,
   children,
   footer,
   description,
@@ -31,32 +33,63 @@ export function Modal({
         document.activeElement instanceof HTMLElement
           ? document.activeElement
           : null;
-    } else if (!open && wasOpenRef.current) {
+    }
+    wasOpenRef.current = open;
+  }, [open]);
+
+  // Fallback if caller unmounts the Modal itself while still open.
+  useEffect(() => {
+    return () => {
+      if (!wasOpenRef.current) return;
       const target = previousFocusRef.current;
       previousFocusRef.current = null;
       if (target && target.isConnected) {
         queueMicrotask(() => {
           if (document.activeElement === document.body || !document.activeElement) {
-            target.focus();
+            target.focus({ preventScroll: true });
           }
         });
       }
-    }
-    wasOpenRef.current = open;
-  }, [open]);
+    };
+  }, []);
 
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
+    <Dialog.Root
+      open={open}
+      onOpenChange={(next) => {
+        if (!busy || next) onOpenChange(next);
+      }}
+    >
       <Dialog.Portal>
         <Dialog.Overlay className="ui-dialog-overlay" />
         <Dialog.Content
           className={`ui-dialog-content ${wide ? 'ui-dialog-content--wide' : ''}`.trim()}
+          aria-busy={busy || undefined}
           aria-describedby={description ? undefined : undefined}
+          onEscapeKeyDown={(e) => {
+            if (busy) e.preventDefault();
+          }}
+          onPointerDownOutside={(e) => {
+            if (busy) e.preventDefault();
+          }}
+          onCloseAutoFocus={(e) => {
+            const target = previousFocusRef.current;
+            previousFocusRef.current = null;
+            if (target && target.isConnected) {
+              e.preventDefault();
+              target.focus({ preventScroll: true });
+            }
+          }}
         >
           <div className="ui-dialog-head">
             <Dialog.Title className="ui-dialog-title">{title}</Dialog.Title>
             <Dialog.Close asChild>
-              <IconButton icon="close" label="关闭" size="sm" />
+              <IconButton
+                icon="close"
+                label="关闭"
+                size="sm"
+                disabled={busy}
+              />
             </Dialog.Close>
           </div>
           {description ? (
@@ -98,6 +131,7 @@ export function ConfirmDialog({
   return (
     <Modal
       open={open}
+      busy={busy}
       onOpenChange={(next) => {
         if (!busy) onOpenChange(next);
       }}
@@ -113,7 +147,7 @@ export function ConfirmDialog({
           </Button>
           <Button
             variant={danger ? 'danger' : 'primary'}
-            disabled={busy}
+            loading={busy}
             onClick={() => {
               void onConfirm();
             }}

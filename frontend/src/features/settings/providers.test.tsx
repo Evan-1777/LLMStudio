@@ -433,6 +433,11 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
     expect(within(dialog).getByLabelText('supportsStreamOptions')).toHaveValue(
       '',
     );
+    expect(within(dialog).getByLabelText('cacheMode')).toHaveValue('');
+    await user.selectOptions(
+      within(dialog).getByLabelText('cacheMode'),
+      'explicit',
+    );
     await user.click(within(dialog).getByRole('button', { name: '保存' }));
 
     await waitFor(() => {
@@ -446,6 +451,7 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
       inputModalities: ['text', 'image'],
       compat: {
         supportsDeveloperRole: false,
+        cacheMode: 'explicit',
         extraBody: { seed: 42 },
       },
       defaultParams: { temperature: 0.2, reasoningEffort: 'high' },
@@ -453,6 +459,21 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
     expect(firstSavedModels[0].compat).not.toHaveProperty(
       'supportsStreamOptions',
     );
+
+    // Re-open, rename ONLY, verify cacheMode: 'explicit' survives.
+    await user.click(screen.getByRole('button', { name: '编辑 GPT 4.1 Custom' }));
+    dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByLabelText('cacheMode')).toHaveValue('explicit');
+    const renameField = within(dialog).getByLabelText('显示名称');
+    await user.clear(renameField);
+    await user.type(renameField, 'GPT 4.1 Explicit');
+    await user.click(within(dialog).getByRole('button', { name: '保存' }));
+    await waitFor(() => {
+      expect(screen.getByText('GPT 4.1 Explicit')).toBeInTheDocument();
+    });
+    const renamedModels = state.lastUpdateBodies[1]
+      .models as ProviderConfig['models'];
+    expect(renamedModels[0].compat?.cacheMode).toBe('explicit');
 
     // Add model validates duplicate ID, negative tokens, and invalid JSON.
     await user.click(screen.getByRole('button', { name: '添加模型' }));
@@ -497,23 +518,23 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
     await waitFor(() => {
       expect(screen.getByText('gemini-2.5-pro')).toBeInTheDocument();
     });
-    const secondSavedModels = state.lastUpdateBodies[1]
+    const secondSavedModels = state.lastUpdateBodies[2]
       .models as ProviderConfig['models'];
     expect(secondSavedModels).toHaveLength(2);
     expect(secondSavedModels[1].compat?.supportsStreamOptions).toBe(false);
 
     // Removing all models submits empty array and shows empty state.
     await user.click(
-      screen.getByRole('button', { name: '移除 GPT 4.1 Custom' }),
+      screen.getByRole('button', { name: '移除 GPT 4.1 Explicit' }),
     );
     await waitFor(() => {
-      expect(screen.queryByText('GPT 4.1 Custom')).not.toBeInTheDocument();
+      expect(screen.queryByText('GPT 4.1 Explicit')).not.toBeInTheDocument();
     });
     await user.click(screen.getByRole('button', { name: '移除 gemini-2.5-pro' }));
     await waitFor(() => {
       expect(screen.getByText('暂无模型')).toBeInTheDocument();
     });
-    expect(state.lastUpdateBodies[3].models).toEqual([]);
+    expect(state.lastUpdateBodies[4].models).toEqual([]);
   });
 
   it('fetches discovered models, allows cancel without mutation, imports selected without overwriting existing, and recovers from fetch failure', async () => {

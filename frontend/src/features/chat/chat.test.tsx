@@ -3,7 +3,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { AppProvider } from '../../app/AppProvider';
-import { setLocalProviderKey } from '../../core/localProviderKeys';
+import { getLocalProviderKey, setLocalProviderKey } from '../../core/localProviderKeys';
 import { SETTINGS_STORAGE_KEY, defaultSettings } from '../../core/settings';
 import { ChatCanvas } from '../workbench/ChatCanvas';
 import { ChatProvider, useChat } from './ChatProvider';
@@ -489,7 +489,12 @@ describe('chatReducer and ChatProvider', () => {
 
     expect(screen.getAllByText('用户').length).toBe(2);
     expect(screen.getAllByText('Friendly Model | MyProvider').length).toBeGreaterThan(0);
-    expect(screen.getByText('Tokens: 30 ↑10 ↓20')).toBeInTheDocument();
+    const usageTrigger = screen.getByText('Tokens: 30 ↑10 ↓20');
+    expect(usageTrigger).toBeInTheDocument();
+    expect(screen.queryByText(/缓存读|缓存写/)).not.toBeInTheDocument();
+    await user.click(usageTrigger);
+    expect(screen.queryByText('缓存读取')).not.toBeInTheDocument();
+    await user.keyboard('{Escape}');
 
     const editBtns = screen.getAllByRole('button', { name: '修改消息' });
     await user.click(editBtns[1]); // Edit A1 which has [thinking, text]
@@ -674,5 +679,880 @@ describe('chatReducer and ChatProvider', () => {
     });
     expect(screen.getByTestId('loc-msgs').textContent).toContain('local-assistant-');
     expect(screen.getByTestId('loc-msgs').textContent).toContain('Local hello');
+  });
+
+  it('closes retry confirm dialog immediately before slow onRetry settles, guards double-click and rejected promises, and keeps delete blocking', async () => {
+    let resolveRetry!: (v: boolean) => void;
+    const onRetry = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveRetry = resolve;
+        }),
+    );
+    let resolveDelete!: (v: boolean) => void;
+    const onDelete = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          resolveDelete = resolve;
+        }),
+    );
+
+    const savedMsg: Message = {
+      id: 'a-retry',
+      conversationId: 'c1',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: 'Original reply' }],
+      stopReason: 'stop',
+      createdAt: '2026-11-17T00:00:00Z',
+    };
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider skipInitialBootstrap>
+        <button type="button">background-focus-target</button>
+        <MessageActions message={savedMsg} onRetry={onRetry} onDelete={onDelete} />
+      </AppProvider>,
+    );
+
+    // Cancel does not call onRetry.
+    await user.click(screen.getByRole('button', { name: '重试消息' }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '取消' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(onRetry).not.toHaveBeenCalled();
+
+    // Double-click / confirm closes dialog BEFORE delayed promise resolves and only invokes onRetry once.
+    await user.click(screen.getByRole('button', { name: '重试消息' }));
+    const confirmBtn = screen.getByRole('button', { name: '重新生成' });
+    await user.dblClick(confirmBtn);
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(onRetry).toHaveBeenCalledTimes(1);
+
+    const bgBtn = screen.getByRole('button', { name: 'background-focus-target' });
+    bgBtn.focus();
+    expect(bgBtn).toHaveFocus();
+
+    resolveRetry(true);
+
+    // Rejected onRetry promise is surfaced via toast without unhandled rejection.
+    const rejectingRetry = vi.fn().mockRejectedValue(new Error('网络重置'));
+    const { rerender } = render(
+      <AppProvider skipInitialBootstrap>
+        <MessageActions message={savedMsg} onRetry={rejectingRetry} onDelete={onDelete} />
+      </AppProvider>,
+    );
+    const retryBtns = screen.getAllByRole('button', { name: '重试消息' });
+    await user.click(retryBtns[1]);
+    await user.click(screen.getByRole('button', { name: '重新生成' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByText('网络重置')).toBeInTheDocument();
+    });
+
+    // Delete confirmation still blocks until onDelete resolves.
+    rerender(
+      <AppProvider skipInitialBootstrap>
+        <MessageActions message={savedMsg} onRetry={rejectingRetry} onDelete={onDelete} />
+      </AppProvider>,
+    );
+    const delBtns = screen.getAllByRole('button', { name: '删除消息' });
+    await user.click(delBtns[1]);
+    await user.click(screen.getByRole('button', { name: '删除' }));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    resolveDelete(true);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+  });
+
+  it('updateConversationMeta updates matching conversation without clearing messages and ignores mismatched IDs', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async () =>
+      new Response(
+        JSON.stringify({
+          conversation: makeConv('c1'),
+          messages: [
+            {
+              id: 'm1',
+              conversationId: 'c1',
+              role: 'user',
+              blocks: [{ type: 'text', text: 'kept' }],
+              createdAt: '2026-11-17T00:00:00Z',
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    function MetaHarness() {
+      const { state, loadConversation, updateConversationMeta } = useChat();
+      return (
+        <div>
+          <span data-testid="model-id">{state.conversation?.modelId ?? ''}</span>
+          <span data-testid="msg-ids">{state.messages.map((m) => m.id).join(',')}</span>
+          <button type="button" onClick={() => void loadConversation('c1')}>
+            load
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              updateConversationMeta({ ...makeConv('c1'), modelId: 'gpt-4.1-mini' })
+            }
+          >
+            update-same
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              updateConversationMeta({ ...makeConv('c-other'), modelId: 'hijack' })
+            }
+          >
+            update-other
+          </button>
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock} skipInitialBootstrap>
+        <ChatProvider>
+          <MetaHarness />
+        </ChatProvider>
+      </AppProvider>,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'load' }));
+    await waitFor(() => expect(screen.getByTestId('model-id')).toHaveTextContent('gpt-4.1'));
+
+    await user.click(screen.getByRole('button', { name: 'update-other' }));
+    expect(screen.getByTestId('model-id')).toHaveTextContent('gpt-4.1');
+
+    await user.click(screen.getByRole('button', { name: 'update-same' }));
+    expect(screen.getByTestId('model-id')).toHaveTextContent('gpt-4.1-mini');
+    expect(screen.getByTestId('msg-ids')).toHaveTextContent('m1');
+  });
+
+  it('tracks thinking block completion independently from block_start ev.block and preserves manual reopen across local ID reconciliation', async () => {
+    // block_start with initial ev.block must NOT mark block completed.
+    let s = chatReducer(initialChatState, {
+      type: 'LOAD_SUCCESS',
+      conversation: makeConv('c1'),
+      messages: [],
+    });
+    s = chatReducer(s, {
+      type: 'STREAM_EVENT',
+      fallbackProviderId: 'openai',
+      fallbackModelId: 'gpt-4.1',
+      event: {
+        type: 'block_start',
+        index: 0,
+        blockType: 'thinking',
+        block: { type: 'thinking', thinking: 'init' },
+      },
+    });
+    expect(s.streaming?.blocksByIndex[0].completed).toBe(false);
+
+    s = chatReducer(s, {
+      type: 'STREAM_EVENT',
+      fallbackProviderId: 'openai',
+      fallbackModelId: 'gpt-4.1',
+      event: {
+        type: 'block_end',
+        index: 0,
+        blockType: 'thinking',
+        block: { type: 'thinking', thinking: 'init done' },
+      },
+    });
+    expect(s.streaming?.blocksByIndex[0].completed).toBe(true);
+
+    // Local stream: user reopens collapsed thinking after block_end; subsequent text + reconcile must keep it open.
+    localStorage.clear();
+    setLocalProviderKey('local-p', 'sk-local');
+    const encoder = new TextEncoder();
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.3.0', authRequired: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(
+          JSON.stringify({
+            providers: [
+              {
+                id: 'local-p',
+                name: 'Local',
+                adapter: 'generic-http',
+                baseURL: 'http://127.0.0.1:11434/v1',
+                authType: 'bearer',
+                apiKeyMasked: '',
+                apiKeySet: false,
+                localRequest: true,
+                models: [{ id: 'r1', name: 'R1', apiFormat: 'openai-completions' }],
+                enabled: true,
+                builtIn: false,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return new Response(JSON.stringify({ assistants: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations')) {
+        return new Response(JSON.stringify({ conversations: [makeConv('c-loc')] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/plugins/search')) {
+        return new Response(JSON.stringify({ engines: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ servers: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-loc') && method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            conversation: makeConv('c-loc'),
+            messages: [
+              { id: 'srv-u1', conversationId: 'c-loc', role: 'user', blocks: [{ type: 'text', text: 'Q' }], createdAt: '2026-11-17T10:00:00Z' },
+              { id: 'srv-a1', conversationId: 'c-loc', role: 'assistant', providerId: 'local-p', modelId: 'r1', blocks: [{ type: 'thinking', thinking: 'reason step' }, { type: 'text', text: 'Answer' }], stopReason: 'stop', createdAt: '2026-11-17T10:00:01Z' },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/c-loc/messages/prepare-local')) {
+        return new Response(
+          JSON.stringify({
+            method: 'POST',
+            url: 'http://127.0.0.1:11434/v1/chat/completions',
+            headers: { 'Content-Type': 'application/json' },
+            body: { model: 'r1', stream: true, messages: [] },
+            authType: 'bearer',
+          }),
+          { status: 200 },
+        );
+      }
+      if (url === 'http://127.0.0.1:11434/v1/chat/completions') {
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            streamController = c;
+          },
+        });
+        return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      if (url.endsWith('/api/v1/conversations/c-loc/messages') && method === 'POST') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as { role: string; blocks: Message['blocks'] };
+        const id = body.role === 'user' ? 'srv-u1' : 'srv-a1';
+        return new Response(
+          JSON.stringify({
+            message: { id, conversationId: 'c-loc', role: body.role, blocks: body.blocks, createdAt: '2026-11-17T10:00:01Z' },
+            conversation: makeConv('c-loc'),
+          }),
+          { status: 201 },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    function ThinkingCanvasHarness() {
+      const { state, loadConversation, sendMessage } = useChat();
+      return (
+        <div>
+          <button type="button" onClick={() => void loadConversation('c-loc')}>
+            load
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void sendMessage({
+                conversationId: 'c-loc',
+                blocks: [{ type: 'text', text: 'Q' }],
+                text: 'Q',
+                providerId: 'local-p',
+                modelId: 'r1',
+              })
+            }
+          >
+            send
+          </button>
+          <ChatCanvas
+            state={state}
+            assistant={{ id: 'default', name: '默认助手', params: {}, isDefault: true }}
+            hasConversationId
+            onUpdateMessage={vi.fn().mockResolvedValue(true)}
+            onRetryMessage={vi.fn().mockResolvedValue(true)}
+            onDeleteMessage={vi.fn().mockResolvedValue(true)}
+            onBranchMessage={vi.fn().mockResolvedValue(null)}
+            onReloadConversation={vi.fn().mockResolvedValue(undefined)}
+            onResetToNewTopic={vi.fn()}
+          />
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter>
+          <ChatProvider>
+            <ThinkingCanvasHarness />
+          </ChatProvider>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/v1/providers'), expect.anything()));
+    await user.click(screen.getByRole('button', { name: 'send' }));
+
+    await waitFor(() => expect(streamController).toBeDefined());
+    streamController.enqueue(encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"reason step"}}]}\n\n'));
+    await waitFor(() => expect(screen.getByText('reason step')).toBeInTheDocument());
+
+    // Transition from thinking to text emits block_end for thinking -> collapses once.
+    streamController.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"Ans"}}]}\n\n'));
+    await waitFor(() => expect(screen.queryByText('reason step')).not.toBeInTheDocument());
+
+    // User manually reopens thinking -> must remain open across more text and final server ID reconciliation!
+    await user.click(screen.getByRole('button', { name: /思考过程/ }));
+    expect(screen.getByText('reason step')).toBeInTheDocument();
+
+    streamController.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"wer"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'));
+    streamController.close();
+
+    await waitFor(() => expect(screen.getByText('Answer')).toBeInTheDocument());
+    expect(screen.getByText('reason step')).toBeInTheDocument();
+  });
+
+  it('continues localRequest multi-round MCP tool execution without sending browser key to gateway and stops cleanly on abort', async () => {
+    setLocalProviderKey('local-p', 'sk-browser-only');
+    const encoder = new TextEncoder();
+    const persisted: Message[] = [];
+    const gatewayBodies: Array<{ url: string; body: string }> = [];
+    let upstreamTurn = 0;
+    let upstreamAuths: string[] = [];
+    let abortToolExec = false;
+
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (init?.body) {
+        gatewayBodies.push({ url, body: String(init.body) });
+      }
+
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.4.0', authRequired: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(
+          JSON.stringify({
+            providers: [
+              {
+                id: 'local-p',
+                name: 'Local Ollama',
+                adapter: 'generic-http',
+                baseURL: 'http://127.0.0.1:11434/v1',
+                authType: 'bearer',
+                apiKeyMasked: '',
+                apiKeySet: false,
+                localRequest: true,
+                models: [{ id: 'qwen', name: 'Qwen', apiFormat: 'openai-completions' }],
+                enabled: true,
+                builtIn: false,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return new Response(JSON.stringify({ assistants: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations')) {
+        return new Response(JSON.stringify({ conversations: [makeConv('c-mcp')] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/plugins/search') || url.endsWith('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ engines: [], servers: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-mcp') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: makeConv('c-mcp'), messages: persisted }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-mcp/messages/prepare-local')) {
+        return new Response(
+          JSON.stringify({
+            method: 'POST',
+            url: 'http://127.0.0.1:11434/v1/chat/completions',
+            headers: { 'Content-Type': 'application/json' },
+            body: { model: 'qwen', stream: true, messages: [] },
+            authType: 'bearer',
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/c-mcp/tools/execute')) {
+        if (abortToolExec) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        const sse = [
+          'event: block_start\ndata: {"type":"block_start","index":0,"blockType":"toolResult","block":{"type":"toolResult","toolCallId":"call_loc_1","toolName":"calc","content":"42"}}\n\n',
+          'event: block_end\ndata: {"type":"block_end","index":0,"blockType":"toolResult","block":{"type":"toolResult","toolCallId":"call_loc_1","toolName":"calc","content":"42"}}\n\n',
+        ].join('');
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(encoder.encode(sse));
+              c.close();
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        );
+      }
+      if (url === 'http://127.0.0.1:11434/v1/chat/completions') {
+        upstreamTurn += 1;
+        upstreamAuths.push(headers.Authorization ?? '');
+        const sse =
+          upstreamTurn % 2 === 1
+            ? 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_loc_1","function":{"name":"calc","arguments":"{\\"n\\":6}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\ndata: [DONE]\n\n'
+            : 'data: {"choices":[{"delta":{"content":"Result is 42"},"finish_reason":"stop"}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":6,"total_tokens":26}}\n\ndata: [DONE]\n\n';
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(encoder.encode(sse));
+              c.close();
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/c-mcp/messages') && method === 'POST') {
+        const body = JSON.parse(String(init?.body ?? '{}')) as {
+          role: string;
+          blocks: Message['blocks'];
+          usage?: Message['usage'];
+          stopReason?: string;
+        };
+        const saved: Message = {
+          id: `srv-${persisted.length + 1}`,
+          conversationId: 'c-mcp',
+          role: body.role,
+          blocks: body.blocks,
+          usage: body.usage,
+          stopReason: body.stopReason,
+          createdAt: '2026-11-17T10:00:05Z',
+        };
+        persisted.push(saved);
+        return new Response(JSON.stringify({ message: saved, conversation: makeConv('c-mcp') }), { status: 201 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    function LocalMCPHarness() {
+      const { state, loadConversation, sendMessage, stopStreaming } = useChat();
+      return (
+        <div>
+          <button type="button" onClick={() => void loadConversation('c-mcp')}>
+            load
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void sendMessage({
+                conversationId: 'c-mcp',
+                blocks: [{ type: 'text', text: 'Compute 6*7' }],
+                text: 'Compute 6*7',
+                providerId: 'local-p',
+                modelId: 'qwen',
+              })
+            }
+          >
+            send
+          </button>
+          <button type="button" onClick={stopStreaming}>
+            stop
+          </button>
+          <div data-testid="run-state">{state.runState}</div>
+          <div data-testid="msg-count">{state.messages.length}</div>
+          <div data-testid="block-types">
+            {state.messages[1]?.blocks.map((b) => b.type).join(',')}
+          </div>
+          <div data-testid="usage-total">
+            {state.messages[1]?.usage?.totalTokens ?? 0}
+          </div>
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter>
+          <ChatProvider>
+            <LocalMCPHarness />
+          </ChatProvider>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/v1/providers'), expect.anything()));
+    await user.click(screen.getByRole('button', { name: 'load' }));
+    await waitFor(() => expect(screen.getByTestId('run-state')).toHaveTextContent('empty'));
+
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(screen.getByTestId('run-state')).toHaveTextContent('idle'));
+
+    expect(upstreamTurn).toBe(2);
+    expect(upstreamAuths).toEqual(['Bearer sk-browser-only', 'Bearer sk-browser-only']);
+    expect(screen.getByTestId('msg-count')).toHaveTextContent('2');
+    expect(screen.getByTestId('block-types')).toHaveTextContent('toolCall,toolResult,text');
+    expect(screen.getByTestId('usage-total')).toHaveTextContent('41');
+    expect(persisted).toHaveLength(2);
+    expect(persisted[1].blocks).toHaveLength(3);
+
+    // Ensure gateway NEVER saw browser API key anywhere in request bodies.
+    for (const req of gatewayBodies) {
+      if (!req.url.startsWith('http://127.0.0.1:11434')) {
+        expect(req.body).not.toContain('sk-browser-only');
+      }
+    }
+
+    // Abort during /tools/execute must NOT trigger next prepare-local or upstream fetch.
+    abortToolExec = true;
+    const turnBeforeAbort = upstreamTurn;
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(screen.getByTestId('run-state')).toHaveTextContent('aborted'));
+    expect(upstreamTurn).toBe(turnBeforeAbort + 1);
+  });
+
+  it('executes localRequest Gemini cache pre-request with browser key, reuses in-memory CacheState, invalidates on key change, and stops cleanly on abort', async () => {
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...defaultSettings(), autoCreateCache: true }),
+    );
+    setLocalProviderKey('local-gem', 'sk-gem-key-1');
+    const encoder = new TextEncoder();
+    const persisted: Message[] = [];
+    const preparePayloads: Array<Record<string, unknown>> = [];
+    const upstreamRequests: Array<{ url: string; body: string }> = [];
+    let cacheCreateCount = 0;
+    let mainGenerateCount = 0;
+    let blockCacheCreate = false;
+    let rejectCacheSmall = false;
+
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      const rawBody = init?.body ? String(init.body) : '';
+
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.4.1', authRequired: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/formats') || url.endsWith('/api/v1/assistants') || url.endsWith('/api/v1/plugins/search') || url.endsWith('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [], assistants: [], engines: [], servers: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(
+          JSON.stringify({
+            providers: [
+              {
+                id: 'local-gem',
+                name: 'Local Gemini',
+                adapter: 'generic-http',
+                baseURL: 'http://127.0.0.1:18888/v1beta',
+                authType: 'query-key',
+                apiKeyMasked: '',
+                apiKeySet: false,
+                localRequest: true,
+                models: [{ id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', apiFormat: 'google-generative-ai' }],
+                enabled: true,
+                builtIn: false,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations')) {
+        return new Response(JSON.stringify({ conversations: [makeConv('c-gem')] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-gem') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: makeConv('c-gem'), messages: persisted }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-gem/messages/prepare-local')) {
+        const payload = JSON.parse(rawBody) as Record<string, unknown>;
+        preparePayloads.push(payload);
+        expect(rawBody).not.toContain('sk-gem-key');
+        const wsBlock = {
+          type: 'webSearch',
+          extra: { query: 'q', engineId: 'tavily', results: [{ title: 'T', url: 'https://t.example' }] },
+        };
+        const resolution = payload.cacheResolution as { planKey: string; status: number; result: { name?: string } } | undefined;
+        const incomingState = payload.cacheState as { resourceName?: string } | undefined;
+
+        if (resolution) {
+          if (resolution.status >= 400) {
+            return new Response(
+              JSON.stringify({
+                method: 'POST',
+                url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+                headers: { 'Content-Type': 'application/json' },
+                body: { contents: [{ role: 'user', parts: [{ text: 'uncached' }] }] },
+                authType: 'query-key',
+                cacheState: { failedPrefixHash: resolution.planKey },
+              }),
+              { status: 200 },
+            );
+          }
+          return new Response(
+            JSON.stringify({
+              method: 'POST',
+              url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+              headers: { 'Content-Type': 'application/json' },
+              body: { cachedContent: resolution.result.name, contents: [{ role: 'user', parts: [{ text: 'q' }] }] },
+              authType: 'query-key',
+              cacheState: { resourceName: resolution.result.name, prefixCount: 0 },
+            }),
+            { status: 200 },
+          );
+        }
+
+        if (incomingState?.resourceName) {
+          return new Response(
+            JSON.stringify({
+              method: 'POST',
+              url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+              headers: { 'Content-Type': 'application/json' },
+              body: { cachedContent: incomingState.resourceName, contents: [{ role: 'user', parts: [{ text: 'q2' }] }] },
+              authType: 'query-key',
+              cacheState: incomingState,
+            }),
+            { status: 200 },
+          );
+        }
+
+        return new Response(
+          JSON.stringify({
+            method: 'POST',
+            url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+            headers: { 'Content-Type': 'application/json' },
+            body: { contents: [{ role: 'user', parts: [{ text: 'fallback' }] }] },
+            authType: 'query-key',
+            ...(payload.preparedSearch ? {} : { webSearchBlock: wsBlock }),
+            cacheStep: {
+              planKey: 'pk-1',
+              request: {
+                method: 'POST',
+                url: 'http://127.0.0.1:18888/v1beta/cachedContents',
+                headers: { 'Content-Type': 'application/json' },
+                body: { model: 'models/gemini-2.5-pro' },
+                authType: 'query-key',
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.startsWith('http://127.0.0.1:18888/v1beta/cachedContents')) {
+        cacheCreateCount += 1;
+        upstreamRequests.push({ url, body: rawBody });
+        if (blockCacheCreate) {
+          return new Promise<Response>((_, reject) => {
+            init?.signal?.addEventListener('abort', () => {
+              reject(new DOMException('Aborted', 'AbortError'));
+            });
+          });
+        }
+        if (rejectCacheSmall) {
+          return new Response(
+            JSON.stringify({ error: { code: 400, message: 'total token count too small' } }),
+            { status: 400 },
+          );
+        }
+        return new Response(
+          JSON.stringify({ name: `cachedContents/b-${cacheCreateCount}`, expireTime: '2099-01-01T00:00:00Z' }),
+          { status: 200 },
+        );
+      }
+
+      if (url.startsWith('http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent')) {
+        mainGenerateCount += 1;
+        upstreamRequests.push({ url, body: rawBody });
+        const sse = 'data: {"candidates":[{"content":{"parts":[{"text":"gem-ok"}]},"finishReason":"STOP"}]}\n\n';
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(encoder.encode(sse));
+              c.close();
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        );
+      }
+
+      if (url.endsWith('/api/v1/conversations/c-gem/messages') && method === 'POST') {
+        const body = JSON.parse(rawBody) as { role: string; blocks: Message['blocks'] };
+        const saved: Message = {
+          id: `g-${persisted.length + 1}`,
+          conversationId: 'c-gem',
+          role: body.role,
+          blocks: body.blocks,
+          createdAt: '2026-11-17T10:00:00Z',
+        };
+        persisted.push(saved);
+        return new Response(JSON.stringify({ message: saved, conversation: makeConv('c-gem') }), { status: 201 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    function LocalGemCacheHarness() {
+      const { state, loadConversation, sendMessage, stopStreaming } = useChat();
+      return (
+        <div>
+          <button type="button" onClick={() => void loadConversation('c-gem')}>
+            load
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void sendMessage({
+                conversationId: 'c-gem',
+                blocks: [{ type: 'text', text: 'hello' }],
+                text: 'hello',
+                providerId: 'local-gem',
+                modelId: 'gemini-2.5-pro',
+                webSearch: true,
+              })
+            }
+          >
+            send
+          </button>
+          <button type="button" onClick={stopStreaming}>
+            stop
+          </button>
+          <div data-testid="gem-run">{state.runState}</div>
+          <div data-testid="gem-count">{state.messages.length}</div>
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter>
+          <ChatProvider>
+            <LocalGemCacheHarness />
+          </ChatProvider>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/v1/providers'), expect.anything()));
+    await user.click(screen.getByRole('button', { name: 'load' }));
+    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('empty'));
+
+    // 1. First send creates cache via browser key, passes preparedSearch + cacheResolution, saves 1 user + 1 assistant.
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('idle'));
+    expect(cacheCreateCount).toBe(1);
+    expect(mainGenerateCount).toBe(1);
+    expect(persisted).toHaveLength(2);
+    expect(upstreamRequests[0].url).toContain('key=sk-gem-key-1');
+    expect(upstreamRequests[1].url).toContain('key=sk-gem-key-1');
+    expect(JSON.parse(upstreamRequests[1].body)).toMatchObject({ cachedContent: 'cachedContents/b-1' });
+    expect(preparePayloads[1]).toHaveProperty('preparedSearch');
+    expect(preparePayloads[1]).toHaveProperty('cacheResolution');
+
+    // 2. Second send reuses in-memory cacheState without a second cachedContents create.
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('idle'));
+    expect(cacheCreateCount).toBe(1);
+    expect(mainGenerateCount).toBe(2);
+
+    // 3. Updating local provider key invalidates in-memory cacheState -> next send creates fresh cache with new key.
+    setLocalProviderKey('local-gem', 'sk-gem-key-2');
+    expect(getLocalProviderKey('local-gem')).toBe('sk-gem-key-2');
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('idle'));
+    expect(cacheCreateCount).toBe(2);
+    expect(mainGenerateCount).toBe(3);
+    expect(upstreamRequests[upstreamRequests.length - 1].url).toContain('key=sk-gem-key-2');
+
+    // 4. Aborting during cacheStep never issues main stream or user message save.
+    setLocalProviderKey('local-gem', 'sk-gem-key-3');
+    blockCacheCreate = true;
+    const savedBeforeAbort = persisted.length;
+    const genBeforeAbort = mainGenerateCount;
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(cacheCreateCount).toBe(3));
+    await user.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('error'));
+    expect(mainGenerateCount).toBe(genBeforeAbort);
+    expect(persisted).toHaveLength(savedBeforeAbort);
+
+    // 5. Small-prefix 400 on cacheStep degrades cleanly and still completes main generation.
+    blockCacheCreate = false;
+    rejectCacheSmall = true;
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('idle'));
+    expect(mainGenerateCount).toBe(genBeforeAbort + 1);
+  });
+
+  it('displays real cache read/write counts on demand in MessageActions Popover without fabricating savings or zero hits', async () => {
+    const user = userEvent.setup();
+    const cachedMsg: Message = {
+      id: 'a-cached',
+      conversationId: 'c1',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: 'Cached reply' }],
+      usage: {
+        inputTokens: 1000,
+        outputTokens: 50,
+        cacheReadInputTokens: 800,
+        cacheCreationInputTokens: 150,
+        totalTokens: 1050,
+      },
+      stopReason: 'stop',
+      createdAt: '2026-11-17T10:00:00Z',
+    };
+    render(
+      <AppProvider skipInitialBootstrap>
+        <MemoryRouter>
+          <ChatCanvas
+            state={{
+              ...initialChatState,
+              conversation: makeConv('c1'),
+              messages: [cachedMsg],
+              runState: 'idle',
+            }}
+            assistant={{ id: 'default', name: '默认助手', params: {}, isDefault: true }}
+            hasConversationId
+            onUpdateMessage={vi.fn().mockResolvedValue(true)}
+            onRetryMessage={vi.fn().mockResolvedValue(true)}
+            onDeleteMessage={vi.fn().mockResolvedValue(true)}
+            onBranchMessage={vi.fn().mockResolvedValue(null)}
+            onReloadConversation={vi.fn().mockResolvedValue(undefined)}
+            onResetToNewTopic={vi.fn()}
+          />
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    const trigger = screen.getByRole('button', { name: '查看 Token 用量详情' });
+    expect(trigger).toHaveTextContent('1,000 in · 50 out · 缓存读 800 · 缓存写 150');
+    await user.click(trigger);
+    expect(screen.getByText('缓存读取')).toBeInTheDocument();
+    expect(screen.getByText('800')).toBeInTheDocument();
+    expect(screen.getByText('缓存写入')).toBeInTheDocument();
+    expect(screen.getByText('150')).toBeInTheDocument();
   });
 });

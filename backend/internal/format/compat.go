@@ -13,6 +13,7 @@ func MergeCompat(base, override domain.CompatConfig) domain.CompatConfig {
 		ThinkingFormat:       base.ThinkingFormat,
 		ReasoningEffortField: base.ReasoningEffortField,
 		PathOverride:         base.PathOverride,
+		CacheMode:            base.CacheMode,
 	}
 	if base.SupportsDeveloperRole != nil {
 		out.SupportsDeveloperRole = domain.BoolPtr(*base.SupportsDeveloperRole)
@@ -44,6 +45,9 @@ func MergeCompat(base, override domain.CompatConfig) domain.CompatConfig {
 	}
 	if override.PathOverride != "" {
 		out.PathOverride = override.PathOverride
+	}
+	if override.CacheMode != "" {
+		out.CacheMode = override.CacheMode
 	}
 	if len(override.ExtraHeaders) > 0 {
 		if out.ExtraHeaders == nil {

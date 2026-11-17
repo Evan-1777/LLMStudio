@@ -439,6 +439,12 @@ func (s *ProviderService) normalizeAndValidate(cfg *domain.ProviderConfig) error
 		if m.APIFormat == "" || !s.formats.Has(m.APIFormat) {
 			return domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unknown apiFormat %q for model %q", m.APIFormat, m.ID), nil)
 		}
+		m.Compat.CacheMode = strings.ToLower(strings.TrimSpace(m.Compat.CacheMode))
+		switch m.Compat.CacheMode {
+		case "", domain.CacheModeAuto, domain.CacheModeImplicit, domain.CacheModeExplicit, domain.CacheModeDisabled:
+		default:
+			return domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("invalid compat.cacheMode %q for model %q", m.Compat.CacheMode, m.ID), nil)
+		}
 	}
 	return nil
 }
