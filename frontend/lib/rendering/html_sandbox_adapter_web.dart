@@ -37,7 +37,7 @@ class _HtmlSandboxViewState extends State<HtmlSandboxView> {
   late final String _nonce;
   web.HTMLIFrameElement? _iframe;
   StreamSubscription<web.MessageEvent>? _messageSub;
-  double _height = 240;
+  late double _height;
 
   @override
   void initState() {
@@ -45,7 +45,7 @@ class _HtmlSandboxViewState extends State<HtmlSandboxView> {
     _viewCounter++;
     _viewType = 'llmstudio-html-sandbox-$_viewCounter';
     _nonce = _generateNonce();
-    _height = widget.minHeight.clamp(120, widget.maxHeight);
+    _height = min(widget.minHeight, widget.maxHeight);
 
     final iframe = web.HTMLIFrameElement()
       ..style.border = 'none'

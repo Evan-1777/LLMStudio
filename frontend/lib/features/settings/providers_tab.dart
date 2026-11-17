@@ -917,12 +917,7 @@ String _defaultPathForFormat(String formatId, List<FormatInfo> formats) {
       return f.defaultPath;
     }
   }
-  return switch (formatId) {
-    'openai-responses' => '/v1/responses',
-    'anthropic-messages' => '/v1/messages',
-    'google-generative-ai' => '/v1beta/models/{model}:streamGenerateContent',
-    _ => '/v1/chat/completions',
-  };
+  return '/v1/chat/completions';
 }
 
 String _deriveModelGroup(String id) {

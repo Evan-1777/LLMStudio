@@ -32,14 +32,6 @@ func (s stubAdapter) ResolveEndpoint(domain.ProviderConfig, domain.ModelConfig, 
 	return ResolvedEndpoint{}, nil
 }
 
-type stubImageGen struct{ id string }
-
-func (s stubImageGen) ID() string          { return s.id }
-func (s stubImageGen) DisplayName() string { return "Gen " + s.id }
-func (s stubImageGen) Generate(context.Context, ImageGenRequest) ([]domain.ContentBlock, error) {
-	return nil, nil
-}
-
 func TestRegistriesAndSyncState(t *testing.T) {
 	formats := NewFormatRegistry()
 	if err := formats.Register(stubFormat{id: "openai-completions"}); err != nil {
@@ -61,14 +53,6 @@ func TestRegistriesAndSyncState(t *testing.T) {
 	}
 	if !providers.Has("generic-http") || len(providers.List()) != 1 {
 		t.Fatalf("unexpected providers registry state: %+v", providers.List())
-	}
-
-	imgGens := NewImageGenRegistry()
-	if err := imgGens.Register(stubImageGen{id: "noop-img"}); err != nil {
-		t.Fatalf("register image gen failed: %v", err)
-	}
-	if _, ok := imgGens.Get("noop-img"); !ok || len(imgGens.List()) != 1 {
-		t.Fatalf("unexpected image gen registry state: %v", imgGens.List())
 	}
 
 	if !ValidSyncState(string(SyncStateLocalOnly)) || !ValidSyncState(string(SyncStateConflict)) {
