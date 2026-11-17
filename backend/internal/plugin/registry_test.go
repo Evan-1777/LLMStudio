@@ -13,6 +13,7 @@ type stubFormat struct{ id string }
 
 func (s stubFormat) ID() string          { return s.id }
 func (s stubFormat) DisplayName() string { return "Stub " + s.id }
+func (s stubFormat) DefaultPath() string { return "/v1/stub" }
 func (s stubFormat) DefaultCompat() domain.CompatConfig {
 	return domain.CompatConfig{MaxTokensField: "max_tokens"}
 }
@@ -47,7 +48,7 @@ func TestRegistriesAndSyncState(t *testing.T) {
 	if err := formats.Register(stubFormat{id: "openai-completions"}); err == nil {
 		t.Fatal("expected duplicate format registration error")
 	}
-	if !formats.Has("openai-completions") || len(formats.List()) != 1 {
+	if !formats.Has("openai-completions") || len(formats.List()) != 1 || formats.List()[0].DefaultPath != "/v1/stub" {
 		t.Fatalf("unexpected formats registry state: %+v", formats.List())
 	}
 

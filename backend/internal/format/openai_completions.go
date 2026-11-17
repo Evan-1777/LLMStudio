@@ -23,6 +23,7 @@ func NewOpenAICompletionsFormat() *OpenAICompletionsFormat {
 
 func (f *OpenAICompletionsFormat) ID() string          { return FormatIDOpenAICompletions }
 func (f *OpenAICompletionsFormat) DisplayName() string { return "OpenAI Chat Completions" }
+func (f *OpenAICompletionsFormat) DefaultPath() string { return "/v1/chat/completions" }
 
 func (f *OpenAICompletionsFormat) DefaultCompat() domain.CompatConfig {
 	return domain.CompatConfig{
@@ -88,12 +89,12 @@ func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.
 		}
 		body[maxField] = *params.MaxTokens
 	}
-	if params.ReasoningEffort != "" {
+	if effort := strings.ToLower(strings.TrimSpace(params.ReasoningEffort)); effort != "" {
 		effortField := compat.ReasoningEffortField
 		if effortField == "" {
 			effortField = "reasoning_effort"
 		}
-		setNestedField(body, effortField, params.ReasoningEffort)
+		setNestedField(body, effortField, effort)
 	}
 	if len(compat.ExtraBody) > 0 {
 		MergeBodyMap(body, compat.ExtraBody)
@@ -107,7 +108,7 @@ func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.
 	headers.Set("Content-Type", "application/json")
 	return plugin.EncodedRequest{
 		Method:      http.MethodPost,
-		DefaultPath: "/v1/chat/completions",
+		DefaultPath: f.DefaultPath(),
 		Headers:     headers,
 		Body:        payload,
 	}, nil

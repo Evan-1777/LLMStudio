@@ -25,6 +25,9 @@ func NewGoogleGenAIFormat() *GoogleGenAIFormat {
 
 func (f *GoogleGenAIFormat) ID() string          { return FormatIDGoogleGenAI }
 func (f *GoogleGenAIFormat) DisplayName() string { return "Google Generative AI" }
+func (f *GoogleGenAIFormat) DefaultPath() string {
+	return "/v1beta/models/{model}:streamGenerateContent"
+}
 
 func (f *GoogleGenAIFormat) DefaultCompat() domain.CompatConfig {
 	return domain.CompatConfig{
@@ -126,14 +129,25 @@ func (f *GoogleGenAIFormat) EncodeRequest(_ context.Context, input plugin.ChatIn
 		}
 		genConfig[maxField] = *params.MaxTokens
 	}
-	if params.ReasoningEffort != "" && input.Model.Reasoning {
+	if effort := strings.ToLower(strings.TrimSpace(params.ReasoningEffort)); effort != "" {
 		thinkField := compat.ReasoningEffortField
-		if thinkField == "" {
+		if thinkField == "" || thinkField == "thinkingLevel" {
 			thinkField = "thinkingConfig"
 		}
-		genConfig[thinkField] = map[string]any{
-			"includeThoughts": true,
-			"thinkingBudget":  geminiThinkingBudget(params.ReasoningEffort),
+		if effort == domain.EffortNone {
+			genConfig[thinkField] = map[string]any{
+				"thinkingBudget": 0,
+			}
+		} else if compat.ReasoningEffortField == "thinkingLevel" {
+			genConfig["thinkingConfig"] = map[string]any{
+				"includeThoughts": true,
+				"thinkingLevel":   strings.ToUpper(effort),
+			}
+		} else {
+			genConfig[thinkField] = map[string]any{
+				"includeThoughts": true,
+				"thinkingBudget":  geminiThinkingBudget(effort),
+			}
 		}
 	}
 	if len(genConfig) > 0 {
@@ -152,7 +166,7 @@ func (f *GoogleGenAIFormat) EncodeRequest(_ context.Context, input plugin.ChatIn
 	query := url.Values{"alt": []string{"sse"}}
 	return plugin.EncodedRequest{
 		Method:      http.MethodPost,
-		DefaultPath: "/v1beta/models/{model}:streamGenerateContent",
+		DefaultPath: f.DefaultPath(),
 		Query:       query,
 		Headers:     headers,
 		Body:        payload,
@@ -203,11 +217,15 @@ func encodeGeminiFunctionResponse(b domain.ContentBlock) map[string]any {
 }
 
 func geminiThinkingBudget(effort string) int {
-	switch strings.ToLower(effort) {
-	case "low":
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case domain.EffortLow:
 		return 1024
-	case "high":
+	case domain.EffortHigh:
 		return 8192
+	case domain.EffortXHigh:
+		return 16384
+	case domain.EffortMax:
+		return 24576
 	default:
 		return 4096
 	}

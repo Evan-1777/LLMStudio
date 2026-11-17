@@ -21,6 +21,7 @@ import (
 	"llmstudio/backend/internal/httpapi"
 	"llmstudio/backend/internal/plugin"
 	"llmstudio/backend/internal/provider"
+	"llmstudio/backend/internal/search"
 	"llmstudio/backend/internal/service"
 	"llmstudio/backend/internal/store"
 )
@@ -44,8 +45,11 @@ func newGatewayFixtureServer(t *testing.T, token string) (*httptest.Server, *sto
 	t.Cleanup(func() { _ = db.Close() })
 
 	provStore := store.NewProviderStore(db)
+	assistStore := store.NewAssistantStore(db)
 	convStore := store.NewConversationStore(db)
 	msgStore := store.NewMessageStore(db)
+	searchStore := store.NewSearchConfigStore(db)
+	mcpStore := store.NewMCPServerStore(db)
 
 	formats := plugin.NewFormatRegistry()
 	formats.MustRegister(format.NewOpenAICompletionsFormat())
@@ -56,6 +60,10 @@ func newGatewayFixtureServer(t *testing.T, token string) (*httptest.Server, *sto
 	adapters := plugin.NewProviderRegistry()
 	adapters.MustRegister(provider.NewGenericHTTPAdapter())
 
+	searchReg := plugin.NewSearchRegistry()
+	searchReg.MustRegister(search.NewTavilyEngine(nil))
+	searchReg.MustRegister(search.NewSearXNGEngine(nil))
+
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Config: config.Config{
 			AccessToken: token,
@@ -63,9 +71,14 @@ func newGatewayFixtureServer(t *testing.T, token string) (*httptest.Server, *sto
 			CORSOrigins: []string{"*"},
 		},
 		Formats:             formats,
+		Adapters:            adapters,
 		ProviderService:     service.NewProviderService(provStore, formats, adapters),
-		ConversationService: service.NewConversationService(convStore, msgStore),
-		ChatService:         service.NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}),
+		AssistantService:    service.NewAssistantService(assistStore),
+		ConversationService: service.NewConversationService(convStore, msgStore).WithAssistants(assistStore),
+		PluginService:       service.NewPluginService(searchReg, searchStore, mcpStore),
+		ChatService: service.NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
+			WithAssistants(assistStore).
+			WithSearch(searchReg, searchStore),
 	})
 
 	srv := httptest.NewServer(router)
@@ -620,5 +633,133 @@ func TestGatewayClientCancelAbortsUpstreamAndPersistsPartial(t *testing.T) {
 	}
 	if !savedAborted {
 		t.Fatal("expected aborted message with partial text to be persisted")
+	}
+}
+
+func TestGatewayV11ProbeSearchUserRetryAndBranch(t *testing.T) {
+	const gwToken = "v11-secret"
+	gw, _ := newGatewayFixtureServer(t, gwToken)
+
+	searchMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"title": "Go 1.27 Notes", "url": "https://go.dev/1.27", "content": "Fast runtime"},
+			},
+		})
+	}))
+	defer searchMock.Close()
+
+	llmMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/models" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []map[string]any{{"id": "gpt-4.1"}},
+			})
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Grounded reply\"},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer llmMock.Close()
+
+	pResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/providers", gwToken, map[string]any{
+		"id":       "p-v11",
+		"name":     "V11",
+		"adapter":  "generic-http",
+		"baseURL":  llmMock.URL + "/v1",
+		"authType": "bearer",
+		"apiKey":   "sk-v11-test",
+		"models":   []map[string]any{{"id": "gpt-4.1", "name": "GPT-4.1", "apiFormat": "openai-completions"}},
+	})
+	pResp.Body.Close()
+
+	// Probe connection & fetch models without passing apiKey again.
+	testResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/providers/p-v11/test", gwToken, map[string]any{})
+	var testBody service.ProviderConnectionResult
+	_ = json.NewDecoder(testResp.Body).Decode(&testBody)
+	testResp.Body.Close()
+	if testResp.StatusCode != http.StatusOK || !testBody.OK || testBody.ModelCount != 1 {
+		t.Fatalf("unexpected provider test response: status=%d body=%+v", testResp.StatusCode, testBody)
+	}
+
+	fetchResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/providers/p-v11/models/fetch", gwToken, map[string]any{})
+	var fetchBody struct {
+		Models []domain.DiscoveredModel `json:"models"`
+	}
+	_ = json.NewDecoder(fetchResp.Body).Decode(&fetchBody)
+	fetchResp.Body.Close()
+	if fetchResp.StatusCode != http.StatusOK || len(fetchBody.Models) != 1 || fetchBody.Models[0].ID != "gpt-4.1" {
+		t.Fatalf("unexpected fetch models response: status=%d body=%+v", fetchResp.StatusCode, fetchBody)
+	}
+
+	// Configure SearXNG and test search endpoint.
+	updSearch := apiDo(t, http.MethodPut, gw.URL+"/api/v1/plugins/search/searxng", gwToken, map[string]any{
+		"enabled":   true,
+		"endpoint":  searchMock.URL + "/search",
+		"isDefault": true,
+	})
+	updSearch.Body.Close()
+	if updSearch.StatusCode != http.StatusOK {
+		t.Fatalf("PUT search failed: %d", updSearch.StatusCode)
+	}
+
+	testSearch := apiDo(t, http.MethodPost, gw.URL+"/api/v1/plugins/search/searxng/test", gwToken, map[string]any{
+		"query": "Go",
+	})
+	var searchTestBody service.SearchEngineTestResult
+	_ = json.NewDecoder(testSearch.Body).Decode(&searchTestBody)
+	testSearch.Body.Close()
+	if testSearch.StatusCode != http.StatusOK || !searchTestBody.OK || searchTestBody.ResultCount != 1 {
+		t.Fatalf("unexpected search test response: status=%d body=%+v", testSearch.StatusCode, searchTestBody)
+	}
+
+	// Create conversation, stream with webSearch=true, then retry on user message ID.
+	cResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations", gwToken, map[string]any{
+		"providerId": "p-v11",
+		"modelId":    "gpt-4.1",
+	})
+	var convWrap struct {
+		Conversation domain.Conversation `json:"conversation"`
+	}
+	_ = json.NewDecoder(cResp.Body).Decode(&convWrap)
+	cResp.Body.Close()
+
+	streamResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+convWrap.Conversation.ID+"/messages/stream", gwToken, map[string]any{
+		"text":      "Go 1.27 changes?",
+		"webSearch": true,
+	})
+	events := readSSEEvents(t, streamResp)
+	var sawWebSearch bool
+	for _, ev := range events {
+		if ev.Type == domain.StreamEventBlockEnd && ev.Index != nil && *ev.Index == 0 && ev.Block != nil && ev.Block.Type == domain.BlockTypeWebSearch {
+			sawWebSearch = true
+		}
+	}
+	if !sawWebSearch {
+		t.Fatalf("expected webSearch block at index 0 in SSE stream: %+v", events)
+	}
+
+	detailResp := apiDo(t, http.MethodGet, gw.URL+"/api/v1/conversations/"+convWrap.Conversation.ID, gwToken, nil)
+	var detail service.ConversationDetail
+	_ = json.NewDecoder(detailResp.Body).Decode(&detail)
+	detailResp.Body.Close()
+	if len(detail.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(detail.Messages))
+	}
+	userMsgID := detail.Messages[0].ID
+
+	// Regenerate targeting userMsgID retains user message and produces fresh assistant message.
+	regenResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+convWrap.Conversation.ID+"/messages/stream", gwToken, map[string]any{
+		"regenerateMessageId": userMsgID,
+		"webSearch":           true,
+	})
+	_ = readSSEEvents(t, regenResp)
+
+	afterRegen := apiDo(t, http.MethodGet, gw.URL+"/api/v1/conversations/"+convWrap.Conversation.ID, gwToken, nil)
+	var detailAfter service.ConversationDetail
+	_ = json.NewDecoder(afterRegen.Body).Decode(&detailAfter)
+	afterRegen.Body.Close()
+	if len(detailAfter.Messages) != 2 || detailAfter.Messages[0].ID != userMsgID {
+		t.Fatalf("expected user message %s preserved after user-targeted retry, got %+v", userMsgID, detailAfter.Messages)
 	}
 }

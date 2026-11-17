@@ -15,6 +15,7 @@ import (
 	"llmstudio/backend/internal/httpapi"
 	"llmstudio/backend/internal/plugin"
 	"llmstudio/backend/internal/provider"
+	"llmstudio/backend/internal/search"
 	"llmstudio/backend/internal/service"
 	"llmstudio/backend/internal/store"
 )
@@ -33,8 +34,11 @@ func main() {
 	defer db.Close()
 
 	providerStore := store.NewProviderStore(db)
+	assistantStore := store.NewAssistantStore(db)
 	convStore := store.NewConversationStore(db)
 	msgStore := store.NewMessageStore(db)
+	searchStore := store.NewSearchConfigStore(db)
+	mcpStore := store.NewMCPServerStore(db)
 
 	if err := provider.SeedBuiltInProviders(ctx, providerStore); err != nil {
 		log.Fatalf("seed built-in providers failed: %v", err)
@@ -49,15 +53,26 @@ func main() {
 	adapters := plugin.NewProviderRegistry()
 	adapters.MustRegister(provider.NewGenericHTTPAdapter())
 
+	searchEngines := plugin.NewSearchRegistry()
+	searchEngines.MustRegister(search.NewTavilyEngine(nil))
+	searchEngines.MustRegister(search.NewSearXNGEngine(nil))
+
 	providerSvc := service.NewProviderService(providerStore, formats, adapters)
-	convSvc := service.NewConversationService(convStore, msgStore)
-	chatSvc := service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{})
+	assistantSvc := service.NewAssistantService(assistantStore)
+	convSvc := service.NewConversationService(convStore, msgStore).WithAssistants(assistantStore)
+	pluginSvc := service.NewPluginService(searchEngines, searchStore, mcpStore)
+	chatSvc := service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
+		WithAssistants(assistantStore).
+		WithSearch(searchEngines, searchStore)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Config:              cfg,
 		Formats:             formats,
+		Adapters:            adapters,
 		ProviderService:     providerSvc,
+		AssistantService:    assistantSvc,
 		ConversationService: convSvc,
+		PluginService:       pluginSvc,
 		ChatService:         chatSvc,
 	})
 

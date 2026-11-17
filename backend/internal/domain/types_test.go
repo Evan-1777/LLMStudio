@@ -144,8 +144,23 @@ func TestProviderConfigRedactionAndModelConfig(t *testing.T) {
 func TestConversationSyncDefaultsAndStreamEventZeroIndex(t *testing.T) {
 	var conv Conversation
 	NewConversationDefaults(&conv)
-	if conv.SyncEnabled || conv.SyncState != SyncStateLocalOnly || conv.SyncVersion != 0 || conv.LastSyncedAt != nil {
-		t.Fatalf("unexpected conversation sync defaults: %+v", conv)
+	if conv.AssistantID != DefaultAssistantID || conv.SyncEnabled || conv.SyncState != SyncStateLocalOnly || conv.SyncVersion != 0 || conv.LastSyncedAt != nil {
+		t.Fatalf("unexpected conversation defaults: %+v", conv)
+	}
+
+	rawSearch, err := json.Marshal(SearchEngineConfig{
+		EngineID:   "tavily",
+		Enabled:    true,
+		Endpoint:   "https://api.tavily.com/search",
+		APIKey:     "tvly-secret-123456",
+		MaxResults: 5,
+		IsDefault:  true,
+	})
+	if err != nil {
+		t.Fatalf("marshal SearchEngineConfig failed: %v", err)
+	}
+	if strings.Contains(string(rawSearch), "tvly-secret-123456") || !strings.Contains(string(rawSearch), `"apiKeySet":true`) {
+		t.Fatalf("SearchEngineConfig redaction failed: %s", string(rawSearch))
 	}
 
 	ev := StreamEvent{

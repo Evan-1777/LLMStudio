@@ -13,6 +13,27 @@ const (
 	BlockTypeImage      = "image"
 	BlockTypeToolCall   = "toolCall"
 	BlockTypeToolResult = "toolResult"
+	BlockTypeWebSearch  = "webSearch"
+)
+
+// Reasoning effort levels.
+const (
+	EffortNone   = "none"
+	EffortLow    = "low"
+	EffortMedium = "medium"
+	EffortHigh   = "high"
+	EffortXHigh  = "xhigh"
+	EffortMax    = "max"
+)
+
+// DefaultAssistantID identifies the built-in fallback assistant.
+const DefaultAssistantID = "default"
+
+// MCP transport types.
+const (
+	MCPTransportStdio          = "stdio"
+	MCPTransportSSE            = "sse"
+	MCPTransportStreamableHTTP = "streamable-http"
 )
 
 // Message roles.
@@ -236,9 +257,87 @@ type Message struct {
 	CreatedAt      time.Time      `json:"createdAt"`
 }
 
+// Assistant represents a reusable persona preset bound to conversations.
+type Assistant struct {
+	ID                string           `json:"id"`
+	Name              string           `json:"name"`
+	SystemPrompt      string           `json:"systemPrompt,omitempty"`
+	DefaultProviderID string           `json:"defaultProviderId,omitempty"`
+	DefaultModelID    string           `json:"defaultModelId,omitempty"`
+	Params            GenerationParams `json:"params"`
+	IsDefault         bool             `json:"isDefault"`
+	CreatedAt         time.Time        `json:"createdAt"`
+	UpdatedAt         time.Time        `json:"updatedAt"`
+}
+
+// SearchEngineConfig stores persisted settings for a registered search engine plugin.
+// APIKey is accepted on JSON unmarshaling and redacted on MarshalJSON output.
+type SearchEngineConfig struct {
+	EngineID   string    `json:"engineId"`
+	Enabled    bool      `json:"enabled"`
+	Endpoint   string    `json:"endpoint"`
+	APIKey     string    `json:"apiKey,omitempty"`
+	MaxResults int       `json:"maxResults"`
+	IsDefault  bool      `json:"isDefault"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+type searchEngineConfigWire struct {
+	EngineID     string    `json:"engineId"`
+	Enabled      bool      `json:"enabled"`
+	Endpoint     string    `json:"endpoint"`
+	APIKeyMasked string    `json:"apiKeyMasked"`
+	APIKeySet    bool      `json:"apiKeySet"`
+	MaxResults   int       `json:"maxResults"`
+	IsDefault    bool      `json:"isDefault"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
+// MarshalJSON redacts APIKey and exposes apiKeyMasked and apiKeySet instead.
+func (s SearchEngineConfig) MarshalJSON() ([]byte, error) {
+	return json.Marshal(searchEngineConfigWire{
+		EngineID:     s.EngineID,
+		Enabled:      s.Enabled,
+		Endpoint:     s.Endpoint,
+		APIKeyMasked: MaskAPIKey(s.APIKey),
+		APIKeySet:    strings.TrimSpace(s.APIKey) != "",
+		MaxResults:   s.MaxResults,
+		IsDefault:    s.IsDefault,
+		UpdatedAt:    s.UpdatedAt,
+	})
+}
+
+// MCPServerConfig defines a configured MCP server connection.
+type MCPServerConfig struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Transport string            `json:"transport"`
+	Endpoint  string            `json:"endpoint,omitempty"`
+	Command   string            `json:"command,omitempty"`
+	Args      []string          `json:"args"`
+	Env       map[string]string `json:"env,omitempty"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Enabled   bool              `json:"enabled"`
+	CreatedAt time.Time         `json:"createdAt"`
+	UpdatedAt time.Time         `json:"updatedAt"`
+}
+
+// DiscoveredModel represents a model normalized from an upstream provider listing.
+type DiscoveredModel struct {
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	Group           string   `json:"group"`
+	APIFormat       string   `json:"apiFormat"`
+	ContextWindow   int      `json:"contextWindow,omitempty"`
+	MaxTokens       int      `json:"maxTokens,omitempty"`
+	Reasoning       bool     `json:"reasoning,omitempty"`
+	InputModalities []string `json:"inputModalities,omitempty"`
+}
+
 // Conversation represents a chat session with reserved selective sync metadata.
 type Conversation struct {
 	ID           string           `json:"id"`
+	AssistantID  string           `json:"assistantId"`
 	Title        string           `json:"title"`
 	ProviderID   string           `json:"providerId,omitempty"`
 	ModelID      string           `json:"modelId,omitempty"`
@@ -252,8 +351,11 @@ type Conversation struct {
 	UpdatedAt    time.Time        `json:"updatedAt"`
 }
 
-// NewConversationDefaults ensures reserved sync metadata fields carry canonical defaults.
+// NewConversationDefaults ensures reserved sync metadata and assistant defaults are populated.
 func NewConversationDefaults(c *Conversation) {
+	if c.AssistantID == "" {
+		c.AssistantID = DefaultAssistantID
+	}
 	if c.SyncState == "" {
 		c.SyncState = SyncStateLocalOnly
 	}

@@ -191,3 +191,113 @@ func TestGoogleGenAIEncodeAndDecode(t *testing.T) {
 		t.Fatalf("missing expected gemini stream outputs: %+v", events)
 	}
 }
+
+func TestAnthropicAndGoogleSixEffortLevelsWithoutReasoningFlag(t *testing.T) {
+	ant := NewAnthropicMessagesFormat()
+	gem := NewGoogleGenAIFormat()
+	if ant.DefaultPath() != "/v1/messages" || gem.DefaultPath() != "/v1beta/models/{model}:streamGenerateContent" {
+		t.Fatalf("unexpected default paths: ant=%q gem=%q", ant.DefaultPath(), gem.DefaultPath())
+	}
+
+	temp := 0.4
+	// Anthropic: none -> no thinking block & temperature preserved.
+	noneReq, err := ant.EncodeRequest(context.Background(), plugin.ChatInput{
+		Model:    domain.ModelConfig{ID: "claude-3-5", Reasoning: false},
+		Params:   domain.GenerationParams{Temperature: &temp, ReasoningEffort: domain.EffortNone},
+		Messages: []domain.Message{{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatalf("anthropic none encode: %v", err)
+	}
+	var noneBody map[string]any
+	_ = json.Unmarshal(noneReq.Body, &noneBody)
+	if noneBody["thinking"] != nil || noneBody["temperature"] != temp {
+		t.Fatalf("anthropic none should omit thinking and keep temperature: %+v", noneBody)
+	}
+
+	antBudgets := map[string]float64{
+		domain.EffortLow:    2048,
+		domain.EffortMedium: 4096,
+		domain.EffortHigh:   8192,
+		domain.EffortXHigh:  16384,
+		domain.EffortMax:    32768,
+	}
+	for effort, wantBudget := range antBudgets {
+		req, err := ant.EncodeRequest(context.Background(), plugin.ChatInput{
+			Model:    domain.ModelConfig{ID: "claude-3-5", Reasoning: false},
+			Params:   domain.GenerationParams{ReasoningEffort: effort},
+			Messages: []domain.Message{{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}}},
+		})
+		if err != nil {
+			t.Fatalf("anthropic %s encode: %v", effort, err)
+		}
+		var b map[string]any
+		_ = json.Unmarshal(req.Body, &b)
+		think := b["thinking"].(map[string]any)
+		if think["type"] != "enabled" || think["budget_tokens"] != wantBudget {
+			t.Fatalf("anthropic %s budget mismatch: got %+v want %v", effort, think, wantBudget)
+		}
+		if b["max_tokens"].(float64) <= wantBudget {
+			t.Fatalf("anthropic %s max_tokens should exceed budget: %+v", effort, b)
+		}
+	}
+
+	// Google: none -> thinkingBudget: 0; low..max -> budget; thinkingLevel override -> thinkingLevel uppercase.
+	gemNoneReq, err := gem.EncodeRequest(context.Background(), plugin.ChatInput{
+		Model:    domain.ModelConfig{ID: "gemini-2.5", Reasoning: false},
+		Params:   domain.GenerationParams{ReasoningEffort: domain.EffortNone},
+		Messages: []domain.Message{{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatalf("gemini none encode: %v", err)
+	}
+	var gemNoneBody map[string]any
+	_ = json.Unmarshal(gemNoneReq.Body, &gemNoneBody)
+	tcNone := gemNoneBody["generationConfig"].(map[string]any)["thinkingConfig"].(map[string]any)
+	if tcNone["thinkingBudget"] != float64(0) || tcNone["includeThoughts"] != nil {
+		t.Fatalf("unexpected gemini none thinkingConfig: %+v", tcNone)
+	}
+
+	gemBudgets := map[string]float64{
+		domain.EffortLow:    1024,
+		domain.EffortMedium: 4096,
+		domain.EffortHigh:   8192,
+		domain.EffortXHigh:  16384,
+		domain.EffortMax:    24576,
+	}
+	for effort, wantBudget := range gemBudgets {
+		req, err := gem.EncodeRequest(context.Background(), plugin.ChatInput{
+			Model:    domain.ModelConfig{ID: "gemini-2.5", Reasoning: false},
+			Params:   domain.GenerationParams{ReasoningEffort: effort},
+			Messages: []domain.Message{{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}}},
+		})
+		if err != nil {
+			t.Fatalf("gemini %s encode: %v", effort, err)
+		}
+		var b map[string]any
+		_ = json.Unmarshal(req.Body, &b)
+		tc := b["generationConfig"].(map[string]any)["thinkingConfig"].(map[string]any)
+		if tc["includeThoughts"] != true || tc["thinkingBudget"] != wantBudget {
+			t.Fatalf("gemini %s budget mismatch: %+v", effort, tc)
+		}
+	}
+
+	lvlReq, err := gem.EncodeRequest(context.Background(), plugin.ChatInput{
+		Model: domain.ModelConfig{
+			ID:        "gemini-3",
+			Reasoning: false,
+		},
+		Compat:   domain.CompatConfig{ReasoningEffortField: "thinkingLevel"},
+		Params:   domain.GenerationParams{ReasoningEffort: domain.EffortXHigh},
+		Messages: []domain.Message{{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}}},
+	})
+	if err != nil {
+		t.Fatalf("gemini thinkingLevel encode: %v", err)
+	}
+	var lvlBody map[string]any
+	_ = json.Unmarshal(lvlReq.Body, &lvlBody)
+	tcLvl := lvlBody["generationConfig"].(map[string]any)["thinkingConfig"].(map[string]any)
+	if tcLvl["includeThoughts"] != true || tcLvl["thinkingLevel"] != "XHIGH" {
+		t.Fatalf("gemini thinkingLevel mismatch: %+v", tcLvl)
+	}
+}

@@ -84,17 +84,20 @@ class FormatInfo {
   const FormatInfo({
     required this.id,
     required this.displayName,
+    this.defaultPath = '',
     this.defaultCompat = const CompatConfig(),
   });
 
   final String id;
   final String displayName;
+  final String defaultPath;
   final CompatConfig defaultCompat;
 
   factory FormatInfo.fromJson(Map<String, dynamic> json) {
     return FormatInfo(
       id: json['id'] as String? ?? '',
       displayName: json['displayName'] as String? ?? '',
+      defaultPath: json['defaultPath'] as String? ?? '',
       defaultCompat: CompatConfig.fromJson(
         json['defaultCompat'] as Map<String, dynamic>?,
       ),

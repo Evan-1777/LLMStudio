@@ -9,12 +9,14 @@ class ConversationsController extends ChangeNotifier {
   final GatewayClient gateway;
 
   List<Conversation> _conversations = const [];
+  String _activeAssistantId = 'default';
   String? _activeId;
   String _searchQuery = '';
   bool _isLoading = false;
   String? _error;
 
   List<Conversation> get conversations => _conversations;
+  String get activeAssistantId => _activeAssistantId;
   String? get activeId => _activeId;
   String get searchQuery => _searchQuery;
   bool get isLoading => _isLoading;
@@ -29,12 +31,23 @@ class ConversationsController extends ChangeNotifier {
     return null;
   }
 
+  List<Conversation> get assistantConversations =>
+      _conversations.where((c) => c.assistantId == _activeAssistantId).toList();
+
   List<Conversation> get filteredConversations {
+    final scoped = assistantConversations;
     final q = _searchQuery.trim().toLowerCase();
-    if (q.isEmpty) return _conversations;
-    return _conversations
-        .where((c) => c.title.toLowerCase().contains(q))
-        .toList();
+    if (q.isEmpty) return scoped;
+    return scoped.where((c) => c.title.toLowerCase().contains(q)).toList();
+  }
+
+  void setActiveAssistantId(String assistantId) {
+    final normalized = assistantId.trim().isEmpty ? 'default' : assistantId;
+    if (_activeAssistantId == normalized) return;
+    _activeAssistantId = normalized;
+    final scoped = assistantConversations;
+    _activeId = scoped.isNotEmpty ? scoped.first.id : null;
+    notifyListeners();
   }
 
   void setSearchQuery(String value) {
@@ -69,12 +82,12 @@ class ConversationsController extends ChangeNotifier {
     notifyListeners();
     try {
       _conversations = await gateway.listConversations();
-      if (_activeId != null &&
-          !_conversations.any((c) => c.id == _activeId)) {
+      final scoped = assistantConversations;
+      if (_activeId != null && !scoped.any((c) => c.id == _activeId)) {
         _activeId = null;
       }
-      if (selectFirstIfEmpty && _activeId == null && _conversations.isNotEmpty) {
-        _activeId = _conversations.first.id;
+      if (selectFirstIfEmpty && _activeId == null && scoped.isNotEmpty) {
+        _activeId = scoped.first.id;
       }
     } catch (e) {
       _error = e.toString();
@@ -85,13 +98,17 @@ class ConversationsController extends ChangeNotifier {
   }
 
   Future<Conversation> createConversation({
+    String? assistantId,
     String title = '',
     String providerId = '',
     String modelId = '',
     String systemPrompt = '',
     GenerationParams? params,
   }) async {
+    final effectiveAssistantId = (assistantId ?? _activeAssistantId).trim();
     final created = await gateway.createConversation(
+      assistantId:
+          effectiveAssistantId.isEmpty ? 'default' : effectiveAssistantId,
       title: title,
       providerId: providerId,
       modelId: modelId,
@@ -99,6 +116,7 @@ class ConversationsController extends ChangeNotifier {
       params: params,
     );
     _conversations = [created, ..._conversations];
+    _activeAssistantId = created.assistantId;
     _activeId = created.id;
     notifyListeners();
     return created;
@@ -106,6 +124,7 @@ class ConversationsController extends ChangeNotifier {
 
   Future<Conversation> patchConversation(
     String id, {
+    String? assistantId,
     String? title,
     String? providerId,
     String? modelId,
@@ -115,6 +134,7 @@ class ConversationsController extends ChangeNotifier {
   }) async {
     final updated = await gateway.patchConversation(
       id,
+      assistantId: assistantId,
       title: title,
       providerId: providerId,
       modelId: modelId,
@@ -130,11 +150,24 @@ class ConversationsController extends ChangeNotifier {
     return updated;
   }
 
+  Future<ConversationDetail> branchFromMessage(
+    String conversationId,
+    String messageId,
+  ) async {
+    final detail = await gateway.branchConversation(conversationId, messageId);
+    _conversations = [detail.conversation, ..._conversations];
+    _activeAssistantId = detail.conversation.assistantId;
+    _activeId = detail.conversation.id;
+    notifyListeners();
+    return detail;
+  }
+
   Future<void> deleteConversation(String id) async {
     await gateway.deleteConversation(id);
     _conversations = _conversations.where((c) => c.id != id).toList();
     if (_activeId == id) {
-      _activeId = _conversations.isNotEmpty ? _conversations.first.id : null;
+      final scoped = assistantConversations;
+      _activeId = scoped.isNotEmpty ? scoped.first.id : null;
     }
     notifyListeners();
   }

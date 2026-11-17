@@ -27,6 +27,7 @@ func NewAnthropicMessagesFormat() *AnthropicMessagesFormat {
 
 func (f *AnthropicMessagesFormat) ID() string          { return FormatIDAnthropicMessages }
 func (f *AnthropicMessagesFormat) DisplayName() string { return "Anthropic Messages" }
+func (f *AnthropicMessagesFormat) DefaultPath() string { return "/v1/messages" }
 
 func (f *AnthropicMessagesFormat) DefaultCompat() domain.CompatConfig {
 	return domain.CompatConfig{
@@ -130,9 +131,10 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 		body["system"] = input.SystemPrompt
 	}
 
+	effort := strings.ToLower(strings.TrimSpace(params.ReasoningEffort))
 	thinkingEnabled := false
-	if params.ReasoningEffort != "" && input.Model.Reasoning {
-		budget := anthropicThinkingBudget(params.ReasoningEffort)
+	if effort != "" && effort != domain.EffortNone {
+		budget := anthropicThinkingBudget(effort)
 		if maxTokens <= budget {
 			maxTokens = budget + 1024
 		}
@@ -165,7 +167,7 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 	headers.Set("anthropic-version", anthropicAPIVersion)
 	return plugin.EncodedRequest{
 		Method:      http.MethodPost,
-		DefaultPath: "/v1/messages",
+		DefaultPath: f.DefaultPath(),
 		Headers:     headers,
 		Body:        payload,
 	}, nil
@@ -211,11 +213,15 @@ func encodeAnthropicToolResult(b domain.ContentBlock) map[string]any {
 }
 
 func anthropicThinkingBudget(effort string) int {
-	switch strings.ToLower(effort) {
-	case "low":
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case domain.EffortLow:
 		return 2048
-	case "high":
+	case domain.EffortHigh:
 		return 8192
+	case domain.EffortXHigh:
+		return 16384
+	case domain.EffortMax:
+		return 32768
 	default:
 		return 4096
 	}

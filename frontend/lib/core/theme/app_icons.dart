@@ -134,6 +134,43 @@ abstract final class AppIcons {
   static final String key = _svg(
     '<circle cx="7.5" cy="15.5" r="4.5"/><path d="m10.8 12.2 8.7-8.7"/><path d="M17 6l3 3"/>',
   );
+
+  static final String globe = _svg(
+    '<circle cx="12" cy="12" r="9"/><path d="M3.6 9h16.8"/><path d="M3.6 15h16.8"/>'
+    '<path d="M12 3a13.5 13.5 0 0 1 0 18"/><path d="M12 3a13.5 13.5 0 0 0 0 18"/>',
+  );
+
+  static final String attachment = _svg(
+    '<path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/>',
+  );
+
+  static final String branch = _svg(
+    '<line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/>'
+    '<circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>',
+  );
+
+  static final String lightbulb = _svg(
+    '<path d="M15 14c.2-1 .7-1.7 1.5-2.5 1-.9 1.5-2.2 1.5-3.5A6 6 0 0 0 6 8c0 1 .2 2.2 1.5 3.5.7.7 1.3 1.5 1.5 2.5"/>'
+    '<path d="M9 18h6"/><path d="M10 22h4"/>',
+  );
+
+  static final String bot = _svg(
+    '<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/>'
+    '<path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>',
+  );
+
+  static final String plugin = _svg(
+    '<path d="M12 2v5"/><path d="M6 7h12v4a6 6 0 0 1-12 0V7Z"/>'
+    '<path d="M12 17v5"/><path d="M9 7V3"/><path d="M15 7V3"/>',
+  );
+
+  static final String arrowLeft = _svg(
+    '<path d="M19 12H5"/><path d="m12 19-7-7 7-7"/>',
+  );
+
+  static final String folder = _svg(
+    '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/>',
+  );
 }
 
 /// Renders an inline SVG icon tinted with the active Material 3 ColorScheme.

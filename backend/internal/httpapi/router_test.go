@@ -17,6 +17,7 @@ import (
 	"llmstudio/backend/internal/format"
 	"llmstudio/backend/internal/plugin"
 	"llmstudio/backend/internal/provider"
+	"llmstudio/backend/internal/search"
 	"llmstudio/backend/internal/service"
 	"llmstudio/backend/internal/store"
 )
@@ -31,8 +32,11 @@ func setupTestRouter(t *testing.T, token string, devMode bool) http.Handler {
 	t.Cleanup(func() { _ = db.Close() })
 
 	providerStore := store.NewProviderStore(db)
+	assistantStore := store.NewAssistantStore(db)
 	convStore := store.NewConversationStore(db)
 	msgStore := store.NewMessageStore(db)
+	searchStore := store.NewSearchConfigStore(db)
+	mcpStore := store.NewMCPServerStore(db)
 
 	formats := plugin.NewFormatRegistry()
 	formats.MustRegister(format.NewOpenAICompletionsFormat())
@@ -43,6 +47,10 @@ func setupTestRouter(t *testing.T, token string, devMode bool) http.Handler {
 	adapters := plugin.NewProviderRegistry()
 	adapters.MustRegister(provider.NewGenericHTTPAdapter())
 
+	searchReg := plugin.NewSearchRegistry()
+	searchReg.MustRegister(search.NewTavilyEngine(nil))
+	searchReg.MustRegister(search.NewSearXNGEngine(nil))
+
 	return NewRouter(RouterDeps{
 		Config: config.Config{
 			AccessToken: token,
@@ -50,9 +58,14 @@ func setupTestRouter(t *testing.T, token string, devMode bool) http.Handler {
 			CORSOrigins: []string{"*"},
 		},
 		Formats:             formats,
+		Adapters:            adapters,
 		ProviderService:     service.NewProviderService(providerStore, formats, adapters),
-		ConversationService: service.NewConversationService(convStore, msgStore),
-		ChatService:         service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}),
+		AssistantService:    service.NewAssistantService(assistantStore),
+		ConversationService: service.NewConversationService(convStore, msgStore).WithAssistants(assistantStore),
+		PluginService:       service.NewPluginService(searchReg, searchStore, mcpStore),
+		ChatService: service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
+			WithAssistants(assistantStore).
+			WithSearch(searchReg, searchStore),
 	})
 }
 
@@ -84,11 +97,12 @@ func TestRouterEndpointsAndStreamCancellation(t *testing.T) {
 		t.Fatalf("GET /formats status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var fmtResp struct {
-		Formats []plugin.FormatInfo `json:"formats"`
+		Formats  []plugin.FormatInfo          `json:"formats"`
+		Adapters []plugin.ProviderAdapterInfo `json:"adapters"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &fmtResp)
-	if len(fmtResp.Formats) != 4 {
-		t.Fatalf("expected 4 formats, got %d", len(fmtResp.Formats))
+	if len(fmtResp.Formats) != 4 || len(fmtResp.Adapters) != 1 || fmtResp.Formats[0].DefaultPath == "" {
+		t.Fatalf("expected 4 formats with defaultPath and 1 adapter, got %+v", fmtResp)
 	}
 
 	// 2. Mock upstream SSE server (supports both fast completion and cancelable slow stream).
@@ -286,5 +300,49 @@ func TestRouterEndpointsAndStreamCancellation(t *testing.T) {
 	}
 	if !abortedFound {
 		t.Fatalf("expected aborted partial message to be persisted, got %+v", detail.Messages)
+	}
+
+	// 8. Assistants, MCP servers, message delete, and branch endpoints.
+	assistRec := doJSONReq(t, router, http.MethodPost, "/api/v1/assistants", tok, map[string]any{
+		"name":         "Reviewer",
+		"systemPrompt": "Review code",
+	})
+	if assistRec.Code != http.StatusCreated {
+		t.Fatalf("POST /assistants status=%d body=%s", assistRec.Code, assistRec.Body.String())
+	}
+	var assistWrap struct {
+		Assistant domain.Assistant `json:"assistant"`
+	}
+	_ = json.Unmarshal(assistRec.Body.Bytes(), &assistWrap)
+	if delDef := doJSONReq(t, router, http.MethodDelete, "/api/v1/assistants/default", tok, nil); delDef.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 deleting default assistant, got %d", delDef.Code)
+	}
+	if delCustom := doJSONReq(t, router, http.MethodDelete, "/api/v1/assistants/"+assistWrap.Assistant.ID, tok, nil); delCustom.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 deleting custom assistant, got %d", delCustom.Code)
+	}
+
+	branchRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/"+convID+"/messages/"+detail.Messages[1].ID+"/branch", tok, nil)
+	if branchRec.Code != http.StatusCreated {
+		t.Fatalf("POST /branch status=%d body=%s", branchRec.Code, branchRec.Body.String())
+	}
+	var branched service.ConversationDetail
+	_ = json.Unmarshal(branchRec.Body.Bytes(), &branched)
+	if len(branched.Messages) != 2 || !strings.HasSuffix(branched.Conversation.Title, "(分支)") {
+		t.Fatalf("unexpected branch detail: %+v", branched)
+	}
+
+	delMsgRec := doJSONReq(t, router, http.MethodDelete, "/api/v1/conversations/"+convID+"/messages/"+detail.Messages[3].ID, tok, nil)
+	if delMsgRec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE message status=%d body=%s", delMsgRec.Code, delMsgRec.Body.String())
+	}
+
+	mcpRec := doJSONReq(t, router, http.MethodPost, "/api/v1/mcp/servers", tok, map[string]any{
+		"name":      "local-mcp",
+		"transport": "stdio",
+		"command":   "npx",
+		"args":      []string{"-y", "mcp-server"},
+	})
+	if mcpRec.Code != http.StatusCreated {
+		t.Fatalf("POST /mcp/servers status=%d body=%s", mcpRec.Code, mcpRec.Body.String())
 	}
 }

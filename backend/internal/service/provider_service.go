@@ -2,34 +2,56 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/plugin"
 	"llmstudio/backend/internal/store"
 )
 
+// ProviderProbeInput defines optional unsaved overrides when probing a provider connection or fetching models.
+type ProviderProbeInput struct {
+	BaseURL  string            `json:"baseURL,omitempty"`
+	AuthType string            `json:"authType,omitempty"`
+	APIKey   string            `json:"apiKey,omitempty"`
+	Headers  map[string]string `json:"headers,omitempty"`
+}
+
+// ProviderConnectionResult summarizes a provider connectivity check.
+type ProviderConnectionResult struct {
+	OK         bool   `json:"ok"`
+	LatencyMs  int64  `json:"latencyMs"`
+	ModelCount int    `json:"modelCount"`
+	Message    string `json:"message"`
+}
+
 // ProviderInput represents a create or update request for a provider configuration.
 type ProviderInput struct {
-	ID          string              `json:"id,omitempty"`
-	Name        string              `json:"name"`
-	Adapter     string              `json:"adapter"`
-	BaseURL     string              `json:"baseURL"`
-	AuthType    string              `json:"authType"`
-	APIKey      string              `json:"apiKey,omitempty"`
-	ClearAPIKey bool                `json:"clearApiKey,omitempty"`
-	Headers     map[string]string   `json:"headers,omitempty"`
+	ID          string               `json:"id,omitempty"`
+	Name        string               `json:"name"`
+	Adapter     string               `json:"adapter"`
+	BaseURL     string               `json:"baseURL"`
+	AuthType    string               `json:"authType"`
+	APIKey      string               `json:"apiKey,omitempty"`
+	ClearAPIKey bool                 `json:"clearApiKey,omitempty"`
+	Headers     map[string]string    `json:"headers,omitempty"`
 	Models      []domain.ModelConfig `json:"models"`
-	Enabled     *bool               `json:"enabled,omitempty"`
+	Enabled     *bool                `json:"enabled,omitempty"`
 }
 
 // ProviderService manages provider configurations and validates format/adapter bindings.
 type ProviderService struct {
-	store     *store.ProviderStore
-	formats   *plugin.FormatRegistry
-	providers *plugin.ProviderRegistry
+	store      *store.ProviderStore
+	formats    *plugin.FormatRegistry
+	providers  *plugin.ProviderRegistry
+	httpClient *http.Client
 }
 
 // NewProviderService constructs a ProviderService.
@@ -39,10 +61,19 @@ func NewProviderService(
 	providers *plugin.ProviderRegistry,
 ) *ProviderService {
 	return &ProviderService{
-		store:     store,
-		formats:   formats,
-		providers: providers,
+		store:      store,
+		formats:    formats,
+		providers:  providers,
+		httpClient: &http.Client{Timeout: 15 * time.Second},
 	}
+}
+
+// WithHTTPClient configures a custom HTTP client for upstream model discovery and probing.
+func (s *ProviderService) WithHTTPClient(client *http.Client) *ProviderService {
+	if client != nil {
+		s.httpClient = client
+	}
+	return s
 }
 
 // List returns all configured providers.
@@ -121,6 +152,242 @@ func (s *ProviderService) Update(ctx context.Context, id string, in ProviderInpu
 // Delete removes a provider by ID.
 func (s *ProviderService) Delete(ctx context.Context, id string) error {
 	return s.store.Delete(ctx, id)
+}
+
+// TestConnection probes upstream reachability by fetching the provider's model listing.
+func (s *ProviderService) TestConnection(ctx context.Context, id string, probe ProviderProbeInput) (ProviderConnectionResult, error) {
+	start := time.Now()
+	models, err := s.FetchUpstreamModels(ctx, id, probe)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		return ProviderConnectionResult{}, err
+	}
+	return ProviderConnectionResult{
+		OK:         true,
+		LatencyMs:  latency,
+		ModelCount: len(models),
+		Message:    "连接正常",
+	}, nil
+}
+
+// FetchUpstreamModels queries the upstream provider models endpoint and normalizes OpenAI, Anthropic, and Gemini responses.
+func (s *ProviderService) FetchUpstreamModels(ctx context.Context, id string, probe ProviderProbeInput) ([]domain.DiscoveredModel, error) {
+	cfg, err := s.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if baseURL := strings.TrimSpace(probe.BaseURL); baseURL != "" {
+		cfg.BaseURL = baseURL
+	}
+	if authType := strings.TrimSpace(probe.AuthType); authType != "" {
+		cfg.AuthType = authType
+	}
+	if apiKey := strings.TrimSpace(probe.APIKey); apiKey != "" {
+		cfg.APIKey = apiKey
+	}
+	if probe.Headers != nil {
+		cfg.Headers = maps.Clone(probe.Headers)
+	}
+	if cfg.Adapter == "" {
+		cfg.Adapter = "generic-http"
+	}
+	if cfg.AuthType == "" {
+		cfg.AuthType = domain.AuthTypeBearer
+	}
+	parsed, err := url.Parse(strings.TrimSpace(cfg.BaseURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "valid baseURL with scheme and host is required", err)
+	}
+	adapter, ok := s.providers.Get(cfg.Adapter)
+	if !ok {
+		return nil, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unknown provider adapter %q", cfg.Adapter), nil)
+	}
+
+	protoKind, targetPath, defaultFormat := detectModelListProtocol(cfg)
+	endpoint, err := adapter.ResolveEndpoint(cfg, domain.ModelConfig{}, targetPath, nil, domain.CompatConfig{})
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.URL, nil)
+	if err != nil {
+		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "construct upstream models request failed", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	for k, vals := range endpoint.Headers {
+		for _, v := range vals {
+			req.Header.Add(k, v)
+		}
+	}
+	if protoKind == "anthropic" && req.Header.Get("anthropic-version") == "" {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+
+	client := s.httpClient
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream request failed: %v", err), err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, "failed to read upstream models response", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream returned HTTP %d: %s", resp.StatusCode, msg), nil)
+	}
+
+	models, err := parseDiscoveredModels(body, defaultFormat)
+	if err != nil {
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, err.Error(), err)
+	}
+	return models, nil
+}
+
+func detectModelListProtocol(cfg domain.ProviderConfig) (kind, path, defaultFormat string) {
+	lowerBase := strings.ToLower(cfg.BaseURL)
+	var firstFormat string
+	if len(cfg.Models) > 0 {
+		firstFormat = strings.TrimSpace(cfg.Models[0].APIFormat)
+	}
+
+	switch {
+	case cfg.AuthType == domain.AuthTypeQueryKey ||
+		strings.Contains(lowerBase, "generativelanguage") ||
+		strings.Contains(lowerBase, "/v1beta") ||
+		firstFormat == "google-generative-ai":
+		return "gemini", "/v1beta/models", "google-generative-ai"
+	case cfg.AuthType == domain.AuthTypeXAPIKey ||
+		strings.Contains(lowerBase, "anthropic") ||
+		firstFormat == "anthropic-messages":
+		return "anthropic", "/v1/models", "anthropic-messages"
+	default:
+		if firstFormat == "" {
+			firstFormat = "openai-completions"
+		}
+		return "openai", "/v1/models", firstFormat
+	}
+}
+
+type discoveredStandardItem struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	DisplayName   string `json:"display_name"`
+	ContextWindow int    `json:"context_window"`
+	MaxTokens     int    `json:"max_tokens"`
+	Reasoning     bool   `json:"reasoning"`
+}
+
+func parseDiscoveredModels(raw []byte, defaultFormat string) ([]domain.DiscoveredModel, error) {
+	type geminiItem struct {
+		Name             string `json:"name"`
+		DisplayName      string `json:"displayName"`
+		InputTokenLimit  int    `json:"inputTokenLimit"`
+		OutputTokenLimit int    `json:"outputTokenLimit"`
+		Thinking         bool   `json:"thinking"`
+	}
+
+	trimmed := strings.TrimSpace(string(raw))
+	if strings.HasPrefix(trimmed, "[") {
+		var items []discoveredStandardItem
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return nil, fmt.Errorf("invalid model list array: %w", err)
+		}
+		return normalizeStandardModels(items, defaultFormat), nil
+	}
+
+	var envelope struct {
+		Data   []discoveredStandardItem `json:"data"`
+		Models []geminiItem             `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, fmt.Errorf("invalid model list JSON: %w", err)
+	}
+	if len(envelope.Models) > 0 {
+		out := make([]domain.DiscoveredModel, 0, len(envelope.Models))
+		seen := make(map[string]struct{}, len(envelope.Models))
+		for _, m := range envelope.Models {
+			id := strings.TrimSpace(strings.TrimPrefix(m.Name, "models/"))
+			if id == "" {
+				continue
+			}
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			name := strings.TrimSpace(m.DisplayName)
+			if name == "" {
+				name = id
+			}
+			out = append(out, domain.DiscoveredModel{
+				ID:            id,
+				Name:          name,
+				Group:         deriveModelGroup(id),
+				APIFormat:     "google-generative-ai",
+				ContextWindow: m.InputTokenLimit,
+				MaxTokens:     m.OutputTokenLimit,
+				Reasoning:     m.Thinking,
+			})
+		}
+		return out, nil
+	}
+	return normalizeStandardModels(envelope.Data, defaultFormat), nil
+}
+
+func normalizeStandardModels(items []discoveredStandardItem, defaultFormat string) []domain.DiscoveredModel {
+	out := make([]domain.DiscoveredModel, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, m := range items {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		name := strings.TrimSpace(m.DisplayName)
+		if name == "" {
+			name = strings.TrimSpace(m.Name)
+		}
+		if name == "" {
+			name = id
+		}
+		apiFormat := defaultFormat
+		if strings.HasPrefix(strings.ToLower(id), "claude") {
+			apiFormat = "anthropic-messages"
+		} else if strings.HasPrefix(strings.ToLower(id), "gemini") {
+			apiFormat = "google-generative-ai"
+		}
+		out = append(out, domain.DiscoveredModel{
+			ID:            id,
+			Name:          name,
+			Group:         deriveModelGroup(id),
+			APIFormat:     apiFormat,
+			ContextWindow: m.ContextWindow,
+			MaxTokens:     m.MaxTokens,
+			Reasoning:     m.Reasoning,
+		})
+	}
+	return out
+}
+
+func deriveModelGroup(id string) string {
+	if prefix, _, ok := strings.Cut(id, "/"); ok && strings.TrimSpace(prefix) != "" {
+		return strings.TrimSpace(prefix)
+	}
+	if prefix, _, ok := strings.Cut(id, "-"); ok && strings.TrimSpace(prefix) != "" {
+		return strings.TrimSpace(prefix)
+	}
+	return "other"
 }
 
 func (s *ProviderService) normalizeAndValidate(cfg *domain.ProviderConfig) error {

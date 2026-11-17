@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 
 import '../../core/models/content_block.dart';
 import '../../core/models/message.dart';
+import '../../core/models/plugin_models.dart';
 import '../../core/state/chat_controller.dart';
 import '../../core/state/providers_controller.dart';
 import '../../core/state/settings_controller.dart';
@@ -25,13 +26,17 @@ class ChatCanvas extends StatefulWidget {
   const ChatCanvas({
     super.key,
     required this.onRetry,
-    required this.onRegenerate,
+    required this.onRetryMessage,
+    required this.onDeleteMessage,
+    required this.onBranchMessage,
     this.onOpenSettings,
     this.assistantTextBuilder,
   });
 
   final VoidCallback onRetry;
-  final ValueChanged<String> onRegenerate;
+  final ValueChanged<String> onRetryMessage;
+  final ValueChanged<String> onDeleteMessage;
+  final ValueChanged<String> onBranchMessage;
   final VoidCallback? onOpenSettings;
   final AssistantTextBuilder? assistantTextBuilder;
 
@@ -165,11 +170,11 @@ class _ChatCanvasState extends State<ChatCanvas> {
                   return _MessageRow(
                     message: msg,
                     isStreaming: isStreamingMsg,
+                    isBusy: chatCtrl.isBusy,
                     rendererRegistry: _rendererRegistry,
-                    onRegenerate:
-                        msg.role == 'assistant' && !msg.id.startsWith('local-')
-                            ? () => widget.onRegenerate(msg.id)
-                            : null,
+                    onRetry: () => widget.onRetryMessage(msg.id),
+                    onDelete: () => widget.onDeleteMessage(msg.id),
+                    onBranch: () => widget.onBranchMessage(msg.id),
                     assistantTextBuilder: widget.assistantTextBuilder,
                   );
                 },
@@ -266,16 +271,80 @@ class _MessageRow extends StatelessWidget {
   const _MessageRow({
     required this.message,
     required this.isStreaming,
+    required this.isBusy,
     required this.rendererRegistry,
-    this.onRegenerate,
+    required this.onRetry,
+    required this.onDelete,
+    required this.onBranch,
     this.assistantTextBuilder,
   });
 
   final Message message;
   final bool isStreaming;
+  final bool isBusy;
   final ContentRendererRegistry rendererRegistry;
-  final VoidCallback? onRegenerate;
+  final VoidCallback onRetry;
+  final VoidCallback onDelete;
+  final VoidCallback onBranch;
   final AssistantTextBuilder? assistantTextBuilder;
+
+  Widget _buildActionBar(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final canMutate = !isBusy;
+    final canBranch = !isBusy && !message.id.startsWith('local-');
+
+    return Padding(
+      padding: const EdgeInsets.only(top: MdSpacing.xs),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _CopyMessageAction(
+            key: Key('msg_copy_${message.id}'),
+            text: message.plainText,
+          ),
+          AppIconAction(
+            key: Key('msg_retry_${message.id}'),
+            svg: AppIcons.refresh,
+            size: 16,
+            tooltip: '重试',
+            onPressed: canMutate ? onRetry : null,
+          ),
+          AppIconAction(
+            key: Key('msg_delete_${message.id}'),
+            svg: AppIcons.trash,
+            size: 16,
+            tooltip: '删除',
+            onPressed: canMutate ? onDelete : null,
+          ),
+          AppIconAction(
+            key: Key('msg_branch_${message.id}'),
+            svg: AppIcons.branch,
+            size: 16,
+            tooltip: '分支',
+            onPressed: canBranch ? onBranch : null,
+          ),
+          if (message.stopReason == 'aborted')
+            Container(
+              margin: const EdgeInsets.only(left: MdSpacing.sm),
+              padding: const EdgeInsets.symmetric(
+                horizontal: MdSpacing.sm,
+                vertical: 2,
+              ),
+              decoration: BoxDecoration(
+                color: scheme.surfaceContainerHigh,
+                borderRadius: BorderRadius.circular(MdRadii.full),
+              ),
+              child: Text(
+                '已终止',
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                      color: scheme.onSurfaceVariant,
+                    ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -283,25 +352,31 @@ class _MessageRow extends StatelessWidget {
     final isUser = message.role == 'user';
 
     if (isUser) {
-      return Align(
-        alignment: Alignment.centerRight,
-        child: Container(
-          constraints: const BoxConstraints(maxWidth: 620),
-          margin: const EdgeInsets.only(bottom: MdSpacing.lg),
-          padding: const EdgeInsets.symmetric(
-            horizontal: MdSpacing.lg,
-            vertical: MdSpacing.md,
-          ),
-          decoration: BoxDecoration(
-            color: scheme.secondaryContainer,
-            borderRadius: BorderRadius.circular(MdRadii.lg),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              for (final block in message.blocks) _buildBlock(context, block),
-            ],
-          ),
+      return Padding(
+        padding: const EdgeInsets.only(bottom: MdSpacing.lg),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            Container(
+              constraints: const BoxConstraints(maxWidth: 620),
+              padding: const EdgeInsets.symmetric(
+                horizontal: MdSpacing.lg,
+                vertical: MdSpacing.md,
+              ),
+              decoration: BoxDecoration(
+                color: scheme.secondaryContainer,
+                borderRadius: BorderRadius.circular(MdRadii.lg),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  for (final block in message.blocks)
+                    _buildBlock(context, block),
+                ],
+              ),
+            ),
+            if (!isStreaming) _buildActionBar(context),
+          ],
         ),
       );
     }
@@ -312,40 +387,7 @@ class _MessageRow extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           for (final block in message.blocks) _buildBlock(context, block),
-          if (!isStreaming)
-            Padding(
-              padding: const EdgeInsets.only(top: MdSpacing.xs),
-              child: Row(
-                children: [
-                  _CopyMessageAction(text: message.plainText),
-                  if (onRegenerate != null)
-                    AppIconAction(
-                      svg: AppIcons.refresh,
-                      size: 16,
-                      tooltip: '重新生成',
-                      onPressed: onRegenerate,
-                    ),
-                  if (message.stopReason == 'aborted')
-                    Container(
-                      margin: const EdgeInsets.only(left: MdSpacing.sm),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: MdSpacing.sm,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: scheme.surfaceContainerHigh,
-                        borderRadius: BorderRadius.circular(MdRadii.full),
-                      ),
-                      child: Text(
-                        '已终止',
-                        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                              color: scheme.onSurfaceVariant,
-                            ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
+          if (!isStreaming) _buildActionBar(context),
         ],
       ),
     );
@@ -390,9 +432,9 @@ class _MessageRow extends StatelessWidget {
           thinking: thinking,
           initiallyExpanded: isStreaming,
         );
-      case ImageBlock(:final url):
+      case ImageBlock(:final url, :final mimeType):
         return Padding(
-          padding: const EdgeInsets.only(top: MdSpacing.sm),
+          padding: const EdgeInsets.only(top: MdSpacing.xs, bottom: MdSpacing.xs),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -404,7 +446,9 @@ class _MessageRow extends StatelessWidget {
               const SizedBox(width: MdSpacing.xs),
               Flexible(
                 child: Text(
-                  url.isNotEmpty ? url : 'Image',
+                  url.isNotEmpty
+                      ? url
+                      : (mimeType.isNotEmpty ? mimeType : '图片附件'),
                   overflow: TextOverflow.ellipsis,
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
@@ -422,12 +466,148 @@ class _MessageRow extends StatelessWidget {
           svg: isError ? AppIcons.warning : AppIcons.check,
           label: toolName.isNotEmpty ? toolName : 'toolResult',
         );
-      case ExtensionBlock(:final type):
+      case ExtensionBlock(:final type, :final extra):
+        if (type == 'webSearch') {
+          return _WebSearchCard(payload: WebSearchPayload.fromExtra(extra));
+        }
         return _CompactBlockChip(
           svg: AppIcons.code,
           label: type,
         );
     }
+  }
+}
+
+class _WebSearchCard extends StatefulWidget {
+  const _WebSearchCard({required this.payload});
+
+  final WebSearchPayload payload;
+
+  @override
+  State<_WebSearchCard> createState() => _WebSearchCardState();
+}
+
+class _WebSearchCardState extends State<_WebSearchCard> {
+  bool _expanded = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final textTheme = Theme.of(context).textTheme;
+    final p = widget.payload;
+    final hasError = p.error.isNotEmpty;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: MdSpacing.sm),
+      decoration: BoxDecoration(
+        color: hasError ? scheme.errorContainer : scheme.surfaceContainerLow,
+        borderRadius: BorderRadius.circular(MdRadii.md),
+        border: Border.all(
+          color: hasError ? scheme.error : scheme.outlineVariant,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          InkWell(
+            onTap: () => setState(() => _expanded = !_expanded),
+            borderRadius: BorderRadius.circular(MdRadii.md),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(
+                horizontal: MdSpacing.md,
+                vertical: MdSpacing.sm,
+              ),
+              child: Row(
+                children: [
+                  AppSvgIcon(
+                    hasError ? AppIcons.warning : AppIcons.globe,
+                    size: 15,
+                    color: hasError ? scheme.onErrorContainer : scheme.primary,
+                  ),
+                  const SizedBox(width: MdSpacing.sm),
+                  Expanded(
+                    child: Text(
+                      hasError
+                          ? '联网搜索失败 (${p.engineId})'
+                          : '联网搜索 · ${p.results.length} 条结果 (${p.engineId})',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: textTheme.labelMedium?.copyWith(
+                        color: hasError
+                            ? scheme.onErrorContainer
+                            : scheme.onSurface,
+                      ),
+                    ),
+                  ),
+                  AppSvgIcon(
+                    _expanded ? AppIcons.chevronUp : AppIcons.chevronDown,
+                    size: 16,
+                    color: hasError
+                        ? scheme.onErrorContainer
+                        : scheme.onSurfaceVariant,
+                  ),
+                ],
+              ),
+            ),
+          ),
+          if (_expanded)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(
+                MdSpacing.md,
+                0,
+                MdSpacing.md,
+                MdSpacing.md,
+              ),
+              child: hasError
+                  ? SelectableText(
+                      p.error,
+                      style: textTheme.bodySmall?.copyWith(
+                        color: scheme.onErrorContainer,
+                      ),
+                    )
+                  : Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (p.query.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: MdSpacing.xs),
+                            child: Text(
+                              '检索词: ${p.query}',
+                              style: textTheme.labelSmall?.copyWith(
+                                color: scheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ),
+                        for (var i = 0; i < p.results.length; i++) ...[
+                          if (i > 0) const SizedBox(height: MdSpacing.xs),
+                          Text(
+                            '${i + 1}. ${p.results[i].title}',
+                            style: textTheme.bodySmall?.copyWith(
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          SelectableText(
+                            p.results[i].url,
+                            style: textTheme.labelSmall?.copyWith(
+                              color: scheme.primary,
+                            ),
+                          ),
+                          if (p.results[i].snippet.isNotEmpty)
+                            Text(
+                              p.results[i].snippet,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: textTheme.bodySmall?.copyWith(
+                                color: scheme.onSurfaceVariant,
+                              ),
+                            ),
+                        ],
+                      ],
+                    ),
+            ),
+        ],
+      ),
+    );
   }
 }
 
@@ -553,7 +733,7 @@ class _CompactBlockChip extends StatelessWidget {
 }
 
 class _CopyMessageAction extends StatefulWidget {
-  const _CopyMessageAction({required this.text});
+  const _CopyMessageAction({super.key, required this.text});
 
   final String text;
 

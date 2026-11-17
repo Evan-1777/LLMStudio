@@ -4,8 +4,11 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
+import '../models/assistant.dart';
+import '../models/content_block.dart';
 import '../models/conversation.dart';
 import '../models/message.dart';
+import '../models/plugin_models.dart';
 import '../models/provider.dart';
 import '../models/stream_event.dart';
 
@@ -144,6 +147,7 @@ class GatewayClient {
   String baseUrl;
   String accessToken;
   final http.Client _client;
+  List<ProviderAdapterInfo> _lastLoadedAdapters = const [];
 
   void updateConfig({
     required String baseUrl,
@@ -227,10 +231,21 @@ class GatewayClient {
   Future<List<FormatInfo>> listFormats() async {
     final data = await _sendJson('GET', '/api/v1/formats');
     final raw = data['formats'] as List<dynamic>? ?? const [];
+    final rawAdapters = data['adapters'] as List<dynamic>? ?? const [];
+    _lastLoadedAdapters = rawAdapters
+        .whereType<Map<String, dynamic>>()
+        .map(ProviderAdapterInfo.fromJson)
+        .toList();
     return raw
         .whereType<Map<String, dynamic>>()
         .map(FormatInfo.fromJson)
         .toList();
+  }
+
+  Future<({List<FormatInfo> formats, List<ProviderAdapterInfo> adapters})>
+      listFormatsAndAdapters() async {
+    final formats = await listFormats();
+    return (formats: formats, adapters: _lastLoadedAdapters);
   }
 
   Future<List<ProviderConfig>> listProviders() async {
@@ -263,6 +278,86 @@ class GatewayClient {
     await _sendJson('DELETE', '/api/v1/providers/$id');
   }
 
+  Future<ProviderConnectionTestResult> testProviderConnection(
+    String id, {
+    String? baseUrl,
+    String? authType,
+    String? apiKey,
+    Map<String, String>? headers,
+  }) async {
+    final body = <String, dynamic>{
+      if (baseUrl != null && baseUrl.isNotEmpty) 'baseURL': baseUrl,
+      if (authType != null && authType.isNotEmpty) 'authType': authType,
+      if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+      'headers': ?headers,
+    };
+    final data = await _sendJson(
+      'POST',
+      '/api/v1/providers/$id/test',
+      body: body,
+    );
+    return ProviderConnectionTestResult.fromJson(data);
+  }
+
+  Future<List<DiscoveredModel>> fetchProviderModels(
+    String id, {
+    String? baseUrl,
+    String? authType,
+    String? apiKey,
+    Map<String, String>? headers,
+  }) async {
+    final body = <String, dynamic>{
+      if (baseUrl != null && baseUrl.isNotEmpty) 'baseURL': baseUrl,
+      if (authType != null && authType.isNotEmpty) 'authType': authType,
+      if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+      'headers': ?headers,
+    };
+    final data = await _sendJson(
+      'POST',
+      '/api/v1/providers/$id/models/fetch',
+      body: body,
+    );
+    final raw = data['models'] as List<dynamic>? ?? const [];
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map(DiscoveredModel.fromJson)
+        .toList();
+  }
+
+  Future<List<Assistant>> listAssistants() async {
+    final data = await _sendJson('GET', '/api/v1/assistants');
+    final raw = data['assistants'] as List<dynamic>? ?? const [];
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map(Assistant.fromJson)
+        .toList();
+  }
+
+  Future<Assistant> createAssistant(AssistantUpsertPayload payload) async {
+    final data = await _sendJson(
+      'POST',
+      '/api/v1/assistants',
+      body: payload.toJson(),
+    );
+    return Assistant.fromJson(data['assistant'] as Map<String, dynamic>);
+  }
+
+  Future<Assistant> updateAssistant(
+    String id,
+    AssistantUpsertPayload payload,
+  ) async {
+    final data = await _sendJson(
+      'PUT',
+      '/api/v1/assistants/$id',
+      body: payload.toJson(),
+    );
+    return Assistant.fromJson(data['assistant'] as Map<String, dynamic>);
+  }
+
+  Future<void> deleteAssistant(String id) async {
+    await _sendJson('DELETE', '/api/v1/assistants/$id');
+  }
+
   Future<List<Conversation>> listConversations() async {
     final data = await _sendJson('GET', '/api/v1/conversations');
     final raw = data['conversations'] as List<dynamic>? ?? const [];
@@ -273,6 +368,7 @@ class GatewayClient {
   }
 
   Future<Conversation> createConversation({
+    String assistantId = 'default',
     String title = '',
     String providerId = '',
     String modelId = '',
@@ -280,6 +376,7 @@ class GatewayClient {
     GenerationParams? params,
   }) async {
     final data = await _sendJson('POST', '/api/v1/conversations', body: {
+      if (assistantId.isNotEmpty) 'assistantId': assistantId,
       if (title.isNotEmpty) 'title': title,
       if (providerId.isNotEmpty) 'providerId': providerId,
       if (modelId.isNotEmpty) 'modelId': modelId,
@@ -296,6 +393,7 @@ class GatewayClient {
 
   Future<Conversation> patchConversation(
     String id, {
+    String? assistantId,
     String? title,
     String? providerId,
     String? modelId,
@@ -305,6 +403,7 @@ class GatewayClient {
     bool? syncEnabled,
   }) async {
     final body = <String, dynamic>{
+      'assistantId': ?assistantId,
       'title': ?title,
       'providerId': ?providerId,
       'modelId': ?modelId,
@@ -324,15 +423,130 @@ class GatewayClient {
     await _sendJson('DELETE', '/api/v1/conversations/$id');
   }
 
+  Future<void> deleteMessage(String conversationId, String messageId) async {
+    await _sendJson(
+      'DELETE',
+      '/api/v1/conversations/$conversationId/messages/$messageId',
+    );
+  }
+
+  Future<ConversationDetail> branchConversation(
+    String conversationId,
+    String messageId,
+  ) async {
+    final data = await _sendJson(
+      'POST',
+      '/api/v1/conversations/$conversationId/messages/$messageId/branch',
+      body: const {},
+    );
+    return ConversationDetail.fromJson(data);
+  }
+
+  Future<List<SearchEnginePluginConfig>> listSearchEngines() async {
+    final data = await _sendJson('GET', '/api/v1/plugins/search');
+    final raw = data['engines'] as List<dynamic>? ?? const [];
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map(SearchEnginePluginConfig.fromJson)
+        .toList();
+  }
+
+  Future<SearchEnginePluginConfig> updateSearchEngine(
+    String id, {
+    bool? enabled,
+    String? endpoint,
+    String? apiKey,
+    bool clearApiKey = false,
+    int? maxResults,
+    bool? isDefault,
+  }) async {
+    final body = <String, dynamic>{
+      'enabled': ?enabled,
+      'endpoint': ?endpoint,
+      if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+      if (clearApiKey) 'clearApiKey': true,
+      'maxResults': ?maxResults,
+      'isDefault': ?isDefault,
+    };
+    final data = await _sendJson(
+      'PUT',
+      '/api/v1/plugins/search/$id',
+      body: body,
+    );
+    return SearchEnginePluginConfig.fromJson(
+      data['engine'] as Map<String, dynamic>,
+    );
+  }
+
+  Future<SearchEngineTestResult> testSearchEngine(
+    String id, {
+    String? query,
+    String? endpoint,
+    String? apiKey,
+    int? maxResults,
+  }) async {
+    final body = <String, dynamic>{
+      if (query != null && query.isNotEmpty) 'query': query,
+      if (endpoint != null && endpoint.isNotEmpty) 'endpoint': endpoint,
+      if (apiKey != null && apiKey.isNotEmpty) 'apiKey': apiKey,
+      'maxResults': ?maxResults,
+    };
+    final data = await _sendJson(
+      'POST',
+      '/api/v1/plugins/search/$id/test',
+      body: body,
+    );
+    return SearchEngineTestResult.fromJson(data);
+  }
+
+  Future<List<McpServerConfig>> listMcpServers() async {
+    final data = await _sendJson('GET', '/api/v1/mcp/servers');
+    final raw = data['servers'] as List<dynamic>? ?? const [];
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map(McpServerConfig.fromJson)
+        .toList();
+  }
+
+  Future<McpServerConfig> createMcpServer(
+    McpServerUpsertPayload payload,
+  ) async {
+    final data = await _sendJson(
+      'POST',
+      '/api/v1/mcp/servers',
+      body: payload.toJson(),
+    );
+    return McpServerConfig.fromJson(data['server'] as Map<String, dynamic>);
+  }
+
+  Future<McpServerConfig> updateMcpServer(
+    String id,
+    McpServerUpsertPayload payload,
+  ) async {
+    final data = await _sendJson(
+      'PUT',
+      '/api/v1/mcp/servers/$id',
+      body: payload.toJson(),
+    );
+    return McpServerConfig.fromJson(data['server'] as Map<String, dynamic>);
+  }
+
+  Future<void> deleteMcpServer(String id) async {
+    await _sendJson('DELETE', '/api/v1/mcp/servers/$id');
+  }
+
   /// Streams chat events from the gateway and aborts the underlying HTTP request
   /// (fetch AbortController on Web) when [abortTrigger] completes.
   Stream<StreamEvent> streamChat({
     required String conversationId,
+    List<ContentBlock>? blocks,
     String? text,
     String? providerId,
     String? modelId,
     GenerationParams? params,
     String? regenerateMessageId,
+    bool webSearch = false,
+    String? searchEngineId,
     Future<void>? abortTrigger,
   }) async* {
     final req = http.AbortableRequest(
@@ -343,12 +557,18 @@ class GatewayClient {
     req.headers.addAll(_headers(includeJson: true));
     req.headers['Accept'] = 'text/event-stream';
     req.body = jsonEncode({
-      if (text != null && text.isNotEmpty) 'text': text,
+      if (blocks != null && blocks.isNotEmpty)
+        'blocks': blocks.map((b) => b.toJson()).toList()
+      else if (text != null && text.isNotEmpty)
+        'text': text,
       if (providerId != null && providerId.isNotEmpty) 'providerId': providerId,
       if (modelId != null && modelId.isNotEmpty) 'modelId': modelId,
       if (params != null && params.toJson().isNotEmpty) 'params': params.toJson(),
       if (regenerateMessageId != null && regenerateMessageId.isNotEmpty)
         'regenerateMessageId': regenerateMessageId,
+      if (webSearch) 'webSearch': true,
+      if (searchEngineId != null && searchEngineId.isNotEmpty)
+        'searchEngineId': searchEngineId,
     });
 
     final streamed = await _client.send(req);

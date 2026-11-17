@@ -37,6 +37,7 @@ type EncodedRequest struct {
 type APIFormat interface {
 	ID() string
 	DisplayName() string
+	DefaultPath() string
 	DefaultCompat() domain.CompatConfig
 	EncodeRequest(ctx context.Context, input ChatInput) (EncodedRequest, error)
 	DecodeStream(ctx context.Context, body io.Reader, emit func(domain.StreamEvent) error) error
@@ -46,6 +47,7 @@ type APIFormat interface {
 type FormatInfo struct {
 	ID            string              `json:"id"`
 	DisplayName   string              `json:"displayName"`
+	DefaultPath   string              `json:"defaultPath"`
 	DefaultCompat domain.CompatConfig `json:"defaultCompat"`
 }
 
@@ -106,6 +108,7 @@ func (r *FormatRegistry) List() []FormatInfo {
 		out = append(out, FormatInfo{
 			ID:            f.ID(),
 			DisplayName:   f.DisplayName(),
+			DefaultPath:   f.DefaultPath(),
 			DefaultCompat: f.DefaultCompat(),
 		})
 	}

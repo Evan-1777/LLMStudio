@@ -24,7 +24,7 @@ func NewConversationStore(db *sql.DB) *ConversationStore {
 // List returns all conversations sorted by most recently updated first.
 func (s *ConversationStore) List(ctx context.Context) ([]domain.Conversation, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, title, provider_id, model_id, system_prompt, params_json,
+		SELECT id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
 		       sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at
 		FROM conversations
 		ORDER BY updated_at DESC, rowid DESC
@@ -51,7 +51,7 @@ func (s *ConversationStore) List(ctx context.Context) ([]domain.Conversation, er
 // Get fetches a conversation by ID.
 func (s *ConversationStore) Get(ctx context.Context, id string) (domain.Conversation, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, title, provider_id, model_id, system_prompt, params_json,
+		SELECT id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
 		       sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at
 		FROM conversations
 		WHERE id = ?
@@ -91,10 +91,10 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO conversations (
-			id, title, provider_id, model_id, system_prompt, params_json,
+			id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
 			sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, c.ID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes),
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, c.ID, c.AssistantID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes),
 		boolToInt(c.SyncEnabled), c.SyncState, c.SyncVersion, lastSynced, formatTime(c.CreatedAt), formatTime(c.UpdatedAt))
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("create conversation: %w", err)
@@ -106,6 +106,7 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 // intentionally leaving sync_state and sync_version untouched until remote sync is implemented.
 func (s *ConversationStore) Update(ctx context.Context, c domain.Conversation) (domain.Conversation, error) {
 	c.UpdatedAt = time.Now().UTC()
+	domain.NewConversationDefaults(&c)
 	paramsBytes, err := json.Marshal(c.Params)
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("encode conversation params: %w", err)
@@ -113,9 +114,9 @@ func (s *ConversationStore) Update(ctx context.Context, c domain.Conversation) (
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE conversations
-		SET title = ?, provider_id = ?, model_id = ?, system_prompt = ?, params_json = ?, sync_enabled = ?, updated_at = ?
+		SET assistant_id = ?, title = ?, provider_id = ?, model_id = ?, system_prompt = ?, params_json = ?, sync_enabled = ?, updated_at = ?
 		WHERE id = ?
-	`, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes), boolToInt(c.SyncEnabled), formatTime(c.UpdatedAt), c.ID)
+	`, c.AssistantID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes), boolToInt(c.SyncEnabled), formatTime(c.UpdatedAt), c.ID)
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("update conversation %s: %w", c.ID, err)
 	}
@@ -164,11 +165,12 @@ func scanConversation(row rowScanner) (domain.Conversation, error) {
 		updatedRaw   string
 	)
 	if err := row.Scan(
-		&c.ID, &c.Title, &c.ProviderID, &c.ModelID, &c.SystemPrompt, &paramsJSON,
+		&c.ID, &c.AssistantID, &c.Title, &c.ProviderID, &c.ModelID, &c.SystemPrompt, &paramsJSON,
 		&syncEnabled, &c.SyncState, &c.SyncVersion, &lastSynced, &createdRaw, &updatedRaw,
 	); err != nil {
 		return domain.Conversation{}, err
 	}
+	domain.NewConversationDefaults(&c)
 	c.SyncEnabled = syncEnabled != 0
 	if paramsJSON != "" && paramsJSON != "{}" {
 		if err := json.Unmarshal([]byte(paramsJSON), &c.Params); err != nil {

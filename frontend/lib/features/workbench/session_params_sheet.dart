@@ -4,7 +4,6 @@ import 'package:provider/provider.dart';
 import '../../core/models/conversation.dart';
 import '../../core/state/chat_controller.dart';
 import '../../core/state/conversations_controller.dart';
-import '../../core/state/providers_controller.dart';
 import '../../core/theme/app_icons.dart';
 import '../../core/theme/md_tokens.dart';
 
@@ -25,7 +24,6 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
   final TextEditingController _maxTokensCtrl = TextEditingController();
   String? _loadedConvId;
   double? _temperature;
-  String _reasoningEffort = '';
   bool _saving = false;
 
   @override
@@ -42,7 +40,6 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
         _systemPromptCtrl.clear();
         _maxTokensCtrl.clear();
         _temperature = null;
-        _reasoningEffort = '';
       }
       return;
     }
@@ -51,7 +48,6 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
     _systemPromptCtrl.text = conv.systemPrompt;
     _temperature = conv.params.temperature;
     _maxTokensCtrl.text = conv.params.maxTokens?.toString() ?? '';
-    _reasoningEffort = conv.params.reasoningEffort;
   }
 
   Future<void> _applyChanges(Conversation conv) async {
@@ -64,7 +60,7 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
             params: GenerationParams(
               temperature: _temperature,
               maxTokens: parsedMax != null && parsedMax > 0 ? parsedMax : null,
-              reasoningEffort: _reasoningEffort,
+              reasoningEffort: conv.params.reasoningEffort,
             ),
             clearNullParams: true,
           );
@@ -81,7 +77,6 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
     setState(() {
       _temperature = null;
       _maxTokensCtrl.clear();
-      _reasoningEffort = '';
     });
     await _applyChanges(conv);
   }
@@ -90,11 +85,8 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final convsCtrl = context.watch<ConversationsController>();
-    final providersCtrl = context.watch<ProvidersController>();
     final conv = convsCtrl.activeConversation;
     _syncFromConversation(conv);
-
-    final options = providersCtrl.availableModels;
 
     return Container(
       color: scheme.surfaceContainer,
@@ -112,7 +104,7 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
               children: [
                 Expanded(
                   child: Text(
-                    '会话参数',
+                    '话题参数',
                     style: Theme.of(context).textTheme.titleSmall?.copyWith(
                           fontWeight: FontWeight.w600,
                         ),
@@ -135,60 +127,18 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
               child: ListView(
                 padding: const EdgeInsets.all(MdSpacing.lg),
                 children: [
-                  if (options.isNotEmpty) ...[
-                    Text(
-                      '模型',
-                      style: Theme.of(context).textTheme.labelMedium,
-                    ),
-                    const SizedBox(height: MdSpacing.xs),
-                    DropdownButtonFormField<String>(
-                      initialValue: options.any(
-                        (o) =>
-                            o.provider.id == conv.providerId &&
-                            o.model.id == conv.modelId,
-                      )
-                          ? '${conv.providerId}::${conv.modelId}'
-                          : null,
-                      isExpanded: true,
-                      decoration: const InputDecoration(isDense: true),
-                      items: [
-                        for (final opt in options)
-                          DropdownMenuItem<String>(
-                            value: '${opt.provider.id}::${opt.model.id}',
-                            child: Text(
-                              '${opt.provider.name} / ${opt.model.name}',
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                      ],
-                      onChanged: (val) async {
-                        if (val == null) return;
-                        final parts = val.split('::');
-                        if (parts.length != 2) return;
-                        await convsCtrl.patchConversation(
-                          conv.id,
-                          providerId: parts[0],
-                          modelId: parts[1],
-                        );
-                        if (!context.mounted) return;
-                        await context
-                            .read<ChatController>()
-                            .loadConversation(conv.id);
-                      },
-                    ),
-                    const SizedBox(height: MdSpacing.lg),
-                  ],
                   Text(
-                    '系统提示词',
+                    '系统提示词覆盖',
                     style: Theme.of(context).textTheme.labelMedium,
                   ),
                   const SizedBox(height: MdSpacing.xs),
                   TextField(
+                    key: const Key('session_system_prompt_field'),
                     controller: _systemPromptCtrl,
                     maxLines: 5,
                     minLines: 3,
                     decoration: const InputDecoration(
-                      hintText: 'System prompt',
+                      hintText: '留空继承助手预设',
                     ),
                   ),
                   const SizedBox(height: MdSpacing.lg),
@@ -224,30 +174,13 @@ class _SessionParamsSheetState extends State<SessionParamsSheet> {
                   ),
                   const SizedBox(height: MdSpacing.xs),
                   TextField(
+                    key: const Key('session_max_tokens_field'),
                     controller: _maxTokensCtrl,
                     keyboardType: TextInputType.number,
                     decoration: const InputDecoration(
                       isDense: true,
                       hintText: '默认',
                     ),
-                  ),
-                  const SizedBox(height: MdSpacing.lg),
-                  Text(
-                    '推理强度',
-                    style: Theme.of(context).textTheme.labelMedium,
-                  ),
-                  const SizedBox(height: MdSpacing.xs),
-                  SegmentedButton<String>(
-                    segments: const [
-                      ButtonSegment(value: '', label: Text('默认')),
-                      ButtonSegment(value: 'low', label: Text('低')),
-                      ButtonSegment(value: 'medium', label: Text('中')),
-                      ButtonSegment(value: 'high', label: Text('高')),
-                    ],
-                    selected: {_reasoningEffort},
-                    onSelectionChanged: (set) {
-                      setState(() => _reasoningEffort = set.first);
-                    },
                   ),
                   const SizedBox(height: MdSpacing.xl),
                   Row(

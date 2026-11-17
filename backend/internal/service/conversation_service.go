@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/store"
@@ -30,6 +31,7 @@ func (p *PatchField[T]) UnmarshalJSON(data []byte) error {
 
 // CreateConversationInput describes payload fields for creating a conversation.
 type CreateConversationInput struct {
+	AssistantID  string                  `json:"assistantId"`
 	Title        string                  `json:"title"`
 	ProviderID   string                  `json:"providerId"`
 	ModelID      string                  `json:"modelId"`
@@ -46,6 +48,7 @@ type PatchParamsInput struct {
 
 // PatchConversationInput supports partial conversation updates with explicit null clearing.
 type PatchConversationInput struct {
+	AssistantID  PatchField[string]           `json:"assistantId"`
 	Title        PatchField[string]           `json:"title"`
 	ProviderID   PatchField[string]           `json:"providerId"`
 	ModelID      PatchField[string]           `json:"modelId"`
@@ -62,8 +65,9 @@ type ConversationDetail struct {
 
 // ConversationService manages conversations and inline message history loading.
 type ConversationService struct {
-	convs *store.ConversationStore
-	msgs  *store.MessageStore
+	convs      *store.ConversationStore
+	msgs       *store.MessageStore
+	assistants *store.AssistantStore
 }
 
 // NewConversationService constructs a ConversationService.
@@ -74,21 +78,48 @@ func NewConversationService(convs *store.ConversationStore, msgs *store.MessageS
 	}
 }
 
+// WithAssistants injects an optional AssistantStore to inherit default model presets on creation.
+func (s *ConversationService) WithAssistants(assistants *store.AssistantStore) *ConversationService {
+	s.assistants = assistants
+	return s
+}
+
 // List returns all conversations sorted by update time descending.
 func (s *ConversationService) List(ctx context.Context) ([]domain.Conversation, error) {
 	return s.convs.List(ctx)
 }
 
-// Create persists a new conversation.
+// Create persists a new conversation, inheriting default provider/model from its assistant when omitted.
 func (s *ConversationService) Create(ctx context.Context, in CreateConversationInput) (domain.Conversation, error) {
+	assistantID := strings.TrimSpace(in.AssistantID)
+	if assistantID == "" {
+		assistantID = domain.DefaultAssistantID
+	}
+	providerID := strings.TrimSpace(in.ProviderID)
+	modelID := strings.TrimSpace(in.ModelID)
+
+	if s.assistants != nil {
+		if assistant, err := s.assistants.Get(ctx, assistantID); err == nil {
+			if providerID == "" && assistant.DefaultProviderID != "" {
+				providerID = assistant.DefaultProviderID
+			}
+			if modelID == "" && assistant.DefaultModelID != "" {
+				modelID = assistant.DefaultModelID
+			}
+		} else if assistantID != domain.DefaultAssistantID {
+			return domain.Conversation{}, err
+		}
+	}
+
 	title := strings.TrimSpace(in.Title)
 	if title == "" {
 		title = "New Chat"
 	}
 	return s.convs.Create(ctx, domain.Conversation{
+		AssistantID:  assistantID,
 		Title:        title,
-		ProviderID:   strings.TrimSpace(in.ProviderID),
-		ModelID:      strings.TrimSpace(in.ModelID),
+		ProviderID:   providerID,
+		ModelID:      modelID,
 		SystemPrompt: in.SystemPrompt,
 		Params:       in.Params,
 	})
@@ -117,6 +148,19 @@ func (s *ConversationService) Patch(ctx context.Context, id string, in PatchConv
 		return domain.Conversation{}, err
 	}
 
+	if in.AssistantID.Set {
+		if in.AssistantID.Null || strings.TrimSpace(in.AssistantID.Value) == "" {
+			conv.AssistantID = domain.DefaultAssistantID
+		} else {
+			aid := strings.TrimSpace(in.AssistantID.Value)
+			if s.assistants != nil {
+				if _, err := s.assistants.Get(ctx, aid); err != nil {
+					return domain.Conversation{}, err
+				}
+			}
+			conv.AssistantID = aid
+		}
+	}
 	if in.Title.Set {
 		if in.Title.Null || strings.TrimSpace(in.Title.Value) == "" {
 			conv.Title = "New Chat"
@@ -188,4 +232,63 @@ func applyPatchParams(dst *domain.GenerationParams, patch PatchParamsInput) {
 // Delete deletes a conversation and cascades to its messages.
 func (s *ConversationService) Delete(ctx context.Context, id string) error {
 	return s.convs.Delete(ctx, id)
+}
+
+// DeleteMessage removes a single message from a conversation and refreshes updated_at.
+func (s *ConversationService) DeleteMessage(ctx context.Context, conversationID, messageID string) error {
+	if _, err := s.convs.Get(ctx, conversationID); err != nil {
+		return err
+	}
+	if err := s.msgs.DeleteByID(ctx, conversationID, messageID); err != nil {
+		return err
+	}
+	return s.convs.TouchUpdatedAt(ctx, conversationID, time.Now().UTC())
+}
+
+// BranchFromMessage clones a conversation and its history up to messageID (inclusive) into a new conversation.
+func (s *ConversationService) BranchFromMessage(ctx context.Context, conversationID, messageID string) (ConversationDetail, error) {
+	orig, err := s.convs.Get(ctx, conversationID)
+	if err != nil {
+		return ConversationDetail{}, err
+	}
+	msgs, err := s.msgs.ListUpTo(ctx, conversationID, messageID)
+	if err != nil {
+		return ConversationDetail{}, err
+	}
+
+	branched, err := s.convs.Create(ctx, domain.Conversation{
+		AssistantID:  orig.AssistantID,
+		Title:        orig.Title + " (分支)",
+		ProviderID:   orig.ProviderID,
+		ModelID:      orig.ModelID,
+		SystemPrompt: orig.SystemPrompt,
+		Params:       orig.Params,
+	})
+	if err != nil {
+		return ConversationDetail{}, err
+	}
+
+	cloned := make([]domain.Message, 0, len(msgs))
+	baseTime := time.Now().UTC()
+	for i, m := range msgs {
+		saved, err := s.msgs.Create(ctx, domain.Message{
+			ConversationID: branched.ID,
+			Role:           m.Role,
+			Blocks:         m.Blocks,
+			ProviderID:     m.ProviderID,
+			ModelID:        m.ModelID,
+			Usage:          m.Usage,
+			StopReason:     m.StopReason,
+			ErrorMessage:   m.ErrorMessage,
+			CreatedAt:      baseTime.Add(time.Duration(i) * time.Microsecond),
+		})
+		if err != nil {
+			return ConversationDetail{}, err
+		}
+		cloned = append(cloned, saved)
+	}
+	return ConversationDetail{
+		Conversation: branched,
+		Messages:     cloned,
+	}, nil
 }

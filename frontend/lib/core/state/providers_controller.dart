@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 
+import '../models/plugin_models.dart';
 import '../models/provider.dart';
 import '../network/gateway_client.dart';
 
@@ -22,11 +23,13 @@ class ProvidersController extends ChangeNotifier {
   final GatewayClient gateway;
 
   List<FormatInfo> _formats = const [];
+  List<ProviderAdapterInfo> _adapters = const [];
   List<ProviderConfig> _providers = const [];
   bool _isLoading = false;
   String? _error;
 
   List<FormatInfo> get formats => _formats;
+  List<ProviderAdapterInfo> get adapters => _adapters;
   List<ProviderConfig> get providers => _providers;
   bool get isLoading => _isLoading;
   String? get error => _error;
@@ -71,10 +74,15 @@ class ProvidersController extends ChangeNotifier {
     notifyListeners();
     try {
       final results = await Future.wait([
-        gateway.listFormats(),
+        gateway.listFormatsAndAdapters(),
         gateway.listProviders(),
       ]);
-      _formats = results[0] as List<FormatInfo>;
+      final fmtMeta = results[0] as ({
+        List<FormatInfo> formats,
+        List<ProviderAdapterInfo> adapters,
+      });
+      _formats = fmtMeta.formats;
+      _adapters = fmtMeta.adapters;
       _providers = results[1] as List<ProviderConfig>;
     } catch (e) {
       _error = e.toString();
@@ -82,6 +90,38 @@ class ProvidersController extends ChangeNotifier {
       _isLoading = false;
       notifyListeners();
     }
+  }
+
+  Future<ProviderConnectionTestResult> testProviderConnection(
+    String id, {
+    String? baseUrl,
+    String? authType,
+    String? apiKey,
+    Map<String, String>? headers,
+  }) {
+    return gateway.testProviderConnection(
+      id,
+      baseUrl: baseUrl,
+      authType: authType,
+      apiKey: apiKey,
+      headers: headers,
+    );
+  }
+
+  Future<List<DiscoveredModel>> fetchProviderModels(
+    String id, {
+    String? baseUrl,
+    String? authType,
+    String? apiKey,
+    Map<String, String>? headers,
+  }) {
+    return gateway.fetchProviderModels(
+      id,
+      baseUrl: baseUrl,
+      authType: authType,
+      apiKey: apiKey,
+      headers: headers,
+    );
   }
 
   Future<ProviderConfig> createProvider(ProviderUpsertPayload payload) async {

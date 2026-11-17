@@ -1,14 +1,18 @@
 import 'dart:async';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:llmstudio_frontend/core/models/assistant.dart';
 import 'package:llmstudio_frontend/core/models/content_block.dart';
 import 'package:llmstudio_frontend/core/models/conversation.dart';
 import 'package:llmstudio_frontend/core/models/message.dart';
+import 'package:llmstudio_frontend/core/models/plugin_models.dart';
 import 'package:llmstudio_frontend/core/models/provider.dart';
 import 'package:llmstudio_frontend/core/models/stream_event.dart';
 import 'package:llmstudio_frontend/core/network/gateway_client.dart';
+import 'package:llmstudio_frontend/core/state/assistants_controller.dart';
 import 'package:llmstudio_frontend/core/state/chat_controller.dart';
 import 'package:llmstudio_frontend/core/state/conversations_controller.dart';
+import 'package:llmstudio_frontend/core/state/plugins_controller.dart';
 import 'package:llmstudio_frontend/core/state/providers_controller.dart';
 
 class _StubGatewayClient extends GatewayClient {
@@ -17,10 +21,20 @@ class _StubGatewayClient extends GatewayClient {
   ConversationDetail? detailToReturn;
   Stream<StreamEvent> Function({Future<void>? abortTrigger})? streamHandler;
   int streamCallCount = 0;
+  List<ContentBlock>? lastBlocks;
+  GenerationParams? lastParams;
+  String? lastRegenerateId;
+  bool lastWebSearch = false;
+  String? lastSearchEngineId;
+  final List<String> deletedMessageIds = [];
 
   @override
   Future<List<FormatInfo>> listFormats() async => const [
-        FormatInfo(id: 'openai-completions', displayName: 'OpenAI Completions'),
+        FormatInfo(
+          id: 'openai-completions',
+          displayName: 'OpenAI Completions',
+          defaultPath: '/v1/chat/completions',
+        ),
       ];
 
   @override
@@ -42,10 +56,41 @@ class _StubGatewayClient extends GatewayClient {
       ];
 
   @override
+  Future<List<Assistant>> listAssistants() async => const [
+        Assistant(id: 'default', name: '默认助手', isDefault: true),
+        Assistant(id: 'a2', name: '代码助手'),
+      ];
+
+  @override
+  Future<List<SearchEnginePluginConfig>> listSearchEngines() async => const [
+        SearchEnginePluginConfig(
+          engineId: 'tavily',
+          displayName: 'Tavily Search',
+          enabled: true,
+          isDefault: true,
+        ),
+      ];
+
+  @override
+  Future<List<McpServerConfig>> listMcpServers() async => const [
+        McpServerConfig(id: 'mcp1', name: 'FS', transport: 'stdio', enabled: true),
+      ];
+
+  @override
   Future<List<Conversation>> listConversations() async => [
         Conversation(
           id: 'c1',
+          assistantId: 'default',
           title: 'First Chat',
+          providerId: 'p1',
+          modelId: 'm1',
+          createdAt: DateTime.utc(2026, 11, 17),
+          updatedAt: DateTime.utc(2026, 11, 17),
+        ),
+        Conversation(
+          id: 'c2',
+          assistantId: 'a2',
+          title: 'Code Review',
           providerId: 'p1',
           modelId: 'm1',
           createdAt: DateTime.utc(2026, 11, 17),
@@ -59,6 +104,7 @@ class _StubGatewayClient extends GatewayClient {
         ConversationDetail(
           conversation: Conversation(
             id: id,
+            assistantId: 'default',
             title: 'First Chat',
             providerId: 'p1',
             modelId: 'm1',
@@ -70,16 +116,56 @@ class _StubGatewayClient extends GatewayClient {
   }
 
   @override
+  Future<void> deleteMessage(String conversationId, String messageId) async {
+    deletedMessageIds.add(messageId);
+  }
+
+  @override
+  Future<ConversationDetail> branchConversation(
+    String conversationId,
+    String messageId,
+  ) async {
+    return ConversationDetail(
+      conversation: Conversation(
+        id: 'c-branch',
+        assistantId: 'default',
+        title: 'First Chat (分支)',
+        providerId: 'p1',
+        modelId: 'm1',
+        createdAt: DateTime.utc(2026, 11, 17),
+        updatedAt: DateTime.utc(2026, 11, 17),
+      ),
+      messages: [
+        Message(
+          id: 'bm1',
+          conversationId: 'c-branch',
+          role: 'user',
+          blocks: const [TextBlock('Hello')],
+          createdAt: DateTime.utc(2026, 11, 17),
+        ),
+      ],
+    );
+  }
+
+  @override
   Stream<StreamEvent> streamChat({
     required String conversationId,
+    List<ContentBlock>? blocks,
     String? text,
     String? providerId,
     String? modelId,
     GenerationParams? params,
     String? regenerateMessageId,
+    bool webSearch = false,
+    String? searchEngineId,
     Future<void>? abortTrigger,
   }) {
     streamCallCount++;
+    lastBlocks = blocks;
+    lastParams = params;
+    lastRegenerateId = regenerateMessageId;
+    lastWebSearch = webSearch;
+    lastSearchEngineId = searchEngineId;
     return streamHandler!(abortTrigger: abortTrigger);
   }
 }
@@ -227,20 +313,122 @@ void main() {
     expect(ctrl.messages.last.plainText, 'Recovered');
   });
 
-  test('ProvidersController and ConversationsController resolve defaults and search', () async {
+  test('AssistantsController, PluginsController, ConversationsController filter by assistant and branch', () async {
     final stub = _StubGatewayClient();
     final providersCtrl = ProvidersController(gateway: stub);
+    final assistantsCtrl = AssistantsController(gateway: stub);
+    final pluginsCtrl = PluginsController(gateway: stub);
     final convsCtrl = ConversationsController(gateway: stub);
 
-    await providersCtrl.refresh();
-    expect(providersCtrl.hasUsableModel, isTrue);
-    expect(providersCtrl.defaultModel()?.model.id, 'm1');
+    await Future.wait([
+      providersCtrl.refresh(),
+      assistantsCtrl.refresh(),
+      pluginsCtrl.refresh(),
+      convsCtrl.refresh(),
+    ]);
 
-    await convsCtrl.refresh();
-    expect(convsCtrl.activeId, 'c1');
-    convsCtrl.setSearchQuery('missing');
-    expect(convsCtrl.filteredConversations, isEmpty);
-    convsCtrl.setSearchQuery('first');
-    expect(convsCtrl.filteredConversations, hasLength(1));
+    expect(providersCtrl.hasUsableModel, isTrue);
+    expect(assistantsCtrl.assistants, hasLength(2));
+    expect(pluginsCtrl.searchEngines.single.engineId, 'tavily');
+    expect(pluginsCtrl.enabledMcpServers, hasLength(1));
+
+    // Scoped to 'default' initially.
+    expect(convsCtrl.filteredConversations.map((c) => c.id), ['c1']);
+
+    // Switching assistant scopes conversations to 'a2'.
+    convsCtrl.setActiveAssistantId('a2');
+    expect(convsCtrl.filteredConversations.map((c) => c.id), ['c2']);
+    expect(convsCtrl.activeId, 'c2');
+
+    // Branch creates new conversation and activates it.
+    final branched = await convsCtrl.branchFromMessage('c1', 'm1');
+    expect(branched.conversation.id, 'c-branch');
+    expect(convsCtrl.activeId, 'c-branch');
+  });
+
+  test('ChatController passes 6 effort levels, webSearch, attachments, deleteMessage, and user/assistant retryMessage', () async {
+    final stub = _StubGatewayClient();
+    stub.detailToReturn = ConversationDetail(
+      conversation: Conversation(
+        id: 'c1',
+        assistantId: 'default',
+        title: 'Session',
+        providerId: 'p1',
+        modelId: 'm1',
+        createdAt: DateTime.utc(2026, 11, 17),
+        updatedAt: DateTime.utc(2026, 11, 17),
+      ),
+      messages: [
+        Message(
+          id: 'u1',
+          conversationId: 'c1',
+          role: 'user',
+          blocks: const [TextBlock('Ask 1')],
+          createdAt: DateTime.utc(2026, 11, 17),
+        ),
+        Message(
+          id: 'a1',
+          conversationId: 'c1',
+          role: 'assistant',
+          blocks: const [TextBlock('Ans 1')],
+          stopReason: 'stop',
+          createdAt: DateTime.utc(2026, 11, 17),
+        ),
+      ],
+    );
+
+    final ctrl = ChatController(gateway: stub);
+    await ctrl.loadConversation('c1');
+
+    ctrl.setReasoningEffort('xhigh');
+    expect(ctrl.reasoningEffort, 'xhigh');
+
+    stub.streamHandler = ({abortTrigger}) async* {
+      yield StreamEvent(
+        type: 'message_end',
+        message: Message(
+          id: 'a2',
+          conversationId: 'c1',
+          role: 'assistant',
+          blocks: const [TextBlock('Ans 2')],
+          stopReason: 'stop',
+          createdAt: DateTime.utc(2026, 11, 17),
+        ),
+      );
+    };
+
+    await ctrl.sendMessage(
+      'Check attachments',
+      providerId: 'p1',
+      modelId: 'm1',
+      webSearch: true,
+      searchEngineId: 'tavily',
+      attachments: const [
+        ComposerAttachment(name: 'notes.txt', textContent: 'hello'),
+        ComposerAttachment(
+          name: 'img.png',
+          mimeType: 'image/png',
+          isImage: true,
+          base64Data: 'QUJD',
+        ),
+      ],
+    );
+
+    expect(stub.lastWebSearch, isTrue);
+    expect(stub.lastSearchEngineId, 'tavily');
+    expect(stub.lastParams?.reasoningEffort, 'xhigh');
+    expect(stub.lastBlocks, hasLength(3));
+    expect(stub.lastBlocks![0], isA<TextBlock>());
+    expect(stub.lastBlocks![1], isA<ImageBlock>());
+
+    // Retry on user message u1 targets assistant a1 (keeps u1).
+    await ctrl.retryMessage('u1', providerId: 'p1', modelId: 'm1');
+    expect(stub.lastRegenerateId, 'a1');
+    expect(ctrl.messages.first.id, 'u1');
+
+    // Delete message removes it locally and calls backend.
+    await ctrl.deleteMessage('u1');
+    expect(stub.deletedMessageIds, ['u1']);
+    expect(ctrl.messages.any((m) => m.id == 'u1'), isFalse);
   });
 }

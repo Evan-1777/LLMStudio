@@ -16,8 +16,11 @@ import (
 type RouterDeps struct {
 	Config              config.Config
 	Formats             *plugin.FormatRegistry
+	Adapters            *plugin.ProviderRegistry
 	ProviderService     *service.ProviderService
+	AssistantService    *service.AssistantService
 	ConversationService *service.ConversationService
+	PluginService       *service.PluginService
 	ChatService         *service.ChatService
 }
 
@@ -28,7 +31,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	mux.HandleFunc("GET /healthz", NewHealthHandler(authRequired))
 
 	if deps.Formats != nil {
-		mux.HandleFunc("GET /api/v1/formats", HandleListFormats(deps.Formats))
+		mux.HandleFunc("GET /api/v1/formats", HandleListFormats(deps.Formats, deps.Adapters))
 	}
 	if deps.ProviderService != nil {
 		ph := NewProviderHandler(deps.ProviderService)
@@ -36,6 +39,15 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("POST /api/v1/providers", ph.Create)
 		mux.HandleFunc("PUT /api/v1/providers/{id}", ph.Update)
 		mux.HandleFunc("DELETE /api/v1/providers/{id}", ph.Delete)
+		mux.HandleFunc("POST /api/v1/providers/{id}/test", ph.TestConnection)
+		mux.HandleFunc("POST /api/v1/providers/{id}/models/fetch", ph.FetchModels)
+	}
+	if deps.AssistantService != nil {
+		ah := NewAssistantHandler(deps.AssistantService)
+		mux.HandleFunc("GET /api/v1/assistants", ah.List)
+		mux.HandleFunc("POST /api/v1/assistants", ah.Create)
+		mux.HandleFunc("PUT /api/v1/assistants/{id}", ah.Update)
+		mux.HandleFunc("DELETE /api/v1/assistants/{id}", ah.Delete)
 	}
 	if deps.ConversationService != nil {
 		ch := NewConversationHandler(deps.ConversationService)
@@ -44,6 +56,18 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("GET /api/v1/conversations/{id}", ch.GetDetail)
 		mux.HandleFunc("PATCH /api/v1/conversations/{id}", ch.Patch)
 		mux.HandleFunc("DELETE /api/v1/conversations/{id}", ch.Delete)
+		mux.HandleFunc("DELETE /api/v1/conversations/{id}/messages/{messageId}", ch.DeleteMessage)
+		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/{messageId}/branch", ch.BranchFromMessage)
+	}
+	if deps.PluginService != nil {
+		plh := NewPluginHandler(deps.PluginService)
+		mux.HandleFunc("GET /api/v1/plugins/search", plh.ListSearchEngines)
+		mux.HandleFunc("PUT /api/v1/plugins/search/{id}", plh.UpdateSearchEngine)
+		mux.HandleFunc("POST /api/v1/plugins/search/{id}/test", plh.TestSearchEngine)
+		mux.HandleFunc("GET /api/v1/mcp/servers", plh.ListMCPServers)
+		mux.HandleFunc("POST /api/v1/mcp/servers", plh.CreateMCPServer)
+		mux.HandleFunc("PUT /api/v1/mcp/servers/{id}", plh.UpdateMCPServer)
+		mux.HandleFunc("DELETE /api/v1/mcp/servers/{id}", plh.DeleteMCPServer)
 	}
 	if deps.ChatService != nil {
 		chatHandler := NewChatHandler(deps.ChatService)

@@ -77,3 +77,20 @@ func (h *ConversationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func (h *ConversationHandler) DeleteMessage(w http.ResponseWriter, r *http.Request) {
+	if err := h.svc.DeleteMessage(r.Context(), r.PathValue("id"), r.PathValue("messageId")); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *ConversationHandler) BranchFromMessage(w http.ResponseWriter, r *http.Request) {
+	detail, err := h.svc.BranchFromMessage(r.Context(), r.PathValue("id"), r.PathValue("messageId"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusCreated, detail)
+}

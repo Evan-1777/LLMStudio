@@ -12,13 +12,11 @@ class ConversationSidebar extends StatefulWidget {
     super.key,
     required this.onSelectConversation,
     required this.onCreateConversation,
-    this.onOpenSettings,
     this.onCloseDrawer,
   });
 
   final ValueChanged<String> onSelectConversation;
   final VoidCallback onCreateConversation;
-  final VoidCallback? onOpenSettings;
   final VoidCallback? onCloseDrawer;
 
   @override
@@ -43,7 +41,7 @@ class _ConversationSidebarState extends State<ConversationSidebar> {
     final updatedTitle = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('重命名会话'),
+        title: const Text('重命名话题'),
         content: TextField(
           controller: ctrl,
           autofocus: true,
@@ -77,7 +75,7 @@ class _ConversationSidebarState extends State<ConversationSidebar> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: const Text('删除会话'),
+        title: const Text('删除话题'),
         content: Text('确认删除「${conv.title}」？'),
         actions: [
           TextButton(
@@ -125,21 +123,19 @@ class _ConversationSidebarState extends State<ConversationSidebar> {
             child: Row(
               children: [
                 Expanded(
-                  child: Text(
-                    'LLMStudio',
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                          fontWeight: FontWeight.w600,
-                        ),
-                    overflow: TextOverflow.ellipsis,
+                  child: FilledButton.tonalIcon(
+                    key: const Key('history_new_topic_button'),
+                    onPressed: () {
+                      widget.onCreateConversation();
+                      widget.onCloseDrawer?.call();
+                    },
+                    icon: AppSvgIcon(
+                      AppIcons.plus,
+                      size: 16,
+                      color: scheme.onSecondaryContainer,
+                    ),
+                    label: const Text('新建话题'),
                   ),
-                ),
-                AppIconAction(
-                  svg: AppIcons.plus,
-                  tooltip: '新建会话',
-                  onPressed: () {
-                    widget.onCreateConversation();
-                    widget.onCloseDrawer?.call();
-                  },
                 ),
                 if (widget.onCloseDrawer != null)
                   AppIconAction(
@@ -153,11 +149,12 @@ class _ConversationSidebarState extends State<ConversationSidebar> {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: MdSpacing.md),
             child: TextField(
+              key: const Key('history_search_field'),
               controller: _searchCtrl,
               onChanged: convsCtrl.setSearchQuery,
               decoration: InputDecoration(
                 isDense: true,
-                hintText: '搜索会话',
+                hintText: '搜索话题',
                 prefixIcon: Padding(
                   padding: const EdgeInsets.all(10),
                   child: AppSvgIcon(
@@ -206,24 +203,6 @@ class _ConversationSidebarState extends State<ConversationSidebar> {
                     },
                   ),
           ),
-          if (widget.onOpenSettings != null) ...[
-            const Divider(height: 1),
-            Padding(
-              padding: const EdgeInsets.all(MdSpacing.sm),
-              child: Row(
-                children: [
-                  AppIconAction(
-                    svg: AppIcons.settings,
-                    tooltip: '设置',
-                    onPressed: () {
-                      widget.onCloseDrawer?.call();
-                      widget.onOpenSettings?.call();
-                    },
-                  ),
-                ],
-              ),
-            ),
-          ],
         ],
       ),
     );

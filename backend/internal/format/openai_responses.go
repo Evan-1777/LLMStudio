@@ -23,6 +23,7 @@ func NewOpenAIResponsesFormat() *OpenAIResponsesFormat {
 
 func (f *OpenAIResponsesFormat) ID() string          { return FormatIDOpenAIResponses }
 func (f *OpenAIResponsesFormat) DisplayName() string { return "OpenAI Responses" }
+func (f *OpenAIResponsesFormat) DefaultPath() string { return "/v1/responses" }
 
 func (f *OpenAIResponsesFormat) DefaultCompat() domain.CompatConfig {
 	return domain.CompatConfig{
@@ -120,12 +121,12 @@ func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.Ch
 		}
 		body[maxField] = *params.MaxTokens
 	}
-	if params.ReasoningEffort != "" {
+	if effort := strings.ToLower(strings.TrimSpace(params.ReasoningEffort)); effort != "" {
 		effortField := compat.ReasoningEffortField
 		if effortField == "" {
 			effortField = "reasoning.effort"
 		}
-		setNestedField(body, effortField, params.ReasoningEffort)
+		setNestedField(body, effortField, effort)
 	}
 	if len(compat.ExtraBody) > 0 {
 		MergeBodyMap(body, compat.ExtraBody)
@@ -139,7 +140,7 @@ func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.Ch
 	headers.Set("Content-Type", "application/json")
 	return plugin.EncodedRequest{
 		Method:      http.MethodPost,
-		DefaultPath: "/v1/responses",
+		DefaultPath: f.DefaultPath(),
 		Headers:     headers,
 		Body:        payload,
 	}, nil

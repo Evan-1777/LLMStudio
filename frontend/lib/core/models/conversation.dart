@@ -49,6 +49,7 @@ class GenerationParams {
 class Conversation {
   const Conversation({
     required this.id,
+    this.assistantId = 'default',
     required this.title,
     this.providerId = '',
     this.modelId = '',
@@ -63,6 +64,7 @@ class Conversation {
   });
 
   final String id;
+  final String assistantId;
   final String title;
   final String providerId;
   final String modelId;
@@ -77,6 +79,7 @@ class Conversation {
 
   Conversation copyWith({
     String? id,
+    String? assistantId,
     String? title,
     String? providerId,
     String? modelId,
@@ -91,6 +94,7 @@ class Conversation {
   }) {
     return Conversation(
       id: id ?? this.id,
+      assistantId: assistantId ?? this.assistantId,
       title: title ?? this.title,
       providerId: providerId ?? this.providerId,
       modelId: modelId ?? this.modelId,
@@ -106,8 +110,10 @@ class Conversation {
   }
 
   factory Conversation.fromJson(Map<String, dynamic> json) {
+    final rawAssistantId = (json['assistantId'] as String? ?? '').trim();
     return Conversation(
       id: json['id'] as String? ?? '',
+      assistantId: rawAssistantId.isEmpty ? 'default' : rawAssistantId,
       title: json['title'] as String? ?? 'New Chat',
       providerId: json['providerId'] as String? ?? '',
       modelId: json['modelId'] as String? ?? '',

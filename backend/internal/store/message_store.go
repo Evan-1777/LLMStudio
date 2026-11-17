@@ -141,6 +141,75 @@ func (s *MessageStore) DeleteFrom(ctx context.Context, conversationID, fromMessa
 	return nil
 }
 
+// DeleteByID deletes a single message in a conversation without removing subsequent messages.
+func (s *MessageStore) DeleteByID(ctx context.Context, conversationID, messageID string) error {
+	res, err := s.db.ExecContext(ctx, `
+		DELETE FROM messages
+		WHERE id = ? AND conversation_id = ?
+	`, messageID, conversationID)
+	if err != nil {
+		return fmt.Errorf("delete message %s: %w", messageID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("rows affected delete message %s: %w", messageID, err)
+	}
+	if affected == 0 {
+		return domain.NewError(domain.ErrCodeNotFound, "message not found in conversation", nil)
+	}
+	return nil
+}
+
+// ListUpTo returns messages in chronological order up to and including upToMessageID.
+func (s *MessageStore) ListUpTo(ctx context.Context, conversationID, upToMessageID string) ([]domain.Message, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin listUpTo tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		targetRowID     int64
+		targetCreatedAt string
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT rowid, created_at
+		FROM messages
+		WHERE id = ? AND conversation_id = ?
+	`, upToMessageID, conversationID).Scan(&targetRowID, &targetCreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, domain.NewError(domain.ErrCodeNotFound, "target message not found in conversation", err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("lookup target message: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
+		FROM messages
+		WHERE conversation_id = ?
+		  AND (created_at < ? OR (created_at = ? AND rowid <= ?))
+		ORDER BY created_at ASC, rowid ASC
+	`, conversationID, targetCreatedAt, targetCreatedAt, targetRowID)
+	if err != nil {
+		return nil, fmt.Errorf("list messages up to %s: %w", upToMessageID, err)
+	}
+	defer rows.Close()
+
+	msgs := make([]domain.Message, 0)
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate messages up to %s: %w", upToMessageID, err)
+	}
+	return msgs, nil
+}
+
 func scanMessage(row rowScanner) (domain.Message, error) {
 	var (
 		m          domain.Message

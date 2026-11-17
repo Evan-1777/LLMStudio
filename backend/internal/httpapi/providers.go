@@ -66,3 +66,33 @@ func (h *ProviderHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+func (h *ProviderHandler) TestConnection(w http.ResponseWriter, r *http.Request) {
+	var in service.ProviderProbeInput
+	if err := decodeOptionalJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	res, err := h.svc.TestConnection(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
+}
+
+func (h *ProviderHandler) FetchModels(w http.ResponseWriter, r *http.Request) {
+	var in service.ProviderProbeInput
+	if err := decodeOptionalJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	models, err := h.svc.FetchUpstreamModels(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"models": models,
+	})
+}

@@ -26,16 +26,21 @@ type StreamChatInput struct {
 	ModelID             string                  `json:"modelId"`
 	Params              domain.GenerationParams `json:"params"`
 	RegenerateMessageID string                  `json:"regenerateMessageId"`
+	WebSearch           bool                    `json:"webSearch"`
+	SearchEngineID      string                  `json:"searchEngineId,omitempty"`
 }
 
 // ChatService orchestrates upstream LLM requests, SSE normalization, cancellation, and persistence.
 type ChatService struct {
-	providers  *store.ProviderStore
-	convs      *store.ConversationStore
-	msgs       *store.MessageStore
-	formats    *plugin.FormatRegistry
-	adapters   *plugin.ProviderRegistry
-	httpClient *http.Client
+	providers   *store.ProviderStore
+	convs       *store.ConversationStore
+	msgs        *store.MessageStore
+	formats     *plugin.FormatRegistry
+	adapters    *plugin.ProviderRegistry
+	httpClient  *http.Client
+	assistants  *store.AssistantStore
+	searchReg   *plugin.SearchRegistry
+	searchStore *store.SearchConfigStore
 }
 
 // NewChatService constructs a ChatService. If httpClient is nil, a default client with no overall request timeout is used.
@@ -60,14 +65,28 @@ func NewChatService(
 	}
 }
 
+// WithAssistants injects an AssistantStore so chat requests inherit assistant presets.
+func (s *ChatService) WithAssistants(assistants *store.AssistantStore) *ChatService {
+	s.assistants = assistants
+	return s
+}
+
+// WithSearch injects the orthogonal SearchRegistry and SearchConfigStore for web search augmentation.
+func (s *ChatService) WithSearch(searchReg *plugin.SearchRegistry, searchStore *store.SearchConfigStore) *ChatService {
+	s.searchReg = searchReg
+	s.searchStore = searchStore
+	return s
+}
+
 // PreparedStream holds a validated, open upstream HTTP response ready to stream SSE events to the client.
 type PreparedStream struct {
-	service      *ChatService
-	conversation domain.Conversation
-	provider     domain.ProviderConfig
-	model        domain.ModelConfig
-	apiFormat    plugin.APIFormat
-	resp         *http.Response
+	service        *ChatService
+	conversation   domain.Conversation
+	provider       domain.ProviderConfig
+	model          domain.ModelConfig
+	apiFormat      plugin.APIFormat
+	resp           *http.Response
+	webSearchBlock *domain.ContentBlock
 }
 
 // Prepare validates inputs, persists user message (or trims regenerated assistant messages),
@@ -135,6 +154,7 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		return nil, err
 	}
 
+	var deleteFromID string
 	if isRegen {
 		targetIdx := -1
 		for i, m := range history {
@@ -146,7 +166,15 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		if targetIdx < 0 {
 			return nil, domain.NewError(domain.ErrCodeNotFound, "target message not found in conversation", nil)
 		}
-		history = history[:targetIdx]
+		if history[targetIdx].Role == domain.RoleUser {
+			if targetIdx+1 < len(history) {
+				deleteFromID = history[targetIdx+1].ID
+			}
+			history = history[:targetIdx+1]
+		} else {
+			deleteFromID = in.RegenerateMessageID
+			history = history[:targetIdx]
+		}
 	} else {
 		history = append(history, domain.Message{
 			ConversationID: conv.ID,
@@ -156,13 +184,41 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		})
 	}
 
-	effectiveParams := mergeGenerationParams(conv.Params, in.Params)
+	effectiveSystemPrompt := conv.SystemPrompt
+	effectiveParams := conv.Params
+	if s.assistants != nil {
+		assistantID := conv.AssistantID
+		if assistantID == "" {
+			assistantID = domain.DefaultAssistantID
+		}
+		if assistant, aErr := s.assistants.Get(ctx, assistantID); aErr == nil {
+			if strings.TrimSpace(effectiveSystemPrompt) == "" && strings.TrimSpace(assistant.SystemPrompt) != "" {
+				effectiveSystemPrompt = assistant.SystemPrompt
+			}
+			effectiveParams = mergeGenerationParams(assistant.Params, conv.Params)
+		}
+	}
+	effectiveParams = mergeGenerationParams(effectiveParams, in.Params)
+
+	var webSearchBlock *domain.ContentBlock
+	if in.WebSearch {
+		block, searchPrompt := s.runWebSearch(ctx, in.SearchEngineID, latestUserQuery(history))
+		webSearchBlock = block
+		if searchPrompt != "" {
+			if strings.TrimSpace(effectiveSystemPrompt) == "" {
+				effectiveSystemPrompt = searchPrompt
+			} else {
+				effectiveSystemPrompt = effectiveSystemPrompt + "\n\n" + searchPrompt
+			}
+		}
+	}
+
 	mergedCompat := format.MergeCompat(apiFormat.DefaultCompat(), model.Compat)
 	encoded, err := apiFormat.EncodeRequest(ctx, plugin.ChatInput{
 		ConversationID: conv.ID,
 		Provider:       prov,
 		Model:          model,
-		SystemPrompt:   conv.SystemPrompt,
+		SystemPrompt:   effectiveSystemPrompt,
 		Messages:       history,
 		Params:         effectiveParams,
 		Compat:         mergedCompat,
@@ -210,9 +266,11 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	}
 
 	if isRegen {
-		if err := s.msgs.DeleteFrom(ctx, conv.ID, in.RegenerateMessageID); err != nil {
-			_ = resp.Body.Close()
-			return nil, err
+		if deleteFromID != "" {
+			if err := s.msgs.DeleteFrom(ctx, conv.ID, deleteFromID); err != nil {
+				_ = resp.Body.Close()
+				return nil, err
+			}
 		}
 	} else {
 		if _, err := s.msgs.Create(ctx, domain.Message{
@@ -236,12 +294,13 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	}
 
 	return &PreparedStream{
-		service:      s,
-		conversation: conv,
-		provider:     prov,
-		model:        model,
-		apiFormat:    apiFormat,
-		resp:         resp,
+		service:        s,
+		conversation:   conv,
+		provider:       prov,
+		model:          model,
+		apiFormat:      apiFormat,
+		resp:           resp,
+		webSearchBlock: webSearchBlock,
 	}, nil
 }
 
@@ -265,12 +324,53 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		return err
 	}
 
+	indexOffset := 0
+	if p.webSearchBlock != nil {
+		idxZero := domain.IntPtr(0)
+		wsStart := domain.StreamEvent{
+			Type:           domain.StreamEventBlockStart,
+			ConversationID: p.conversation.ID,
+			MessageID:      assistantID,
+			ProviderID:     p.provider.ID,
+			ModelID:        p.model.ID,
+			Index:          idxZero,
+			BlockType:      domain.BlockTypeWebSearch,
+			Block:          p.webSearchBlock,
+		}
+		acc.apply(wsStart)
+		if err := emit(wsStart); err != nil {
+			p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			return err
+		}
+
+		wsEnd := domain.StreamEvent{
+			Type:           domain.StreamEventBlockEnd,
+			ConversationID: p.conversation.ID,
+			MessageID:      assistantID,
+			ProviderID:     p.provider.ID,
+			ModelID:        p.model.ID,
+			Index:          idxZero,
+			BlockType:      domain.BlockTypeWebSearch,
+			Block:          p.webSearchBlock,
+		}
+		acc.apply(wsEnd)
+		if err := emit(wsEnd); err != nil {
+			p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			return err
+		}
+		indexOffset = 1
+	}
+
 	var streamErrMsg string
 	decodeErr := p.apiFormat.DecodeStream(ctx, p.resp.Body, func(ev domain.StreamEvent) error {
 		ev.ConversationID = p.conversation.ID
 		ev.MessageID = assistantID
 		ev.ProviderID = p.provider.ID
 		ev.ModelID = p.model.ID
+		if indexOffset > 0 && ev.Index != nil {
+			shifted := *ev.Index + indexOffset
+			ev.Index = &shifted
+		}
 
 		acc.apply(ev)
 		if ev.Type == domain.StreamEventError && ev.Error != nil {
@@ -514,4 +614,131 @@ func deriveTitleFromBlocks(blocks []domain.ContentBlock) string {
 		}
 	}
 	return ""
+}
+
+func latestUserQuery(history []domain.Message) string {
+	for i := len(history) - 1; i >= 0; i-- {
+		if history[i].Role != domain.RoleUser {
+			continue
+		}
+		var parts []string
+		for _, b := range history[i].Blocks {
+			if b.Type == domain.BlockTypeText && strings.TrimSpace(b.Text) != "" {
+				parts = append(parts, strings.TrimSpace(b.Text))
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+	return ""
+}
+
+func (s *ChatService) runWebSearch(ctx context.Context, requestedEngineID, query string) (*domain.ContentBlock, string) {
+	makeErrorBlock := func(engineID, errMsg string) (*domain.ContentBlock, string) {
+		raw, _ := json.Marshal(map[string]any{
+			"query":    query,
+			"engineId": engineID,
+			"error":    errMsg,
+		})
+		return &domain.ContentBlock{
+			Type:  domain.BlockTypeWebSearch,
+			Extra: raw,
+		}, ""
+	}
+
+	engineID := strings.TrimSpace(requestedEngineID)
+	if s.searchReg == nil || s.searchStore == nil {
+		return makeErrorBlock(engineID, "搜索引擎服务未启用")
+	}
+
+	var (
+		cfg domain.SearchEngineConfig
+		ok  bool
+	)
+	if engineID != "" {
+		if stored, err := s.searchStore.Get(ctx, engineID); err == nil {
+			cfg = stored
+			ok = true
+		} else {
+			cfg = domain.SearchEngineConfig{EngineID: engineID, MaxResults: 5}
+			ok = true
+		}
+	} else {
+		storedList, err := s.searchStore.List(ctx)
+		if err == nil {
+			for _, item := range storedList {
+				if item.IsDefault && item.Enabled {
+					cfg = item
+					engineID = item.EngineID
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				for _, item := range storedList {
+					if item.Enabled {
+						cfg = item
+						engineID = item.EngineID
+						ok = true
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if !ok || engineID == "" {
+		return makeErrorBlock(engineID, "未配置或未启用联网搜索引擎")
+	}
+	engine, exists := s.searchReg.Get(engineID)
+	if !exists {
+		return makeErrorBlock(engineID, fmt.Sprintf("未注册搜索引擎 %q", engineID))
+	}
+	if strings.TrimSpace(query) == "" {
+		return makeErrorBlock(engineID, "检索内容为空")
+	}
+
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if endpoint == "" {
+		endpoint = engine.DefaultEndpoint()
+	}
+	maxResults := cfg.MaxResults
+	if maxResults <= 0 {
+		maxResults = 5
+	}
+
+	searchCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+
+	results, err := engine.Search(searchCtx, plugin.SearchQueryInput{
+		Query:      query,
+		Endpoint:   endpoint,
+		APIKey:     cfg.APIKey,
+		MaxResults: maxResults,
+	})
+	if err != nil {
+		return makeErrorBlock(engineID, err.Error())
+	}
+
+	raw, _ := json.Marshal(map[string]any{
+		"query":    query,
+		"engineId": engineID,
+		"results":  results,
+	})
+	block := &domain.ContentBlock{
+		Type:  domain.BlockTypeWebSearch,
+		Extra: raw,
+	}
+
+	var sb strings.Builder
+	sb.WriteString("[联网搜索结果]\n")
+	for i, r := range results {
+		fmt.Fprintf(&sb, "%d. %s (%s)\n", i+1, r.Title, r.URL)
+		if r.Snippet != "" {
+			fmt.Fprintf(&sb, "   %s\n", r.Snippet)
+		}
+	}
+	sb.WriteString("请结合以上联网搜索结果回答用户问题，并在合适位置引用来源链接。")
+	return block, sb.String()
 }

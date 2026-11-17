@@ -244,3 +244,49 @@ func TestOpenAIResponsesEncodeAndDecode(t *testing.T) {
 		t.Fatalf("missing expected responses events: %+v", events)
 	}
 }
+
+func TestOpenAIFormatsDefaultPathAndSixEffortLevelsWithoutReasoningFlag(t *testing.T) {
+	comp := NewOpenAICompletionsFormat()
+	resp := NewOpenAIResponsesFormat()
+	if comp.DefaultPath() != "/v1/chat/completions" || resp.DefaultPath() != "/v1/responses" {
+		t.Fatalf("unexpected default paths: comp=%q resp=%q", comp.DefaultPath(), resp.DefaultPath())
+	}
+
+	efforts := []string{
+		domain.EffortNone,
+		domain.EffortLow,
+		domain.EffortMedium,
+		domain.EffortHigh,
+		domain.EffortXHigh,
+		domain.EffortMax,
+	}
+	for _, effort := range efforts {
+		req1, err := comp.EncodeRequest(context.Background(), plugin.ChatInput{
+			Model:    domain.ModelConfig{ID: "custom", Reasoning: false},
+			Params:   domain.GenerationParams{ReasoningEffort: effort},
+			Messages: []domain.Message{{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}}},
+		})
+		if err != nil {
+			t.Fatalf("completions encode %s: %v", effort, err)
+		}
+		var b1 map[string]any
+		_ = json.Unmarshal(req1.Body, &b1)
+		if b1["reasoning_effort"] != effort {
+			t.Fatalf("completions effort %s not encoded: %+v", effort, b1)
+		}
+
+		req2, err := resp.EncodeRequest(context.Background(), plugin.ChatInput{
+			Model:    domain.ModelConfig{ID: "custom", Reasoning: false},
+			Params:   domain.GenerationParams{ReasoningEffort: effort},
+			Messages: []domain.Message{{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}}},
+		})
+		if err != nil {
+			t.Fatalf("responses encode %s: %v", effort, err)
+		}
+		var b2 map[string]any
+		_ = json.Unmarshal(req2.Body, &b2)
+		if rMap, ok := b2["reasoning"].(map[string]any); !ok || rMap["effort"] != effort {
+			t.Fatalf("responses effort %s not encoded: %+v", effort, b2)
+		}
+	}
+}
