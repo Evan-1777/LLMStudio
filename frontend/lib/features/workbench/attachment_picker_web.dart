@@ -23,7 +23,7 @@ Future<List<ComposerAttachment>> pickComposerAttachments() async {
     input.removeEventListener('cancel', cancelListener);
   }
 
-  changeListener = ((web.Event _) async {
+  Future<void> handleChange() async {
     cleanup();
     final files = input.files;
     if (files == null || files.length == 0) {
@@ -41,6 +41,10 @@ Future<List<ComposerAttachment>> pickComposerAttachments() async {
     if (!completer.isCompleted) {
       completer.complete(results);
     }
+  }
+
+  changeListener = ((web.Event _) {
+    unawaited(handleChange());
   }).toJS;
 
   cancelListener = ((web.Event _) {
