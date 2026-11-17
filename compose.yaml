@@ -1,0 +1,33 @@
+services:
+  llmstudio:
+    # 默认优先拉取云端镜像（missing：本地缺失时从 GHCR 拉取；不可拉取或显式 --build 时回退本地 Dockerfile 构建）
+    # 拉取更新：docker compose pull && docker compose up -d（或设 LLMSTUDIO_PULL_POLICY=always）
+    # 本地构建：docker compose up -d --build（或设 LLMSTUDIO_PULL_POLICY=build）
+    image: ghcr.io/evan-1777/llmstudio:${LLMSTUDIO_IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: ${LLMSTUDIO_PULL_POLICY:-missing}
+    container_name: llmstudio
+    restart: unless-stopped
+    ports:
+      - "${LLMSTUDIO_PORT:-8080}:8080"
+    environment:
+      LLMSTUDIO_PORT: "8080"
+      LLMSTUDIO_DB_PATH: "/data/llmstudio.db"
+      LLMSTUDIO_STATIC_DIR: "/app/web"
+      # 须设置访问令牌（仅本地调试可显式设 LLMSTUDIO_DEV_MODE=true）
+      LLMSTUDIO_ACCESS_TOKEN: "${LLMSTUDIO_ACCESS_TOKEN:-}"
+      LLMSTUDIO_DEV_MODE: "${LLMSTUDIO_DEV_MODE:-false}"
+      LLMSTUDIO_CORS_ORIGINS: "${LLMSTUDIO_CORS_ORIGINS:-*}"
+    volumes:
+      - llmstudio_data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  llmstudio_data:
