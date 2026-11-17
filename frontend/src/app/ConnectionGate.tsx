@@ -83,9 +83,7 @@ export function ConnectionGate({ children }: { children: ReactNode }) {
     <main className="gate-shell">
       <form className="gate-card" onSubmit={handleSubmit}>
         <div className="gate-head">
-          <span className="gate-logo" aria-hidden="true">
-            L
-          </span>
+          <img src="/favicon.png" alt="" className="gate-logo" aria-hidden="true" />
           <div>
             <h1 className="gate-title">LLMStudio</h1>
             <p className="gate-sub">

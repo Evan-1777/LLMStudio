@@ -130,9 +130,14 @@ func (s *ConversationStore) Update(ctx context.Context, c domain.Conversation) (
 	return s.Get(ctx, c.ID)
 }
 
-// TouchUpdatedAt bumps the conversation's updated_at timestamp.
+// TouchUpdatedAt bumps the conversation's updated_at timestamp monotonically.
 func (s *ConversationStore) TouchUpdatedAt(ctx context.Context, id string, updatedAt time.Time) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE conversations SET updated_at = ? WHERE id = ?`, formatTime(updatedAt), id)
+	ts := formatTime(updatedAt)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE conversations
+		SET updated_at = CASE WHEN updated_at > ? THEN updated_at ELSE ? END
+		WHERE id = ?
+	`, ts, ts, id)
 	if err != nil {
 		return fmt.Errorf("touch conversation %s: %w", id, err)
 	}

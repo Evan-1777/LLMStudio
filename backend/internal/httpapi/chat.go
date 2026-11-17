@@ -53,3 +53,19 @@ func (h *ChatHandler) Stream(w http.ResponseWriter, r *http.Request) {
 		return rc.Flush()
 	})
 }
+
+func (h *ChatHandler) PrepareLocal(w http.ResponseWriter, r *http.Request) {
+	var in service.StreamChatInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	in.ConversationID = r.PathValue("id")
+
+	prepared, err := h.svc.PrepareLocal(r.Context(), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, prepared)
+}

@@ -74,6 +74,7 @@ export interface ProviderConfig {
   models: ModelConfig[];
   enabled: boolean;
   builtIn: boolean;
+  localRequest?: boolean;
   createdAt?: string;
   updatedAt?: string;
 }
@@ -89,6 +90,7 @@ export interface ProviderUpsertPayload {
   headers?: Record<string, string>;
   models: ModelConfig[];
   enabled?: boolean;
+  localRequest?: boolean;
 }
 
 export interface ProviderProbeInput {
@@ -388,6 +390,34 @@ export interface StreamChatInput {
   regenerateMessageId?: string;
   webSearch?: boolean;
   searchEngineId?: string;
+}
+
+export interface CreateMessageInput {
+  role: 'user' | 'assistant' | 'toolResult';
+  blocks: ContentBlock[];
+  providerId?: string;
+  modelId?: string;
+  usage?: TokenUsage;
+  stopReason?: StopReason | string;
+  errorMessage?: string;
+  replaceMessageId?: string;
+  afterMessageId?: string;
+}
+
+export interface CreateMessageResult {
+  message: Message;
+  conversation: Conversation;
+}
+
+export interface PreparedLocalRequest {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: unknown;
+  authType: AuthType | string;
+  webSearchBlock?: ContentBlock;
+  replaceMessageId?: string;
+  insertAfterMessageId?: string;
 }
 
 export interface HealthResponse {

@@ -31,9 +31,7 @@ export function AssistantSidebar({
     >
       <div className="wb-rail__head">
         <div className="wb-brand">
-          <span className="wb-brand__mark" aria-hidden="true">
-            L
-          </span>
+          <img src="/favicon.png" alt="" className="wb-brand__mark" aria-hidden="true" />
           <span>LLMStudio</span>
         </div>
         <IconButton

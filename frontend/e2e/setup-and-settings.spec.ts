@@ -25,6 +25,13 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await page.getByLabel('消息输入框').waitFor();
     consoleErrors.length = 0; // Reset after intentional wrong-token 401 test above.
 
+    // Verify custom brand favicon loads cleanly as circular image in sidebar.
+    const brandImgLoaded = await page.evaluate(() => {
+      const img = document.querySelector<HTMLImageElement>('img.wb-brand__mark');
+      return Boolean(img && img.complete && img.naturalWidth > 0);
+    });
+    expect(brandImgLoaded).toBe(true);
+
     // 2. Assistant CRUD persists across reload.
     await page.getByRole('button', { name: '添加助手' }).click();
     const asstDialog = page.getByRole('dialog');
@@ -122,6 +129,61 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
 
     await page.getByRole('button', { name: 'MCP 配置' }).click();
     await expect(page.getByText('local-fs')).toBeVisible();
+
+    // 7. Create a localRequest provider, verify browser-direct probe/fetch/chat with CORS preflight, and verify Feed mode UI.
+    await page.getByRole('button', { name: '模型服务' }).click();
+    await page.getByRole('button', { name: '添加供应商' }).click();
+    const localDialog = page.getByRole('dialog');
+    await localDialog.getByLabel('名称').fill('Direct Local');
+    await localDialog.getByLabel('API 地址').fill(upstream.url);
+    await localDialog.getByLabel('API Key').fill('sk-browser-direct');
+    await localDialog.getByRole('switch', { name: '本地请求' }).click();
+    await localDialog.getByRole('button', { name: '添加' }).click();
+    await expect(page.getByRole('heading', { name: 'Direct Local' })).toBeVisible();
+
+    const directProbeReqPromise = page.waitForRequest(
+      (req) => req.url() === `${upstream.url}/v1/models` && req.method() === 'GET',
+    );
+    await page.getByRole('button', { name: '测试连接' }).click();
+    await directProbeReqPromise;
+    await expect(page.getByText(/连接正常.*2 个模型/)).toBeVisible();
+
+    await page.getByRole('button', { name: '获取模型' }).first().click();
+    const localImportDialog = page.getByRole('dialog');
+    await localImportDialog.getByRole('checkbox', { name: /Mock Chat/ }).check();
+    await localImportDialog.getByRole('button', { name: '导入 (1)' }).click();
+    await expect(page.getByText('Mock Chat')).toBeVisible();
+
+    await page.getByRole('button', { name: '返回工作台' }).click();
+    await page.getByLabel('消息输入框').waitFor();
+    await page.getByRole('button', { name: '选择模型' }).click();
+    await page.getByLabel('搜索模型').fill('Direct Local');
+    await page.getByRole('option', { name: /Mock Chat/ }).click();
+
+    const directChatReqPromise = page.waitForRequest(
+      (req) =>
+        req.url() === `${upstream.url}/v1/chat/completions` &&
+        req.method() === 'POST',
+    );
+    await page.getByLabel('消息输入框').fill('Direct browser chat');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await directChatReqPromise;
+    await expect(page.getByText(/to: Direct browser chat/)).toBeVisible();
+
+    // Switch to Feed display mode via toolbar button and verify author/provider header & Token summary.
+    await page.getByRole('button', { name: '切换消息显示模式' }).click();
+    await expect(page.locator('.wb-feed-author', { hasText: '用户' })).toBeVisible();
+    await expect(
+      page.locator('.wb-feed-author', { hasText: 'Mock Chat | Direct Local' }),
+    ).toBeVisible();
+    await expect(page.getByText(/Tokens: 40 ↑15 ↓25/)).toBeVisible();
+
+    // Reload preserves persisted local chat history and Feed mode.
+    await page.reload({ waitUntil: 'networkidle' });
+    await expect(
+      page.locator('.wb-feed-author', { hasText: 'Mock Chat | Direct Local' }),
+    ).toBeVisible();
+    await expect(page.getByText(/to: Direct browser chat/)).toBeVisible();
 
     expect(consoleErrors).toEqual([]);
   });

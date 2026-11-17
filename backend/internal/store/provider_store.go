@@ -25,7 +25,7 @@ func NewProviderStore(db *sql.DB) *ProviderStore {
 // List returns all configured providers ordered with built-ins first, then creation time.
 func (s *ProviderStore) List(ctx context.Context) ([]domain.ProviderConfig, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, created_at, updated_at
+		SELECT id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at
 		FROM providers
 		ORDER BY built_in DESC, created_at ASC, name ASC
 	`)
@@ -51,7 +51,7 @@ func (s *ProviderStore) List(ctx context.Context) ([]domain.ProviderConfig, erro
 // Get fetches a single provider by ID.
 func (s *ProviderStore) Get(ctx context.Context, id string) (domain.ProviderConfig, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, created_at, updated_at
+		SELECT id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at
 		FROM providers
 		WHERE id = ?
 	`, id)
@@ -83,9 +83,9 @@ func (s *ProviderStore) Create(ctx context.Context, p domain.ProviderConfig) (do
 	}
 
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
+		INSERT INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), boolToInt(p.LocalRequest), formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return domain.ProviderConfig{}, domain.NewError(domain.ErrCodeConflict, "provider already exists", err)
@@ -110,9 +110,9 @@ func (s *ProviderStore) EnsureBuiltIn(ctx context.Context, p domain.ProviderConf
 	}
 
 	_, err = s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
+		INSERT OR IGNORE INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), boolToInt(p.LocalRequest), formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("ensure built-in provider %s: %w", p.ID, err)
 	}
@@ -129,9 +129,9 @@ func (s *ProviderStore) Update(ctx context.Context, p domain.ProviderConfig) (do
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE providers
-		SET name = ?, adapter = ?, base_url = ?, auth_type = ?, api_key = ?, headers_json = ?, models_json = ?, enabled = ?, updated_at = ?
+		SET name = ?, adapter = ?, base_url = ?, auth_type = ?, api_key = ?, headers_json = ?, models_json = ?, enabled = ?, local_request = ?, updated_at = ?
 		WHERE id = ?
-	`, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), formatTime(p.UpdatedAt), p.ID)
+	`, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.LocalRequest), formatTime(p.UpdatedAt), p.ID)
 	if err != nil {
 		return domain.ProviderConfig{}, fmt.Errorf("update provider %s: %w", p.ID, err)
 	}
@@ -167,22 +167,24 @@ type rowScanner interface {
 
 func scanProvider(row rowScanner) (domain.ProviderConfig, error) {
 	var (
-		p           domain.ProviderConfig
-		headersJSON string
-		modelsJSON  string
-		enabledInt  int
-		builtInInt  int
-		createdRaw  string
-		updatedRaw  string
+		p               domain.ProviderConfig
+		headersJSON     string
+		modelsJSON      string
+		enabledInt      int
+		builtInInt      int
+		localRequestInt int
+		createdRaw      string
+		updatedRaw      string
 	)
 	if err := row.Scan(
 		&p.ID, &p.Name, &p.Adapter, &p.BaseURL, &p.AuthType, &p.APIKey,
-		&headersJSON, &modelsJSON, &enabledInt, &builtInInt, &createdRaw, &updatedRaw,
+		&headersJSON, &modelsJSON, &enabledInt, &builtInInt, &localRequestInt, &createdRaw, &updatedRaw,
 	); err != nil {
 		return domain.ProviderConfig{}, err
 	}
 	p.Enabled = enabledInt != 0
 	p.BuiltIn = builtInInt != 0
+	p.LocalRequest = localRequestInt != 0
 
 	if headersJSON != "" && headersJSON != "{}" {
 		if err := json.Unmarshal([]byte(headersJSON), &p.Headers); err != nil {

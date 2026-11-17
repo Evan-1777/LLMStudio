@@ -28,6 +28,8 @@ function WorkbenchInner() {
 
   const {
     gateway,
+    settings,
+    updateSettings,
     connectionState,
     connectionEpoch,
     resources,
@@ -44,6 +46,7 @@ function WorkbenchInner() {
     reloadCurrentConversation,
     sendMessage,
     regenerateMessage,
+    updateMessage,
     deleteMessage,
     branchFromMessage,
     stopStreaming,
@@ -364,6 +367,9 @@ function WorkbenchInner() {
 
   const handleDeleteMessage = (message: Message) => deleteMessage(message.id);
 
+  const handleUpdateMessage = (messageId: string, blocks: ContentBlock[]) =>
+    updateMessage(messageId, blocks);
+
   const handleBranchMessage = async (message: Message) => {
     const detail = await branchFromMessage(message.id);
     if (detail) {
@@ -471,6 +477,21 @@ function WorkbenchInner() {
           <div className="wb-toolbar__spacer" />
 
           <IconButton
+            icon={
+              settings.chatDisplayMode === 'feed'
+                ? 'layoutStream'
+                : 'messageSquare'
+            }
+            label="切换消息显示模式"
+            active={settings.chatDisplayMode === 'feed'}
+            onClick={() =>
+              updateSettings({
+                chatDisplayMode:
+                  settings.chatDisplayMode === 'feed' ? 'bubble' : 'feed',
+              })
+            }
+          />
+          <IconButton
             icon="sliders"
             label="话题参数"
             active={inspectorOpen}
@@ -487,7 +508,9 @@ function WorkbenchInner() {
         <ChatCanvas
           state={chatState}
           assistant={activeAssistant}
+          providers={resources.providers}
           hasConversationId={Boolean(conversationId)}
+          onUpdateMessage={handleUpdateMessage}
           onRetryMessage={handleRetryMessage}
           onDeleteMessage={handleDeleteMessage}
           onBranchMessage={handleBranchMessage}

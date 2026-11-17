@@ -2,13 +2,57 @@ import { useMemo, useState, type ReactNode } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useApp } from '../app/AppProvider';
-import { Icon, Modal } from '../components/ui';
+import { Icon, IconButton, Modal } from '../components/ui';
 import type { ContentBlock, WebSearchExtra } from '../core/types';
 import { CodeBlock } from './CodeBlock';
 import { CollapsibleBlock } from './CollapsibleBlock';
-import { HtmlPreview } from './HtmlPreview';
+import { SandboxedIframe } from './HtmlPreview';
 import { parseAssistantContent, shouldAutoCollapseText } from './segments';
 import './rendering.css';
+
+function RawHtmlCodeCard({
+  html,
+  isClosed,
+  collapseKey,
+}: {
+  html: string;
+  isClosed: boolean;
+  collapseKey: string;
+}) {
+  const { settings, toast } = useApp();
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(html);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      toast('无法写入剪贴板', 'error');
+    }
+  };
+
+  return (
+    <CollapsibleBlock
+      collapseKey={collapseKey}
+      title={isClosed ? 'HTML' : 'HTML · 输出中'}
+      icon="code"
+      defaultCollapsed={shouldAutoCollapseText(html, settings)}
+      actions={
+        <IconButton
+          size="sm"
+          icon={copied ? 'check' : 'copy'}
+          label="复制 HTML"
+          onClick={() => void handleCopy()}
+        />
+      }
+    >
+      <pre className="code-pre">
+        <code>{html}</code>
+      </pre>
+    </CollapsibleBlock>
+  );
+}
 
 function sanitizeLinkUrl(raw?: string): string | undefined {
   if (!raw) return undefined;
@@ -146,14 +190,30 @@ export function ContentRenderer({
               collapseKey={segKey}
             />,
           );
+        } else if (settings.visualHtmlRender) {
+          if (seg.isClosed) {
+            otherNodes.push(
+              <SandboxedIframe
+                key={segKey}
+                html={seg.html}
+                seamless
+                minHeight={24}
+              />,
+            );
+          } else {
+            otherNodes.push(
+              <pre key={segKey} className="code-pre code-pre--streaming">
+                <code>{seg.html}</code>
+              </pre>,
+            );
+          }
         } else {
           otherNodes.push(
-            <HtmlPreview
+            <RawHtmlCodeCard
               key={segKey}
               html={seg.html}
               isClosed={seg.isClosed}
               collapseKey={segKey}
-              title="HTML"
             />,
           );
         }

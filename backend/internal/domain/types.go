@@ -145,11 +145,12 @@ type ProviderConfig struct {
 	AuthType  string            `json:"authType"`
 	APIKey    string            `json:"apiKey,omitempty"`
 	Headers   map[string]string `json:"headers,omitempty"`
-	Models    []ModelConfig     `json:"models"`
-	Enabled   bool              `json:"enabled"`
-	BuiltIn   bool              `json:"builtIn"`
-	CreatedAt time.Time         `json:"createdAt"`
-	UpdatedAt time.Time         `json:"updatedAt"`
+	Models       []ModelConfig     `json:"models"`
+	Enabled      bool              `json:"enabled"`
+	BuiltIn      bool              `json:"builtIn"`
+	LocalRequest bool              `json:"localRequest"`
+	CreatedAt    time.Time         `json:"createdAt"`
+	UpdatedAt    time.Time         `json:"updatedAt"`
 }
 
 type providerWire struct {
@@ -164,6 +165,7 @@ type providerWire struct {
 	Models       []ModelConfig     `json:"models"`
 	Enabled      bool              `json:"enabled"`
 	BuiltIn      bool              `json:"builtIn"`
+	LocalRequest bool              `json:"localRequest"`
 	CreatedAt    time.Time         `json:"createdAt"`
 	UpdatedAt    time.Time         `json:"updatedAt"`
 }
@@ -186,6 +188,7 @@ func (p ProviderConfig) MarshalJSON() ([]byte, error) {
 		Models:       models,
 		Enabled:      p.Enabled,
 		BuiltIn:      p.BuiltIn,
+		LocalRequest: p.LocalRequest,
 		CreatedAt:    p.CreatedAt,
 		UpdatedAt:    p.UpdatedAt,
 	}

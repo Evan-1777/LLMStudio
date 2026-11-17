@@ -29,6 +29,7 @@ export interface StreamingDraft {
   messageId: string;
   providerId: string;
   modelId: string;
+  insertIndex?: number;
   blockOrder: number[];
   blocksByIndex: Record<number, StreamingBlockBuffer>;
   usage?: TokenUsage;
@@ -43,6 +44,7 @@ export interface ChatState {
   errorCode: string | null;
   errorMessage: string | null;
   needsReloadAfterAbort: boolean;
+  pendingInsertIndex: number | null;
   streaming: StreamingDraft | null;
 }
 
@@ -54,8 +56,29 @@ export const initialChatState: ChatState = {
   errorCode: null,
   errorMessage: null,
   needsReloadAfterAbort: false,
+  pendingInsertIndex: null,
   streaming: null,
 };
+
+export function insertMessageAt(
+  messages: Message[],
+  msg: Message,
+  insertIndex?: number | null,
+): Message[] {
+  if (
+    insertIndex === undefined ||
+    insertIndex === null ||
+    insertIndex < 0 ||
+    insertIndex >= messages.length
+  ) {
+    return [...messages, msg];
+  }
+  return [
+    ...messages.slice(0, insertIndex),
+    msg,
+    ...messages.slice(insertIndex),
+  ];
+}
 
 export function isLocalMessageId(id: string): boolean {
   return id.startsWith('local-');
@@ -83,7 +106,7 @@ export function deriveRestState(messages: Message[]): {
   return { runState: 'idle', errorCode: null, errorMessage: null };
 }
 
-function bufferToBlock(buf: StreamingBlockBuffer): ContentBlock {
+export function bufferToBlock(buf: StreamingBlockBuffer): ContentBlock {
   if (buf.finalized) return buf.finalized;
   if (buf.blockType === 'thinking') {
     return {
@@ -153,6 +176,8 @@ export type ChatAction =
   | { type: 'ABORT_LOCAL' }
   | { type: 'RECONCILE_DETAIL'; conversation: Conversation; messages: Message[]; markReloadNeeded?: boolean }
   | { type: 'MARK_NEEDS_RELOAD' }
+  | { type: 'UPDATE_MESSAGE'; message: Message }
+  | { type: 'REPLACE_MESSAGE_BY_ID'; targetId: string; message: Message }
   | { type: 'REMOVE_MESSAGE'; messageId: string };
 
 export function chatReducer(state: ChatState, action: ChatAction): ChatState {
@@ -170,6 +195,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorCode: null,
         errorMessage: null,
         needsReloadAfterAbort: false,
+        pendingInsertIndex: null,
         streaming: null,
       };
 
@@ -190,6 +216,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorCode: rest.errorCode,
         errorMessage: rest.errorMessage,
         needsReloadAfterAbort: false,
+        pendingInsertIndex: null,
         streaming: null,
       };
     }
@@ -200,6 +227,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         runState: 'error',
         errorCode: action.code,
         errorMessage: action.message,
+        pendingInsertIndex: null,
         streaming: null,
       };
 
@@ -217,6 +245,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorCode: null,
         errorMessage: null,
         needsReloadAfterAbort: false,
+        pendingInsertIndex: null,
         streaming: null,
       };
 
@@ -230,6 +259,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         runState: 'error',
         errorCode: action.code,
         errorMessage: action.message,
+        pendingInsertIndex: null,
         streaming: null,
       };
     }
@@ -241,6 +271,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorCode: null,
         errorMessage: null,
         needsReloadAfterAbort: false,
+        pendingInsertIndex: null,
         streaming: null,
       };
 
@@ -250,13 +281,30 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       );
       if (idx < 0) return state;
       const target = state.messages[idx];
-      const truncated =
-        target.role === 'user'
-          ? state.messages.slice(0, idx + 1)
-          : state.messages.slice(0, idx);
+      if (target.role === 'user') {
+        const nextMsg = state.messages[idx + 1];
+        if (nextMsg && nextMsg.role === 'assistant') {
+          return {
+            ...state,
+            messages: [
+              ...state.messages.slice(0, idx + 1),
+              ...state.messages.slice(idx + 2),
+            ],
+            pendingInsertIndex: idx + 1,
+          };
+        }
+        return {
+          ...state,
+          pendingInsertIndex: idx + 1,
+        };
+      }
       return {
         ...state,
-        messages: truncated,
+        messages: [
+          ...state.messages.slice(0, idx),
+          ...state.messages.slice(idx + 1),
+        ],
+        pendingInsertIndex: idx,
       };
     }
 
@@ -266,6 +314,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         runState: 'error',
         errorCode: action.code,
         errorMessage: action.message,
+        pendingInsertIndex: null,
         streaming: null,
       };
 
@@ -280,6 +329,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
             `local-assistant-${Date.now()}-${Math.random().toString(16).slice(2)}`,
           providerId: ev.providerId || action.fallbackProviderId,
           modelId: ev.modelId || action.fallbackModelId,
+          insertIndex: state.pendingInsertIndex ?? undefined,
           blockOrder: [],
           blocksByIndex: {},
         };
@@ -410,13 +460,15 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
                 stopReason: state.streaming.stopReason || 'stop',
               })
             : null);
+        const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
         const nextMessages = finalMsg
-          ? [...state.messages, finalMsg]
+          ? insertMessageAt(state.messages, finalMsg, slotIndex)
           : state.messages;
         const rest = deriveRestState(nextMessages);
         return {
           ...state,
           messages: nextMessages,
+          pendingInsertIndex: null,
           streaming: null,
           runState: rest.runState,
           errorCode: rest.errorCode,
@@ -428,6 +480,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (ev.type === 'error') {
         const errMsg = ev.error?.message || '流式生成失败';
         const errCode = ev.error?.code || 'UPSTREAM_ERROR';
+        const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
         const finalized = state.streaming
           ? materializeStreamingMessage(convId, state.streaming, {
               stopReason: 'error',
@@ -437,8 +490,9 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         return {
           ...state,
           messages: finalized
-            ? [...state.messages, finalized]
+            ? insertMessageAt(state.messages, finalized, slotIndex)
             : state.messages,
+          pendingInsertIndex: null,
           streaming: null,
           runState: 'error',
           errorCode: errCode,
@@ -451,6 +505,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'ABORT_LOCAL': {
       const convId = state.conversation?.id ?? '';
+      const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
       const partial = state.streaming
         ? materializeStreamingMessage(convId, state.streaming, {
             stopReason: 'aborted',
@@ -458,7 +513,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         : null;
       return {
         ...state,
-        messages: partial ? [...state.messages, partial] : state.messages,
+        messages: partial
+          ? insertMessageAt(state.messages, partial, slotIndex)
+          : state.messages,
+        pendingInsertIndex: null,
         streaming: null,
         runState: 'aborted',
         errorCode: null,
@@ -468,6 +526,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'STREAM_EOF_INCOMPLETE': {
       const convId = state.conversation?.id ?? '';
+      const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
       const partial = state.streaming
         ? materializeStreamingMessage(convId, state.streaming, {
             stopReason: 'error',
@@ -476,7 +535,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         : null;
       return {
         ...state,
-        messages: partial ? [...state.messages, partial] : state.messages,
+        messages: partial
+          ? insertMessageAt(state.messages, partial, slotIndex)
+          : state.messages,
+        pendingInsertIndex: null,
         streaming: null,
         runState: 'error',
         errorCode: 'STREAM_INCOMPLETE',
@@ -486,6 +548,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'STREAM_NETWORK_ERROR': {
       const convId = state.conversation?.id ?? '';
+      const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
       const partial = state.streaming
         ? materializeStreamingMessage(convId, state.streaming, {
             stopReason: 'error',
@@ -494,7 +557,10 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         : null;
       return {
         ...state,
-        messages: partial ? [...state.messages, partial] : state.messages,
+        messages: partial
+          ? insertMessageAt(state.messages, partial, slotIndex)
+          : state.messages,
+        pendingInsertIndex: null,
         streaming: null,
         runState: 'error',
         errorCode: action.code,
@@ -512,6 +578,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorCode: rest.errorCode,
         errorMessage: rest.errorMessage,
         needsReloadAfterAbort: action.markReloadNeeded ?? false,
+        pendingInsertIndex: null,
         streaming: null,
       };
     }
@@ -520,6 +587,22 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         needsReloadAfterAbort: true,
+      };
+
+    case 'UPDATE_MESSAGE':
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.id === action.message.id ? action.message : m,
+        ),
+      };
+
+    case 'REPLACE_MESSAGE_BY_ID':
+      return {
+        ...state,
+        messages: state.messages.map((m) =>
+          m.id === action.targetId ? action.message : m,
+        ),
       };
 
     case 'REMOVE_MESSAGE': {

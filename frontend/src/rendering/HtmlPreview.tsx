@@ -16,7 +16,11 @@ function generateNonce(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function buildSandboxedSrcDoc(rawHtml: string, nonce: string): string {
+export function buildSandboxedSrcDoc(
+  rawHtml: string,
+  nonce: string,
+  options?: { seamless?: boolean; theme?: 'light' | 'dark' },
+): string {
   const safeNonce = JSON.stringify(nonce);
   const bridgeScript = `
 <script>
@@ -57,18 +61,33 @@ export function buildSandboxedSrcDoc(rawHtml: string, nonce: string): string {
     return `${rawHtml}\n${bridgeScript}`;
   }
 
-  return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<style>
+  const isSeamless = Boolean(options?.seamless);
+  const isDark = options?.theme === 'dark';
+  const styleBlock = isSeamless
+    ? `
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: transparent;
+    color: ${isDark ? '#f5f5f7' : '#1d1d1f'};
+    color-scheme: ${isDark ? 'dark' : 'light'};
+    box-sizing: border-box;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "PingFang SC", sans-serif;
+  }`
+    : `
   html, body {
     margin: 0;
     padding: 10px;
     box-sizing: border-box;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  }
+  }`;
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>${styleBlock}
 </style>
 </head>
 <body>
@@ -78,21 +97,36 @@ ${bridgeScript}
 </html>`;
 }
 
-function SandboxedIframe({
+export function SandboxedIframe({
   html,
   minHeight = 140,
   maxHeight = 680,
   fillAvailable = false,
+  seamless = false,
 }: {
   html: string;
   minHeight?: number;
   maxHeight?: number;
   fillAvailable?: boolean;
+  seamless?: boolean;
 }) {
+  const { resolvedTheme } = useApp();
+  const effectiveMinHeight = seamless && minHeight === 140 ? 24 : minHeight;
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const nonce = useMemo(() => generateNonce(), []);
-  const srcDoc = useMemo(() => buildSandboxedSrcDoc(html, nonce), [html, nonce]);
-  const [height, setHeight] = useState(minHeight);
+  const srcDoc = useMemo(
+    () =>
+      buildSandboxedSrcDoc(html, nonce, {
+        seamless,
+        theme: resolvedTheme,
+      }),
+    [html, nonce, seamless, resolvedTheme],
+  );
+  const [height, setHeight] = useState(effectiveMinHeight);
+
+  useEffect(() => {
+    setHeight(effectiveMinHeight);
+  }, [effectiveMinHeight]);
 
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
@@ -109,22 +143,35 @@ function SandboxedIframe({
         Number.isFinite(reported) &&
         reported > 0
       ) {
-        const clamped = Math.min(maxHeight, Math.max(minHeight, Math.round(reported)));
+        const clamped = Math.min(
+          maxHeight,
+          Math.max(effectiveMinHeight, Math.round(reported)),
+        );
         setHeight((prev) => (Math.abs(clamped - prev) >= 1 ? clamped : prev));
       }
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [maxHeight, minHeight, nonce]);
+  }, [effectiveMinHeight, maxHeight, nonce]);
 
   return (
-    <div className="html-sandbox-wrap">
+    <div
+      className={
+        seamless
+          ? 'html-sandbox-wrap html-sandbox-wrap--seamless'
+          : 'html-sandbox-wrap'
+      }
+    >
       <iframe
         ref={iframeRef}
         title="HTML 预览"
         sandbox="allow-scripts"
         srcDoc={srcDoc}
-        className="html-sandbox-frame"
+        className={
+          seamless
+            ? 'html-sandbox-frame html-sandbox-frame--seamless'
+            : 'html-sandbox-frame'
+        }
         style={{
           height: fillAvailable ? 'min(70dvh, 640px)' : `${height}px`,
         }}

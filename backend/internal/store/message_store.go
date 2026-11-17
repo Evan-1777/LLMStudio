@@ -73,32 +73,220 @@ func (s *MessageStore) Create(ctx context.Context, m domain.Message) (domain.Mes
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = time.Now().UTC()
 	}
-	blocks := m.Blocks
-	if blocks == nil {
-		blocks = []domain.ContentBlock{}
-	}
-	blocksBytes, err := json.Marshal(blocks)
+	blocksJSON, usageJSON, err := encodeMessagePayloads(m.Blocks, m.Usage)
 	if err != nil {
-		return domain.Message{}, fmt.Errorf("encode message blocks: %w", err)
-	}
-	var usageJSON sql.NullString
-	if m.Usage != nil {
-		usageBytes, err := json.Marshal(m.Usage)
-		if err != nil {
-			return domain.Message{}, fmt.Errorf("encode message usage: %w", err)
-		}
-		usageJSON = sql.NullString{String: string(usageBytes), Valid: true}
+		return domain.Message{}, err
 	}
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO messages (
 			id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, m.ID, m.ConversationID, m.Role, string(blocksBytes), m.ProviderID, m.ModelID, usageJSON, m.StopReason, m.ErrorMessage, formatTime(m.CreatedAt))
+	`, m.ID, m.ConversationID, m.Role, blocksJSON, m.ProviderID, m.ModelID, usageJSON, m.StopReason, m.ErrorMessage, formatTime(m.CreatedAt))
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("create message: %w", err)
 	}
 	return s.Get(ctx, m.ID)
+}
+
+// UpdateBlocks updates blocks_json of an existing message in place while preserving its identity and order.
+func (s *MessageStore) UpdateBlocks(ctx context.Context, conversationID, messageID string, blocks []domain.ContentBlock) (domain.Message, error) {
+	blocksJSON, _, err := encodeMessagePayloads(blocks, nil)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE messages
+		SET blocks_json = ?
+		WHERE id = ? AND conversation_id = ?
+	`, blocksJSON, messageID, conversationID)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("update message %s: %w", messageID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("rows affected update message %s: %w", messageID, err)
+	}
+	if affected == 0 {
+		return domain.Message{}, domain.NewError(domain.ErrCodeNotFound, "message not found in conversation", nil)
+	}
+	return s.Get(ctx, messageID)
+}
+
+// ReplaceByID overwrites a message in place while preserving its original created_at and SQLite rowid.
+func (s *MessageStore) ReplaceByID(ctx context.Context, conversationID, targetMessageID string, next domain.Message) (domain.Message, error) {
+	if next.ID == "" {
+		next.ID = domain.NewUUID()
+	}
+	blocksJSON, usageJSON, err := encodeMessagePayloads(next.Blocks, next.Usage)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE messages
+		SET id = ?, role = ?, blocks_json = ?, provider_id = ?, model_id = ?, usage_json = ?, stop_reason = ?, error_message = ?
+		WHERE id = ? AND conversation_id = ?
+	`, next.ID, next.Role, blocksJSON, next.ProviderID, next.ModelID, usageJSON, next.StopReason, next.ErrorMessage, targetMessageID, conversationID)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("replace message %s: %w", targetMessageID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("rows affected replace message %s: %w", targetMessageID, err)
+	}
+	if affected == 0 {
+		return domain.Message{}, domain.NewError(domain.ErrCodeNotFound, "message not found in conversation", nil)
+	}
+	return s.Get(ctx, next.ID)
+}
+
+// InsertAfter inserts next immediately after afterMessageID within the conversation's chronological order.
+func (s *MessageStore) InsertAfter(ctx context.Context, conversationID, afterMessageID string, next domain.Message) (domain.Message, error) {
+	if next.ID == "" {
+		next.ID = domain.NewUUID()
+	}
+	blocksJSON, usageJSON, err := encodeMessagePayloads(next.Blocks, next.Usage)
+	if err != nil {
+		return domain.Message{}, err
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("begin insertAfter tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		afterRowID      int64
+		afterCreatedRaw string
+	)
+	err = tx.QueryRowContext(ctx, `
+		SELECT rowid, created_at
+		FROM messages
+		WHERE id = ? AND conversation_id = ?
+	`, afterMessageID, conversationID).Scan(&afterRowID, &afterCreatedRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Message{}, domain.NewError(domain.ErrCodeNotFound, "anchor message not found in conversation", err)
+	}
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("lookup anchor message: %w", err)
+	}
+	afterCreatedAt, err := parseTime(afterCreatedRaw)
+	if err != nil {
+		return domain.Message{}, fmt.Errorf("parse anchor created_at: %w", err)
+	}
+
+	var nextCreatedRaw string
+	err = tx.QueryRowContext(ctx, `
+		SELECT created_at
+		FROM messages
+		WHERE conversation_id = ?
+		  AND (created_at > ? OR (created_at = ? AND rowid > ?))
+		ORDER BY created_at ASC, rowid ASC
+		LIMIT 1
+	`, conversationID, afterCreatedRaw, afterCreatedRaw, afterRowID).Scan(&nextCreatedRaw)
+
+	var insertAt time.Time
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		now := time.Now().UTC()
+		candidate := afterCreatedAt.Add(time.Microsecond)
+		if now.After(candidate) {
+			insertAt = now
+		} else {
+			insertAt = candidate
+		}
+	case err != nil:
+		return domain.Message{}, fmt.Errorf("lookup following message: %w", err)
+	default:
+		nextCreatedAt, pErr := parseTime(nextCreatedRaw)
+		if pErr != nil {
+			return domain.Message{}, fmt.Errorf("parse following created_at: %w", pErr)
+		}
+		gap := nextCreatedAt.Sub(afterCreatedAt)
+		if gap >= 2*time.Nanosecond {
+			insertAt = afterCreatedAt.Add(gap / 2)
+		} else {
+			if err := shiftMessagesForward(ctx, tx, conversationID, afterCreatedRaw, afterRowID, 2*time.Millisecond); err != nil {
+				return domain.Message{}, err
+			}
+			insertAt = afterCreatedAt.Add(time.Millisecond)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO messages (
+			id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, next.ID, conversationID, next.Role, blocksJSON, next.ProviderID, next.ModelID, usageJSON, next.StopReason, next.ErrorMessage, formatTime(insertAt)); err != nil {
+		return domain.Message{}, fmt.Errorf("insert message after %s: %w", afterMessageID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Message{}, fmt.Errorf("commit insertAfter tx: %w", err)
+	}
+	return s.Get(ctx, next.ID)
+}
+
+func shiftMessagesForward(ctx context.Context, tx *sql.Tx, conversationID, afterCreatedRaw string, afterRowID int64, delta time.Duration) error {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, created_at
+		FROM messages
+		WHERE conversation_id = ?
+		  AND (created_at > ? OR (created_at = ? AND rowid > ?))
+		ORDER BY created_at ASC, rowid ASC
+	`, conversationID, afterCreatedRaw, afterCreatedRaw, afterRowID)
+	if err != nil {
+		return fmt.Errorf("query messages to shift: %w", err)
+	}
+	type rowItem struct {
+		id        string
+		createdAt time.Time
+	}
+	var toShift []rowItem
+	for rows.Next() {
+		var id, raw string
+		if err := rows.Scan(&id, &raw); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan message to shift: %w", err)
+		}
+		t, err := parseTime(raw)
+		if err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("parse created_at to shift: %w", err)
+		}
+		toShift = append(toShift, rowItem{id: id, createdAt: t.Add(delta)})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("iterate messages to shift: %w", err)
+	}
+	_ = rows.Close()
+
+	for _, item := range toShift {
+		if _, err := tx.ExecContext(ctx, `UPDATE messages SET created_at = ? WHERE id = ?`, formatTime(item.createdAt), item.id); err != nil {
+			return fmt.Errorf("shift message %s: %w", item.id, err)
+		}
+	}
+	return nil
+}
+
+func encodeMessagePayloads(blocks []domain.ContentBlock, usage *domain.Usage) (string, sql.NullString, error) {
+	if blocks == nil {
+		blocks = []domain.ContentBlock{}
+	}
+	blocksBytes, err := json.Marshal(blocks)
+	if err != nil {
+		return "", sql.NullString{}, fmt.Errorf("encode message blocks: %w", err)
+	}
+	var usageJSON sql.NullString
+	if usage != nil {
+		usageBytes, err := json.Marshal(usage)
+		if err != nil {
+			return "", sql.NullString{}, fmt.Errorf("encode message usage: %w", err)
+		}
+		usageJSON = sql.NullString{String: string(usageBytes), Valid: true}
+	}
+	return string(blocksBytes), usageJSON, nil
 }
 
 // DeleteFrom deletes the specified target message and all messages that follow it in the conversation.

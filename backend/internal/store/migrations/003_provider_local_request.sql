@@ -1,0 +1,1 @@
+ALTER TABLE providers ADD COLUMN local_request INTEGER NOT NULL DEFAULT 0;

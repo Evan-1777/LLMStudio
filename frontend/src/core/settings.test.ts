@@ -39,10 +39,18 @@ describe('settings storage and migration', () => {
       themeMode: 'dark',
       seedColorValue: 0xff2d6a4f,
       enterToSend: false,
+      visualHtmlRender: true,
       defaultHtmlPreview: false,
+      chatDisplayMode: 'bubble',
       autoCollapseEnabled: false,
       collapseLineThreshold: 200,
       collapseCharThreshold: 120,
+    });
+
+    expect(defaultSettings()).toMatchObject({
+      visualHtmlRender: true,
+      defaultHtmlPreview: false,
+      chatDisplayMode: 'bubble',
     });
 
     expect(localStorage.getItem(LEGACY_FLUTTER_SETTINGS_KEY)).toBe(doubleEncoded);
@@ -65,12 +73,18 @@ describe('settings storage and migration', () => {
         ...defaultSettings(),
         gatewayBaseUrl: 'https://new.example',
         themeMode: 'light',
+        visualHtmlRender: false,
+        defaultHtmlPreview: true,
+        chatDisplayMode: 'feed',
       }),
     );
 
     const res = loadSettings();
     expect(res.settings.gatewayBaseUrl).toBe('https://new.example');
     expect(res.settings.themeMode).toBe('light');
+    expect(res.settings.visualHtmlRender).toBe(false);
+    expect(res.settings.defaultHtmlPreview).toBe(true);
+    expect(res.settings.chatDisplayMode).toBe('feed');
     expect(res.migratedFromLegacy).toBe(false);
   });
 

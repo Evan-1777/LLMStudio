@@ -80,21 +80,152 @@ func (s *ChatService) WithSearch(searchReg *plugin.SearchRegistry, searchStore *
 
 // PreparedStream holds a validated, open upstream HTTP response ready to stream SSE events to the client.
 type PreparedStream struct {
-	service        *ChatService
-	conversation   domain.Conversation
-	provider       domain.ProviderConfig
-	model          domain.ModelConfig
-	apiFormat      plugin.APIFormat
-	resp           *http.Response
-	webSearchBlock *domain.ContentBlock
+	service              *ChatService
+	conversation         domain.Conversation
+	provider             domain.ProviderConfig
+	model                domain.ModelConfig
+	apiFormat            plugin.APIFormat
+	resp                 *http.Response
+	webSearchBlock       *domain.ContentBlock
+	replaceMessageID     string
+	insertAfterMessageID string
 }
 
-// Prepare validates inputs, persists user message (or trims regenerated assistant messages),
-// encodes the upstream payload, and opens the upstream HTTP connection BEFORE SSE headers are sent.
+// PreparedLocalRequest holds a pre-encoded upstream request for browser-direct execution.
+// Server-stored API keys are never included in URL or Headers.
+type PreparedLocalRequest struct {
+	Method               string               `json:"method"`
+	URL                  string               `json:"url"`
+	Headers              map[string]string    `json:"headers"`
+	Body                 json.RawMessage      `json:"body"`
+	AuthType             string               `json:"authType"`
+	WebSearchBlock       *domain.ContentBlock `json:"webSearchBlock,omitempty"`
+	ReplaceMessageID     string               `json:"replaceMessageId,omitempty"`
+	InsertAfterMessageID string               `json:"insertAfterMessageId,omitempty"`
+}
+
+type preparedUpstream struct {
+	conversation         domain.Conversation
+	provider             domain.ProviderConfig
+	model                domain.ModelConfig
+	apiFormat            plugin.APIFormat
+	encoded              plugin.EncodedRequest
+	endpoint             plugin.ResolvedEndpoint
+	webSearchBlock       *domain.ContentBlock
+	isRegen              bool
+	userBlocks           []domain.ContentBlock
+	historyLen           int
+	replaceMessageID     string
+	insertAfterMessageID string
+}
+
+// Prepare validates inputs, encodes the upstream payload, opens the upstream HTTP connection,
+// and persists any new user prompt BEFORE SSE headers are sent.
 func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*PreparedStream, error) {
-	conv, err := s.convs.Get(ctx, in.ConversationID)
+	prep, err := s.prepareUpstream(ctx, in, false)
 	if err != nil {
 		return nil, err
+	}
+
+	upReq, err := http.NewRequestWithContext(ctx, prep.encoded.Method, prep.endpoint.URL, bytes.NewReader(prep.encoded.Body))
+	if err != nil {
+		return nil, domain.NewError(domain.ErrCodeInternalError, "construct upstream request failed", err)
+	}
+	upReq.Header = mergeRequestHeaders(prep.encoded.Headers, prep.endpoint.Headers)
+
+	resp, err := s.httpClient.Do(upReq)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, domain.NewError(domain.ErrCodeUpstreamError, "request canceled", ctx.Err())
+		}
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream request failed: %v", err), err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		bodySnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		msg := strings.TrimSpace(string(bodySnippet))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream returned HTTP %d: %s", resp.StatusCode, msg), nil)
+	}
+
+	conv := prep.conversation
+	if !prep.isRegen {
+		if _, err := s.msgs.Create(ctx, domain.Message{
+			ConversationID: conv.ID,
+			Role:           domain.RoleUser,
+			Blocks:         prep.userBlocks,
+			CreatedAt:      time.Now().UTC(),
+		}); err != nil {
+			_ = resp.Body.Close()
+			return nil, err
+		}
+		// Auto-title freshly created conversations from the first user prompt.
+		if (conv.Title == "" || conv.Title == "New Chat") && prep.historyLen == 1 {
+			if derived := deriveTitleFromBlocks(prep.userBlocks); derived != "" {
+				conv.Title = derived
+				if updated, uErr := s.convs.Update(ctx, conv); uErr == nil {
+					conv = updated
+				}
+			}
+		}
+	}
+
+	return &PreparedStream{
+		service:              s,
+		conversation:         conv,
+		provider:             prep.provider,
+		model:                prep.model,
+		apiFormat:            prep.apiFormat,
+		resp:                 resp,
+		webSearchBlock:       prep.webSearchBlock,
+		replaceMessageID:     prep.replaceMessageID,
+		insertAfterMessageID: prep.insertAfterMessageID,
+	}, nil
+}
+
+// PrepareLocal validates inputs, runs optional web search, and encodes the upstream request
+// without mutating SQLite or emitting server-stored API keys.
+func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (PreparedLocalRequest, error) {
+	prep, err := s.prepareUpstream(ctx, in, true)
+	if err != nil {
+		return PreparedLocalRequest{}, err
+	}
+
+	merged := mergeRequestHeaders(prep.encoded.Headers, prep.endpoint.Headers)
+	headers := make(map[string]string, len(merged))
+	for k, vals := range merged {
+		if len(vals) > 0 {
+			headers[k] = strings.Join(vals, ", ")
+		}
+	}
+	body := json.RawMessage(prep.encoded.Body)
+	if len(body) == 0 {
+		body = json.RawMessage("{}")
+	}
+
+	authType := strings.TrimSpace(prep.provider.AuthType)
+	if authType == "" {
+		authType = domain.AuthTypeBearer
+	}
+
+	return PreparedLocalRequest{
+		Method:               prep.encoded.Method,
+		URL:                  prep.endpoint.URL,
+		Headers:              headers,
+		Body:                 body,
+		AuthType:             authType,
+		WebSearchBlock:       prep.webSearchBlock,
+		ReplaceMessageID:     prep.replaceMessageID,
+		InsertAfterMessageID: prep.insertAfterMessageID,
+	}, nil
+}
+
+func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, allowMissingLocalKey bool) (preparedUpstream, error) {
+	conv, err := s.convs.Get(ctx, in.ConversationID)
+	if err != nil {
+		return preparedUpstream{}, err
 	}
 
 	providerID := strings.TrimSpace(in.ProviderID)
@@ -106,28 +237,28 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		modelID = conv.ModelID
 	}
 	if providerID == "" || modelID == "" {
-		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "providerId and modelId are required", nil)
+		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, "providerId and modelId are required", nil)
 	}
 
 	prov, err := s.providers.Get(ctx, providerID)
 	if err != nil {
-		return nil, err
+		return preparedUpstream{}, err
 	}
 	if !prov.Enabled {
-		return nil, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("provider %q is disabled", prov.Name), nil)
+		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("provider %q is disabled", prov.Name), nil)
 	}
 	model, ok := findModel(prov.Models, modelID)
 	if !ok {
-		return nil, domain.NewError(domain.ErrCodeNotFound, fmt.Sprintf("model %q not found on provider %q", modelID, prov.Name), nil)
+		return preparedUpstream{}, domain.NewError(domain.ErrCodeNotFound, fmt.Sprintf("model %q not found on provider %q", modelID, prov.Name), nil)
 	}
 
 	apiFormat, ok := s.formats.Get(model.APIFormat)
 	if !ok {
-		return nil, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unregistered apiFormat %q", model.APIFormat), nil)
+		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unregistered apiFormat %q", model.APIFormat), nil)
 	}
 	adapter, ok := s.adapters.Get(prov.Adapter)
 	if !ok {
-		return nil, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unregistered provider adapter %q", prov.Adapter), nil)
+		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unregistered provider adapter %q", prov.Adapter), nil)
 	}
 
 	isRegen := strings.TrimSpace(in.RegenerateMessageID) != ""
@@ -141,20 +272,20 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 			}}
 		}
 		if len(userBlocks) == 0 {
-			return nil, domain.NewError(domain.ErrCodeInvalidArgument, "message blocks or text are required", nil)
+			return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, "message blocks or text are required", nil)
 		}
 	} else {
 		if _, err := s.msgs.Get(ctx, in.RegenerateMessageID); err != nil {
-			return nil, err
+			return preparedUpstream{}, err
 		}
 	}
 
 	history, err := s.msgs.ListByConversation(ctx, conv.ID)
 	if err != nil {
-		return nil, err
+		return preparedUpstream{}, err
 	}
 
-	var deleteFromID string
+	var replaceMessageID, insertAfterMessageID string
 	if isRegen {
 		targetIdx := -1
 		for i, m := range history {
@@ -164,15 +295,19 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 			}
 		}
 		if targetIdx < 0 {
-			return nil, domain.NewError(domain.ErrCodeNotFound, "target message not found in conversation", nil)
+			return preparedUpstream{}, domain.NewError(domain.ErrCodeNotFound, "target message not found in conversation", nil)
 		}
 		if history[targetIdx].Role == domain.RoleUser {
 			if targetIdx+1 < len(history) {
-				deleteFromID = history[targetIdx+1].ID
+				if history[targetIdx+1].Role == domain.RoleAssistant {
+					replaceMessageID = history[targetIdx+1].ID
+				} else {
+					insertAfterMessageID = history[targetIdx].ID
+				}
 			}
 			history = history[:targetIdx+1]
 		} else {
-			deleteFromID = in.RegenerateMessageID
+			replaceMessageID = history[targetIdx].ID
 			history = history[:targetIdx]
 		}
 	} else {
@@ -224,84 +359,62 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		Compat:         mergedCompat,
 	})
 	if err != nil {
-		return nil, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", err)
+		return preparedUpstream{}, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", err)
 	}
 
-	endpoint, err := adapter.ResolveEndpoint(prov, model, encoded.DefaultPath, encoded.Query, mergedCompat)
+	resolveProv := prov
+	if allowMissingLocalKey {
+		authType := strings.TrimSpace(prov.AuthType)
+		if authType == "" {
+			authType = domain.AuthTypeBearer
+		}
+		if !prov.LocalRequest && authType != domain.AuthTypeNone && strings.TrimSpace(prov.APIKey) == "" {
+			return preparedUpstream{}, domain.NewError(
+				domain.ErrCodeInvalidArgument,
+				fmt.Sprintf("provider %q API key is required for authType %q", prov.Name, authType),
+				nil,
+			)
+		}
+		// Never emit server-stored API keys in pre-encoded browser-direct responses.
+		resolveProv.AuthType = domain.AuthTypeNone
+		resolveProv.APIKey = ""
+	}
+
+	endpoint, err := adapter.ResolveEndpoint(resolveProv, model, encoded.DefaultPath, encoded.Query, mergedCompat)
 	if err != nil {
-		return nil, err
+		return preparedUpstream{}, err
 	}
 
-	upReq, err := http.NewRequestWithContext(ctx, encoded.Method, endpoint.URL, bytes.NewReader(encoded.Body))
-	if err != nil {
-		return nil, domain.NewError(domain.ErrCodeInternalError, "construct upstream request failed", err)
-	}
-	for k, vals := range encoded.Headers {
-		for _, v := range vals {
-			upReq.Header.Add(k, v)
-		}
-	}
-	for k, vals := range endpoint.Headers {
-		upReq.Header.Del(k)
-		for _, v := range vals {
-			upReq.Header.Add(k, v)
-		}
-	}
-
-	resp, err := s.httpClient.Do(upReq)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, domain.NewError(domain.ErrCodeUpstreamError, "request canceled", ctx.Err())
-		}
-		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream request failed: %v", err), err)
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		bodySnippet, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		_ = resp.Body.Close()
-		msg := strings.TrimSpace(string(bodySnippet))
-		if msg == "" {
-			msg = resp.Status
-		}
-		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream returned HTTP %d: %s", resp.StatusCode, msg), nil)
-	}
-
-	if isRegen {
-		if deleteFromID != "" {
-			if err := s.msgs.DeleteFrom(ctx, conv.ID, deleteFromID); err != nil {
-				_ = resp.Body.Close()
-				return nil, err
-			}
-		}
-	} else {
-		if _, err := s.msgs.Create(ctx, domain.Message{
-			ConversationID: conv.ID,
-			Role:           domain.RoleUser,
-			Blocks:         userBlocks,
-			CreatedAt:      time.Now().UTC(),
-		}); err != nil {
-			_ = resp.Body.Close()
-			return nil, err
-		}
-		// Auto-title freshly created conversations from the first user prompt.
-		if (conv.Title == "" || conv.Title == "New Chat") && len(history) == 1 {
-			if derived := deriveTitleFromBlocks(userBlocks); derived != "" {
-				conv.Title = derived
-				if updated, uErr := s.convs.Update(ctx, conv); uErr == nil {
-					conv = updated
-				}
-			}
-		}
-	}
-
-	return &PreparedStream{
-		service:        s,
-		conversation:   conv,
-		provider:       prov,
-		model:          model,
-		apiFormat:      apiFormat,
-		resp:           resp,
-		webSearchBlock: webSearchBlock,
+	return preparedUpstream{
+		conversation:         conv,
+		provider:             prov,
+		model:                model,
+		apiFormat:            apiFormat,
+		encoded:              encoded,
+		endpoint:             endpoint,
+		webSearchBlock:       webSearchBlock,
+		isRegen:              isRegen,
+		userBlocks:           userBlocks,
+		historyLen:           len(history),
+		replaceMessageID:     replaceMessageID,
+		insertAfterMessageID: insertAfterMessageID,
 	}, nil
+}
+
+func mergeRequestHeaders(encodedHeaders, endpointHeaders http.Header) http.Header {
+	merged := make(http.Header)
+	for k, vals := range encodedHeaders {
+		for _, v := range vals {
+			merged.Add(k, v)
+		}
+	}
+	for k, vals := range endpointHeaders {
+		merged.Del(k)
+		for _, v := range vals {
+			merged.Add(k, v)
+		}
+	}
+	return merged
 }
 
 // Stream consumes the upstream response body, translates events via emit, handles cancellation,
@@ -447,11 +560,22 @@ func (p *PreparedStream) persistResult(
 		ErrorMessage:   errMsg,
 		CreatedAt:      time.Now().UTC(),
 	}
-	saved, err := p.service.msgs.Create(persistCtx, msg)
+	var (
+		saved domain.Message
+		err   error
+	)
+	switch {
+	case p.replaceMessageID != "":
+		saved, err = p.service.msgs.ReplaceByID(persistCtx, p.conversation.ID, p.replaceMessageID, msg)
+	case p.insertAfterMessageID != "":
+		saved, err = p.service.msgs.InsertAfter(persistCtx, p.conversation.ID, p.insertAfterMessageID, msg)
+	default:
+		saved, err = p.service.msgs.Create(persistCtx, msg)
+	}
 	if err != nil {
 		return msg
 	}
-	_ = p.service.convs.TouchUpdatedAt(persistCtx, p.conversation.ID, saved.CreatedAt)
+	_ = p.service.convs.TouchUpdatedAt(persistCtx, p.conversation.ID, time.Now().UTC())
 	return saved
 }
 

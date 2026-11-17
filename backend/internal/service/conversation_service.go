@@ -234,6 +234,140 @@ func (s *ConversationService) Delete(ctx context.Context, id string) error {
 	return s.convs.Delete(ctx, id)
 }
 
+// CreateMessageInput describes payload fields for persisting a single message (including local-request writes).
+type CreateMessageInput struct {
+	Role             string                `json:"role"`
+	Blocks           []domain.ContentBlock `json:"blocks"`
+	ProviderID       string                `json:"providerId,omitempty"`
+	ModelID          string                `json:"modelId,omitempty"`
+	Usage            *domain.Usage         `json:"usage,omitempty"`
+	StopReason       string                `json:"stopReason,omitempty"`
+	ErrorMessage     string                `json:"errorMessage,omitempty"`
+	ReplaceMessageID string                `json:"replaceMessageId,omitempty"`
+	AfterMessageID   string                `json:"afterMessageId,omitempty"`
+}
+
+// CreateMessageResult bundles the persisted message and updated conversation metadata.
+type CreateMessageResult struct {
+	Message      domain.Message      `json:"message"`
+	Conversation domain.Conversation `json:"conversation"`
+}
+
+// UpdateMessage updates a persisted message's blocks in place and refreshes the conversation timestamp.
+func (s *ConversationService) UpdateMessage(ctx context.Context, conversationID, messageID string, blocks []domain.ContentBlock) (domain.Message, error) {
+	if _, err := s.convs.Get(ctx, conversationID); err != nil {
+		return domain.Message{}, err
+	}
+	if len(blocks) == 0 {
+		return domain.Message{}, domain.NewError(domain.ErrCodeInvalidArgument, "message blocks must not be empty", nil)
+	}
+	for _, b := range blocks {
+		if strings.TrimSpace(b.Type) == "" {
+			return domain.Message{}, domain.NewError(domain.ErrCodeInvalidArgument, "content block type is required", nil)
+		}
+	}
+	updated, err := s.msgs.UpdateBlocks(ctx, conversationID, messageID, blocks)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if err := s.convs.TouchUpdatedAt(ctx, conversationID, time.Now().UTC()); err != nil {
+		return domain.Message{}, err
+	}
+	return updated, nil
+}
+
+// CreateMessage persists a new, replaced, or interval-inserted message and updates conversation metadata.
+func (s *ConversationService) CreateMessage(ctx context.Context, conversationID string, in CreateMessageInput) (CreateMessageResult, error) {
+	conv, err := s.convs.Get(ctx, conversationID)
+	if err != nil {
+		return CreateMessageResult{}, err
+	}
+	role := strings.TrimSpace(in.Role)
+	switch role {
+	case domain.RoleUser, domain.RoleAssistant, domain.RoleToolResult:
+	default:
+		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "invalid message role", nil)
+	}
+	blocks := in.Blocks
+	if blocks == nil {
+		blocks = []domain.ContentBlock{}
+	}
+	if role == domain.RoleUser && len(blocks) == 0 {
+		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "message blocks are required for user message", nil)
+	}
+	for _, b := range blocks {
+		if strings.TrimSpace(b.Type) == "" {
+			return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "content block type is required", nil)
+		}
+	}
+	replaceID := strings.TrimSpace(in.ReplaceMessageID)
+	afterID := strings.TrimSpace(in.AfterMessageID)
+	if replaceID != "" && afterID != "" {
+		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "replaceMessageId and afterMessageId are mutually exclusive", nil)
+	}
+
+	msg := domain.Message{
+		ConversationID: conversationID,
+		Role:           role,
+		Blocks:         blocks,
+		ProviderID:     strings.TrimSpace(in.ProviderID),
+		ModelID:        strings.TrimSpace(in.ModelID),
+		Usage:          in.Usage,
+		StopReason:     strings.TrimSpace(in.StopReason),
+		ErrorMessage:   in.ErrorMessage,
+		CreatedAt:      time.Now().UTC(),
+	}
+
+	var saved domain.Message
+	switch {
+	case replaceID != "":
+		saved, err = s.msgs.ReplaceByID(ctx, conversationID, replaceID, msg)
+	case afterID != "":
+		saved, err = s.msgs.InsertAfter(ctx, conversationID, afterID, msg)
+	default:
+		saved, err = s.msgs.Create(ctx, msg)
+	}
+	if err != nil {
+		return CreateMessageResult{}, err
+	}
+
+	if saved.Role == domain.RoleUser && (conv.Title == "" || conv.Title == "New Chat") {
+		msgs, listErr := s.msgs.ListByConversation(ctx, conversationID)
+		if listErr == nil && countRoleMessages(msgs, domain.RoleUser) == 1 {
+			if derived := deriveTitleFromBlocks(saved.Blocks); derived != "" {
+				conv.Title = derived
+				if updated, uErr := s.convs.Update(ctx, conv); uErr == nil {
+					return CreateMessageResult{
+						Message:      saved,
+						Conversation: updated,
+					}, nil
+				}
+			}
+		}
+	}
+
+	if err := s.convs.TouchUpdatedAt(ctx, conversationID, time.Now().UTC()); err != nil {
+		return CreateMessageResult{}, err
+	}
+	if latest, gErr := s.convs.Get(ctx, conversationID); gErr == nil {
+		conv = latest
+	}
+	return CreateMessageResult{
+		Message:      saved,
+		Conversation: conv,
+	}, nil
+}
+
+func countRoleMessages(msgs []domain.Message, role string) int {
+	n := 0
+	for _, m := range msgs {
+		if m.Role == role {
+			n++
+		}
+	}
+	return n
+}
+
 // DeleteMessage removes a single message from a conversation and refreshes updated_at.
 func (s *ConversationService) DeleteMessage(ctx context.Context, conversationID, messageID string) error {
 	if _, err := s.convs.Get(ctx, conversationID); err != nil {

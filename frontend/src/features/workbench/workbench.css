@@ -60,13 +60,9 @@
 .wb-brand__mark {
   width: 24px;
   height: 24px;
-  border-radius: 7px;
-  background: var(--text-primary);
-  color: var(--bg-surface);
-  display: grid;
-  place-items: center;
-  font-size: 13px;
-  font-weight: 700;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
   flex: none;
 }
 
@@ -398,6 +394,117 @@
   font-size: 11px;
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
+}
+
+.wb-msg-editor {
+  width: 100%;
+  max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-surface-secondary);
+}
+
+.wb-msg-editor__textarea {
+  min-height: 76px;
+  background: var(--bg-surface);
+}
+
+.wb-msg-editor__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* Feed Display Mode */
+.wb-feed-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.wb-feed-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.wb-feed-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 9px;
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+
+.wb-feed-avatar--user {
+  background: var(--success);
+  color: #ffffff;
+}
+
+.wb-feed-avatar--asst {
+  background: var(--bg-surface-secondary);
+  border: 1px solid var(--border-hairline);
+  color: var(--accent);
+  border-radius: 50%;
+}
+
+.wb-feed-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
+.wb-feed-author {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-feed-time {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+}
+
+.wb-feed-body {
+  padding-left: 42px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  font-size: 14.5px;
+  line-height: 1.6;
+  color: var(--text-primary);
+}
+
+.wb-feed-msg--user .msg-actions {
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-apple);
+}
+
+.wb-feed-msg--user:hover .msg-actions,
+.wb-feed-msg--user:focus-within .msg-actions {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .wb-user-msg .msg-actions,
+  .wb-feed-msg--user .msg-actions {
+    opacity: 1;
+  }
 }
 
 .wb-scroll-bottom-btn {
@@ -866,6 +973,15 @@
   .wb-model-btn {
     max-width: 130px;
     padding: 0 8px;
+  }
+
+  .wb-feed-body {
+    padding-left: 0;
+  }
+
+  .wb-user-msg .msg-actions,
+  .wb-feed-msg--user .msg-actions {
+    opacity: 1;
   }
 
   .wb-chat-inner {

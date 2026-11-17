@@ -18,15 +18,28 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     await page.getByRole('option', { name: /Mock Chat/ }).click();
 
     const composer = page.getByLabel('消息输入框');
+
+    // 1. Raw unwrapped HTML renders seamlessly (borderless, no card header) by default.
+    await composer.fill('[RAW_HTML_VISUAL]');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await expect(page.getByText('前置说明')).toBeVisible();
+    const seamlessIframe = page.locator('iframe.html-sandbox-frame--seamless');
+    await expect(seamlessIframe).toBeVisible();
+    await expect(seamlessIframe).toHaveAttribute('sandbox', 'allow-scripts');
+
+    // 2. Fenced ```html block defaults to code view (defaultHtmlPreview=false) and isolates sandboxed iframe on preview.
     await composer.fill('[HTML_SANDBOX]');
     await page.getByRole('button', { name: '发送消息' }).click();
 
-    // Markdown heading, table, code block, and HTML sandbox iframe render.
+    // Markdown heading, table, code block render; fenced HTML starts in source mode.
     await expect(page.getByRole('heading', { name: 'Markdown Title' })).toBeVisible();
     await expect(page.getByRole('cell', { name: 'Safe' })).toBeVisible();
     await expect(page.getByText('export const safe = true;')).toBeVisible();
+    await expect(page.getByText('<div id="sandbox-card">')).toBeVisible();
 
-    const iframe = page.locator('iframe[title="HTML 预览"]');
+    await page.getByRole('button', { name: '预览 HTML' }).click();
+
+    const iframe = page.locator('iframe[title="HTML 预览"]:not(.html-sandbox-frame--seamless)');
     await expect(iframe).toBeVisible();
     await expect(iframe).toHaveAttribute('sandbox', 'allow-scripts');
 

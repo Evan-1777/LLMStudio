@@ -10,6 +10,7 @@ import {
 } from '../../components/ui';
 import {
   PRESET_ACCENT_COLORS,
+  type ChatDisplayMode,
   type ThemeMode,
 } from '../../core/settings';
 
@@ -179,10 +180,52 @@ export function AppearancePage() {
           <h3 className="st-subhead">内容显示</h3>
           <div className="st-group">
             <div className="st-row--inline">
-              <span className="st-row__label--plain">HTML 默认预览</span>
+              <span className="st-row__label--plain">对话布局模式</span>
+              <SegmentedControl<ChatDisplayMode>
+                ariaLabel="对话布局模式"
+                value={settings.chatDisplayMode}
+                options={[
+                  {
+                    value: 'bubble',
+                    label: (
+                      <>
+                        <Icon name="messageSquare" size={14} />
+                        <span>气泡模式</span>
+                      </>
+                    ),
+                  },
+                  {
+                    value: 'feed',
+                    label: (
+                      <>
+                        <Icon name="layoutStream" size={14} />
+                        <span>信息流模式</span>
+                      </>
+                    ),
+                  },
+                ]}
+                onChange={(chatDisplayMode) =>
+                  updateSettings({ chatDisplayMode })
+                }
+              />
+            </div>
+
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">可视化功能渲染</span>
+              <Switch
+                checked={settings.visualHtmlRender}
+                label="可视化功能渲染"
+                onCheckedChange={(visualHtmlRender) =>
+                  updateSettings({ visualHtmlRender })
+                }
+              />
+            </div>
+
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">HTML 代码块预览</span>
               <Switch
                 checked={settings.defaultHtmlPreview}
-                label="HTML 默认预览"
+                label="HTML 代码块预览"
                 onCheckedChange={(defaultHtmlPreview) =>
                   updateSettings({ defaultHtmlPreview })
                 }

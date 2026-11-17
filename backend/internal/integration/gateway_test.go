@@ -763,3 +763,312 @@ func TestGatewayV11ProbeSearchUserRetryAndBranch(t *testing.T) {
 		t.Fatalf("expected user message %s preserved after user-targeted retry, got %+v", userMsgID, detailAfter.Messages)
 	}
 }
+
+func TestGatewayMessageEditNonDestructiveRetryAndPrepareLocal(t *testing.T) {
+	const gwToken = "v13-token"
+	gw, msgStore := newGatewayFixtureServer(t, gwToken)
+
+	var (
+		mu          sync.Mutex
+		seenPrompts []string
+		replySeq    int
+	)
+	llmMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bodyBytes, _ := io.ReadAll(r.Body)
+		var reqJSON map[string]any
+		_ = json.Unmarshal(bodyBytes, &reqJSON)
+		mu.Lock()
+		replySeq++
+		seq := replySeq
+		if msgs, ok := reqJSON["messages"].([]any); ok && len(msgs) > 0 {
+			last := msgs[len(msgs)-1].(map[string]any)
+			if content, ok := last["content"].(string); ok {
+				seenPrompts = append(seenPrompts, content)
+			}
+		}
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":\"reply-%d\"},\"finish_reason\":\"stop\"}]}\n\n", seq)
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer llmMock.Close()
+
+	// Configure SearXNG for prepare-local webSearch test.
+	searchMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []map[string]any{
+				{"title": "Local Search Hit", "url": "https://example.org/hit", "content": "Snippet"},
+			},
+		})
+	}))
+	defer searchMock.Close()
+
+	updSearch := apiDo(t, http.MethodPut, gw.URL+"/api/v1/plugins/search/searxng", gwToken, map[string]any{
+		"enabled":   true,
+		"endpoint":  searchMock.URL + "/search",
+		"isDefault": true,
+	})
+	updSearch.Body.Close()
+
+	pResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/providers", gwToken, map[string]any{
+		"id":           "p-non-destructive",
+		"name":         "Test",
+		"adapter":      "generic-http",
+		"baseURL":      llmMock.URL + "/v1",
+		"authType":     "bearer",
+		"apiKey":       "sk-test",
+		"localRequest": false,
+		"models":       []map[string]any{{"id": "m1", "name": "M1", "apiFormat": "openai-completions"}},
+	})
+	pResp.Body.Close()
+
+	cResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations", gwToken, map[string]any{
+		"providerId": "p-non-destructive",
+		"modelId":    "m1",
+	})
+	var convWrap struct {
+		Conversation domain.Conversation `json:"conversation"`
+	}
+	_ = json.NewDecoder(cResp.Body).Decode(&convWrap)
+	cResp.Body.Close()
+	convID := convWrap.Conversation.ID
+
+	// Seed 4-message conversation [U1, A1, U2, A2] with past timestamps.
+	base := time.Date(2026, 11, 17, 1, 0, 0, 0, time.UTC)
+	u1, _ := msgStore.Create(context.Background(), domain.Message{
+		ConversationID: convID,
+		Role:           domain.RoleUser,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "U1"}},
+		CreatedAt:      base,
+	})
+	a1, _ := msgStore.Create(context.Background(), domain.Message{
+		ConversationID: convID,
+		Role:           domain.RoleAssistant,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "A1"}},
+		StopReason:     domain.StopReasonStop,
+		CreatedAt:      base.Add(time.Second),
+	})
+	u2, _ := msgStore.Create(context.Background(), domain.Message{
+		ConversationID: convID,
+		Role:           domain.RoleUser,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "U2"}},
+		CreatedAt:      base.Add(2 * time.Second),
+	})
+	a2, _ := msgStore.Create(context.Background(), domain.Message{
+		ConversationID: convID,
+		Role:           domain.RoleAssistant,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "A2"}},
+		StopReason:     domain.StopReasonStop,
+		CreatedAt:      base.Add(3 * time.Second),
+	})
+
+	// PATCH empty blocks should return 400.
+	badPatch := apiDo(t, http.MethodPatch, gw.URL+"/api/v1/conversations/"+convID+"/messages/"+u1.ID, gwToken, map[string]any{
+		"blocks": []any{},
+	})
+	badPatch.Body.Close()
+	if badPatch.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on empty blocks PATCH, got %d", badPatch.StatusCode)
+	}
+
+	// PATCH U1 and A2.
+	patchU1 := apiDo(t, http.MethodPatch, gw.URL+"/api/v1/conversations/"+convID+"/messages/"+u1.ID, gwToken, map[string]any{
+		"blocks": []map[string]any{{"type": "text", "text": "U1-edited"}},
+	})
+	patchU1.Body.Close()
+	if patchU1.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH U1 failed: %d", patchU1.StatusCode)
+	}
+	patchA2 := apiDo(t, http.MethodPatch, gw.URL+"/api/v1/conversations/"+convID+"/messages/"+a2.ID, gwToken, map[string]any{
+		"blocks": []map[string]any{{"type": "text", "text": "A2-edited"}},
+	})
+	patchA2.Body.Close()
+	if patchA2.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH A2 failed: %d", patchA2.StatusCode)
+	}
+
+	beforeDetailResp := apiDo(t, http.MethodGet, gw.URL+"/api/v1/conversations/"+convID, gwToken, nil)
+	var beforeDetail service.ConversationDetail
+	_ = json.NewDecoder(beforeDetailResp.Body).Decode(&beforeDetail)
+	beforeDetailResp.Body.Close()
+
+	// Retry on U1: replaces A1 only, preserves U2 and A2, and updatedAt >= previous updatedAt.
+	regenU1 := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+convID+"/messages/stream", gwToken, map[string]any{
+		"regenerateMessageId": u1.ID,
+	})
+	_ = readSSEEvents(t, regenU1)
+
+	midResp := apiDo(t, http.MethodGet, gw.URL+"/api/v1/conversations/"+convID, gwToken, nil)
+	var midDetail service.ConversationDetail
+	_ = json.NewDecoder(midResp.Body).Decode(&midDetail)
+	midResp.Body.Close()
+	if len(midDetail.Messages) != 4 {
+		t.Fatalf("expected 4 messages preserved after retrying U1, got %d", len(midDetail.Messages))
+	}
+	if midDetail.Messages[0].ID != u1.ID || midDetail.Messages[0].Blocks[0].Text != "U1-edited" {
+		t.Fatalf("unexpected U1 after retry: %+v", midDetail.Messages[0])
+	}
+	if midDetail.Messages[1].ID == a1.ID || midDetail.Messages[1].Blocks[0].Text != "reply-1" {
+		t.Fatalf("expected A1 replaced with reply-1, got %+v", midDetail.Messages[1])
+	}
+	if midDetail.Messages[2].ID != u2.ID || midDetail.Messages[2].Blocks[0].Text != "U2" ||
+		midDetail.Messages[3].ID != a2.ID || midDetail.Messages[3].Blocks[0].Text != "A2-edited" {
+		t.Fatalf("expected U2 and A2 untouched, got %+v", midDetail.Messages[2:])
+	}
+	if midDetail.Conversation.UpdatedAt.Before(beforeDetail.Conversation.UpdatedAt) {
+		t.Fatalf("expected conversation updatedAt not to regress: %v < %v", midDetail.Conversation.UpdatedAt, beforeDetail.Conversation.UpdatedAt)
+	}
+
+	// Retry on the middle assistant message ID: replaces index 1 again, preserves U2 and A2.
+	regenA1 := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+convID+"/messages/stream", gwToken, map[string]any{
+		"regenerateMessageId": midDetail.Messages[1].ID,
+	})
+	_ = readSSEEvents(t, regenA1)
+
+	afterA1Resp := apiDo(t, http.MethodGet, gw.URL+"/api/v1/conversations/"+convID, gwToken, nil)
+	var afterA1Detail service.ConversationDetail
+	_ = json.NewDecoder(afterA1Resp.Body).Decode(&afterA1Detail)
+	afterA1Resp.Body.Close()
+	if len(afterA1Detail.Messages) != 4 || afterA1Detail.Messages[1].Blocks[0].Text != "reply-2" ||
+		afterA1Detail.Messages[2].ID != u2.ID || afterA1Detail.Messages[3].ID != a2.ID {
+		t.Fatalf("unexpected state after retrying middle assistant message: %+v", afterA1Detail.Messages)
+	}
+	mu.Lock()
+	if len(seenPrompts) != 2 || seenPrompts[0] != "U1-edited" || seenPrompts[1] != "U1-edited" {
+		t.Fatalf("expected edited U1 prompt on both retries, got %+v", seenPrompts)
+	}
+	mu.Unlock()
+
+	// POST /messages create, replace, insertAfter, and first-message auto-title.
+	c2Resp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations", gwToken, map[string]any{})
+	var c2Wrap struct {
+		Conversation domain.Conversation `json:"conversation"`
+	}
+	_ = json.NewDecoder(c2Resp.Body).Decode(&c2Wrap)
+	c2Resp.Body.Close()
+
+	mU1Resp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+c2Wrap.Conversation.ID+"/messages", gwToken, map[string]any{
+		"role":   "user",
+		"blocks": []map[string]any{{"type": "text", "text": "Hello local chat"}},
+	})
+	var mU1Res service.CreateMessageResult
+	_ = json.NewDecoder(mU1Resp.Body).Decode(&mU1Res)
+	mU1Resp.Body.Close()
+	if mU1Resp.StatusCode != http.StatusCreated || mU1Res.Conversation.Title != "Hello local chat" {
+		t.Fatalf("expected 201 and auto-title, got status=%d res=%+v", mU1Resp.StatusCode, mU1Res)
+	}
+
+	mU2Resp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+c2Wrap.Conversation.ID+"/messages", gwToken, map[string]any{
+		"role":   "user",
+		"blocks": []map[string]any{{"type": "text", "text": "Second user"}},
+	})
+	var mU2Res service.CreateMessageResult
+	_ = json.NewDecoder(mU2Resp.Body).Decode(&mU2Res)
+	mU2Resp.Body.Close()
+
+	// Insert assistant reply between mU1 and mU2 via afterMessageId.
+	mInsResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+c2Wrap.Conversation.ID+"/messages", gwToken, map[string]any{
+		"role":           "assistant",
+		"blocks":         []map[string]any{{"type": "text", "text": "Inserted reply"}},
+		"afterMessageId": mU1Res.Message.ID,
+		"stopReason":     "stop",
+	})
+	var mInsRes service.CreateMessageResult
+	_ = json.NewDecoder(mInsResp.Body).Decode(&mInsRes)
+	mInsResp.Body.Close()
+	if mInsResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for afterMessageId insert, got %d", mInsResp.StatusCode)
+	}
+
+	// Replace Inserted reply via replaceMessageId.
+	mRepResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+c2Wrap.Conversation.ID+"/messages", gwToken, map[string]any{
+		"role":             "assistant",
+		"blocks":           []map[string]any{{"type": "text", "text": "Replaced reply"}},
+		"replaceMessageId": mInsRes.Message.ID,
+		"stopReason":       "stop",
+	})
+	mRepResp.Body.Close()
+	if mRepResp.StatusCode != http.StatusCreated {
+		t.Fatalf("expected 201 for replaceMessageId, got %d", mRepResp.StatusCode)
+	}
+
+	c2DetailResp := apiDo(t, http.MethodGet, gw.URL+"/api/v1/conversations/"+c2Wrap.Conversation.ID, gwToken, nil)
+	var c2Detail service.ConversationDetail
+	_ = json.NewDecoder(c2DetailResp.Body).Decode(&c2Detail)
+	c2DetailResp.Body.Close()
+	if len(c2Detail.Messages) != 3 ||
+		c2Detail.Messages[0].ID != mU1Res.Message.ID ||
+		c2Detail.Messages[1].Blocks[0].Text != "Replaced reply" ||
+		c2Detail.Messages[2].ID != mU2Res.Message.ID {
+		t.Fatalf("unexpected c2 messages: %+v", c2Detail.Messages)
+	}
+
+	// POST /prepare-local across all 4 protocols with localRequest=true (no server API key) + webSearch.
+	localProvResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/providers", gwToken, map[string]any{
+		"id":           "p-local-4",
+		"name":         "Local Multi",
+		"adapter":      "generic-http",
+		"baseURL":      "http://127.0.0.1:11434",
+		"authType":     "bearer",
+		"localRequest": true,
+		"models": []map[string]any{
+			{"id": "m-comp", "name": "Comp", "apiFormat": "openai-completions"},
+			{"id": "m-resp", "name": "Resp", "apiFormat": "openai-responses"},
+			{"id": "m-anth", "name": "Anth", "apiFormat": "anthropic-messages"},
+			{"id": "m-gem", "name": "Gem", "apiFormat": "google-generative-ai"},
+		},
+	})
+	localProvResp.Body.Close()
+
+	protoTargets := []struct {
+		modelID      string
+		expectedPath string
+		authType     string
+	}{
+		{"m-comp", "http://127.0.0.1:11434/v1/chat/completions", "bearer"},
+		{"m-resp", "http://127.0.0.1:11434/v1/responses", "bearer"},
+		{"m-anth", "http://127.0.0.1:11434/v1/messages", "bearer"},
+		{"m-gem", "http://127.0.0.1:11434/v1beta/models/m-gem:streamGenerateContent?alt=sse", "bearer"},
+	}
+
+	countBefore := len(c2Detail.Messages)
+	for _, pt := range protoTargets {
+		prepResp := apiDo(t, http.MethodPost, gw.URL+"/api/v1/conversations/"+c2Wrap.Conversation.ID+"/messages/prepare-local", gwToken, map[string]any{
+			"providerId": "p-local-4",
+			"modelId":    pt.modelID,
+			"text":       "Search and answer",
+			"webSearch":  true,
+		})
+		var prep service.PreparedLocalRequest
+		rawPrep, _ := io.ReadAll(prepResp.Body)
+		prepResp.Body.Close()
+		if prepResp.StatusCode != http.StatusOK {
+			t.Fatalf("prepare-local %s failed status=%d body=%s", pt.modelID, prepResp.StatusCode, rawPrep)
+		}
+		if err := json.Unmarshal(rawPrep, &prep); err != nil {
+			t.Fatalf("decode prepare-local %s: %v", pt.modelID, err)
+		}
+		if prep.Method != http.MethodPost || prep.URL != pt.expectedPath || prep.AuthType != pt.authType {
+			t.Fatalf("unexpected prepare-local target for %s: %+v", pt.modelID, prep)
+		}
+		if prep.WebSearchBlock == nil || prep.WebSearchBlock.Type != domain.BlockTypeWebSearch {
+			t.Fatalf("expected webSearchBlock for %s, got %+v", pt.modelID, prep.WebSearchBlock)
+		}
+		if !strings.Contains(string(prep.Body), "Local Search Hit") {
+			t.Fatalf("expected webSearch prompt injected into body for %s: %s", pt.modelID, prep.Body)
+		}
+		if _, hasAuth := prep.Headers["Authorization"]; hasAuth {
+			t.Fatalf("prepare-local must not emit Authorization secret header: %+v", prep.Headers)
+		}
+	}
+
+	// Verify prepare-local did not mutate DB messages.
+	afterPrepDetailResp := apiDo(t, http.MethodGet, gw.URL+"/api/v1/conversations/"+c2Wrap.Conversation.ID, gwToken, nil)
+	var afterPrepDetail service.ConversationDetail
+	_ = json.NewDecoder(afterPrepDetailResp.Body).Decode(&afterPrepDetail)
+	afterPrepDetailResp.Body.Close()
+	if len(afterPrepDetail.Messages) != countBefore {
+		t.Fatalf("prepare-local mutated messages: before=%d after=%d", countBefore, len(afterPrepDetail.Messages))
+	}
+}

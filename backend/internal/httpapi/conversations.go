@@ -3,6 +3,7 @@ package httpapi
 import (
 	"net/http"
 
+	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/service"
 )
 
@@ -76,6 +77,38 @@ func (h *ConversationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *ConversationHandler) CreateMessage(w http.ResponseWriter, r *http.Request) {
+	var in service.CreateMessageInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	res, err := h.svc.CreateMessage(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusCreated, res)
+}
+
+func (h *ConversationHandler) UpdateMessage(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Blocks []domain.ContentBlock `json:"blocks"`
+	}
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	updated, err := h.svc.UpdateMessage(r.Context(), r.PathValue("id"), r.PathValue("messageId"), in.Blocks)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"message": updated,
+	})
 }
 
 func (h *ConversationHandler) DeleteMessage(w http.ResponseWriter, r *http.Request) {

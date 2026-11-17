@@ -99,17 +99,29 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     await page.getByRole('button', { name: '发送消息' }).click();
     await expect(page.getByRole('alert')).toContainText(/EOF|意外中断/);
 
-    // 4. User-message retry on the first user turn must NOT duplicate user message.
+    // 4. User-message retry on the first user turn must NOT duplicate user message AND preserves trailing turns.
     await page.reload({ waitUntil: 'networkidle' });
+    const beforeUserRetryDetail = (await (
+      await fetch(`${appUrl}/api/v1/conversations/${encodeURIComponent(convId)}`, {
+        headers: { Authorization: `Bearer ${E2E_TOKEN}` },
+      })
+    ).json()) as {
+      conversation: { updatedAt: string };
+      messages: Array<{ id: string; role: string }>;
+    };
+    expect(beforeUserRetryDetail.messages).toHaveLength(6);
+
     const retryButtons = page.getByRole('button', { name: '重试消息' });
     await retryButtons.first().click();
     const confirmRetry = page.getByRole('dialog');
     await expect(confirmRetry.getByText(/保留这条用户消息/)).toBeVisible();
     await confirmRetry.getByRole('button', { name: '重新生成' }).click();
 
-    await expect(page.getByText(/Reply #\d+ to:/)).toBeVisible();
+    await expect(
+      page.getByText(/Reply #(?:[2-9]|\d{2,}) to: First turn question/),
+    ).toBeVisible();
 
-    // Confirm via Go API that there is only 1 user message + 1 assistant message (no duplicate user message).
+    // Confirm via Go API that only index 1 was replaced, trailing turns stayed, and updatedAt moved forward.
     await expect
       .poll(async () => {
         const res = await fetch(
@@ -117,18 +129,22 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
           { headers: { Authorization: `Bearer ${E2E_TOKEN}` } },
         );
         const detail = (await res.json()) as {
+          conversation: { updatedAt: string };
           messages: Array<{ id: string; role: string }>;
         };
+        if (detail.messages[1]?.id === beforeUserRetryDetail.messages[1]?.id) {
+          return 'waiting';
+        }
         return detail.messages.map((m) => m.role).join(',');
       })
-      .toBe('user,assistant');
+      .toBe('user,assistant,user,assistant,user,assistant');
 
     // Add a second turn so branch vs original divergence and single-message delete can be verified.
     await composer.fill('Second turn question');
     await page.getByRole('button', { name: '发送消息' }).click();
     await expect(page.getByText(/to: Second turn question/)).toBeVisible();
 
-    // Reload to ensure all 4 messages have final server IDs.
+    // Reload to ensure all 8 messages have final server IDs.
     await page.reload({ waitUntil: 'networkidle' });
     await expect(page.getByText(/to: Second turn question/)).toBeVisible();
 
@@ -137,10 +153,10 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         headers: { Authorization: `Bearer ${E2E_TOKEN}` },
       })
     ).json()) as { messages: Array<{ id: string }> };
-    expect(originalDetailBeforeBranch.messages).toHaveLength(4);
+    expect(originalDetailBeforeBranch.messages).toHaveLength(8);
     const originalIds = new Set(originalDetailBeforeBranch.messages.map((m) => m.id));
 
-    // 5. Branch from the FIRST assistant message -> new URL, 2 messages with newly assigned IDs; original retains 4 messages.
+    // 5. Branch from the FIRST assistant message -> new URL, 2 messages with newly assigned IDs; original retains 8 messages.
     const branchButtons = page.getByRole('button', { name: '从此处分支' });
     await branchButtons.first().click();
     await expect(page).not.toHaveURL(new RegExp(`${convId}$`));
@@ -158,13 +174,68 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
       expect(originalIds.has(m.id)).toBe(false);
     }
 
-    // Navigate back to original conversation: all 4 messages remain intact.
+    // Navigate back to original conversation: all 8 messages remain intact.
     await page.goto(`${appUrl}/chat/${encodeURIComponent(convId)}`, {
       waitUntil: 'networkidle',
     });
     await expect(page.getByText(/to: Second turn question/)).toBeVisible();
 
-    // 6. Single-message delete removes ONLY the first user message; subsequent messages stay after reload.
+    // 6. Edit first user message and last assistant message inline and verify persistence across reload.
+    const editButtons = page.getByRole('button', { name: '修改消息' });
+    await editButtons.first().click();
+    const msgEditor = page.getByLabel('编辑消息内容');
+    await msgEditor.fill('Edited first turn');
+    await page.getByRole('button', { name: '保存' }).click();
+    await expect(page.getByText('Edited first turn')).toBeVisible();
+
+    await editButtons.last().click();
+    await page.getByLabel('编辑消息内容').fill('Edited second reply');
+    await page.getByRole('button', { name: '保存' }).click();
+    await expect(page.getByText('Edited second reply')).toBeVisible();
+
+    await page.reload({ waitUntil: 'networkidle' });
+    await expect(page.getByText('Edited first turn')).toBeVisible();
+    await expect(page.getByText('Edited second reply')).toBeVisible();
+
+    // 7. Non-truncating retry on middle assistant message refreshes ONLY index 1 while preserving trailing turns!
+    const beforeMidRetry = (await (
+      await fetch(`${appUrl}/api/v1/conversations/${encodeURIComponent(convId)}`, {
+        headers: { Authorization: `Bearer ${E2E_TOKEN}` },
+      })
+    ).json()) as {
+      conversation: { updatedAt: string };
+      messages: Array<{ id: string }>;
+    };
+
+    const retryMiddleBtn = page.getByRole('button', { name: '重试消息' }).nth(1);
+    await retryMiddleBtn.click();
+    const confirmAsstRetry = page.getByRole('dialog');
+    await expect(
+      confirmAsstRetry.getByText(/仅重新生成当前回复，下方其余历史消息保持不变/),
+    ).toBeVisible();
+    await confirmAsstRetry.getByRole('button', { name: '重新生成' }).click();
+
+    await expect(page.getByText(/Reply #\d+ to: Edited first turn/)).toBeVisible();
+    await expect(page.getByText('Edited second reply')).toBeVisible();
+    await expect
+      .poll(async () => {
+        const res = await fetch(
+          `${appUrl}/api/v1/conversations/${encodeURIComponent(convId)}`,
+          { headers: { Authorization: `Bearer ${E2E_TOKEN}` } },
+        );
+        const detail = (await res.json()) as {
+          conversation: { updatedAt: string };
+          messages: Array<{ id: string; role: string }>;
+        };
+        if (detail.messages[1]?.id === beforeMidRetry.messages[1]?.id) {
+          return 'waiting';
+        }
+        expect(detail.conversation.updatedAt >= beforeMidRetry.conversation.updatedAt).toBe(true);
+        return detail.messages.map((m) => m.role).join(',');
+      })
+      .toBe('user,assistant,user,assistant,user,assistant,user,assistant');
+
+    // 8. Single-message delete removes ONLY the first user message; subsequent messages stay after reload.
     await page.getByRole('button', { name: '删除消息' }).first().click();
     await page.getByRole('dialog').getByRole('button', { name: '删除' }).click();
 
@@ -177,26 +248,9 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         const detail = (await res.json()) as { messages: Array<{ id: string }> };
         return detail.messages.length;
       })
-      .toBe(3);
+      .toBe(7);
 
     await page.reload({ waitUntil: 'networkidle' });
-    await expect(page.getByText(/to: Second turn question/)).toBeVisible();
-
-    // 7. Assistant-message retry replaces the target assistant reply and truncates trailing turns.
-    await page.getByRole('button', { name: '重试消息' }).first().click();
-    const confirmAsstRetry = page.getByRole('dialog');
-    await expect(confirmAsstRetry.getByText(/替换当前回复及其后的所有历史消息/)).toBeVisible();
-    await confirmAsstRetry.getByRole('button', { name: '重新生成' }).click();
-
-    await expect
-      .poll(async () => {
-        const res = await fetch(
-          `${appUrl}/api/v1/conversations/${encodeURIComponent(convId)}`,
-          { headers: { Authorization: `Bearer ${E2E_TOKEN}` } },
-        );
-        const detail = (await res.json()) as { messages: Array<{ role: string }> };
-        return detail.messages.map((m) => m.role).join(',');
-      })
-      .toBe('assistant');
+    await expect(page.getByText('Edited second reply')).toBeVisible();
   });
 });

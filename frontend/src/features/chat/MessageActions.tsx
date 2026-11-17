@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useApp } from '../../app/AppProvider';
 import { ConfirmDialog, IconButton } from '../../components/ui';
+import type { ChatDisplayMode } from '../../core/settings';
 import type { Message } from '../../core/types';
 import { isLocalMessageId } from './chatReducer';
 
@@ -15,12 +16,16 @@ export function extractMessageCopyText(message: Message): string {
 export function MessageActions({
   message,
   disabled = false,
+  displayMode = 'bubble',
+  onEdit,
   onRetry,
   onDelete,
   onBranch,
 }: {
   message: Message;
   disabled?: boolean;
+  displayMode?: ChatDisplayMode;
+  onEdit?: (message: Message) => void;
   onRetry: (message: Message) => Promise<boolean> | void;
   onDelete: (message: Message) => Promise<boolean> | void;
   onBranch?: (message: Message) => Promise<unknown> | void;
@@ -79,6 +84,15 @@ export function MessageActions({
           disabled={disabled || isLocal}
           onClick={() => setConfirmKind('retry')}
         />
+        {onEdit ? (
+          <IconButton
+            size="sm"
+            icon="edit"
+            label="修改消息"
+            disabled={disabled || isLocal}
+            onClick={() => onEdit(message)}
+          />
+        ) : null}
         <IconButton
           size="sm"
           icon="trash"
@@ -97,11 +111,17 @@ export function MessageActions({
           />
         ) : null}
         {usage ? (
-          <span className="msg-usage">
-            {usage.inputTokens.toLocaleString()} in ·{' '}
-            {usage.outputTokens.toLocaleString()} out
-            {usage.thinkingTokens ? ` · ${usage.thinkingTokens.toLocaleString()} think` : ''}
-          </span>
+          displayMode === 'feed' ? (
+            <span className="msg-usage msg-usage--feed">
+              Tokens: {usage.totalTokens} ↑{usage.inputTokens} ↓{usage.outputTokens}
+            </span>
+          ) : (
+            <span className="msg-usage">
+              {usage.inputTokens.toLocaleString()} in ·{' '}
+              {usage.outputTokens.toLocaleString()} out
+              {usage.thinkingTokens ? ` · ${usage.thinkingTokens.toLocaleString()} think` : ''}
+            </span>
+          )
         ) : null}
       </div>
 
@@ -114,8 +134,8 @@ export function MessageActions({
         message={
           confirmKind === 'retry'
             ? message.role === 'user'
-              ? '将保留这条用户消息，并替换其后的所有历史消息。'
-              : '将替换当前回复及其后的所有历史消息。'
+              ? '将保留这条用户消息，并仅重新生成紧邻的下一条回复，下方其余历史消息保持不变。'
+              : '将仅重新生成当前回复，下方其余历史消息保持不变。'
             : '只删除这一条消息，后续消息会保留。此操作不可撤销。'
         }
         confirmLabel={confirmKind === 'retry' ? '重新生成' : '删除'}

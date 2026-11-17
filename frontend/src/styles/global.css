@@ -515,13 +515,10 @@ a {
 .gate-logo {
   width: 34px;
   height: 34px;
-  border-radius: 9px;
-  background: var(--text-primary);
-  color: var(--bg-surface);
-  display: grid;
-  place-items: center;
-  font-weight: 700;
-  font-size: 16px;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+  flex: none;
 }
 
 .gate-title {

@@ -3,6 +3,7 @@ export const LEGACY_FLUTTER_SETTINGS_KEY = 'flutter.llmstudio.settings.v1';
 export const SETTINGS_MIGRATED_KEY = 'llmstudio.settings.v2.migrated';
 
 export type ThemeMode = 'system' | 'light' | 'dark';
+export type ChatDisplayMode = 'bubble' | 'feed';
 
 export const DEFAULT_APPLE_BLUE = 0xff007aff;
 
@@ -26,7 +27,9 @@ export interface AppSettings {
   themeMode: ThemeMode;
   seedColorValue: number;
   enterToSend: boolean;
+  visualHtmlRender: boolean;
   defaultHtmlPreview: boolean;
+  chatDisplayMode: ChatDisplayMode;
   autoCollapseEnabled: boolean;
   collapseLineThreshold: number;
   collapseCharThreshold: number;
@@ -52,7 +55,9 @@ export function defaultSettings(): AppSettings {
     themeMode: 'system',
     seedColorValue: DEFAULT_APPLE_BLUE,
     enterToSend: true,
-    defaultHtmlPreview: true,
+    visualHtmlRender: true,
+    defaultHtmlPreview: false,
+    chatDisplayMode: 'bubble',
     autoCollapseEnabled: true,
     collapseLineThreshold: 24,
     collapseCharThreshold: 1200,
@@ -93,6 +98,11 @@ export function normalizeSettings(raw: unknown): AppSettings {
       ? Math.trunc(obj.seedColorValue) >>> 0
       : defaults.seedColorValue;
 
+  const chatDisplayMode: ChatDisplayMode =
+    obj.chatDisplayMode === 'feed' || obj.chatDisplayMode === 'bubble'
+      ? obj.chatDisplayMode
+      : defaults.chatDisplayMode;
+
   return {
     gatewayBaseUrl: rawUrl || defaults.gatewayBaseUrl,
     accessToken:
@@ -103,10 +113,15 @@ export function normalizeSettings(raw: unknown): AppSettings {
       typeof obj.enterToSend === 'boolean'
         ? obj.enterToSend
         : defaults.enterToSend,
+    visualHtmlRender:
+      typeof obj.visualHtmlRender === 'boolean'
+        ? obj.visualHtmlRender
+        : defaults.visualHtmlRender,
     defaultHtmlPreview:
       typeof obj.defaultHtmlPreview === 'boolean'
         ? obj.defaultHtmlPreview
         : defaults.defaultHtmlPreview,
+    chatDisplayMode,
     autoCollapseEnabled:
       typeof obj.autoCollapseEnabled === 'boolean'
         ? obj.autoCollapseEnabled

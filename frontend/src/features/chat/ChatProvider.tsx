@@ -10,19 +10,28 @@ import {
 } from 'react';
 import { useApp } from '../../app/AppProvider';
 import { GatewayError } from '../../core/gateway';
+import { applyLocalAuth } from '../../core/localProvider';
+import { getLocalProviderKey } from '../../core/localProviderKeys';
+import { decodeUpstreamSseStream } from '../../core/localStreamDecoders';
 import { decodeSseByteStream, parseStreamEventFrame } from '../../core/sse';
 import type {
   ContentBlock,
   Conversation,
   ConversationDetail,
   GenerationParams,
+  Message,
+  PreparedLocalRequest,
   ReasoningEffort,
+  StreamEvent,
+  TokenUsage,
 } from '../../core/types';
 import {
+  bufferToBlock,
   chatReducer,
   initialChatState,
   isLocalMessageId,
   type ChatState,
+  type StreamingBlockBuffer,
 } from './chatReducer';
 
 export interface SendMessageOptions {
@@ -56,6 +65,7 @@ export interface ChatContextValue {
   reloadCurrentConversation: () => Promise<void>;
   sendMessage: (opts: SendMessageOptions) => Promise<boolean>;
   regenerateMessage: (opts: RegenerateOptions) => Promise<boolean>;
+  updateMessage: (messageId: string, blocks: ContentBlock[]) => Promise<boolean>;
   deleteMessage: (messageId: string) => Promise<boolean>;
   branchFromMessage: (messageId: string) => Promise<ConversationDetail | null>;
   applyBranchedDetail: (detail: ConversationDetail) => void;
@@ -84,6 +94,7 @@ function formatError(err: unknown): { code: string; message: string } {
 export function ChatProvider({ children }: { children: ReactNode }) {
   const {
     gateway,
+    resources,
     connectionEpoch,
     upsertLocalConversation,
     toast,
@@ -394,6 +405,415 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [gateway, reconcileAfterStream],
   );
 
+  const executeLocalStream = useCallback(
+    async (opts: {
+      conversationId: string;
+      input: {
+        blocks?: ContentBlock[];
+        text?: string;
+        providerId: string;
+        modelId: string;
+        params?: GenerationParams;
+        regenerateMessageId?: string;
+        webSearch?: boolean;
+        searchEngineId?: string;
+      };
+      optimisticUserId?: string;
+      regenerateTargetId?: string;
+      expectedCountOnAbort: number;
+      onStreamAccepted?: () => void;
+    }): Promise<boolean> => {
+      if (sendingRef.current) return false;
+      sendingRef.current = true;
+      const epoch = ++epochRef.current;
+      const ctrl = new AbortController();
+      activeAbortRef.current = ctrl;
+      manualAbortRef.current = false;
+
+      const provider = resources.providers.find(
+        (p) => p.id === opts.input.providerId,
+      );
+      const model = provider?.models.find((m) => m.id === opts.input.modelId);
+      const apiFormat = model?.apiFormat || 'openai-completions';
+
+      let prepared: PreparedLocalRequest;
+      let response: Response;
+
+      try {
+        prepared = await gateway.prepareLocalChat(
+          opts.conversationId,
+          opts.input,
+          ctrl.signal,
+        );
+        const localApiKey = getLocalProviderKey(opts.input.providerId);
+        const authed = applyLocalAuth(
+          prepared.url,
+          prepared.headers ?? {},
+          prepared.authType,
+          localApiKey,
+          provider?.headers,
+        );
+        const serializedBody =
+          typeof prepared.body === 'string'
+            ? prepared.body
+            : JSON.stringify(prepared.body ?? {});
+
+        try {
+          response = await gateway.fetchImpl(authed.url, {
+            method: prepared.method || 'POST',
+            headers: authed.headers,
+            body: serializedBody,
+            signal: ctrl.signal,
+          });
+        } catch (fetchErr) {
+          if (isAbortError(fetchErr)) throw fetchErr;
+          if (fetchErr instanceof TypeError) {
+            throw new GatewayError(
+              'LOCAL_NETWORK_ERROR',
+              '无法直连本地模型服务，请检查服务是否启动并已开启 CORS 跨域支持',
+            );
+          }
+          throw fetchErr;
+        }
+
+        if (!response.ok) {
+          const snippet = await response.text().catch(() => '');
+          throw new GatewayError(
+            `HTTP_${response.status}`,
+            snippet.trim()
+              ? `上游返回 HTTP ${response.status}: ${snippet.trim().slice(0, 300)}`
+              : `上游返回 HTTP ${response.status}`,
+            response.status,
+          );
+        }
+      } catch (err) {
+        sendingRef.current = false;
+        if (activeAbortRef.current === ctrl) activeAbortRef.current = null;
+        if (epoch !== epochRef.current) return false;
+
+        if (isAbortError(err) && manualAbortRef.current) {
+          if (opts.optimisticUserId) {
+            dispatch({
+              type: 'SEND_PREPARE_FAILED',
+              optimisticUserId: opts.optimisticUserId,
+              code: 'ABORTED',
+              message: '已取消请求',
+            });
+          } else {
+            dispatch({ type: 'ABORT_LOCAL' });
+          }
+          return false;
+        }
+
+        const e = formatError(err);
+        if (opts.optimisticUserId) {
+          dispatch({
+            type: 'SEND_PREPARE_FAILED',
+            optimisticUserId: opts.optimisticUserId,
+            code: e.code,
+            message: e.message,
+          });
+        } else {
+          dispatch({
+            type: 'REGEN_PREPARE_FAILED',
+            code: e.code,
+            message: e.message,
+          });
+        }
+        return false;
+      }
+
+      if (epoch !== epochRef.current) {
+        await response.body?.cancel().catch(() => {});
+        sendingRef.current = false;
+        return false;
+      }
+
+      if (opts.optimisticUserId) {
+        const userBlocks: ContentBlock[] =
+          opts.input.blocks && opts.input.blocks.length > 0
+            ? opts.input.blocks
+            : [{ type: 'text', text: opts.input.text ?? '' }];
+        try {
+          const savedUser = await gateway.createMessage(opts.conversationId, {
+            role: 'user',
+            blocks: userBlocks,
+          });
+          if (epoch !== epochRef.current) {
+            await response.body?.cancel().catch(() => {});
+            sendingRef.current = false;
+            return false;
+          }
+          upsertLocalConversation(savedUser.conversation);
+          dispatch({
+            type: 'UPDATE_CONVERSATION_META',
+            conversation: savedUser.conversation,
+          });
+          dispatch({
+            type: 'REPLACE_MESSAGE_BY_ID',
+            targetId: opts.optimisticUserId,
+            message: savedUser.message,
+          });
+          opts.onStreamAccepted?.();
+        } catch (userPersistErr) {
+          await response.body?.cancel().catch(() => {});
+          sendingRef.current = false;
+          if (activeAbortRef.current === ctrl) activeAbortRef.current = null;
+          if (epoch !== epochRef.current) return false;
+          const e = formatError(userPersistErr);
+          dispatch({
+            type: 'SEND_PREPARE_FAILED',
+            optimisticUserId: opts.optimisticUserId,
+            code: e.code,
+            message: e.message,
+          });
+          return false;
+        }
+      } else {
+        opts.onStreamAccepted?.();
+        if (opts.regenerateTargetId) {
+          dispatch({
+            type: 'REGEN_PREPARE_CONFIRMED',
+            targetMessageId: opts.regenerateTargetId,
+          });
+        }
+      }
+
+      const localAssistantId = `local-assistant-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const accOrder: number[] = [];
+      const accBlocks: Record<number, StreamingBlockBuffer> = {};
+      let accUsage: TokenUsage | undefined;
+      let accStopReason: string | undefined;
+      let streamErrorMsg: string | undefined;
+
+      const applyLocalAccum = (ev: StreamEvent) => {
+        if (ev.type === 'block_start' && ev.index !== undefined) {
+          if (!accBlocks[ev.index]) {
+            accOrder.push(ev.index);
+            const initTool =
+              ev.block && ev.block.type === 'toolCall' ? ev.block : undefined;
+            accBlocks[ev.index] = {
+              blockType: ev.blockType || ev.block?.type || 'text',
+              id: initTool ? String(initTool.id ?? '') : '',
+              name: initTool ? String(initTool.name ?? '') : '',
+              text: '',
+              signature: '',
+              finalized: ev.block,
+            };
+          }
+        } else if (ev.type === 'block_delta' && ev.index !== undefined) {
+          let buf = accBlocks[ev.index];
+          if (!buf) {
+            accOrder.push(ev.index);
+            buf = {
+              blockType: ev.blockType || 'text',
+              id: '',
+              name: '',
+              text: '',
+              signature: '',
+            };
+            accBlocks[ev.index] = buf;
+          }
+          buf.finalized = undefined;
+          if (ev.deltaType === 'signature_delta') {
+            buf.signature += ev.delta ?? '';
+          } else {
+            buf.text += ev.delta ?? '';
+          }
+        } else if (
+          ev.type === 'block_end' &&
+          ev.index !== undefined &&
+          ev.block
+        ) {
+          if (!accBlocks[ev.index]) {
+            accOrder.push(ev.index);
+            accBlocks[ev.index] = {
+              blockType: ev.block.type,
+              id: '',
+              name: '',
+              text: '',
+              signature: '',
+              finalized: ev.block,
+            };
+          } else {
+            accBlocks[ev.index].finalized = ev.block;
+          }
+        } else if (ev.type === 'message_delta') {
+          if (ev.usage) accUsage = ev.usage;
+          if (ev.stopReason) accStopReason = ev.stopReason;
+        }
+      };
+
+      const emitEvent = (ev: StreamEvent) => {
+        applyLocalAccum(ev);
+        dispatch({
+          type: 'STREAM_EVENT',
+          event: ev,
+          fallbackProviderId: opts.input.providerId,
+          fallbackModelId: opts.input.modelId,
+        });
+      };
+
+      let caughtDecodeErr: unknown = null;
+
+      try {
+        if (!response.body) {
+          throw new GatewayError('STREAM_EMPTY', '上游未返回事件流');
+        }
+
+        emitEvent({
+          type: 'message_start',
+          conversationId: opts.conversationId,
+          messageId: localAssistantId,
+          providerId: opts.input.providerId,
+          modelId: opts.input.modelId,
+        });
+
+        let indexOffset = 0;
+        if (prepared.webSearchBlock) {
+          emitEvent({
+            type: 'block_start',
+            conversationId: opts.conversationId,
+            messageId: localAssistantId,
+            providerId: opts.input.providerId,
+            modelId: opts.input.modelId,
+            index: 0,
+            blockType: 'webSearch',
+            block: prepared.webSearchBlock,
+          });
+          emitEvent({
+            type: 'block_end',
+            conversationId: opts.conversationId,
+            messageId: localAssistantId,
+            providerId: opts.input.providerId,
+            modelId: opts.input.modelId,
+            index: 0,
+            blockType: 'webSearch',
+            block: prepared.webSearchBlock,
+          });
+          indexOffset = 1;
+        }
+
+        await decodeUpstreamSseStream(
+          apiFormat,
+          response.body,
+          {
+            conversationId: opts.conversationId,
+            messageId: localAssistantId,
+            providerId: opts.input.providerId,
+            modelId: opts.input.modelId,
+          },
+          (rawEv) => {
+            if (epoch !== epochRef.current || manualAbortRef.current) return;
+            const shiftedEv: StreamEvent =
+              indexOffset > 0 && rawEv.index !== undefined
+                ? { ...rawEv, index: rawEv.index + indexOffset }
+                : rawEv;
+            if (shiftedEv.type === 'error') {
+              streamErrorMsg = shiftedEv.error?.message || '流式生成失败';
+            }
+            emitEvent(shiftedEv);
+          },
+        );
+      } catch (err) {
+        caughtDecodeErr = err;
+      } finally {
+        sendingRef.current = false;
+        if (activeAbortRef.current === ctrl) {
+          activeAbortRef.current = null;
+        }
+      }
+
+      if (epoch !== epochRef.current) return false;
+
+      const finalBlocks = accOrder.map((idx) => bufferToBlock(accBlocks[idx]));
+      let stopReason = accStopReason || 'stop';
+      let errMsg = '';
+
+      if (manualAbortRef.current || isAbortError(caughtDecodeErr)) {
+        stopReason = 'aborted';
+        dispatch({ type: 'ABORT_LOCAL' });
+      } else if (streamErrorMsg) {
+        stopReason = 'error';
+        errMsg = streamErrorMsg;
+      } else if (caughtDecodeErr) {
+        const e = formatError(caughtDecodeErr);
+        stopReason = 'error';
+        errMsg = e.message;
+        dispatch({
+          type: 'STREAM_NETWORK_ERROR',
+          code: e.code,
+          message: e.message,
+        });
+      } else {
+        const localFinalMsg: Message = {
+          id: localAssistantId,
+          conversationId: opts.conversationId,
+          role: 'assistant',
+          blocks: finalBlocks,
+          providerId: opts.input.providerId,
+          modelId: opts.input.modelId,
+          ...(accUsage ? { usage: accUsage } : {}),
+          stopReason,
+          createdAt: new Date().toISOString(),
+        };
+        dispatch({
+          type: 'STREAM_EVENT',
+          event: {
+            type: 'message_end',
+            conversationId: opts.conversationId,
+            messageId: localAssistantId,
+            providerId: opts.input.providerId,
+            modelId: opts.input.modelId,
+            message: localFinalMsg,
+          },
+          fallbackProviderId: opts.input.providerId,
+          fallbackModelId: opts.input.modelId,
+        });
+      }
+
+      try {
+        const saved = await gateway.createMessage(opts.conversationId, {
+          role: 'assistant',
+          blocks: finalBlocks,
+          providerId: opts.input.providerId,
+          modelId: opts.input.modelId,
+          ...(accUsage ? { usage: accUsage } : {}),
+          stopReason,
+          ...(errMsg ? { errorMessage: errMsg } : {}),
+          ...(prepared.replaceMessageId
+            ? { replaceMessageId: prepared.replaceMessageId }
+            : {}),
+          ...(prepared.insertAfterMessageId
+            ? { afterMessageId: prepared.insertAfterMessageId }
+            : {}),
+        });
+        if (epoch !== epochRef.current) return false;
+        upsertLocalConversation(saved.conversation);
+        await reconcileAfterStream(opts.conversationId, epoch, {
+          isAbort: stopReason === 'aborted',
+          minExpectedMessages: opts.expectedCountOnAbort,
+        });
+        return stopReason !== 'aborted' && stopReason !== 'error';
+      } catch (saveErr) {
+        if (epoch !== epochRef.current) return false;
+        toast(
+          `回复已生成，但保存至服务端失败：${formatError(saveErr).message}`,
+          'error',
+        );
+        dispatch({ type: 'MARK_NEEDS_RELOAD' });
+        return false;
+      }
+    },
+    [
+      gateway,
+      reconcileAfterStream,
+      resources.providers,
+      toast,
+      upsertLocalConversation,
+    ],
+  );
+
   const sendMessage = useCallback(
     async (opts: SendMessageOptions): Promise<boolean> => {
       if (sendingRef.current || (opts.blocks.length === 0 && !opts.text?.trim())) {
@@ -425,7 +845,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         },
       });
 
-      return executeStream({
+      const isLocal = Boolean(
+        resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
+      );
+      const streamRunner = isLocal ? executeLocalStream : executeStream;
+      return streamRunner({
         conversationId: opts.conversationId,
         input: {
           blocks: opts.blocks,
@@ -441,7 +865,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         onStreamAccepted: opts.onStreamAccepted,
       });
     },
-    [executeStream],
+    [executeLocalStream, executeStream, resources.providers],
   );
 
   const regenerateMessage = useCallback(
@@ -457,7 +881,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       );
       if (idx < 0) return false;
       const target = stateRef.current.messages[idx];
-      const baseCount = target.role === 'user' ? idx + 1 : idx;
+      const isReplacing =
+        target.role !== 'user' ||
+        stateRef.current.messages[idx + 1]?.role === 'assistant';
+      const expectedCountOnAbort = isReplacing
+        ? stateRef.current.messages.length
+        : stateRef.current.messages.length + 1;
 
       const mergedParams: GenerationParams = {
         ...opts.params,
@@ -467,7 +896,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       dispatch({ type: 'REGEN_PREPARE_START' });
 
-      return executeStream({
+      const isLocal = Boolean(
+        resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
+      );
+      const streamRunner = isLocal ? executeLocalStream : executeStream;
+      return streamRunner({
         conversationId: conv.id,
         input: {
           providerId: opts.providerId,
@@ -478,10 +911,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           searchEngineId: opts.searchEngineId,
         },
         regenerateTargetId: opts.targetMessageId,
-        expectedCountOnAbort: baseCount + 1,
+        expectedCountOnAbort,
       });
     },
-    [executeStream, toast],
+    [executeLocalStream, executeStream, resources.providers, toast],
   );
 
   const stopStreaming = useCallback(() => {
@@ -500,6 +933,26 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     if (!convId || isBusy) return;
     await loadConversation(convId);
   }, [isBusy, loadConversation]);
+
+  const updateMessage = useCallback(
+    async (messageId: string, blocks: ContentBlock[]): Promise<boolean> => {
+      const conv = stateRef.current.conversation;
+      if (!conv || sendingRef.current) return false;
+      if (isLocalMessageId(messageId)) {
+        toast('该消息尚未确认落盘，请先重新加载', 'error');
+        return false;
+      }
+      try {
+        const updated = await gateway.updateMessage(conv.id, messageId, blocks);
+        dispatch({ type: 'UPDATE_MESSAGE', message: updated });
+        return true;
+      } catch (err) {
+        toast(formatError(err).message, 'error');
+        return false;
+      }
+    },
+    [gateway, toast],
+  );
 
   const deleteMessage = useCallback(
     async (messageId: string): Promise<boolean> => {
@@ -569,6 +1022,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       reloadCurrentConversation,
       sendMessage,
       regenerateMessage,
+      updateMessage,
       deleteMessage,
       branchFromMessage,
       applyBranchedDetail,
@@ -583,6 +1037,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       reloadCurrentConversation,
       sendMessage,
       regenerateMessage,
+      updateMessage,
       deleteMessage,
       branchFromMessage,
       applyBranchedDetail,

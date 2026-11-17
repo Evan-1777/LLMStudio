@@ -2,16 +2,21 @@ import {
   MAX_GATEWAY_BODY_BYTES,
   type Assistant,
   type AssistantUpsertPayload,
+  type ContentBlock,
   type Conversation,
   type ConversationDetail,
   type CreateConversationInput,
+  type CreateMessageInput,
+  type CreateMessageResult,
   type DiscoveredModel,
   type FormatInfo,
   type HealthResponse,
   type MCPServerConfig,
   type MCPServerInput,
+  type Message,
   type ModelConfig,
   type PatchConversationInput,
+  type PreparedLocalRequest,
   type ProviderAdapterInfo,
   type ProviderConfig,
   type ProviderConnectionResult,
@@ -179,6 +184,9 @@ function sanitizeProviderPayload(
   if (payload.enabled !== undefined) {
     out.enabled = payload.enabled;
   }
+  if (payload.localRequest !== undefined) {
+    out.localRequest = payload.localRequest;
+  }
   return out;
 }
 
@@ -257,10 +265,34 @@ function parseErrorEnvelope(
   return { code: `HTTP_${status}`, message: `请求失败 (${status})` };
 }
 
+function buildStreamChatPayload(input: StreamChatInput): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  if (input.blocks && input.blocks.length > 0) {
+    payload.blocks = input.blocks;
+  } else if (input.text && input.text !== '') {
+    payload.text = input.text;
+  }
+  if (input.providerId) payload.providerId = input.providerId;
+  if (input.modelId) payload.modelId = input.modelId;
+  if (input.params && Object.keys(input.params).length > 0) {
+    payload.params = input.params;
+  }
+  if (input.regenerateMessageId) {
+    payload.regenerateMessageId = input.regenerateMessageId;
+  }
+  if (input.webSearch) {
+    payload.webSearch = true;
+  }
+  if (input.searchEngineId) {
+    payload.searchEngineId = input.searchEngineId;
+  }
+  return payload;
+}
+
 export class GatewayClient {
   baseUrl: string;
   accessToken: string;
-  private readonly fetchImpl: typeof fetch;
+  readonly fetchImpl: typeof fetch;
 
   constructor(options: GatewayClientOptions) {
     this.baseUrl = options.baseUrl;
@@ -542,6 +574,43 @@ export class GatewayClient {
     );
   }
 
+  updateMessage(
+    conversationId: string,
+    messageId: string,
+    blocks: ContentBlock[],
+    signal?: AbortSignal,
+  ): Promise<Message> {
+    return this.requestJson<{ message: Message }>(
+      'PATCH',
+      `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+      { body: { blocks }, signal },
+    ).then((res) => res.message);
+  }
+
+  createMessage(
+    conversationId: string,
+    input: CreateMessageInput,
+    signal?: AbortSignal,
+  ): Promise<CreateMessageResult> {
+    return this.requestJson<CreateMessageResult>(
+      'POST',
+      `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages`,
+      { body: input, signal },
+    );
+  }
+
+  prepareLocalChat(
+    conversationId: string,
+    input: StreamChatInput,
+    signal?: AbortSignal,
+  ): Promise<PreparedLocalRequest> {
+    return this.requestJson<PreparedLocalRequest>(
+      'POST',
+      `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/prepare-local`,
+      { body: buildStreamChatPayload(input), signal },
+    );
+  }
+
   branchConversation(
     conversationId: string,
     messageId: string,
@@ -630,28 +699,7 @@ export class GatewayClient {
     input: StreamChatInput,
     signal?: AbortSignal,
   ): Promise<Response> {
-    const payload: Record<string, unknown> = {};
-    if (input.blocks && input.blocks.length > 0) {
-      payload.blocks = input.blocks;
-    } else if (input.text && input.text !== '') {
-      payload.text = input.text;
-    }
-    if (input.providerId) payload.providerId = input.providerId;
-    if (input.modelId) payload.modelId = input.modelId;
-    if (input.params && Object.keys(input.params).length > 0) {
-      payload.params = input.params;
-    }
-    if (input.regenerateMessageId) {
-      payload.regenerateMessageId = input.regenerateMessageId;
-    }
-    if (input.webSearch) {
-      payload.webSearch = true;
-    }
-    if (input.searchEngineId) {
-      payload.searchEngineId = input.searchEngineId;
-    }
-
-    const serialized = this.serializeBody(payload);
+    const serialized = this.serializeBody(buildStreamChatPayload(input));
     const url = resolveGatewayUrl(
       this.baseUrl,
       `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/stream`,

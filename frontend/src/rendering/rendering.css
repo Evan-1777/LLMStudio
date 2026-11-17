@@ -186,6 +186,12 @@
   tab-size: 2;
 }
 
+.code-pre--streaming {
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface-secondary);
+}
+
 .thinking-body {
   padding: 10px 12px;
   font-size: 13px;
@@ -200,11 +206,19 @@
   overflow: hidden;
 }
 
+.html-sandbox-wrap--seamless {
+  background: transparent;
+}
+
 .html-sandbox-frame {
   display: block;
   width: 100%;
   border: 0;
   background: #ffffff;
+}
+
+.html-sandbox-frame--seamless {
+  background: transparent;
 }
 
 .search-sources {

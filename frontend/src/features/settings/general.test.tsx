@@ -163,8 +163,10 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
     expect(document.documentElement.dataset.theme).toBe('light');
 
     await user.click(screen.getByRole('radio', { name: 'Forest Teal' }));
+    await user.click(screen.getByRole('radio', { name: '信息流模式' }));
     await user.click(screen.getByRole('switch', { name: 'Enter 发送' }));
-    await user.click(screen.getByRole('switch', { name: 'HTML 默认预览' }));
+    await user.click(screen.getByRole('switch', { name: '可视化功能渲染' }));
+    await user.click(screen.getByRole('switch', { name: 'HTML 代码块预览' }));
 
     const lineInput = screen.getByLabelText('行数阈值');
     await user.clear(lineInput);
@@ -185,8 +187,10 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
     ) as Record<string, unknown>;
     expect(persisted).toMatchObject({
       themeMode: 'light',
+      chatDisplayMode: 'feed',
       enterToSend: false,
-      defaultHtmlPreview: false,
+      visualHtmlRender: false,
+      defaultHtmlPreview: true,
       collapseLineThreshold: 48,
       collapseCharThreshold: 2400,
     });

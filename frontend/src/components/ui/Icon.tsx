@@ -45,7 +45,10 @@ export type IconName =
   | 'folder'
   | 'stop'
   | 'ellipsis'
-  | 'info';
+  | 'info'
+  | 'user'
+  | 'layoutStream'
+  | 'messageSquare';
 
 const ICON_BODIES: Record<IconName, ReactNode> = {
   plus: (
@@ -326,6 +329,21 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
       <path d="M12 11v5" />
       <circle cx="12" cy="8" r=".75" fill="currentColor" stroke="none" />
     </>
+  ),
+  user: (
+    <>
+      <circle cx="12" cy="8" r="4" />
+      <path d="M5 20a7 7 0 0 1 14 0" />
+    </>
+  ),
+  layoutStream: (
+    <>
+      <rect x="3" y="4" width="18" height="7" rx="2" />
+      <rect x="3" y="13" width="18" height="7" rx="2" />
+    </>
+  ),
+  messageSquare: (
+    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2Z" />
   ),
 };
 

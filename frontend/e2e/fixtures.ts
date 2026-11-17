@@ -96,7 +96,23 @@ async function startMockUpstream(): Promise<{
     },
   };
 
+  const corsHeaders: Record<string, string> = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers':
+      'Authorization, Content-Type, x-api-key, anthropic-version',
+  };
+
   const server = http.createServer(async (req, res) => {
+    for (const [k, v] of Object.entries(corsHeaders)) {
+      res.setHeader(k, v);
+    }
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     const parsedUrl = new URL(req.url || '/', 'http://127.0.0.1');
 
     if (parsedUrl.pathname === '/v1/models' && req.method === 'GET') {
@@ -205,6 +221,19 @@ async function startMockUpstream(): Promise<{
           choices: [{ delta: { content: 'Truncated chunk before EOF' } }],
         });
         setTimeout(() => res.destroy(), 40);
+        return;
+      }
+
+      if (prompt.includes('[RAW_HTML_VISUAL]')) {
+        const rawHtmlReply =
+          '前置说明\n\n<div id="raw-visual-card" style="padding:8px;border:1px solid #007aff;">Raw Seamless Visual Content</div>\n\n后置说明';
+        writeChunk({ choices: [{ delta: { content: rawHtmlReply } }] });
+        writeChunk({
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        });
+        res.write('data: [DONE]\n\n');
+        res.end();
         return;
       }
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"llmstudio/backend/internal/domain"
 )
@@ -289,5 +290,135 @@ func TestV1UpgradeAssistantsSearchMCPAndMessageOps(t *testing.T) {
 	}
 	if err := mcps.Delete(ctx, mcpSrv.ID); err != nil {
 		t.Fatalf("delete mcp server failed: %v", err)
+	}
+}
+
+func TestLocalRequestAndNonDestructiveMessageOps(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "v13.db")
+	db, err := OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer db.Close()
+
+	providers := NewProviderStore(db)
+	convs := NewConversationStore(db)
+	msgs := NewMessageStore(db)
+
+	// ProviderConfig.LocalRequest round-trip + default false.
+	localProv, err := providers.Create(ctx, domain.ProviderConfig{
+		ID:           "local-ollama",
+		Name:         "Local Ollama",
+		Adapter:      "generic-http",
+		BaseURL:      "http://127.0.0.1:11434/v1",
+		AuthType:     domain.AuthTypeNone,
+		Enabled:      true,
+		LocalRequest: true,
+	})
+	if err != nil || !localProv.LocalRequest {
+		t.Fatalf("expected LocalRequest=true on create, err=%v prov=%+v", err, localProv)
+	}
+	localProv.LocalRequest = false
+	updatedProv, err := providers.Update(ctx, localProv)
+	if err != nil || updatedProv.LocalRequest {
+		t.Fatalf("expected LocalRequest=false after update, err=%v prov=%+v", err, updatedProv)
+	}
+	defaultProv, err := providers.Create(ctx, domain.ProviderConfig{
+		ID:       "remote-default",
+		Name:     "Remote",
+		Adapter:  "generic-http",
+		BaseURL:  "https://api.example.com/v1",
+		AuthType: domain.AuthTypeBearer,
+		APIKey:   "sk-test",
+		Enabled:  true,
+	})
+	if err != nil || defaultProv.LocalRequest {
+		t.Fatalf("expected LocalRequest=false by default, err=%v prov=%+v", err, defaultProv)
+	}
+
+	// Conversation monotonic TouchUpdatedAt.
+	conv, err := convs.Create(ctx, domain.Conversation{Title: "Monotonic Test"})
+	if err != nil {
+		t.Fatalf("create conv: %v", err)
+	}
+	initialUpdated := conv.UpdatedAt
+	if err := convs.TouchUpdatedAt(ctx, conv.ID, initialUpdated.Add(-10*time.Minute)); err != nil {
+		t.Fatalf("TouchUpdatedAt older: %v", err)
+	}
+	fetchedConv, _ := convs.Get(ctx, conv.ID)
+	if !fetchedConv.UpdatedAt.Equal(initialUpdated) {
+		t.Fatalf("expected updated_at not to regress: got %v want %v", fetchedConv.UpdatedAt, initialUpdated)
+	}
+	future := initialUpdated.Add(5 * time.Minute)
+	if err := convs.TouchUpdatedAt(ctx, conv.ID, future); err != nil {
+		t.Fatalf("TouchUpdatedAt newer: %v", err)
+	}
+	fetchedConv, _ = convs.Get(ctx, conv.ID)
+	if !fetchedConv.UpdatedAt.Equal(future) {
+		t.Fatalf("expected updated_at to advance to %v, got %v", future, fetchedConv.UpdatedAt)
+	}
+
+	// UpdateBlocks preserves id, role, created_at.
+	t0 := time.Date(2026, 11, 17, 10, 0, 0, 0, time.UTC)
+	u1, _ := msgs.Create(ctx, domain.Message{
+		ConversationID: conv.ID,
+		Role:           domain.RoleUser,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "u1"}},
+		CreatedAt:      t0,
+	})
+	u2, _ := msgs.Create(ctx, domain.Message{
+		ConversationID: conv.ID,
+		Role:           domain.RoleUser,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "u2"}},
+		CreatedAt:      t0, // Exact timestamp collision with u1.
+	})
+	u3, _ := msgs.Create(ctx, domain.Message{
+		ConversationID: conv.ID,
+		Role:           domain.RoleUser,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "u3"}},
+		CreatedAt:      t0.Add(time.Nanosecond),
+	})
+
+	editedU1, err := msgs.UpdateBlocks(ctx, conv.ID, u1.ID, []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "u1-edited"}})
+	if err != nil {
+		t.Fatalf("UpdateBlocks failed: %v", err)
+	}
+	if editedU1.ID != u1.ID || editedU1.Role != domain.RoleUser || !editedU1.CreatedAt.Equal(u1.CreatedAt) || editedU1.Blocks[0].Text != "u1-edited" {
+		t.Fatalf("unexpected UpdateBlocks result: %+v", editedU1)
+	}
+
+	// InsertAfter with timestamp collision places a1 strictly between u1 and u2, keeping u3 after u2.
+	a1, err := msgs.InsertAfter(ctx, conv.ID, u1.ID, domain.Message{
+		Role:       domain.RoleAssistant,
+		Blocks:     []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "a1"}},
+		StopReason: domain.StopReasonStop,
+	})
+	if err != nil {
+		t.Fatalf("InsertAfter collision failed: %v", err)
+	}
+	ordered, err := msgs.ListByConversation(ctx, conv.ID)
+	if err != nil {
+		t.Fatalf("ListByConversation failed: %v", err)
+	}
+	if len(ordered) != 4 || ordered[0].ID != u1.ID || ordered[1].ID != a1.ID || ordered[2].ID != u2.ID || ordered[3].ID != u3.ID {
+		t.Fatalf("unexpected order after InsertAfter: %+v", ordered)
+	}
+
+	// ReplaceByID overwrites a1 in place while preserving its position and created_at.
+	replaced, err := msgs.ReplaceByID(ctx, conv.ID, a1.ID, domain.Message{
+		Role:       domain.RoleAssistant,
+		Blocks:     []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "a1-replaced"}},
+		StopReason: domain.StopReasonStop,
+	})
+	if err != nil {
+		t.Fatalf("ReplaceByID failed: %v", err)
+	}
+	if !replaced.CreatedAt.Equal(a1.CreatedAt) || replaced.Blocks[0].Text != "a1-replaced" {
+		t.Fatalf("unexpected ReplaceByID result: %+v", replaced)
+	}
+	orderedAfterReplace, _ := msgs.ListByConversation(ctx, conv.ID)
+	if len(orderedAfterReplace) != 4 || orderedAfterReplace[0].ID != u1.ID || orderedAfterReplace[1].ID != replaced.ID || orderedAfterReplace[2].ID != u2.ID || orderedAfterReplace[3].ID != u3.ID {
+		t.Fatalf("unexpected order after ReplaceByID: %+v", orderedAfterReplace)
 	}
 }

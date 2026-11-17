@@ -11,7 +11,9 @@ import {
   LoadingSpinner,
   Modal,
   Select,
+  Switch,
 } from '../../components/ui';
+import { setLocalProviderKey } from '../../core/localProviderKeys';
 import type { AuthType } from '../../core/types';
 import { ProviderEditor } from './ProviderEditor';
 import { errorMessageOf, validateHttpUrl } from './jsonValidation';
@@ -41,6 +43,7 @@ function CreateProviderModal({
   const [authType, setAuthType] = useState<string>('bearer');
   const [apiKey, setApiKey] = useState('');
   const [showKey, setShowKey] = useState(false);
+  const [localRequest, setLocalRequest] = useState(false);
 
   const [nameError, setNameError] = useState<string | null>(null);
   const [urlError, setUrlError] = useState<string | null>(null);
@@ -55,6 +58,7 @@ function CreateProviderModal({
     setAuthType('bearer');
     setApiKey('');
     setShowKey(false);
+    setLocalRequest(false);
     setNameError(null);
     setUrlError(null);
     setSubmitError(null);
@@ -72,15 +76,20 @@ function CreateProviderModal({
     setSaving(true);
     setSubmitError(null);
     try {
+      const trimmedKey = apiKey.trim();
       const created = await gateway.createProvider({
         name: trimmedName,
         adapter,
         baseURL: baseURL.trim(),
         authType,
-        ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+        ...(trimmedKey ? { apiKey: trimmedKey } : {}),
         models: [],
         enabled: true,
+        localRequest,
       });
+      if (created.localRequest && trimmedKey) {
+        setLocalProviderKey(created.id, trimmedKey);
+      }
       upsertLocalProvider(created);
       onCreated(created.id);
       onOpenChange(false);
@@ -200,6 +209,15 @@ function CreateProviderModal({
             />
           </div>
         </Field>
+
+        <div className="st-row--inline" style={{ padding: '4px 0' }}>
+          <span className="st-row__label--plain">本地请求</span>
+          <Switch
+            checked={localRequest}
+            label="本地请求"
+            onCheckedChange={setLocalRequest}
+          />
+        </div>
       </form>
     </Modal>
   );
@@ -332,6 +350,9 @@ export function ProvidersPage() {
                     {p.models.length} 个模型
                   </span>
                 </span>
+                {p.localRequest ? (
+                  <span className="st-badge st-badge--accent">本地</span>
+                ) : null}
                 {!p.enabled ? (
                   <span className="st-badge st-badge--muted">停用</span>
                 ) : null}

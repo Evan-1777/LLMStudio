@@ -1,11 +1,15 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { AppProvider } from '../app/AppProvider';
+import { SETTINGS_STORAGE_KEY, defaultSettings } from '../core/settings';
 import { CollapseStateProvider } from './CollapsibleBlock';
 import { ContentRenderer } from './ContentRenderer';
 
 describe('ContentRenderer and HTML sandbox', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
   it('renders headings, tables, links, thinking, webSearch errors, tool blocks, and preserves manual collapse across streaming deltas', async () => {
     const md = `# Title
 
@@ -82,31 +86,69 @@ describe('ContentRenderer and HTML sandbox', () => {
     expect(screen.getByText('More text')).toBeInTheDocument();
   });
 
-  it('mounts sandboxed iframe only when HTML block is closed and omits allow-same-origin', () => {
-    const { rerender } = render(
+  it('renders closed raw HTML seamlessly by default, hides iframe when visualHtmlRender=false, and keeps fenced HTML code preview gated', async () => {
+    const user = userEvent.setup();
+    const { container, rerender } = render(
       <AppProvider skipInitialBootstrap>
         <ContentRenderer
           messageId="m2"
           isStreaming
-          blocks={[{ type: 'text', text: '```html\n<div>hi' }]}
+          blocks={[{ type: 'text', text: '<div>streaming' }]}
         />
       </AppProvider>,
     );
 
+    // Unclosed raw HTML while streaming does not mount iframe yet.
     expect(screen.queryByTitle('HTML 预览')).not.toBeInTheDocument();
-    expect(screen.getByText('<div>hi')).toBeInTheDocument();
+    expect(screen.getByText('<div>streaming')).toBeInTheDocument();
 
+    // Closed raw HTML renders seamlessly (no CollapsibleBlock card shell).
     rerender(
       <AppProvider skipInitialBootstrap>
         <ContentRenderer
           messageId="m2"
           isStreaming={false}
-          blocks={[{ type: 'text', text: '```html\n<div>hi</div>\n```' }]}
+          blocks={[{ type: 'text', text: '<div>visual-ok</div>' }]}
         />
       </AppProvider>,
     );
+    const seamlessIframe = screen.getByTitle('HTML 预览');
+    expect(seamlessIframe).toHaveAttribute('sandbox', 'allow-scripts');
+    expect(seamlessIframe).toHaveClass('html-sandbox-frame--seamless');
+    expect(container.querySelector('.block-card')).not.toBeInTheDocument();
 
-    const iframe = screen.getByTitle('HTML 预览');
-    expect(iframe).toHaveAttribute('sandbox', 'allow-scripts');
+    // Fenced ```html code block defaults to source view (defaultHtmlPreview=false) with manual preview toggle.
+    rerender(
+      <AppProvider skipInitialBootstrap>
+        <ContentRenderer
+          messageId="m3"
+          isStreaming={false}
+          blocks={[{ type: 'text', text: '```html\n<div>fenced</div>\n```' }]}
+        />
+      </AppProvider>,
+    );
+    expect(screen.queryByTitle('HTML 预览')).not.toBeInTheDocument();
+    expect(screen.getByText('<div>fenced</div>')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '预览 HTML' }));
+    expect(screen.getByTitle('HTML 预览')).toHaveAttribute(
+      'sandbox',
+      'allow-scripts',
+    );
+
+    // When visualHtmlRender is false, closed raw HTML shows read-only code card without mounting iframe.
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...defaultSettings(), visualHtmlRender: false }),
+    );
+    render(
+      <AppProvider skipInitialBootstrap>
+        <ContentRenderer
+          messageId="m4"
+          isStreaming={false}
+          blocks={[{ type: 'text', text: '<div>raw-disabled</div>' }]}
+        />
+      </AppProvider>,
+    );
+    expect(screen.getByText('<div>raw-disabled</div>')).toBeInTheDocument();
   });
 });

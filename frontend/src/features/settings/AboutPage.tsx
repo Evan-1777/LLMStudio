@@ -1,5 +1,5 @@
 import { useApp, type ConnectionState } from '../../app/AppProvider';
-import { ErrorBanner, Icon } from '../../components/ui';
+import { ErrorBanner } from '../../components/ui';
 
 function formatConnectionState(state: ConnectionState): string {
   switch (state) {
@@ -35,20 +35,18 @@ export function AboutPage() {
       <div className="st-container">
         <div className="st-card">
           <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <div
+            <img
+              src="/favicon.png"
+              alt="LLMStudio"
               style={{
                 width: 40,
                 height: 40,
-                borderRadius: 10,
-                background: 'var(--accent-soft)',
-                color: 'var(--accent)',
-                display: 'grid',
-                placeItems: 'center',
+                borderRadius: '50%',
+                objectFit: 'cover',
+                display: 'block',
                 flex: 'none',
               }}
-            >
-              <Icon name="bot" size={20} />
-            </div>
+            />
             <div>
               <h2 className="st-section-title">LLMStudio</h2>
               <div className="st-subtitle">

@@ -41,9 +41,10 @@ type ProviderInput struct {
 	AuthType    string               `json:"authType"`
 	APIKey      string               `json:"apiKey,omitempty"`
 	ClearAPIKey bool                 `json:"clearApiKey,omitempty"`
-	Headers     map[string]string    `json:"headers,omitempty"`
-	Models      []domain.ModelConfig `json:"models"`
-	Enabled     *bool                `json:"enabled,omitempty"`
+	Headers      map[string]string    `json:"headers,omitempty"`
+	Models       []domain.ModelConfig `json:"models"`
+	Enabled      *bool                `json:"enabled,omitempty"`
+	LocalRequest *bool                `json:"localRequest,omitempty"`
 }
 
 // ProviderService manages provider configurations and validates format/adapter bindings.
@@ -102,6 +103,9 @@ func (s *ProviderService) Create(ctx context.Context, in ProviderInput) (domain.
 	if in.Enabled != nil {
 		cfg.Enabled = *in.Enabled
 	}
+	if in.LocalRequest != nil {
+		cfg.LocalRequest = *in.LocalRequest
+	}
 	if err := s.normalizeAndValidate(&cfg); err != nil {
 		return domain.ProviderConfig{}, err
 	}
@@ -141,6 +145,9 @@ func (s *ProviderService) Update(ctx context.Context, id string, in ProviderInpu
 	}
 	if in.Enabled != nil {
 		cfg.Enabled = *in.Enabled
+	}
+	if in.LocalRequest != nil {
+		cfg.LocalRequest = *in.LocalRequest
 	}
 
 	if err := s.normalizeAndValidate(&cfg); err != nil {

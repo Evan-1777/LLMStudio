@@ -56,6 +56,8 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("GET /api/v1/conversations/{id}", ch.GetDetail)
 		mux.HandleFunc("PATCH /api/v1/conversations/{id}", ch.Patch)
 		mux.HandleFunc("DELETE /api/v1/conversations/{id}", ch.Delete)
+		mux.HandleFunc("POST /api/v1/conversations/{id}/messages", ch.CreateMessage)
+		mux.HandleFunc("PATCH /api/v1/conversations/{id}/messages/{messageId}", ch.UpdateMessage)
 		mux.HandleFunc("DELETE /api/v1/conversations/{id}/messages/{messageId}", ch.DeleteMessage)
 		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/{messageId}/branch", ch.BranchFromMessage)
 	}
@@ -72,6 +74,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 	if deps.ChatService != nil {
 		chatHandler := NewChatHandler(deps.ChatService)
 		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/stream", chatHandler.Stream)
+		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/prepare-local", chatHandler.PrepareLocal)
 	}
 
 	if deps.Config.StaticDir != "" {
