@@ -36,9 +36,25 @@ export function ConnectionPage() {
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
 
+  // Reset the draft only when the persisted connection actually changes, so the
+  // mount-time effect cannot overwrite edits typed before React flushes effects.
+  const syncedConnectionRef = useRef({
+    gatewayBaseUrl: settings.gatewayBaseUrl,
+    accessToken: settings.accessToken,
+  });
+
   useEffect(() => {
-    setGatewayUrl(settings.gatewayBaseUrl);
-    setAccessToken(settings.accessToken);
+    const { gatewayBaseUrl, accessToken } = settings;
+    const synced = syncedConnectionRef.current;
+    if (
+      synced.gatewayBaseUrl === gatewayBaseUrl &&
+      synced.accessToken === accessToken
+    ) {
+      return;
+    }
+    syncedConnectionRef.current = { gatewayBaseUrl, accessToken };
+    setGatewayUrl(gatewayBaseUrl);
+    setAccessToken(accessToken);
   }, [settings.accessToken, settings.gatewayBaseUrl]);
 
   const normalizedUrl = gatewayUrl.trim() || '/';
