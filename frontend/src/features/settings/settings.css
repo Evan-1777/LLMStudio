@@ -202,6 +202,7 @@
 }
 
 .st-group {
+  flex-shrink: 0;
   background: var(--bg-surface);
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-lg);
@@ -284,6 +285,7 @@
 }
 
 .st-actions-bar {
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -456,6 +458,8 @@
 
 /* Models List */
 .st-model-group {
+  /* overflow: hidden resets automatic min-height to 0; prevent flex columns from clipping rows */
+  flex-shrink: 0;
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-lg);
   overflow: hidden;
@@ -532,6 +536,7 @@
 
 /* Collapsible Details */
 .st-details {
+  flex-shrink: 0;
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
@@ -615,8 +620,10 @@
 }
 
 .st-import-list {
+  min-height: 0;
   max-height: 320px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 10px;

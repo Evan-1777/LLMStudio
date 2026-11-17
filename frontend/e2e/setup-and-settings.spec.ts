@@ -1,4 +1,10 @@
-import { E2E_TOKEN, expect, test } from './fixtures';
+import {
+  connectWithToken,
+  E2E_TOKEN,
+  expect,
+  seedMockProviderViaApi,
+  test,
+} from './fixtures';
 
 test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
   test('connects via token gate, manages assistants/providers/model import/search/MCP/appearance, and persists across reload', async ({
@@ -186,5 +192,126 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await expect(page.getByText(/to: Direct browser chat/)).toBeVisible();
 
     expect(consoleErrors).toEqual([]);
+  });
+
+  test('scrolls overflowing model import list and selects bottom models across desktop and short viewports', async ({
+    appUrl,
+    upstream,
+    page,
+  }) => {
+    await seedMockProviderViaApi(appUrl, upstream.url);
+    upstream.models = [
+      ...Array.from({ length: 14 }, (_, idx) => {
+        const num = String(idx + 1).padStart(2, '0');
+        return {
+          id: `gpt-batch-${num}`,
+          name: `GPT Batch ${num}`,
+          context_window: 128000,
+          max_tokens: 8192,
+          reasoning: idx % 2 === 0,
+        };
+      }),
+      ...Array.from({ length: 6 }, (_, idx) => {
+        const num = String(idx + 1).padStart(2, '0');
+        return {
+          id: `claude-batch-${num}`,
+          name: `Claude Batch ${num}`,
+          context_window: 200000,
+          max_tokens: 8192,
+        };
+      }),
+      ...Array.from({ length: 4 }, (_, idx) => {
+        const num = String(idx + 1).padStart(2, '0');
+        return {
+          id: `qwen-batch-${num}`,
+          name: `Qwen Batch ${num}`,
+          context_window: 128000,
+          max_tokens: 8192,
+        };
+      }),
+      {
+        id: 'qwen-tail-max',
+        name: 'Qwen Tail Max',
+        context_window: 128000,
+        max_tokens: 8192,
+        reasoning: true,
+      },
+    ];
+
+    await connectWithToken(page, appUrl);
+    await page.getByRole('link', { name: '设置' }).click();
+    await page.getByRole('button', { name: /E2E Mock Provider/ }).click();
+    await expect(page.getByRole('heading', { name: 'E2E Mock Provider' })).toBeVisible();
+
+    await page.getByRole('button', { name: '获取模型' }).first().click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByText('GPT Batch 01')).toBeVisible();
+
+    const list = dialog.locator('.st-import-list');
+    await expect(list).toBeVisible();
+
+    const desktopMetrics = await list.evaluate((el) => {
+      const groups = Array.from(el.querySelectorAll<HTMLElement>('.st-model-group'));
+      const style = getComputedStyle(el);
+      const listRect = el.getBoundingClientRect();
+      const tailInput = Array.from(el.querySelectorAll<HTMLElement>('.st-import-item')).pop();
+      const tailRect = tailInput ? tailInput.getBoundingClientRect() : null;
+      return {
+        overflowY: style.overflowY,
+        clientHeight: el.clientHeight,
+        scrollHeight: el.scrollHeight,
+        clippedGroups: groups.filter((g) => g.scrollHeight > g.clientHeight + 1).length,
+        tailBelowViewport: tailRect ? tailRect.bottom > listRect.bottom : false,
+      };
+    });
+
+    expect(desktopMetrics.overflowY).toBe('auto');
+    expect(desktopMetrics.clientHeight).toBeLessThanOrEqual(320);
+    expect(desktopMetrics.scrollHeight).toBeGreaterThan(desktopMetrics.clientHeight + 200);
+    expect(desktopMetrics.clippedGroups).toBe(0);
+    expect(desktopMetrics.tailBelowViewport).toBe(true);
+
+    // Wheel scroll inside the modal list should move scrollTop cleanly.
+    const box = await list.boundingBox();
+    expect(box).not.toBeNull();
+    await page.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+    await page.mouse.wheel(0, 600);
+    await expect.poll(async () => list.evaluate((el) => el.scrollTop)).toBeGreaterThan(0);
+
+    // On a short mobile landscape viewport, dialog head/actions/footer remain visible while list shrinks & scrolls.
+    await page.setViewportSize({ width: 667, height: 375 });
+    const shortMetrics = await dialog.evaluate((dlg) => {
+      const listEl = dlg.querySelector<HTMLElement>('.st-import-list');
+      const headEl = dlg.querySelector<HTMLElement>('.ui-dialog-head');
+      const actionsEl = dlg.querySelector<HTMLElement>('.st-actions-bar');
+      const footEl = dlg.querySelector<HTMLElement>('.ui-dialog-foot');
+      return {
+        listClientHeight: listEl?.clientHeight ?? 0,
+        listScrollHeight: listEl?.scrollHeight ?? 0,
+        headBottom: headEl?.getBoundingClientRect().bottom ?? 0,
+        actionsBottom: actionsEl?.getBoundingClientRect().bottom ?? 0,
+        footTop: footEl?.getBoundingClientRect().top ?? 0,
+        footBottom: footEl?.getBoundingClientRect().bottom ?? 0,
+      };
+    });
+    expect(shortMetrics.listClientHeight).toBeGreaterThan(60);
+    expect(shortMetrics.listClientHeight).toBeLessThan(320);
+    expect(shortMetrics.listScrollHeight).toBeGreaterThan(shortMetrics.listClientHeight);
+    expect(shortMetrics.headBottom).toBeGreaterThan(0);
+    expect(shortMetrics.actionsBottom).toBeGreaterThan(shortMetrics.headBottom);
+    expect(shortMetrics.footTop).toBeLessThan(shortMetrics.footBottom);
+    expect(shortMetrics.footBottom).toBeLessThanOrEqual(375);
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // Scroll to the tail item, check it, and verify import persists to provider detail list.
+    const tailCheckbox = dialog.getByRole('checkbox', { name: /Qwen Tail Max/ });
+    await tailCheckbox.scrollIntoViewIfNeeded();
+    await tailCheckbox.check();
+    await expect(tailCheckbox).toBeChecked();
+
+    await dialog.getByRole('button', { name: '导入 (1)' }).click();
+    await expect(dialog).toBeHidden();
+    await expect(page.getByText('Qwen Tail Max')).toBeVisible();
   });
 });

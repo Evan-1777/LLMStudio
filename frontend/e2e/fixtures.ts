@@ -21,8 +21,34 @@ const DIST_DIR = path.join(FRONTEND_DIR, 'dist');
 
 export const E2E_TOKEN = 'e2e-test-token-2026';
 
+export interface MockUpstreamModel {
+  id: string;
+  name: string;
+  context_window?: number;
+  max_tokens?: number;
+  reasoning?: boolean;
+}
+
+const DEFAULT_UPSTREAM_MODELS: MockUpstreamModel[] = [
+  {
+    id: 'mock-chat',
+    name: 'Mock Chat',
+    context_window: 128000,
+    max_tokens: 8192,
+    reasoning: true,
+  },
+  {
+    id: 'mock-vision',
+    name: 'Mock Vision',
+    context_window: 128000,
+    max_tokens: 4096,
+    reasoning: false,
+  },
+];
+
 export interface MockUpstreamControl {
   url: string;
+  models: MockUpstreamModel[];
   lastAuthHeaders: string[];
   lastChatBodies: Array<Record<string, unknown>>;
   abortedCount: number;
@@ -86,10 +112,12 @@ async function startMockUpstream(): Promise<{
 }> {
   const control: MockUpstreamControl = {
     url: '',
+    models: DEFAULT_UPSTREAM_MODELS.map((m) => ({ ...m })),
     lastAuthHeaders: [],
     lastChatBodies: [],
     abortedCount: 0,
     reset() {
+      this.models = DEFAULT_UPSTREAM_MODELS.map((m) => ({ ...m }));
       this.lastAuthHeaders = [];
       this.lastChatBodies = [];
       this.abortedCount = 0;
@@ -122,22 +150,7 @@ async function startMockUpstream(): Promise<{
       res.end(
         JSON.stringify({
           object: 'list',
-          data: [
-            {
-              id: 'mock-chat',
-              name: 'Mock Chat',
-              context_window: 128000,
-              max_tokens: 8192,
-              reasoning: true,
-            },
-            {
-              id: 'mock-vision',
-              name: 'Mock Vision',
-              context_window: 128000,
-              max_tokens: 4096,
-              reasoning: false,
-            },
-          ],
+          data: control.models,
         }),
       );
       return;
