@@ -1,17 +1,28 @@
-# llmstudio_frontend
+# LLMStudio Web
 
-A new Flutter project.
+React 19 + TypeScript + Vite web client for LLMStudio, served behind the Go gateway in production.
 
-## Getting Started
+## Prerequisites
 
-This project is a starting point for a Flutter application.
+- Node.js 24 (`>=24.0.0 <25.0.0`)
+- npm 11 (`>=11.0.0 <12.0.0`)
 
-A few resources to get you started if this is your first Flutter project:
+## Development
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+Start the Go gateway first (`cd ../backend && LLMSTUDIO_DEV_MODE=true go run ./cmd/server`), then start the Vite dev server (proxies `/api` and `/healthz` to `VITE_GATEWAY_TARGET`, default `http://127.0.0.1:8080`):
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+```bash
+npm ci
+npm run dev
+```
+
+## Checks & Production Build
+
+```bash
+npm run typecheck
+npm test
+npm run build
+npm run test:e2e
+```
+
+Production build outputs static assets to `dist/`, which the Go gateway serves when `LLMSTUDIO_STATIC_DIR` points to that directory (e.g. `/app/web` in Docker).

@@ -1,0 +1,221 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { IconButton, Modal } from '../components/ui';
+import { useApp } from '../app/AppProvider';
+import { CollapsibleBlock } from './CollapsibleBlock';
+import { shouldAutoCollapseText } from './segments';
+
+function generateNonce(): string {
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function buildSandboxedSrcDoc(rawHtml: string, nonce: string): string {
+  const safeNonce = JSON.stringify(nonce);
+  const bridgeScript = `
+<script>
+(function() {
+  var nonce = ${safeNonce};
+  function postHeight() {
+    try {
+      var docEl = document.documentElement;
+      var body = document.body;
+      var h = Math.max(
+        docEl ? docEl.scrollHeight : 0,
+        body ? body.scrollHeight : 0
+      );
+      window.parent.postMessage({
+        type: "llmstudio-html-height",
+        nonce: nonce,
+        height: h
+      }, "*");
+    } catch (_) {}
+  }
+  window.addEventListener("load", postHeight);
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(postHeight).observe(document.documentElement);
+  }
+  setTimeout(postHeight, 40);
+})();
+</script>`;
+
+  const lower = rawHtml.toLowerCase();
+  const hasDocRoot = lower.includes('<!doctype') || lower.includes('<html');
+  if (hasDocRoot) {
+    const closeBody = lower.lastIndexOf('</body>');
+    if (closeBody >= 0) {
+      return (
+        rawHtml.slice(0, closeBody) + bridgeScript + rawHtml.slice(closeBody)
+      );
+    }
+    return `${rawHtml}\n${bridgeScript}`;
+  }
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body {
+    margin: 0;
+    padding: 10px;
+    box-sizing: border-box;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+</style>
+</head>
+<body>
+${rawHtml}
+${bridgeScript}
+</body>
+</html>`;
+}
+
+function SandboxedIframe({
+  html,
+  minHeight = 140,
+  maxHeight = 680,
+  fillAvailable = false,
+}: {
+  html: string;
+  minHeight?: number;
+  maxHeight?: number;
+  fillAvailable?: boolean;
+}) {
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const nonce = useMemo(() => generateNonce(), []);
+  const srcDoc = useMemo(() => buildSandboxedSrcDoc(html, nonce), [html, nonce]);
+  const [height, setHeight] = useState(minHeight);
+
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const iframeWin = iframeRef.current?.contentWindow;
+      if (!iframeWin || event.source !== iframeWin) return;
+      const data: unknown = event.data;
+      if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+      const payload = data as Record<string, unknown>;
+      if (payload.type !== 'llmstudio-html-height') return;
+      if (payload.nonce !== nonce) return;
+      const reported = payload.height;
+      if (
+        typeof reported === 'number' &&
+        Number.isFinite(reported) &&
+        reported > 0
+      ) {
+        const clamped = Math.min(maxHeight, Math.max(minHeight, Math.round(reported)));
+        setHeight((prev) => (Math.abs(clamped - prev) >= 1 ? clamped : prev));
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [maxHeight, minHeight, nonce]);
+
+  return (
+    <div className="html-sandbox-wrap">
+      <iframe
+        ref={iframeRef}
+        title="HTML 预览"
+        sandbox="allow-scripts"
+        srcDoc={srcDoc}
+        className="html-sandbox-frame"
+        style={{
+          height: fillAvailable ? 'min(70dvh, 640px)' : `${height}px`,
+        }}
+      />
+    </div>
+  );
+}
+
+export function HtmlPreview({
+  html,
+  isClosed,
+  collapseKey,
+  title = 'HTML',
+}: {
+  html: string;
+  isClosed: boolean;
+  collapseKey: string;
+  title?: string;
+}) {
+  const { settings, toast } = useApp();
+  const [previewOverride, setPreviewOverride] = useState<boolean | null>(null);
+  const [copied, setCopied] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
+
+  const canPreview = isClosed;
+  const showPreview =
+    canPreview && (previewOverride ?? settings.defaultHtmlPreview);
+
+  const defaultCollapsed = shouldAutoCollapseText(html, settings);
+
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(html);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      toast('无法写入剪贴板', 'error');
+    }
+  };
+
+  return (
+    <>
+      <CollapsibleBlock
+        collapseKey={collapseKey}
+        title={isClosed ? title : `${title} · 输出中`}
+        icon={showPreview ? 'preview' : 'code'}
+        defaultCollapsed={defaultCollapsed}
+        actions={
+          <>
+            {canPreview ? (
+              <IconButton
+                size="sm"
+                icon={showPreview ? 'code' : 'preview'}
+                label={showPreview ? '查看源码' : '预览 HTML'}
+                onClick={() => setPreviewOverride(!showPreview)}
+              />
+            ) : null}
+            {canPreview ? (
+              <IconButton
+                size="sm"
+                icon="expand"
+                label="全屏预览"
+                onClick={() => setFullscreen(true)}
+              />
+            ) : null}
+            <IconButton
+              size="sm"
+              icon={copied ? 'check' : 'copy'}
+              label="复制 HTML"
+              onClick={() => void handleCopy()}
+            />
+          </>
+        }
+      >
+        {showPreview ? (
+          <SandboxedIframe html={html} />
+        ) : (
+          <pre className="code-pre">
+            <code>{html}</code>
+          </pre>
+        )}
+      </CollapsibleBlock>
+
+      <Modal
+        open={fullscreen}
+        onOpenChange={setFullscreen}
+        title="HTML 预览"
+        wide
+      >
+        {canPreview ? <SandboxedIframe html={html} fillAvailable /> : null}
+      </Modal>
+    </>
+  );
+}

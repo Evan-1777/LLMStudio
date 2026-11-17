@@ -1,0 +1,84 @@
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+import * as PopoverPrimitive from '@radix-ui/react-popover';
+import type { ReactNode } from 'react';
+
+export function Popover({
+  open,
+  onOpenChange,
+  trigger,
+  children,
+  align = 'start',
+  side = 'bottom',
+}: {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  trigger: ReactNode;
+  children: ReactNode;
+  align?: 'start' | 'center' | 'end';
+  side?: 'top' | 'bottom' | 'left' | 'right';
+}) {
+  return (
+    <PopoverPrimitive.Root open={open} onOpenChange={onOpenChange}>
+      <PopoverPrimitive.Trigger asChild>{trigger}</PopoverPrimitive.Trigger>
+      <PopoverPrimitive.Portal>
+        <PopoverPrimitive.Content
+          align={align}
+          side={side}
+          sideOffset={6}
+          collisionPadding={10}
+          className="ui-popover-content"
+        >
+          {children}
+        </PopoverPrimitive.Content>
+      </PopoverPrimitive.Portal>
+    </PopoverPrimitive.Root>
+  );
+}
+
+export function Dropdown({
+  trigger,
+  children,
+  align = 'start',
+  side = 'bottom',
+}: {
+  trigger: ReactNode;
+  children: ReactNode;
+  align?: 'start' | 'center' | 'end';
+  side?: 'top' | 'bottom' | 'left' | 'right';
+}) {
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>{trigger}</DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align={align}
+          side={side}
+          sideOffset={6}
+          collisionPadding={10}
+          className="ui-menu-content"
+        >
+          {children}
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+export function DropdownItem({
+  active = false,
+  onSelect,
+  children,
+}: {
+  active?: boolean;
+  onSelect: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <DropdownMenu.Item
+      className={`ui-menu-item ${active ? 'ui-menu-item--active' : ''}`.trim()}
+      onSelect={onSelect}
+    >
+      {children}
+    </DropdownMenu.Item>
+  );
+}

@@ -5,6 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"llmstudio/backend/internal/config"
+	"llmstudio/backend/internal/plugin"
 )
 
 func TestAuthMiddlewareAndHealthz(t *testing.T) {
@@ -79,4 +82,92 @@ func TestAuthMiddlewareAndHealthz(t *testing.T) {
 			t.Fatalf("expected 200 in dev mode, got %d", rec.Code)
 		}
 	})
+}
+
+func TestHealthzAuthRequiredMatchesMiddlewareMatrix(t *testing.T) {
+	cases := []struct {
+		name             string
+		token            string
+		devMode          bool
+		wantAuthRequired bool
+		wantUnauthStatus int
+		wantAuthStatus   int
+	}{
+		{
+			name:             "devMode_without_token",
+			token:            "",
+			devMode:          true,
+			wantAuthRequired: false,
+			wantUnauthStatus: http.StatusOK,
+			wantAuthStatus:   http.StatusOK,
+		},
+		{
+			name:             "devMode_with_token",
+			token:            "dev-secret",
+			devMode:          true,
+			wantAuthRequired: true,
+			wantUnauthStatus: http.StatusUnauthorized,
+			wantAuthStatus:   http.StatusOK,
+		},
+		{
+			name:             "prod_with_token",
+			token:            "prod-secret",
+			devMode:          false,
+			wantAuthRequired: true,
+			wantUnauthStatus: http.StatusUnauthorized,
+			wantAuthStatus:   http.StatusOK,
+		},
+		{
+			name:             "prod_without_token",
+			token:            "",
+			devMode:          false,
+			wantAuthRequired: true,
+			wantUnauthStatus: http.StatusUnauthorized,
+			wantAuthStatus:   http.StatusUnauthorized,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			router := NewRouter(RouterDeps{
+				Config: config.Config{
+					AccessToken: tc.token,
+					DevMode:     tc.devMode,
+					CORSOrigins: []string{"*"},
+				},
+				Formats: plugin.NewFormatRegistry(),
+			})
+
+			healthReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+			healthRec := httptest.NewRecorder()
+			router.ServeHTTP(healthRec, healthReq)
+			if healthRec.Code != http.StatusOK {
+				t.Fatalf("expected 200 on /healthz, got %d", healthRec.Code)
+			}
+			var health map[string]any
+			if err := json.Unmarshal(healthRec.Body.Bytes(), &health); err != nil {
+				t.Fatalf("decode /healthz: %v", err)
+			}
+			if health["authRequired"] != tc.wantAuthRequired {
+				t.Fatalf("authRequired=%v, want %v", health["authRequired"], tc.wantAuthRequired)
+			}
+
+			unauthReq := httptest.NewRequest(http.MethodGet, "/api/v1/formats", nil)
+			unauthRec := httptest.NewRecorder()
+			router.ServeHTTP(unauthRec, unauthReq)
+			if unauthRec.Code != tc.wantUnauthStatus {
+				t.Fatalf("unauthenticated /api/v1/formats status=%d, want %d", unauthRec.Code, tc.wantUnauthStatus)
+			}
+
+			if tc.token != "" {
+				authReq := httptest.NewRequest(http.MethodGet, "/api/v1/formats", nil)
+				authReq.Header.Set("Authorization", "Bearer "+tc.token)
+				authRec := httptest.NewRecorder()
+				router.ServeHTTP(authRec, authReq)
+				if authRec.Code != tc.wantAuthStatus {
+					t.Fatalf("authenticated /api/v1/formats status=%d, want %d", authRec.Code, tc.wantAuthStatus)
+				}
+			}
+		})
+	}
 }

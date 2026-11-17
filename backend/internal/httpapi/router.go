@@ -27,7 +27,7 @@ type RouterDeps struct {
 // NewRouter constructs the root HTTP handler with CORS, authentication, API routes, and optional static assets.
 func NewRouter(deps RouterDeps) http.Handler {
 	mux := http.NewServeMux()
-	authRequired := !deps.Config.DevMode && deps.Config.AccessToken != ""
+	authRequired := AuthRequiredForConfig(deps.Config.AccessToken, deps.Config.DevMode)
 	mux.HandleFunc("GET /healthz", NewHealthHandler(authRequired))
 
 	if deps.Formats != nil {

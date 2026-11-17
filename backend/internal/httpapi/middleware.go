@@ -51,6 +51,12 @@ func CORSMiddleware(allowedOrigins []string, next http.Handler) http.Handler {
 	})
 }
 
+// AuthRequiredForConfig reports whether /api/ routes require authentication
+// for the given access token and devMode setting.
+func AuthRequiredForConfig(accessToken string, devMode bool) bool {
+	return accessToken != "" || !devMode
+}
+
 // AuthMiddleware enforces Bearer token verification on /api/ routes when accessToken is configured.
 // Health check (/healthz) and static web assets remain exempt.
 func AuthMiddleware(accessToken string, devMode bool, next http.Handler) http.Handler {
@@ -60,11 +66,11 @@ func AuthMiddleware(accessToken string, devMode bool, next http.Handler) http.Ha
 			next.ServeHTTP(w, r)
 			return
 		}
+		if !AuthRequiredForConfig(accessToken, devMode) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if accessToken == "" {
-			if devMode {
-				next.ServeHTTP(w, r)
-				return
-			}
 			WriteError(w, http.StatusUnauthorized, "UNAUTHORIZED", "access token is not configured")
 			return
 		}
