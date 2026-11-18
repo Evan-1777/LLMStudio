@@ -13,7 +13,6 @@ import {
   Select,
   Switch,
 } from '../../components/ui';
-import { setLocalProviderKey } from '../../core/localProviderKeys';
 import type { AuthType } from '../../core/types';
 import { ProviderEditor } from './ProviderEditor';
 import { errorMessageOf, validateHttpUrl } from './jsonValidation';
@@ -87,9 +86,6 @@ function CreateProviderModal({
         enabled: true,
         localRequest,
       });
-      if (created.localRequest && trimmedKey) {
-        setLocalProviderKey(created.id, trimmedKey);
-      }
       upsertLocalProvider(created);
       onCreated(created.id);
       onOpenChange(false);

@@ -10,9 +10,16 @@ import {
 } from 'react';
 import { GatewayClient, GatewayError, validateGatewayUrl } from '../core/gateway';
 import {
+  clearLegacyPreferences,
+  defaultAppPreferences,
   loadSettings,
+  normalizeSettings,
+  pickAppPreferences,
+  readLegacyPreferences,
   resolveAccentColors,
-  saveSettings,
+  saveConnectionSettings,
+  writeThemeHint,
+  type AppPreferences,
   type AppSettings,
   type SettingsSaveResult,
 } from '../core/settings';
@@ -26,6 +33,7 @@ import type {
   ProviderAdapterInfo,
   ProviderConfig,
   SearchEngineView,
+  ServerPreferences,
 } from '../core/types';
 import { ConfirmDialog } from '../components/ui/Modal';
 
@@ -66,6 +74,9 @@ export interface AppContextValue {
       | Partial<AppSettings>
       | ((prev: AppSettings) => AppSettings),
   ) => SettingsSaveResult;
+  updatePreferences: (
+    patch: Partial<AppPreferences>,
+  ) => Promise<{ ok: boolean; error?: string }>;
   connectionState: ConnectionState;
   connectionError: string | null;
   gatewayHealth: HealthResponse | null;
@@ -200,6 +211,10 @@ export function AppProvider({
     initialLoad.notice,
   );
   const [systemDark, setSystemDark] = useState<boolean>(getSystemPrefersDark);
+  // Last values confirmed by the gateway; failed writes roll back to this snapshot.
+  const [serverPreferences, setServerPreferences] = useState<AppPreferences>(
+    defaultAppPreferences,
+  );
 
   const [connectionEpoch, setConnectionEpoch] = useState(1);
   const epochRef = useRef(1);
@@ -295,15 +310,100 @@ export function AppProvider({
         typeof patchOrUpdater === 'function'
           ? patchOrUpdater(settingsRef.current)
           : { ...settingsRef.current, ...patchOrUpdater };
-      const result = saveSettings(nextRaw);
-      settingsRef.current = result.settings;
-      setSettings(result.settings);
-      if (result.notice) {
-        setSettingsNotice(result.notice);
-      }
-      return result;
+      const normalized = normalizeSettings(nextRaw);
+      settingsRef.current = normalized;
+      setSettings(normalized);
+      // Only browser-owned connection info is persisted locally; preferences live
+      // in the gateway and are written through updatePreferences.
+      saveConnectionSettings({
+        gatewayBaseUrl: normalized.gatewayBaseUrl,
+        accessToken: normalized.accessToken,
+      });
+      return { settings: normalized, persisted: true, notice: null };
     },
     [],
+  );
+
+  // The gateway owns preference values once its row is initialized. Until then
+  // the browser snapshot is the only source, so it seeds the server on first write
+  // while still rendering correctly.
+  const hydratePreferences = useCallback(
+    async (signal: AbortSignal, epoch: number): Promise<void> => {
+      // Legacy browser preferences are imported at most once; the gateway refuses
+      // to overwrite values another browser already committed.
+      const connectionGateway = settingsRef.current.gatewayBaseUrl;
+      const legacy = readLegacyPreferences();
+      const envelope = await gateway.getPreferences(signal);
+      if (epoch !== epochRef.current) return;
+      // A gateway switch while the request was in flight must not apply stale values.
+      if (connectionGateway !== settingsRef.current.gatewayBaseUrl) return;
+
+      let resolved = envelope;
+      if (!envelope.initialized) {
+        const seed = legacy ?? pickAppPreferences(settingsRef.current);
+        try {
+          resolved = await gateway.importLegacyPreferences(seed, signal);
+        } catch {
+          // An older gateway without the import route still accepts a full PATCH.
+          resolved = await gateway.updatePreferences(seed, signal);
+        }
+        if (epoch !== epochRef.current) return;
+      }
+
+      const next = resolved.initialized
+        ? resolved.preferences
+        : (legacy ?? pickAppPreferences(settingsRef.current));
+      settingsRef.current = { ...settingsRef.current, ...next };
+      setServerPreferences(next);
+      setSettings(settingsRef.current);
+      writeThemeHint(settingsRef.current.gatewayBaseUrl, {
+        themeMode: next.themeMode,
+        seedColorValue: next.seedColorValue,
+      });
+      if (resolved.initialized) {
+        clearLegacyPreferences();
+      }
+    },
+    [gateway],
+  );
+
+  const updatePreferences = useCallback(
+    async (
+      patch: Partial<AppPreferences>,
+    ): Promise<{ ok: boolean; error?: string }> => {
+      const epoch = epochRef.current;
+      const previous = serverPreferences;
+      const optimistic = { ...previous, ...patch };
+      settingsRef.current = { ...settingsRef.current, ...optimistic };
+      setSettings(settingsRef.current);
+      try {
+        const envelope = await gateway.updatePreferences(
+          patch as Partial<ServerPreferences>,
+        );
+        if (epoch !== epochRef.current) return { ok: true };
+        const confirmed = envelope.initialized
+          ? (envelope.preferences as AppPreferences)
+          : optimistic;
+        settingsRef.current = { ...settingsRef.current, ...confirmed };
+        setServerPreferences(confirmed);
+        setSettings(settingsRef.current);
+        writeThemeHint(settingsRef.current.gatewayBaseUrl, {
+          themeMode: confirmed.themeMode,
+          seedColorValue: confirmed.seedColorValue,
+        });
+        setSettingsNotice(null);
+        return { ok: true };
+      } catch (err) {
+        if (epoch !== epochRef.current) return { ok: true };
+        settingsRef.current = { ...settingsRef.current, ...previous };
+        setServerPreferences(previous);
+        setSettings(settingsRef.current);
+        const message = errorMessageOf(err);
+        setSettingsNotice(`设置保存失败：${message}`);
+        return { ok: false, error: message };
+      }
+    },
+    [gateway, serverPreferences],
   );
 
   const trackSignal = useCallback((): {
@@ -507,6 +607,11 @@ export function AppProvider({
           return;
         }
 
+        // Preferences are part of the authenticated handshake: the workspace stays
+        // gated until the authoritative values are applied.
+        await hydratePreferences(signal, nextEpoch);
+        if (nextEpoch !== epochRef.current) return;
+
         setConnectionState('connected');
         await Promise.all([
           refreshProviders(),
@@ -518,6 +623,8 @@ export function AppProvider({
         if (nextEpoch !== epochRef.current) return;
         if (err instanceof DOMException && err.name === 'AbortError') return;
         if (err instanceof Error && err.name === 'AbortError') return;
+        // Any 401 during the handshake (preferences included) means the token is rejected.
+        if (handleAuthFailureIf401(err, nextEpoch)) return;
         setGatewayHealth(null);
         setConnectionState('error');
         setConnectionError(errorMessageOf(err));
@@ -527,6 +634,8 @@ export function AppProvider({
     },
     [
       gateway,
+      handleAuthFailureIf401,
+      hydratePreferences,
       refreshAssistants,
       refreshConversations,
       refreshPlugins,
@@ -745,6 +854,7 @@ export function AppProvider({
       settingsNotice,
       dismissSettingsNotice: () => setSettingsNotice(null),
       updateSettings,
+      updatePreferences,
       connectionState,
       connectionError,
       gatewayHealth,
@@ -778,6 +888,7 @@ export function AppProvider({
       resolvedTheme,
       settingsNotice,
       updateSettings,
+      updatePreferences,
       connectionState,
       connectionError,
       gatewayHealth,

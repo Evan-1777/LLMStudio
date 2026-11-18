@@ -19,6 +19,56 @@
     <link rel="icon" type="image/png" href="/favicon.png" />
     <link rel="apple-touch-icon" href="/favicon.png" />
     <title>LLMStudio</title>
+    <!--
+      Applies the gateway-confirmed theme before the app mounts so the first paint
+      matches the authoritative preference. Mirrors readThemeHint()/CONNECTION_STORAGE_KEY
+      in src/core/settings.ts, which also owns the authoritative values.
+    -->
+    <script>
+      (function () {
+        try {
+          var storage = window.localStorage;
+          var connection = JSON.parse(
+            storage.getItem('llmstudio.connection.v1') || 'null',
+          );
+          var gateway =
+            connection && typeof connection.gatewayBaseUrl === 'string'
+              ? connection.gatewayBaseUrl
+              : '/';
+          var hint = JSON.parse(
+            storage.getItem('llmstudio.themeHint.v1::' + gateway) || 'null',
+          );
+          if (!hint) return;
+          var mode = hint.themeMode;
+          var dark =
+            mode === 'dark' ||
+            (mode !== 'light' &&
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var root = document.documentElement;
+          root.dataset.theme = dark ? 'dark' : 'light';
+          if (typeof hint.seedColorValue === 'number') {
+            var seed = hint.seedColorValue >>> 0;
+            var presets = {
+              4278221567: ['#007AFF', '#409CFF'],
+              4282343312: ['#3F5F90', '#6B8EC4'],
+              4281166415: ['#2D6A4F', '#52B788'],
+              4284960932: ['#6750A4', '#9A82DB'],
+              4288430625: ['#9C4221', '#E07A5F'],
+              4282865001: ['#475569', '#94A3B8'],
+            };
+            var preset = presets[seed];
+            var accent = preset
+              ? preset[dark ? 1 : 0]
+              : '#' +
+                (seed & 0xffffff).toString(16).padStart(6, '0');
+            root.style.setProperty('--accent', accent);
+          }
+        } catch (error) {
+          /* first paint falls back to the default theme */
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

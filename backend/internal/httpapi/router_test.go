@@ -37,6 +37,7 @@ func setupTestRouter(t *testing.T, token string, devMode bool) http.Handler {
 	msgStore := store.NewMessageStore(db)
 	searchStore := store.NewSearchConfigStore(db)
 	mcpStore := store.NewMCPServerStore(db)
+	prefStore := store.NewPreferenceStore(db)
 
 	formats := plugin.NewFormatRegistry()
 	formats.MustRegister(format.NewOpenAICompletionsFormat())
@@ -66,6 +67,7 @@ func setupTestRouter(t *testing.T, token string, devMode bool) http.Handler {
 		ChatService: service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
 			WithAssistants(assistantStore).
 			WithSearch(searchReg, searchStore),
+		PreferenceService: service.NewPreferenceService(prefStore),
 	})
 }
 
@@ -85,6 +87,139 @@ func doJSONReq(t *testing.T, h http.Handler, method, path, token string, body an
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	return rec
+}
+
+func fetchPreferences(t *testing.T, h http.Handler, token string) (domain.Preferences, bool) {
+	t.Helper()
+	rec := doJSONReq(t, h, http.MethodGet, "/api/v1/settings", token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /settings status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var envelope struct {
+		Preferences domain.Preferences `json:"preferences"`
+		Initialized bool               `json:"initialized"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode settings envelope: %v", err)
+	}
+	return envelope.Preferences, envelope.Initialized
+}
+
+func TestProviderAPIKeyImportEndpoint(t *testing.T) {
+	const tok = "test-token"
+	router := setupTestRouter(t, tok, false)
+
+	createRec := doJSONReq(t, router, http.MethodPost, "/api/v1/providers", tok, map[string]any{
+		"id": "local-provider", "name": "Local", "adapter": "generic-http",
+		"baseURL": "https://example.com", "authType": "bearer", "localRequest": true,
+	})
+	if createRec.Code != http.StatusCreated {
+		t.Fatalf("create provider status=%d body=%s", createRec.Code, createRec.Body.String())
+	}
+	doJSONReq(t, router, http.MethodPost, "/api/v1/providers", tok, map[string]any{
+		"id": "forward-provider", "name": "Forward", "adapter": "generic-http",
+		"baseURL": "https://example.com", "authType": "bearer",
+	})
+
+	if rec := doJSONReq(t, router, http.MethodPost, "/api/v1/providers/local-provider/keys/import", "", map[string]any{"apiKey": "sk-x"}); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated import status=%d", rec.Code)
+	}
+
+	rec := doJSONReq(t, router, http.MethodPost, "/api/v1/providers/local-provider/keys/import", tok, map[string]any{"apiKey": "sk-browser"})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("import status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "\"applied\":true") {
+		t.Fatalf("expected applied=true, body=%s", body)
+	}
+	if strings.Contains(body, "sk-browser") {
+		t.Fatalf("import response leaked the credential: %s", body)
+	}
+
+	// Replaying the import reports "already managed" without overwriting.
+	replay := doJSONReq(t, router, http.MethodPost, "/api/v1/providers/local-provider/keys/import", tok, map[string]any{"apiKey": "sk-second"})
+	if replay.Code != http.StatusOK || !strings.Contains(replay.Body.String(), "\"applied\":false") {
+		t.Fatalf("replay status=%d body=%s", replay.Code, replay.Body.String())
+	}
+	list := doJSONReq(t, router, http.MethodGet, "/api/v1/providers", tok, nil)
+	if !strings.Contains(list.Body.String(), "sk-b...wser") {
+		t.Fatalf("provider list lost the adopted key mask: %s", list.Body.String())
+	}
+
+	// Ineligible and missing providers have distinct, credential-free errors.
+	if rec := doJSONReq(t, router, http.MethodPost, "/api/v1/providers/forward-provider/keys/import", tok, map[string]any{"apiKey": "sk-x"}); rec.Code != http.StatusConflict {
+		t.Fatalf("forward import status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := doJSONReq(t, router, http.MethodPost, "/api/v1/providers/missing/keys/import", tok, map[string]any{"apiKey": "sk-x"}); rec.Code != http.StatusNotFound {
+		t.Fatalf("missing import status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := doJSONReq(t, router, http.MethodPost, "/api/v1/providers/local-provider/keys/import", tok, map[string]any{"apiKey": "  "}); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty import status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestPreferenceEndpoints(t *testing.T) {
+	const tok = "test-token"
+	router := setupTestRouter(t, tok, false)
+
+	if rec := doJSONReq(t, router, http.MethodGet, "/api/v1/settings", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /settings status=%d", rec.Code)
+	}
+
+	prefs, initialized := fetchPreferences(t, router, tok)
+	if initialized {
+		t.Fatal("expected fresh gateway to report initialized=false")
+	}
+	if prefs != domain.DefaultPreferences() {
+		t.Fatalf("unexpected defaults: %+v", prefs)
+	}
+
+	rec := doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, map[string]any{
+		"themeMode":   "dark",
+		"enterToSend": false,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH /settings status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var patched struct {
+		Preferences domain.Preferences `json:"preferences"`
+		Initialized bool               `json:"initialized"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &patched); err != nil {
+		t.Fatalf("decode PATCH response: %v", err)
+	}
+	if !patched.Initialized || patched.Preferences.ThemeMode != domain.ThemeModeDark || patched.Preferences.EnterToSend {
+		t.Fatalf("unexpected PATCH response: %+v", patched)
+	}
+	if patched.Preferences.SeedColorValue != domain.DefaultAppleBlue || patched.Preferences.CollapseLineThreshold != 24 {
+		t.Fatalf("partial PATCH overwrote untouched defaults: %+v", patched.Preferences)
+	}
+
+	// A later single-field update must not reset previously committed fields.
+	if rec := doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, map[string]any{
+		"collapseLineThreshold": 40,
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("second PATCH status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	prefs, initialized = fetchPreferences(t, router, tok)
+	if !initialized || prefs.ThemeMode != domain.ThemeModeDark || prefs.EnterToSend || prefs.CollapseLineThreshold != 40 {
+		t.Fatalf("settings not preserved across updates: %+v initialized=%v", prefs, initialized)
+	}
+
+	invalid := []map[string]any{
+		{"themeMode": "sepia"},
+		{"chatDisplayMode": "grid"},
+		{"collapseLineThreshold": 1},
+		{"collapseCharThreshold": 999999},
+		{"seedColorValue": -1},
+		{"enterToSend": "yes"},
+	}
+	for _, body := range invalid {
+		if rec := doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, body); rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for %v, got status=%d body=%s", body, rec.Code, rec.Body.String())
+		}
+	}
 }
 
 func TestRouterEndpointsAndStreamCancellation(t *testing.T) {

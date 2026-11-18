@@ -22,6 +22,7 @@ type RouterDeps struct {
 	ConversationService *service.ConversationService
 	PluginService       *service.PluginService
 	ChatService         *service.ChatService
+	PreferenceService   *service.PreferenceService
 }
 
 // NewRouter constructs the root HTTP handler with CORS, authentication, API routes, and optional static assets.
@@ -41,6 +42,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("DELETE /api/v1/providers/{id}", ph.Delete)
 		mux.HandleFunc("POST /api/v1/providers/{id}/test", ph.TestConnection)
 		mux.HandleFunc("POST /api/v1/providers/{id}/models/fetch", ph.FetchModels)
+		mux.HandleFunc("POST /api/v1/providers/{id}/keys/import", ph.ImportAPIKey)
 	}
 	if deps.AssistantService != nil {
 		ah := NewAssistantHandler(deps.AssistantService)
@@ -78,6 +80,12 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("DELETE /api/v1/mcp/servers/{id}", plh.DeleteMCPServer)
 		mux.HandleFunc("GET /api/v1/mcp/servers/{id}/tools", plh.ListMCPServerTools)
 		mux.HandleFunc("POST /api/v1/mcp/servers/{id}/test", plh.TestMCPServer)
+	}
+	if deps.PreferenceService != nil {
+		prefHandler := NewPreferenceHandler(deps.PreferenceService)
+		mux.HandleFunc("GET /api/v1/settings", prefHandler.Get)
+		mux.HandleFunc("PATCH /api/v1/settings", prefHandler.Patch)
+		mux.HandleFunc("POST /api/v1/settings/import", prefHandler.ImportOnce)
 	}
 	if deps.ChatService != nil {
 		chatHandler := NewChatHandler(deps.ChatService)

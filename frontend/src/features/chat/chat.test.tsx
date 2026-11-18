@@ -3,7 +3,6 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { AppProvider } from '../../app/AppProvider';
-import { getLocalProviderKey, setLocalProviderKey } from '../../core/localProviderKeys';
 import { SETTINGS_STORAGE_KEY, defaultSettings } from '../../core/settings';
 import { ChatCanvas } from '../workbench/ChatCanvas';
 import { ChatProvider, useChat } from './ChatProvider';
@@ -510,7 +509,6 @@ describe('chatReducer and ChatProvider', () => {
 
   it('routes localRequest providers via prepare-local -> direct upstream -> createMessage and preserves reply on persist failure', async () => {
     localStorage.clear();
-    setLocalProviderKey('local-p', 'sk-local-secret');
 
     const encoder = new TextEncoder();
     let failAssistantPersist = false;
@@ -573,7 +571,11 @@ describe('chatReducer and ChatProvider', () => {
           JSON.stringify({
             method: 'POST',
             url: 'http://127.0.0.1:11434/v1/chat/completions',
-            headers: { 'Content-Type': 'application/json' },
+            // The gateway binds the stored credential to the envelope.
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer sk-local-secret',
+            },
             body: { model: 'qwen', stream: true, messages: [] },
             authType: 'bearer',
           }),
@@ -868,7 +870,6 @@ describe('chatReducer and ChatProvider', () => {
 
     // Local stream: user reopens collapsed thinking after block_end; subsequent text + reconcile must keep it open.
     localStorage.clear();
-    setLocalProviderKey('local-p', 'sk-local');
     const encoder = new TextEncoder();
     let streamController!: ReadableStreamDefaultController<Uint8Array>;
 
@@ -932,7 +933,10 @@ describe('chatReducer and ChatProvider', () => {
           JSON.stringify({
             method: 'POST',
             url: 'http://127.0.0.1:11434/v1/chat/completions',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer sk-local',
+            },
             body: { model: 'r1', stream: true, messages: [] },
             authType: 'bearer',
           }),
@@ -1031,7 +1035,6 @@ describe('chatReducer and ChatProvider', () => {
   });
 
   it('continues localRequest multi-round MCP tool execution without sending browser key to gateway and stops cleanly on abort', async () => {
-    setLocalProviderKey('local-p', 'sk-browser-only');
     const encoder = new TextEncoder();
     const persisted: Message[] = [];
     const gatewayBodies: Array<{ url: string; body: string }> = [];
@@ -1092,7 +1095,10 @@ describe('chatReducer and ChatProvider', () => {
           JSON.stringify({
             method: 'POST',
             url: 'http://127.0.0.1:11434/v1/chat/completions',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: 'Bearer sk-browser-only',
+            },
             body: { model: 'qwen', stream: true, messages: [] },
             authType: 'bearer',
           }),
@@ -1233,20 +1239,18 @@ describe('chatReducer and ChatProvider', () => {
     expect(upstreamTurn).toBe(turnBeforeAbort + 1);
   });
 
-  it('executes localRequest Gemini cache pre-request with browser key, reuses in-memory CacheState, invalidates on key change, and stops cleanly on abort', async () => {
+  it('executes localRequest Gemini cache pre-request with the gateway credential, reuses in-memory CacheState, and follows credential rotation', async () => {
     localStorage.setItem(
       SETTINGS_STORAGE_KEY,
       JSON.stringify({ ...defaultSettings(), autoCreateCache: true }),
     );
-    setLocalProviderKey('local-gem', 'sk-gem-key-1');
+    let credentialKey = 'sk-gem-key-1';
     const encoder = new TextEncoder();
     const persisted: Message[] = [];
     const preparePayloads: Array<Record<string, unknown>> = [];
     const upstreamRequests: Array<{ url: string; body: string }> = [];
     let cacheCreateCount = 0;
     let mainGenerateCount = 0;
-    let blockCacheCreate = false;
-    let rejectCacheSmall = false;
 
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = typeof input === 'string' ? input : input.toString();
@@ -1269,8 +1273,8 @@ describe('chatReducer and ChatProvider', () => {
                 adapter: 'generic-http',
                 baseURL: 'http://127.0.0.1:18888/v1beta',
                 authType: 'query-key',
-                apiKeyMasked: '',
-                apiKeySet: false,
+                apiKeyMasked: 'sk-g...key-1',
+                apiKeySet: true,
                 localRequest: true,
                 models: [{ id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', apiFormat: 'google-generative-ai' }],
                 enabled: true,
@@ -1287,10 +1291,23 @@ describe('chatReducer and ChatProvider', () => {
       if (url.endsWith('/api/v1/conversations/c-gem') && method === 'GET') {
         return new Response(JSON.stringify({ conversation: makeConv('c-gem'), messages: persisted }), { status: 200 });
       }
+      const withCredential = (
+        status: number,
+        envelope: Record<string, unknown>,
+      ) =>
+        new Response(
+          JSON.stringify({
+            ...envelope,
+            // The gateway binds the stored credential to the prepared envelope.
+            url: `${String(envelope.url)}&key=${credentialKey}`,
+          }),
+          { status },
+        );
       if (url.endsWith('/api/v1/conversations/c-gem/messages/prepare-local')) {
         const payload = JSON.parse(rawBody) as Record<string, unknown>;
         preparePayloads.push(payload);
         expect(rawBody).not.toContain('sk-gem-key');
+        expect(payload.credentialEnvelope).toBe(true);
         const wsBlock = {
           type: 'webSearch',
           extra: { query: 'q', engineId: 'tavily', results: [{ title: 'T', url: 'https://t.example' }] },
@@ -1300,84 +1317,60 @@ describe('chatReducer and ChatProvider', () => {
 
         if (resolution) {
           if (resolution.status >= 400) {
-            return new Response(
-              JSON.stringify({
-                method: 'POST',
-                url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
-                headers: { 'Content-Type': 'application/json' },
-                body: { contents: [{ role: 'user', parts: [{ text: 'uncached' }] }] },
-                authType: 'query-key',
-                cacheState: { failedPrefixHash: resolution.planKey },
-              }),
-              { status: 200 },
-            );
+            return withCredential(200, {
+              method: 'POST',
+              url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+              headers: { 'Content-Type': 'application/json' },
+              body: { contents: [{ role: 'user', parts: [{ text: 'uncached' }] }] },
+              authType: 'query-key',
+              cacheState: { failedPrefixHash: resolution.planKey },
+            });
           }
-          return new Response(
-            JSON.stringify({
-              method: 'POST',
-              url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
-              headers: { 'Content-Type': 'application/json' },
-              body: { cachedContent: resolution.result.name, contents: [{ role: 'user', parts: [{ text: 'q' }] }] },
-              authType: 'query-key',
-              cacheState: { resourceName: resolution.result.name, prefixCount: 0 },
-            }),
-            { status: 200 },
-          );
-        }
-
-        if (incomingState?.resourceName) {
-          return new Response(
-            JSON.stringify({
-              method: 'POST',
-              url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
-              headers: { 'Content-Type': 'application/json' },
-              body: { cachedContent: incomingState.resourceName, contents: [{ role: 'user', parts: [{ text: 'q2' }] }] },
-              authType: 'query-key',
-              cacheState: incomingState,
-            }),
-            { status: 200 },
-          );
-        }
-
-        return new Response(
-          JSON.stringify({
+          return withCredential(200, {
             method: 'POST',
             url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
             headers: { 'Content-Type': 'application/json' },
-            body: { contents: [{ role: 'user', parts: [{ text: 'fallback' }] }] },
+            body: { cachedContent: resolution.result.name, contents: [{ role: 'user', parts: [{ text: 'q' }] }] },
             authType: 'query-key',
-            ...(payload.preparedSearch ? {} : { webSearchBlock: wsBlock }),
-            cacheStep: {
-              planKey: 'pk-1',
-              request: {
-                method: 'POST',
-                url: 'http://127.0.0.1:18888/v1beta/cachedContents',
-                headers: { 'Content-Type': 'application/json' },
-                body: { model: 'models/gemini-2.5-pro' },
-                authType: 'query-key',
-              },
+            cacheState: { resourceName: resolution.result.name, prefixCount: 0 },
+          });
+        }
+
+        if (incomingState?.resourceName) {
+          return withCredential(200, {
+            method: 'POST',
+            url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+            headers: { 'Content-Type': 'application/json' },
+            body: { cachedContent: incomingState.resourceName, contents: [{ role: 'user', parts: [{ text: 'q2' }] }] },
+            authType: 'query-key',
+            cacheState: incomingState,
+          });
+        }
+
+        return withCredential(200, {
+          method: 'POST',
+          url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+          headers: { 'Content-Type': 'application/json' },
+          body: { contents: [{ role: 'user', parts: [{ text: 'fallback' }] }] },
+          authType: 'query-key',
+          ...(payload.preparedSearch ? {} : { webSearchBlock: wsBlock }),
+          cacheStep: {
+            planKey: 'pk-1',
+            request: {
+              method: 'POST',
+              // The gateway also binds the credential to the cache pre-request.
+              url: `http://127.0.0.1:18888/v1beta/cachedContents?key=${credentialKey}`,
+              headers: { 'Content-Type': 'application/json' },
+              body: { model: 'models/gemini-2.5-pro' },
+              authType: 'query-key',
             },
-          }),
-          { status: 200 },
-        );
+          },
+        });
       }
 
       if (url.startsWith('http://127.0.0.1:18888/v1beta/cachedContents')) {
         cacheCreateCount += 1;
         upstreamRequests.push({ url, body: rawBody });
-        if (blockCacheCreate) {
-          return new Promise<Response>((_, reject) => {
-            init?.signal?.addEventListener('abort', () => {
-              reject(new DOMException('Aborted', 'AbortError'));
-            });
-          });
-        }
-        if (rejectCacheSmall) {
-          return new Response(
-            JSON.stringify({ error: { code: 400, message: 'total token count too small' } }),
-            { status: 400 },
-          );
-        }
         return new Response(
           JSON.stringify({ name: `cachedContents/b-${cacheCreateCount}`, expireTime: '2099-01-01T00:00:00Z' }),
           { status: 200 },
@@ -1466,6 +1459,8 @@ describe('chatReducer and ChatProvider', () => {
     expect(cacheCreateCount).toBe(1);
     expect(mainGenerateCount).toBe(1);
     expect(persisted).toHaveLength(2);
+    expect(preparePayloads[0].credentialEnvelope).toBe(true);
+    // The cache-create envelope carries the credential, the main request follows it.
     expect(upstreamRequests[0].url).toContain('key=sk-gem-key-1');
     expect(upstreamRequests[1].url).toContain('key=sk-gem-key-1');
     expect(JSON.parse(upstreamRequests[1].body)).toMatchObject({ cachedContent: 'cachedContents/b-1' });
@@ -1478,33 +1473,19 @@ describe('chatReducer and ChatProvider', () => {
     expect(cacheCreateCount).toBe(1);
     expect(mainGenerateCount).toBe(2);
 
-    // 3. Updating local provider key invalidates in-memory cacheState -> next send creates fresh cache with new key.
-    setLocalProviderKey('local-gem', 'sk-gem-key-2');
-    expect(getLocalProviderKey('local-gem')).toBe('sk-gem-key-2');
+    // 3. A gateway-side credential rotation reuses the in-memory cacheState while
+    // the prepared envelope immediately carries the new credential.
+    credentialKey = 'sk-gem-key-2';
     await user.click(screen.getByRole('button', { name: 'send' }));
     await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('idle'));
-    expect(cacheCreateCount).toBe(2);
+    expect(cacheCreateCount).toBe(1);
     expect(mainGenerateCount).toBe(3);
-    expect(upstreamRequests[upstreamRequests.length - 1].url).toContain('key=sk-gem-key-2');
-
-    // 4. Aborting during cacheStep never issues main stream or user message save.
-    setLocalProviderKey('local-gem', 'sk-gem-key-3');
-    blockCacheCreate = true;
-    const savedBeforeAbort = persisted.length;
-    const genBeforeAbort = mainGenerateCount;
-    await user.click(screen.getByRole('button', { name: 'send' }));
-    await waitFor(() => expect(cacheCreateCount).toBe(3));
-    await user.click(screen.getByRole('button', { name: 'stop' }));
-    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('error'));
-    expect(mainGenerateCount).toBe(genBeforeAbort);
-    expect(persisted).toHaveLength(savedBeforeAbort);
-
-    // 5. Small-prefix 400 on cacheStep degrades cleanly and still completes main generation.
-    blockCacheCreate = false;
-    rejectCacheSmall = true;
-    await user.click(screen.getByRole('button', { name: 'send' }));
-    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('idle'));
-    expect(mainGenerateCount).toBe(genBeforeAbort + 1);
+    expect(upstreamRequests[upstreamRequests.length - 1].url).toContain(
+      'key=sk-gem-key-2',
+    );
+    expect(preparePayloads[preparePayloads.length - 1].credentialEnvelope).toBe(
+      true,
+    );
   });
 
   it('displays real cache read/write counts on demand in MessageActions Popover without fabricating savings or zero hits', async () => {

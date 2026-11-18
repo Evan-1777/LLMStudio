@@ -3,7 +3,16 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { AppProvider } from '../../app/AppProvider';
-import { SETTINGS_STORAGE_KEY } from '../../core/settings';
+import { CONNECTION_STORAGE_KEY, defaultSettings } from '../../core/settings';
+
+type MutablePreferences = Record<string, unknown>;
+
+function createPreferences(): MutablePreferences {
+  const { gatewayBaseUrl, accessToken, ...preferences } = defaultSettings();
+  void gatewayBaseUrl;
+  void accessToken;
+  return preferences;
+}
 import { SettingsLayout } from './SettingsLayout';
 
 function setupMatchMedia(initialDark = false) {
@@ -35,7 +44,7 @@ function setupMatchMedia(initialDark = false) {
   };
 }
 
-function makeGatewayFetch() {
+function makeGatewayFetch(preferences: MutablePreferences) {
   return vi.fn<typeof fetch>(async (input, init) => {
     const url = typeof input === 'string' ? input : input.toString();
     const auth = (init?.headers as Record<string, string>)?.Authorization;
@@ -56,6 +65,18 @@ function makeGatewayFetch() {
       return new Response(
         JSON.stringify({ code: 'UNAUTHORIZED', message: 'invalid token' }),
         { status: 401 },
+      );
+    }
+    if (url.endsWith('/api/v1/settings')) {
+      if ((init?.method ?? 'GET').toUpperCase() === 'PATCH') {
+        Object.assign(
+          preferences,
+          JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>,
+        );
+      }
+      return new Response(
+        JSON.stringify({ preferences, initialized: true }),
+        { status: 200 },
       );
     }
     if (url.endsWith('/api/v1/formats')) {
@@ -90,7 +111,8 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
 
   it('navigates all 6 sections, guards dirty connection draft, tests without overwriting, and displays real health version on About', async () => {
     const mm = setupMatchMedia(false);
-    const fetchMock = makeGatewayFetch();
+    const preferences = createPreferences();
+    const fetchMock = makeGatewayFetch(preferences);
     const user = userEvent.setup();
 
     render(
@@ -117,7 +139,13 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
     await user.click(cacheSwitch);
     expect(cacheSwitch).toBeChecked();
     expect(
-      JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}').autoCreateCache,
+      fetchMock.mock.calls.some(
+        ([input, init]) =>
+          String(input).endsWith('/api/v1/settings') &&
+          (init?.method ?? 'GET').toUpperCase() === 'PATCH' &&
+          (JSON.parse(String(init?.body ?? '{}')) as { autoCreateCache?: boolean })
+            .autoCreateCache === true,
+      ),
     ).toBe(true);
     const healthCallsAfterToggle = fetchMock.mock.calls.filter(([input]) =>
       String(input).endsWith('/healthz'),
@@ -139,9 +167,8 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
     await waitFor(() => {
       expect(screen.getByText('invalid token')).toBeInTheDocument();
     });
-    expect(
-      JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}').gatewayBaseUrl,
-    ).toBe('/');
+    // Only the probe used the unsaved values; the persisted gateway stays untouched.
+    expect(preferences.themeMode).toBe('system');
 
     // Dirty guard triggers when leaving ConnectionPage with unsaved edits.
     await user.click(screen.getByRole('button', { name: '关于' }));
@@ -158,7 +185,7 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
 
     await waitFor(() => {
       const saved = JSON.parse(
-        localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}',
+        localStorage.getItem(CONNECTION_STORAGE_KEY) || '{}',
       ) as Record<string, unknown>;
       expect(saved.gatewayBaseUrl).toBe('https://custom-gw.example');
       expect(saved.accessToken).toBe('gw-secret');
@@ -206,10 +233,7 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
     await user.clear(charInput);
     await user.type(charInput, '2400');
 
-    const persisted = JSON.parse(
-      localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}',
-    ) as Record<string, unknown>;
-    expect(persisted).toMatchObject({
+    expect(preferences).toMatchObject({
       themeMode: 'light',
       chatDisplayMode: 'feed',
       enterToSend: false,

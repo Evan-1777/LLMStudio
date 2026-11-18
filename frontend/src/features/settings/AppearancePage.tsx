@@ -20,7 +20,7 @@ export function AppearancePage() {
     resolvedTheme,
     settingsNotice,
     dismissSettingsNotice,
-    updateSettings,
+    updatePreferences,
   } = useApp();
 
   const [lineInput, setLineInput] = useState(
@@ -51,7 +51,7 @@ export function AppearancePage() {
       return;
     }
     setLineError(null);
-    updateSettings({ collapseLineThreshold: n });
+    void updatePreferences({ collapseLineThreshold: n });
   };
 
   const handleCharChange = (raw: string) => {
@@ -63,7 +63,7 @@ export function AppearancePage() {
       return;
     }
     setCharError(null);
-    updateSettings({ collapseCharThreshold: n });
+    void updatePreferences({ collapseCharThreshold: n });
   };
 
   return (
@@ -119,7 +119,7 @@ export function AppearancePage() {
                     ),
                   },
                 ]}
-                onChange={(themeMode) => updateSettings({ themeMode })}
+                onChange={(themeMode) => void updatePreferences({ themeMode })}
               />
             </div>
 
@@ -148,7 +148,7 @@ export function AppearancePage() {
                       }`.trim()}
                       style={{ backgroundColor: swatchHex }}
                       onClick={() =>
-                        updateSettings({ seedColorValue: preset.value })
+                        void updatePreferences({ seedColorValue: preset.value })
                       }
                     >
                       {active ? <Icon name="check" size={14} /> : null}
@@ -169,7 +169,7 @@ export function AppearancePage() {
                 checked={settings.enterToSend}
                 label="Enter 发送"
                 onCheckedChange={(enterToSend) =>
-                  updateSettings({ enterToSend })
+                  void updatePreferences({ enterToSend })
                 }
               />
             </div>
@@ -205,7 +205,7 @@ export function AppearancePage() {
                   },
                 ]}
                 onChange={(chatDisplayMode) =>
-                  updateSettings({ chatDisplayMode })
+                  void updatePreferences({ chatDisplayMode })
                 }
               />
             </div>
@@ -216,7 +216,7 @@ export function AppearancePage() {
                 checked={settings.visualHtmlRender}
                 label="可视化功能渲染"
                 onCheckedChange={(visualHtmlRender) =>
-                  updateSettings({ visualHtmlRender })
+                  void updatePreferences({ visualHtmlRender })
                 }
               />
             </div>
@@ -227,7 +227,7 @@ export function AppearancePage() {
                 checked={settings.defaultHtmlPreview}
                 label="HTML 代码块预览"
                 onCheckedChange={(defaultHtmlPreview) =>
-                  updateSettings({ defaultHtmlPreview })
+                  void updatePreferences({ defaultHtmlPreview })
                 }
               />
             </div>
@@ -238,7 +238,7 @@ export function AppearancePage() {
                 checked={settings.autoCollapseThinkingOnComplete}
                 label="思考完成后自动折叠"
                 onCheckedChange={(autoCollapseThinkingOnComplete) =>
-                  updateSettings({ autoCollapseThinkingOnComplete })
+                  void updatePreferences({ autoCollapseThinkingOnComplete })
                 }
               />
             </div>
@@ -249,7 +249,7 @@ export function AppearancePage() {
                 checked={settings.autoCollapseToolsOnComplete}
                 label="工具执行完成后自动折叠"
                 onCheckedChange={(autoCollapseToolsOnComplete) =>
-                  updateSettings({ autoCollapseToolsOnComplete })
+                  void updatePreferences({ autoCollapseToolsOnComplete })
                 }
               />
             </div>
@@ -260,7 +260,7 @@ export function AppearancePage() {
                 checked={settings.autoCollapseEnabled}
                 label="自动折叠长内容"
                 onCheckedChange={(autoCollapseEnabled) =>
-                  updateSettings({ autoCollapseEnabled })
+                  void updatePreferences({ autoCollapseEnabled })
                 }
               />
             </div>

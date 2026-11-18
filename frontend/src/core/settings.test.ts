@@ -4,9 +4,15 @@ import {
   LEGACY_FLUTTER_SETTINGS_KEY,
   SETTINGS_MIGRATED_KEY,
   SETTINGS_STORAGE_KEY,
+  clearLegacyPreferences,
   defaultSettings,
+  loadConnectionSettings,
   loadSettings,
+  readLegacyPreferences,
+  readThemeHint,
+  saveConnectionSettings,
   saveSettings,
+  writeThemeHint,
 } from './settings';
 
 describe('settings storage and migration', () => {
@@ -107,6 +113,64 @@ describe('settings storage and migration', () => {
     const v2Corrupt = loadSettings();
     expect(v2Corrupt.settings).toEqual(defaultSettings());
     expect(v2Corrupt.notice).toBeTruthy();
+  });
+
+  it('keeps connection info separate from gateway-owned preferences', () => {
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...defaultSettings(), themeMode: 'dark' }),
+    );
+
+    saveConnectionSettings({
+      gatewayBaseUrl: ' https://gw.example ',
+      accessToken: 'tok',
+    });
+
+    const connection = loadConnectionSettings();
+    expect(connection).toEqual({
+      gatewayBaseUrl: 'https://gw.example',
+      accessToken: 'tok',
+    });
+    // The legacy blob no longer drives the connection, only the preferences import.
+    expect(readLegacyPreferences()).toMatchObject({ themeMode: 'dark' });
+  });
+
+  it('imports legacy preferences once and clears browser copies afterwards', () => {
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...defaultSettings(), themeMode: 'light', enterToSend: false }),
+    );
+
+    expect(readLegacyPreferences()).toMatchObject({
+      themeMode: 'light',
+      enterToSend: false,
+    });
+
+    clearLegacyPreferences();
+    expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).toBeNull();
+    expect(readLegacyPreferences()).toBeNull();
+    expect(loadConnectionSettings()).toEqual({
+      gatewayBaseUrl: '/',
+      accessToken: '',
+    });
+  });
+
+  it('scopes the first-paint theme hint to its gateway', () => {
+    writeThemeHint('/', { themeMode: 'dark', seedColorValue: 0x2d6a4f });
+    writeThemeHint('https://other.example', {
+      themeMode: 'light',
+      seedColorValue: 0x007aff,
+    });
+
+    expect(readThemeHint('/')).toEqual({
+      themeMode: 'dark',
+      seedColorValue: 0x2d6a4f,
+    });
+    expect(readThemeHint('https://other.example')).toEqual({
+      themeMode: 'light',
+      seedColorValue: 0x007aff,
+    });
+    expect(readThemeHint('https://unknown.example')).toBeNull();
   });
 
   it('handles disabled storage and write failures gracefully without claiming persistence', () => {

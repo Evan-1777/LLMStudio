@@ -67,6 +67,10 @@ func (h *ChatHandler) PrepareLocal(w http.ResponseWriter, r *http.Request) {
 		writeServiceError(w, err)
 		return
 	}
+	if in.CredentialEnvelope {
+		// The response carries an upstream credential; never let it be cached.
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	WriteJSON(w, http.StatusOK, prepared)
 }
 

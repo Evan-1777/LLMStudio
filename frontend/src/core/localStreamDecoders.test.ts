@@ -1,14 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  applyLocalAuth,
-  fetchLocalProviderModels,
-  resolveLocalProbeEndpoint,
-} from './localProvider';
-import {
-  getLocalProviderKey,
-  removeLocalProviderKey,
-  setLocalProviderKey,
-} from './localProviderKeys';
+import { readLegacyProviderKeys } from './localProviderKeys';
 import { decodeUpstreamSseStream } from './localStreamDecoders';
 import type { StreamEvent } from './types';
 
@@ -26,116 +17,18 @@ function sseStreamFromText(text: string): ReadableStream<Uint8Array> {
   });
 }
 
-describe('localProviderKeys & localProvider', () => {
-  it('stores, reads, and removes local provider API keys', () => {
+describe('legacy browser provider credentials', () => {
+  it('reads a trimmed legacy key map and ignores malformed entries', () => {
     const store = window.localStorage;
     store.clear();
-    expect(getLocalProviderKey('p1', store)).toBe('');
-    expect(setLocalProviderKey('p1', '  sk-local-123  ', store)).toBe(true);
-    expect(getLocalProviderKey('p1', store)).toBe('sk-local-123');
-    expect(removeLocalProviderKey('p1', store)).toBe(true);
-    expect(getLocalProviderKey('p1', store)).toBe('');
-  });
-
-  it('applies all 5 auth modes, deduplicates /v1, and rejects missing keys', () => {
-    const bearer = applyLocalAuth(
-      'http://127.0.0.1:11434/v1/chat/completions',
-      { 'Content-Type': 'application/json' },
-      'bearer',
-      'sk-1',
+    store.setItem(
+      'llmstudio.localProviderKeys.v1',
+      JSON.stringify({ p1: '  sk-local-123  ', p2: 42, p3: '' }),
     );
-    expect(bearer.headers.Authorization).toBe('Bearer sk-1');
+    expect(readLegacyProviderKeys(store)).toEqual({ p1: 'sk-local-123' });
 
-    const xApiKey = applyLocalAuth(
-      'https://api.anthropic.com/v1/messages',
-      {},
-      'x-api-key',
-      'ant-key',
-    );
-    expect(xApiKey.headers['x-api-key']).toBe('ant-key');
-
-    const queryKey = applyLocalAuth(
-      'https://generativelanguage.googleapis.com/v1beta/models/g:streamGenerateContent?alt=sse',
-      {},
-      'query-key',
-      'gem-key',
-    );
-    expect(queryKey.url).toContain('key=gem-key');
-    expect(queryKey.url).toContain('alt=sse');
-
-    const headerTemplate = applyLocalAuth(
-      'https://custom.local/chat',
-      { Authorization: 'Token {{apiKey}}' },
-      'header-key',
-      'custom-secret',
-    );
-    expect(headerTemplate.headers.Authorization).toBe('Token custom-secret');
-
-    const headerMeta = applyLocalAuth(
-      'https://custom.local/chat',
-      {},
-      'header-key',
-      'meta-secret',
-      { 'x-auth-header': 'X-My-Token' },
-    );
-    expect(headerMeta.headers['X-My-Token']).toBe('meta-secret');
-
-    const noneAuth = applyLocalAuth(
-      'http://127.0.0.1:11434/v1/chat/completions',
-      {},
-      'none',
-      '',
-    );
-    expect(noneAuth.headers.Authorization).toBeUndefined();
-
-    expect(() =>
-      applyLocalAuth('http://127.0.0.1:11434/v1/chat/completions', {}, 'bearer', ''),
-    ).toThrow(/本地 API Key/);
-
-    const probe = resolveLocalProbeEndpoint({
-      baseURL: 'http://127.0.0.1:11434/v1',
-      authType: 'none',
-    });
-    expect(probe.url).toBe('http://127.0.0.1:11434/v1/models');
-  });
-
-  it('parses OpenAI, Anthropic, and Gemini model listings directly', async () => {
-    const oai = await fetchLocalProviderModels({
-      baseURL: 'http://127.0.0.1:11434/v1',
-      authType: 'none',
-      fetchImpl: async () =>
-        new Response(JSON.stringify({ data: [{ id: 'qwen2.5:7b' }] }), {
-          status: 200,
-        }),
-    });
-    expect(oai[0].id).toBe('qwen2.5:7b');
-
-    const gem = await fetchLocalProviderModels({
-      baseURL: 'https://generativelanguage.googleapis.com/v1beta',
-      authType: 'query-key',
-      apiKey: 'gk',
-      fetchImpl: async () =>
-        new Response(
-          JSON.stringify({
-            models: [
-              {
-                name: 'models/gemini-2.5-flash',
-                displayName: 'Gemini 2.5 Flash',
-                inputTokenLimit: 1000000,
-                outputTokenLimit: 8192,
-                thinking: true,
-              },
-            ],
-          }),
-          { status: 200 },
-        ),
-    });
-    expect(gem[0]).toMatchObject({
-      id: 'gemini-2.5-flash',
-      name: 'Gemini 2.5 Flash',
-      apiFormat: 'google-generative-ai',
-      reasoning: true,
-    });
+    store.setItem('llmstudio.localProviderKeys.v1', 'not-json');
+    expect(readLegacyProviderKeys(store)).toEqual({});
   });
 });
 

@@ -59,6 +59,22 @@ func (h *ProviderHandler) Update(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *ProviderHandler) ImportAPIKey(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		APIKey string `json:"apiKey"`
+	}
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	res, err := h.svc.ImportAPIKey(r.Context(), r.PathValue("id"), in.APIKey)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
+}
+
 func (h *ProviderHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if err := h.svc.Delete(r.Context(), r.PathValue("id")); err != nil {
 		writeServiceError(w, err)

@@ -34,13 +34,13 @@ type ProviderConnectionResult struct {
 
 // ProviderInput represents a create or update request for a provider configuration.
 type ProviderInput struct {
-	ID          string               `json:"id,omitempty"`
-	Name        string               `json:"name"`
-	Adapter     string               `json:"adapter"`
-	BaseURL     string               `json:"baseURL"`
-	AuthType    string               `json:"authType"`
-	APIKey      string               `json:"apiKey,omitempty"`
-	ClearAPIKey bool                 `json:"clearApiKey,omitempty"`
+	ID           string               `json:"id,omitempty"`
+	Name         string               `json:"name"`
+	Adapter      string               `json:"adapter"`
+	BaseURL      string               `json:"baseURL"`
+	AuthType     string               `json:"authType"`
+	APIKey       string               `json:"apiKey,omitempty"`
+	ClearAPIKey  bool                 `json:"clearApiKey,omitempty"`
 	Headers      map[string]string    `json:"headers,omitempty"`
 	Models       []domain.ModelConfig `json:"models"`
 	Enabled      *bool                `json:"enabled,omitempty"`
@@ -133,9 +133,13 @@ func (s *ProviderService) Update(ctx context.Context, id string, in ProviderInpu
 		cfg.AuthType = authType
 	}
 	if in.ClearAPIKey {
+		// An explicit clear is a gateway-owned decision: a stale browser copy must
+		// not be able to revive the credential afterwards.
 		cfg.APIKey = ""
+		cfg.MarkAPIKeyManaged()
 	} else if key := strings.TrimSpace(in.APIKey); key != "" {
 		cfg.APIKey = key
+		cfg.MarkAPIKeyManaged()
 	}
 	if in.Headers != nil {
 		cfg.Headers = in.Headers
@@ -159,6 +163,41 @@ func (s *ProviderService) Update(ctx context.Context, id string, in ProviderInpu
 // Delete removes a provider by ID.
 func (s *ProviderService) Delete(ctx context.Context, id string) error {
 	return s.store.Delete(ctx, id)
+}
+
+// APIKeyImportResult reports the outcome of adopting a legacy browser credential.
+type APIKeyImportResult struct {
+	Applied  bool                  `json:"applied"`
+	Provider domain.ProviderConfig `json:"provider"`
+}
+
+// ImportAPIKey adopts a non-empty legacy browser credential for an unmanaged
+// local-request provider exactly once. Failures never echo the submitted key.
+func (s *ProviderService) ImportAPIKey(ctx context.Context, id, apiKey string) (APIKeyImportResult, error) {
+	if strings.TrimSpace(apiKey) == "" {
+		return APIKeyImportResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "apiKey is required", nil)
+	}
+	outcome, err := s.store.ImportAPIKey(ctx, id, apiKey)
+	if err != nil {
+		return APIKeyImportResult{}, err
+	}
+	switch outcome {
+	case store.KeyImportNotFound:
+		return APIKeyImportResult{}, domain.NewError(domain.ErrCodeNotFound, "provider not found", nil)
+	case store.KeyImportNotEligible:
+		return APIKeyImportResult{}, domain.NewError(domain.ErrCodeConflict, "provider is not in local request mode", nil)
+	case store.KeyImportAlreadyManaged:
+		cfg, err := s.store.Get(ctx, id)
+		if err != nil {
+			return APIKeyImportResult{}, err
+		}
+		return APIKeyImportResult{Applied: false, Provider: cfg}, nil
+	}
+	cfg, err := s.store.Get(ctx, id)
+	if err != nil {
+		return APIKeyImportResult{}, err
+	}
+	return APIKeyImportResult{Applied: true, Provider: cfg}, nil
 }
 
 // TestConnection probes upstream reachability by fetching the provider's model listing.

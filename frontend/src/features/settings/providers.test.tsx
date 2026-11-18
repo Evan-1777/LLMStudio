@@ -3,7 +3,6 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router-dom';
 import { AppProvider } from '../../app/AppProvider';
-import { getLocalProviderKey } from '../../core/localProviderKeys';
 import type { DiscoveredModel, ProviderConfig } from '../../core/types';
 import { ProvidersPage } from './ProvidersPage';
 
@@ -43,7 +42,6 @@ interface MockState {
   lastUpdateBodies: Array<Record<string, unknown>>;
   lastProbeBodies: Array<Record<string, unknown>>;
   lastFetchBodies: Array<Record<string, unknown>>;
-  directRequests?: string[];
 }
 
 function makeFetchMock(state: MockState) {
@@ -54,16 +52,6 @@ function makeFetchMock(state: MockState) {
     const parsedBody = bodyText
       ? (JSON.parse(bodyText) as Record<string, unknown>)
       : {};
-
-    if (url.startsWith('http://127.0.0.1:11434/')) {
-      state.directRequests?.push(url);
-      return new Response(
-        JSON.stringify({
-          data: [{ id: 'qwen2.5:7b' }],
-        }),
-        { status: 200 },
-      );
-    }
 
     if (url.endsWith('/healthz')) {
       return new Response(
@@ -658,20 +646,16 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
       lastUpdateBodies: [],
       lastProbeBodies: [],
       lastFetchBodies: [],
-      directRequests: [],
     };
 
     const user = userEvent.setup();
     renderProviders(state);
 
-    // Cross-browser missing local key hint appears when apiKeySet=true and no local key cached.
     await waitFor(() => {
-      expect(
-        screen.getByText(/当前浏览器未缓存本地密钥/),
-      ).toBeInTheDocument();
+      expect(screen.getByRole('heading', { name: 'Remote Keyed' })).toBeInTheDocument();
     });
 
-    // Create a localRequest provider with key -> caches local key & shows 本地 badge.
+    // Create a localRequest provider with a key -> the gateway owns the credential.
     await user.click(screen.getByRole('button', { name: '添加供应商' }));
     const addDialog = screen.getByRole('dialog');
     await user.type(within(addDialog).getByLabelText('名称'), 'Ollama Local');
@@ -691,21 +675,32 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
         screen.getByRole('heading', { name: 'Ollama Local' }),
       ).toBeInTheDocument();
     });
-    expect(getLocalProviderKey('p-2')).toBe('sk-local-ollama');
+    const created = state.providers.find((p) => p.id === 'p-2');
+    expect(created?.apiKeySet).toBe(true);
+    expect(created?.localRequest).toBe(true);
 
-    // Test connection & fetch models go directly to 127.0.0.1:11434 instead of backend proxy endpoints.
+    // Test connection and model discovery always go through the gateway, which
+    // resolves the stored credential for local-request providers.
     await user.click(screen.getByRole('button', { name: '测试连接' }));
     await waitFor(() => {
       expect(screen.getByText(/连接正常/)).toBeInTheDocument();
     });
-    expect(state.lastProbeBodies).toHaveLength(0);
-    expect(state.directRequests).toContain('http://127.0.0.1:11434/v1/models');
+    expect(state.lastProbeBodies).toHaveLength(1);
+    expect(state.lastProbeBodies[0]).not.toHaveProperty('apiKey');
 
+    state.discovered = [
+      {
+        id: 'qwen2.5:7b',
+        name: 'qwen2.5:7b',
+        group: 'qwen',
+        apiFormat: 'openai-completions',
+      },
+    ];
     await user.click(screen.getAllByRole('button', { name: '获取模型' })[0]);
     const importDialog = screen.getByRole('dialog');
     await waitFor(() => {
       expect(within(importDialog).getByText('qwen2.5:7b')).toBeInTheDocument();
     });
-    expect(state.lastFetchBodies).toHaveLength(0);
+    expect(state.lastFetchBodies).toHaveLength(1);
   });
 });

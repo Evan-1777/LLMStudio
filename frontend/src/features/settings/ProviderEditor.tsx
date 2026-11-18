@@ -13,12 +13,8 @@ import {
   Switch,
   Textarea,
 } from '../../components/ui';
-import { testLocalProviderConnection } from '../../core/localProvider';
 import {
-  getLocalProviderKey,
-  hasLocalProviderKey,
-  removeLocalProviderKey,
-  setLocalProviderKey,
+  importLegacyProviderKeys,
 } from '../../core/localProviderKeys';
 import type {
   AuthType,
@@ -67,6 +63,7 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
     upsertLocalProvider,
     removeLocalProvider,
     registerDirtyGuard,
+    refreshProviders,
     toast,
   } = useApp();
 
@@ -78,9 +75,6 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
   const [clearApiKey, setClearApiKey] = useState(false);
   const [localRequest, setLocalRequest] = useState(
     Boolean(provider.localRequest),
-  );
-  const [localKeyPresent, setLocalKeyPresent] = useState(() =>
-    hasLocalProviderKey(provider.id),
   );
   const [headersText, setHeadersText] = useState(() =>
     serializeHeaders(provider.headers),
@@ -124,7 +118,6 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
     setApiKey('');
     setClearApiKey(false);
     setLocalRequest(Boolean(p.localRequest));
-    setLocalKeyPresent(hasLocalProviderKey(p.id));
     setHeadersText(serialized);
     setInitialHeadersText(serialized);
     setFieldErrors({});
@@ -139,10 +132,22 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
     if (prevProviderIdRef.current !== provider.id) {
       prevProviderIdRef.current = provider.id;
       syncDraftFromProvider(provider);
-    } else {
-      setLocalKeyPresent(hasLocalProviderKey(provider.id));
     }
   }, [provider]);
+
+  // Adopt any pre-migration browser credential exactly once; the gateway refuses
+  // to overwrite values it or another browser already committed.
+  useEffect(() => {
+    if (!provider.localRequest) return;
+    let cancelled = false;
+    void importLegacyProviderKeys(gateway, [provider.id]).then(() => {
+      if (cancelled) return;
+      void refreshProviders();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [gateway, provider.id, provider.localRequest, refreshProviders]);
 
   const isDirty =
     name.trim() !== provider.name ||
@@ -213,19 +218,8 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
     setTestResult(null);
     setFormError(null);
     try {
-      const effectiveLocalKey = clearApiKey
-        ? ''
-        : apiKey.trim() || getLocalProviderKey(provider.id);
-      const res = localRequest
-        ? await testLocalProviderConnection({
-            baseURL: probe.baseURL ?? baseURL.trim(),
-            authType: probe.authType ?? authType,
-            apiKey: effectiveLocalKey,
-            headers: probe.headers,
-            models: provider.models,
-            fetchImpl: gateway.fetchImpl,
-          })
-        : await gateway.testProviderConnection(provider.id, probe);
+      // The gateway resolves stored credentials, including local-request providers.
+      const res = await gateway.testProviderConnection(provider.id, probe);
       setTestResult({
         ok: res.ok,
         text: `${res.message || '连接正常'} · ${res.latencyMs} ms · ${res.modelCount} 个模型`,
@@ -276,11 +270,6 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
         enabled: provider.enabled,
         localRequest,
       });
-      if (clearApiKey) {
-        removeLocalProviderKey(provider.id);
-      } else if (updated.localRequest && trimmedKey) {
-        setLocalProviderKey(provider.id, trimmedKey);
-      }
       upsertLocalProvider(updated);
       const savedHeaders = serializeHeaders(updated.headers);
       setName(updated.name);
@@ -290,7 +279,6 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
       setApiKey('');
       setClearApiKey(false);
       setLocalRequest(Boolean(updated.localRequest));
-      setLocalKeyPresent(hasLocalProviderKey(provider.id));
       setHeadersText(savedHeaders);
       setInitialHeadersText(savedHeaders);
       toast('供应商已保存');
@@ -380,7 +368,6 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
     setFormError(null);
     try {
       await gateway.deleteProvider(provider.id);
-      removeLocalProviderKey(provider.id);
       removeLocalProvider(provider.id);
       setConfirmDeleteOpen(false);
       onDeleted(provider.id);
@@ -532,16 +519,6 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
                 onValueChange={setApiKey}
                 onClearApiKeyChange={setClearApiKey}
               />
-              {localRequest &&
-              authType !== 'none' &&
-              provider.apiKeySet &&
-              !localKeyPresent &&
-              !apiKey.trim() &&
-              !clearApiKey ? (
-                <span className="st-status-text st-status-text--error" role="status">
-                  当前浏览器未缓存本地密钥，请重新录入密钥或改用 none 鉴权
-                </span>
-              ) : null}
             </div>
           </div>
 
@@ -827,10 +804,6 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
         providerName={provider.name}
         probeInput={probeSnapshot}
         existingModels={provider.models}
-        localRequest={localRequest}
-        localApiKey={
-          clearApiKey ? '' : apiKey.trim() || getLocalProviderKey(provider.id)
-        }
         onImport={handleImportModels}
       />
 

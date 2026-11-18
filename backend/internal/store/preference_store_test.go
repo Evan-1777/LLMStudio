@@ -1,0 +1,173 @@
+package store
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+
+	"llmstudio/backend/internal/domain"
+)
+
+func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "prefs.db")
+
+	db, err := OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	prefs := NewPreferenceStore(db)
+
+	got, initialized, err := prefs.Get(ctx)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	if initialized {
+		t.Fatal("expected a fresh database to report initialized=false")
+	}
+	if got != domain.DefaultPreferences() {
+		t.Fatalf("unexpected defaults: %+v", got)
+	}
+
+	theme := domain.ThemeModeDark
+	enter := false
+	if _, initialized, err = prefs.Update(ctx, domain.PreferencesPatch{ThemeMode: &theme, EnterToSend: &enter}, false); err != nil {
+		t.Fatalf("partial update: %v", err)
+	} else if !initialized {
+		t.Fatal("expected update to report initialized=true")
+	}
+
+	got, initialized, err = prefs.Get(ctx)
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if !initialized {
+		t.Fatal("expected persisted row to report initialized=true")
+	}
+	if got.ThemeMode != domain.ThemeModeDark || got.EnterToSend {
+		t.Fatalf("update not applied: %+v", got)
+	}
+	if got.SeedColorValue != domain.DefaultAppleBlue || got.CollapseLineThreshold != 24 || got.ChatDisplayMode != domain.ChatDisplayBubble {
+		t.Fatalf("partial update overwrote untouched fields: %+v", got)
+	}
+
+	// Explicitly disabling a default-on flag must survive a restart.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	db, err = OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen sqlite: %v", err)
+	}
+	prefs = NewPreferenceStore(db)
+
+	preview := false
+	if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{DefaultHTMLPreview: &preview}, false); err != nil {
+		t.Fatalf("explicit false update: %v", err)
+	}
+	got, _, err = prefs.Get(ctx)
+	if err != nil {
+		t.Fatalf("get after explicit false: %v", err)
+	}
+	if got.ThemeMode != domain.ThemeModeDark || got.EnterToSend {
+		t.Fatalf("restart lost previous values: %+v", got)
+	}
+
+	// A late legacy import is ignored once the row is initialized.
+	legacy := domain.DefaultPreferences()
+	legacy.ThemeMode = domain.ThemeModeLight
+	stored, initialized, err := prefs.Update(ctx, patchFromPreferences(legacy), true)
+	if err != nil {
+		t.Fatalf("legacy import on initialized row: %v", err)
+	}
+	if !initialized || stored.ThemeMode != domain.ThemeModeDark {
+		t.Fatalf("legacy import overwrote committed values: %+v", stored)
+	}
+
+	// Resetting import state lets the next legacy import apply exactly once.
+	if _, err := db.ExecContext(ctx, "UPDATE user_preferences SET imported = 0"); err != nil {
+		t.Fatalf("reset imported flag: %v", err)
+	}
+	stored, _, err = prefs.Update(ctx, patchFromPreferences(legacy), true)
+	if err != nil {
+		t.Fatalf("legacy import: %v", err)
+	}
+	if stored.ThemeMode != domain.ThemeModeLight {
+		t.Fatalf("legacy import not applied: %+v", stored)
+	}
+	stored, _, err = prefs.Update(ctx, domain.PreferencesPatch{ThemeMode: &theme}, true)
+	if err != nil {
+		t.Fatalf("second legacy import: %v", err)
+	}
+	if stored.ThemeMode != domain.ThemeModeLight {
+		t.Fatalf("legacy import replayed: %+v", stored)
+	}
+}
+
+func TestMigration005BackfillsManagedAPIKeys(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "legacy.db")
+
+	db, err := OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	// Replaying the full migration set on a fresh database must keep legacy
+	// non-empty keys managed and legacy empty keys unmanaged.
+	providers := NewProviderStore(db)
+	if _, err := providers.Create(ctx, domain.ProviderConfig{
+		ID: "with-key", Name: "With Key", Adapter: "generic-http",
+		BaseURL: "https://example.com", AuthType: domain.AuthTypeBearer, APIKey: "sk-legacy",
+	}); err != nil {
+		t.Fatalf("create provider with key: %v", err)
+	}
+	if _, err := providers.Create(ctx, domain.ProviderConfig{
+		ID: "without-key", Name: "Without Key", Adapter: "generic-http",
+		BaseURL: "https://example.com", AuthType: domain.AuthTypeBearer,
+	}); err != nil {
+		t.Fatalf("create provider without key: %v", err)
+	}
+
+	// Simulate an upgrade path: drop the migration record plus column, then re-apply.
+	if _, err := db.ExecContext(ctx, "DELETE FROM schema_migrations WHERE version = '005_user_preferences.sql'"); err != nil {
+		t.Fatalf("reset migration record: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE providers DROP COLUMN api_key_managed"); err != nil {
+		t.Fatalf("drop column: %v", err)
+	}
+	if err := RunMigrations(ctx, db); err != nil {
+		t.Fatalf("re-run migrations: %v", err)
+	}
+
+	assertManaged := func(id string, want bool) {
+		t.Helper()
+		var managed int
+		if err := db.QueryRowContext(ctx, "SELECT api_key_managed FROM providers WHERE id = ?", id).Scan(&managed); err != nil {
+			t.Fatalf("read api_key_managed for %s: %v", id, err)
+		}
+		if (managed != 0) != want {
+			t.Fatalf("provider %s api_key_managed=%d, want %v", id, managed, want)
+		}
+	}
+	assertManaged("with-key", true)
+	assertManaged("without-key", false)
+}
+
+func patchFromPreferences(p domain.Preferences) domain.PreferencesPatch {
+	return domain.PreferencesPatch{
+		ThemeMode:             &p.ThemeMode,
+		SeedColorValue:        &p.SeedColorValue,
+		EnterToSend:           &p.EnterToSend,
+		VisualHTMLRender:      &p.VisualHTMLRender,
+		DefaultHTMLPreview:    &p.DefaultHTMLPreview,
+		ChatDisplayMode:       &p.ChatDisplayMode,
+		AutoCollapseEnabled:   &p.AutoCollapseEnabled,
+		AutoCreateCache:       &p.AutoCreateCache,
+		CollapseLineThreshold: &p.CollapseLineThreshold,
+		CollapseCharThreshold: &p.CollapseCharThreshold,
+	}
+}

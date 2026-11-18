@@ -529,6 +529,8 @@ export interface StreamChatInput {
   preparedSearch?: PreparedSearchInput;
   cacheState?: PromptCacheState;
   cacheResolution?: LocalCacheResolutionInput;
+  // Asks the gateway to embed the stored provider credential in the prepared envelope.
+  credentialEnvelope?: boolean;
 }
 
 export interface CreateMessageInput {
@@ -584,3 +586,28 @@ export interface ApiErrorEnvelope {
   code: string;
   message: string;
 }
+
+// Server-managed application preferences. Gateway address and access token stay
+// in browser connection storage and are not part of this contract.
+export interface ServerPreferences {
+  themeMode: 'system' | 'light' | 'dark';
+  seedColorValue: number;
+  enterToSend: boolean;
+  visualHtmlRender: boolean;
+  defaultHtmlPreview: boolean;
+  chatDisplayMode: 'bubble' | 'feed';
+  autoCollapseEnabled: boolean;
+  autoCollapseThinkingOnComplete: boolean;
+  autoCollapseToolsOnComplete: boolean;
+  autoCreateCache: boolean;
+  collapseLineThreshold: number;
+  collapseCharThreshold: number;
+}
+
+export interface ServerPreferencesEnvelope {
+  preferences: ServerPreferences;
+  initialized: boolean;
+}
+
+/** Full preference payload used for the one-shot legacy browser import. */
+export type ServerPreferencesImport = ServerPreferences;

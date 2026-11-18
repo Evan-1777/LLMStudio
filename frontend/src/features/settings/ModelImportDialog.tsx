@@ -9,7 +9,6 @@ import {
   LoadingSpinner,
   Modal,
 } from '../../components/ui';
-import { fetchLocalProviderModels } from '../../core/localProvider';
 import type {
   DiscoveredModel,
   ModelConfig,
@@ -25,8 +24,6 @@ export interface ModelImportDialogProps {
   providerName: string;
   probeInput: ProviderProbeInput;
   existingModels: readonly ModelConfig[];
-  localRequest?: boolean;
-  localApiKey?: string;
   onImport: (models: ModelConfig[]) => Promise<void>;
 }
 
@@ -55,8 +52,6 @@ export function ModelImportDialog({
   providerName,
   probeInput,
   existingModels,
-  localRequest = false,
-  localApiKey,
   onImport,
 }: ModelImportDialogProps) {
   const { gateway } = useApp();
@@ -80,17 +75,12 @@ export function ModelImportDialog({
       setFetchError(null);
       setSaveError(null);
       try {
-        const models = localRequest
-          ? await fetchLocalProviderModels({
-              baseURL: probeInput.baseURL ?? '',
-              authType: probeInput.authType ?? 'bearer',
-              apiKey: localApiKey ?? probeInput.apiKey ?? '',
-              headers: probeInput.headers,
-              models: existingModels,
-              signal,
-              fetchImpl: gateway.fetchImpl,
-            })
-          : await gateway.fetchProviderModels(providerId, probeInput, signal);
+        // The gateway performs the discovery, including local-request providers.
+        const models = await gateway.fetchProviderModels(
+          providerId,
+          probeInput,
+          signal,
+        );
         if (signal?.aborted) return;
         setDiscovered(models);
         setSelectedIds(new Set());
@@ -104,14 +94,7 @@ export function ModelImportDialog({
         }
       }
     },
-    [
-      existingModels,
-      gateway,
-      localApiKey,
-      localRequest,
-      probeInput,
-      providerId,
-    ],
+    [gateway, probeInput, providerId],
   );
 
   useEffect(() => {

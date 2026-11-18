@@ -34,6 +34,9 @@ import {
   type SearchEngineTestResult,
   type SearchEngineUpdateInput,
   type SearchEngineView,
+  type ServerPreferences,
+  type ServerPreferencesEnvelope,
+  type ServerPreferencesImport,
   type StreamChatInput,
   type ToolCallExecutionInput,
 } from './types';
@@ -312,6 +315,9 @@ function buildStreamChatPayload(input: StreamChatInput): Record<string, unknown>
   if (input.cacheResolution) {
     payload.cacheResolution = input.cacheResolution;
   }
+  if (input.credentialEnvelope) {
+    payload.credentialEnvelope = true;
+  }
   if (input.localContinuation) {
     payload.localContinuation = {
       ...(input.localContinuation.userMessageId
@@ -432,6 +438,39 @@ export class GatewayClient {
     });
   }
 
+  getPreferences(signal?: AbortSignal): Promise<ServerPreferencesEnvelope> {
+    return this.requestJson<ServerPreferencesEnvelope>(
+      'GET',
+      '/api/v1/settings',
+      { signal },
+    ).then((res) => ({
+      preferences: res.preferences as ServerPreferences,
+      initialized: res.initialized === true,
+    }));
+  }
+
+  updatePreferences(
+    patch: Partial<ServerPreferences>,
+    signal?: AbortSignal,
+  ): Promise<ServerPreferencesEnvelope> {
+    return this.requestJson<ServerPreferencesEnvelope>(
+      'PATCH',
+      '/api/v1/settings',
+      { body: patch, signal },
+    );
+  }
+
+  importLegacyPreferences(
+    preferences: ServerPreferencesImport,
+    signal?: AbortSignal,
+  ): Promise<ServerPreferencesEnvelope> {
+    return this.requestJson<ServerPreferencesEnvelope>(
+      'POST',
+      '/api/v1/settings/import',
+      { body: preferences, signal },
+    );
+  }
+
   listFormatsAndAdapters(
     signal?: AbortSignal,
   ): Promise<{ formats: FormatInfo[]; adapters: ProviderAdapterInfo[] }> {
@@ -473,6 +512,18 @@ export class GatewayClient {
       `/api/v1/providers/${encodeURIComponent(id)}`,
       { body: sanitizeProviderPayload(payload), signal },
     ).then((res) => res.provider);
+  }
+
+  importProviderAPIKey(
+    id: string,
+    apiKey: string,
+    signal?: AbortSignal,
+  ): Promise<{ applied: boolean; provider: ProviderConfig }> {
+    return this.requestJson<{ applied: boolean; provider: ProviderConfig }>(
+      'POST',
+      `/api/v1/providers/${encodeURIComponent(id)}/keys/import`,
+      { body: { apiKey }, signal },
+    );
   }
 
   deleteProvider(id: string, signal?: AbortSignal): Promise<void> {

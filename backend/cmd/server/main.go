@@ -40,6 +40,7 @@ func main() {
 	msgStore := store.NewMessageStore(db)
 	searchStore := store.NewSearchConfigStore(db)
 	mcpStore := store.NewMCPServerStore(db)
+	prefStore := store.NewPreferenceStore(db)
 
 	if err := provider.SeedBuiltInProviders(ctx, providerStore); err != nil {
 		log.Fatalf("seed built-in providers failed: %v", err)
@@ -65,6 +66,7 @@ func main() {
 	assistantSvc := service.NewAssistantService(assistantStore)
 	convSvc := service.NewConversationService(convStore, msgStore).WithAssistants(assistantStore)
 	pluginSvc := service.NewPluginService(searchEngines, searchStore, mcpStore).WithMCPClient(mcpRuntime)
+	prefSvc := service.NewPreferenceService(prefStore)
 	chatSvc := service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithAssistants(assistantStore).
 		WithSearch(searchEngines, searchStore).
@@ -79,6 +81,7 @@ func main() {
 		ConversationService: convSvc,
 		PluginService:       pluginSvc,
 		ChatService:         chatSvc,
+		PreferenceService:   prefSvc,
 	})
 
 	srv := &http.Server{

@@ -147,20 +147,31 @@ type ModelConfig struct {
 // ProviderConfig defines an upstream AI provider connection and its configured models.
 // APIKey is accepted on JSON unmarshaling but never emitted in MarshalJSON output.
 type ProviderConfig struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Adapter   string            `json:"adapter"`
-	BaseURL   string            `json:"baseURL"`
-	AuthType  string            `json:"authType"`
-	APIKey    string            `json:"apiKey,omitempty"`
-	Headers   map[string]string `json:"headers,omitempty"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Adapter      string            `json:"adapter"`
+	BaseURL      string            `json:"baseURL"`
+	AuthType     string            `json:"authType"`
+	APIKey       string            `json:"apiKey,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
 	Models       []ModelConfig     `json:"models"`
 	Enabled      bool              `json:"enabled"`
 	BuiltIn      bool              `json:"builtIn"`
 	LocalRequest bool              `json:"localRequest"`
 	CreatedAt    time.Time         `json:"createdAt"`
 	UpdatedAt    time.Time         `json:"updatedAt"`
+
+	// apiKeyManaged is a storage-only marker: true once the gateway itself wrote
+	// the credential (create, explicit set, explicit clear, or one-time import).
+	// It never appears in API responses.
+	apiKeyManaged bool
 }
+
+// APIKeyManaged reports whether the stored credential is gateway-owned.
+func (p ProviderConfig) APIKeyManaged() bool { return p.apiKeyManaged }
+
+// MarkAPIKeyManaged records that the gateway owns the stored credential.
+func (p *ProviderConfig) MarkAPIKeyManaged() { p.apiKeyManaged = true }
 
 type providerWire struct {
 	ID           string            `json:"id"`

@@ -15,7 +15,7 @@ export function ConnectionPage() {
     settings,
     settingsNotice,
     dismissSettingsNotice,
-    updateSettings,
+    updatePreferences,
     connectionState,
     connectionError,
     saveConnection,
@@ -234,7 +234,7 @@ export function ConnectionPage() {
                 checked={settings.autoCreateCache}
                 label="自动创建缓存"
                 onCheckedChange={(autoCreateCache) =>
-                  updateSettings({ autoCreateCache })
+                  void updatePreferences({ autoCreateCache })
                 }
               />
             </div>

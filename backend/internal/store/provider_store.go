@@ -51,11 +51,11 @@ func (s *ProviderStore) List(ctx context.Context) ([]domain.ProviderConfig, erro
 // Get fetches a single provider by ID.
 func (s *ProviderStore) Get(ctx context.Context, id string) (domain.ProviderConfig, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at
+		SELECT id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at, api_key_managed
 		FROM providers
 		WHERE id = ?
 	`, id)
-	p, err := scanProvider(row)
+	p, err := scanProviderWithManaged(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.ProviderConfig{}, domain.NewError(domain.ErrCodeNotFound, "provider not found", err)
 	}
@@ -83,9 +83,9 @@ func (s *ProviderStore) Create(ctx context.Context, p domain.ProviderConfig) (do
 	}
 
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), boolToInt(p.LocalRequest), formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
+		INSERT INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at, api_key_managed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), boolToInt(p.LocalRequest), formatTime(p.CreatedAt), formatTime(p.UpdatedAt), boolToInt(p.APIKeyManaged() || strings.TrimSpace(p.APIKey) != ""))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return domain.ProviderConfig{}, domain.NewError(domain.ErrCodeConflict, "provider already exists", err)
@@ -110,9 +110,9 @@ func (s *ProviderStore) EnsureBuiltIn(ctx context.Context, p domain.ProviderConf
 	}
 
 	_, err = s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), boolToInt(p.LocalRequest), formatTime(p.CreatedAt), formatTime(p.UpdatedAt))
+		INSERT OR IGNORE INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at, api_key_managed)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), boolToInt(p.LocalRequest), formatTime(p.CreatedAt), formatTime(p.UpdatedAt), boolToInt(p.APIKeyManaged() || strings.TrimSpace(p.APIKey) != ""))
 	if err != nil {
 		return fmt.Errorf("ensure built-in provider %s: %w", p.ID, err)
 	}
@@ -129,9 +129,9 @@ func (s *ProviderStore) Update(ctx context.Context, p domain.ProviderConfig) (do
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE providers
-		SET name = ?, adapter = ?, base_url = ?, auth_type = ?, api_key = ?, headers_json = ?, models_json = ?, enabled = ?, local_request = ?, updated_at = ?
+		SET name = ?, adapter = ?, base_url = ?, auth_type = ?, api_key = ?, headers_json = ?, models_json = ?, enabled = ?, local_request = ?, api_key_managed = ?, updated_at = ?
 		WHERE id = ?
-	`, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.LocalRequest), formatTime(p.UpdatedAt), p.ID)
+	`, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.LocalRequest), boolToInt(p.APIKeyManaged()), formatTime(p.UpdatedAt), p.ID)
 	if err != nil {
 		return domain.ProviderConfig{}, fmt.Errorf("update provider %s: %w", p.ID, err)
 	}
@@ -165,7 +165,70 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// KeyImportResult reports whether an unmanaged browser credential was adopted.
+type KeyImportResult int
+
+// Key import outcomes. Zero-row updates are separated because the caller must tell
+// "provider missing", "not in local request mode", and "already gateway-owned" apart.
+const (
+	KeyImportApplied KeyImportResult = iota
+	KeyImportNotFound
+	KeyImportNotEligible
+	KeyImportAlreadyManaged
+)
+
+// ImportAPIKey copies a legacy browser credential into an unmanaged local-request
+// provider. The conditional UPDATE is atomic: a concurrent set, clear, or import
+// cannot be overwritten by a stale browser copy, and only a non-empty key is taken.
+func (s *ProviderStore) ImportAPIKey(ctx context.Context, id, apiKey string) (KeyImportResult, error) {
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		return s.classifyKeyImport(ctx, id)
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE providers
+		SET api_key = ?, api_key_managed = 1, updated_at = ?
+		WHERE id = ? AND local_request = 1 AND api_key = '' AND api_key_managed = 0
+	`, key, formatTime(time.Now().UTC()), id)
+	if err != nil {
+		return KeyImportNotFound, fmt.Errorf("import provider api key %s: %w", id, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return KeyImportNotFound, fmt.Errorf("rows affected import provider api key %s: %w", id, err)
+	}
+	if affected == 0 {
+		return s.classifyKeyImport(ctx, id)
+	}
+	return KeyImportApplied, nil
+}
+
+func (s *ProviderStore) classifyKeyImport(ctx context.Context, id string) (KeyImportResult, error) {
+	var localRequest, managed int
+	err := s.db.QueryRowContext(ctx,
+		"SELECT local_request, api_key_managed FROM providers WHERE id = ?", id,
+	).Scan(&localRequest, &managed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return KeyImportNotFound, nil
+	}
+	if err != nil {
+		return KeyImportNotFound, fmt.Errorf("classify provider api key import %s: %w", id, err)
+	}
+	if localRequest == 0 {
+		return KeyImportNotEligible, nil
+	}
+	return KeyImportAlreadyManaged, nil
+}
+
 func scanProvider(row rowScanner) (domain.ProviderConfig, error) {
+	return scanProviderRow(row, false)
+}
+
+func scanProviderWithManaged(row rowScanner) (domain.ProviderConfig, error) {
+	return scanProviderRow(row, true)
+}
+
+func scanProviderRow(row rowScanner, withManaged bool) (domain.ProviderConfig, error) {
 	var (
 		p               domain.ProviderConfig
 		headersJSON     string
@@ -176,11 +239,19 @@ func scanProvider(row rowScanner) (domain.ProviderConfig, error) {
 		createdRaw      string
 		updatedRaw      string
 	)
-	if err := row.Scan(
+	dest := []any{
 		&p.ID, &p.Name, &p.Adapter, &p.BaseURL, &p.AuthType, &p.APIKey,
 		&headersJSON, &modelsJSON, &enabledInt, &builtInInt, &localRequestInt, &createdRaw, &updatedRaw,
-	); err != nil {
+	}
+	var managedInt int
+	if withManaged {
+		dest = append(dest, &managedInt)
+	}
+	if err := row.Scan(dest...); err != nil {
 		return domain.ProviderConfig{}, err
+	}
+	if withManaged && managedInt != 0 {
+		p.MarkAPIKeyManaged()
 	}
 	p.Enabled = enabledInt != 0
 	p.BuiltIn = builtInInt != 0

@@ -1,11 +1,87 @@
+// Legacy single-blob key: pre-migration browser state, removed once the gateway
+// confirms the import (or already holds server-owned preferences).
 export const SETTINGS_STORAGE_KEY = 'llmstudio.settings.v2';
 export const LEGACY_FLUTTER_SETTINGS_KEY = 'flutter.llmstudio.settings.v1';
 export const SETTINGS_MIGRATED_KEY = 'llmstudio.settings.v2.migrated';
+// Browser-owned connection info: required before the gateway can be reached.
+export const CONNECTION_STORAGE_KEY = 'llmstudio.connection.v1';
+// First-paint theme hint per normalized gateway; never authoritative.
+export const THEME_HINT_STORAGE_PREFIX = 'llmstudio.themeHint.v1::';
+
+export function themeHintKey(gatewayBaseUrl: string): string {
+  return `${THEME_HINT_STORAGE_PREFIX}${canonicalGateway(gatewayBaseUrl)}`;
+}
+
+export function canonicalGateway(raw: string): string {
+  const trimmed = raw.trim();
+  return trimmed === '' ? '/' : trimmed;
+}
+
+export interface ThemeHint {
+  themeMode: ThemeMode;
+  seedColorValue: number;
+}
+
+function safeStorage(explicit?: Storage | null): Storage | null {
+  if (explicit !== undefined) return explicit;
+  try {
+    return typeof window !== 'undefined' ? window.localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Reads the stored rendering hint for a gateway, if any. */
+export function readThemeHint(
+  gatewayBaseUrl: string,
+  explicitStorage?: Storage | null,
+): ThemeHint | null {
+  const storage = safeStorage(explicitStorage);
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(themeHintKey(gatewayBaseUrl));
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return null;
+    }
+    const obj = parsed as Record<string, unknown>;
+    const themeMode: ThemeMode =
+      obj.themeMode === 'light' ||
+      obj.themeMode === 'dark' ||
+      obj.themeMode === 'system'
+        ? obj.themeMode
+        : 'system';
+    const seedColorValue =
+      typeof obj.seedColorValue === 'number' &&
+      Number.isFinite(obj.seedColorValue)
+        ? Math.trunc(obj.seedColorValue) >>> 0
+        : DEFAULT_APPLE_BLUE;
+    return { themeMode, seedColorValue };
+  } catch {
+    return null;
+  }
+}
+
+/** Stores a rendering hint from a value confirmed by the gateway. */
+export function writeThemeHint(
+  gatewayBaseUrl: string,
+  hint: ThemeHint,
+  explicitStorage?: Storage | null,
+): void {
+  const storage = safeStorage(explicitStorage);
+  if (!storage) return;
+  try {
+    storage.setItem(themeHintKey(gatewayBaseUrl), JSON.stringify(hint));
+  } catch {
+    // Rendering hints are optional; a failed write only costs a brief default theme.
+  }
+}
 
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type ChatDisplayMode = 'bubble' | 'feed';
 
-export const DEFAULT_APPLE_BLUE = 0xff007aff;
+export const DEFAULT_APPLE_BLUE = 0x007aff;
 
 export const PRESET_ACCENT_COLORS: readonly {
   value: number;
@@ -22,8 +98,10 @@ export const PRESET_ACCENT_COLORS: readonly {
 ];
 
 export interface AppSettings {
+  // Browser connection info: required before the gateway can be reached.
   gatewayBaseUrl: string;
   accessToken: string;
+  // Application preferences: the gateway owns these values once they are initialized.
   themeMode: ThemeMode;
   seedColorValue: number;
   enterToSend: boolean;
@@ -49,6 +127,48 @@ export interface SettingsSaveResult {
   settings: AppSettings;
   persisted: boolean;
   notice: string | null;
+}
+
+// Preference fields hosted by the gateway, in the order of the server contract.
+export const APP_PREFERENCE_KEYS = [
+  'themeMode',
+  'seedColorValue',
+  'enterToSend',
+  'visualHtmlRender',
+  'defaultHtmlPreview',
+  'chatDisplayMode',
+  'autoCollapseEnabled',
+  'autoCollapseThinkingOnComplete',
+  'autoCollapseToolsOnComplete',
+  'autoCreateCache',
+  'collapseLineThreshold',
+  'collapseCharThreshold',
+] as const satisfies readonly (keyof AppSettings)[];
+
+export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
+export type AppPreferences = Pick<AppSettings, AppPreferenceKey>;
+
+/** Extracts the server-managed subset of a settings snapshot. */
+export function pickAppPreferences(settings: AppSettings): AppPreferences {
+  return {
+    themeMode: settings.themeMode,
+    seedColorValue: settings.seedColorValue,
+    enterToSend: settings.enterToSend,
+    visualHtmlRender: settings.visualHtmlRender,
+    defaultHtmlPreview: settings.defaultHtmlPreview,
+    chatDisplayMode: settings.chatDisplayMode,
+    autoCollapseEnabled: settings.autoCollapseEnabled,
+    autoCollapseThinkingOnComplete: settings.autoCollapseThinkingOnComplete,
+    autoCollapseToolsOnComplete: settings.autoCollapseToolsOnComplete,
+    autoCreateCache: settings.autoCreateCache,
+    collapseLineThreshold: settings.collapseLineThreshold,
+    collapseCharThreshold: settings.collapseCharThreshold,
+  };
+}
+
+/** Defaults for the server-managed subset, used before the gateway replies. */
+export function defaultAppPreferences(): AppPreferences {
+  return pickAppPreferences(defaultSettings());
 }
 
 export function defaultSettings(): AppSettings {
@@ -159,15 +279,6 @@ export function normalizeSettings(raw: unknown): AppSettings {
   };
 }
 
-function getSafeStorage(explicit?: Storage | null): Storage | null {
-  if (explicit !== undefined) return explicit;
-  try {
-    return typeof window !== 'undefined' ? window.localStorage : null;
-  } catch {
-    return null;
-  }
-}
-
 function parseLegacyDoubleEncoded(raw: string): Record<string, unknown> {
   const first: unknown = JSON.parse(raw);
   const inner: unknown = typeof first === 'string' ? JSON.parse(first) : first;
@@ -178,7 +289,7 @@ function parseLegacyDoubleEncoded(raw: string): Record<string, unknown> {
 }
 
 export function loadSettings(explicitStorage?: Storage | null): SettingsLoadResult {
-  const storage = getSafeStorage(explicitStorage);
+  const storage = safeStorage(explicitStorage);
   if (!storage) {
     return {
       settings: defaultSettings(),
@@ -273,12 +384,105 @@ export function loadSettings(explicitStorage?: Storage | null): SettingsLoadResu
   };
 }
 
+/** Persists only browser-owned connection info, leaving server preferences alone. */
+export function saveConnectionSettings(
+  connection: { gatewayBaseUrl: string; accessToken: string },
+  explicitStorage?: Storage | null,
+): void {
+  const storage = safeStorage(explicitStorage);
+  if (!storage) return;
+  try {
+    storage.setItem(
+      CONNECTION_STORAGE_KEY,
+      JSON.stringify({
+        gatewayBaseUrl: canonicalGateway(connection.gatewayBaseUrl),
+        accessToken: connection.accessToken,
+      }),
+    );
+  } catch {
+    // Connection info stays usable for this session when storage is unavailable.
+  }
+}
+
+/** Reads browser connection info, ignoring any preference fields. */
+export function loadConnectionSettings(explicitStorage?: Storage | null): {
+  gatewayBaseUrl: string;
+  accessToken: string;
+} {
+  const defaults = defaultSettings();
+  const storage = safeStorage(explicitStorage);
+  if (!storage) {
+    return { gatewayBaseUrl: defaults.gatewayBaseUrl, accessToken: defaults.accessToken };
+  }
+  try {
+    const raw = storage.getItem(CONNECTION_STORAGE_KEY);
+    if (!raw) {
+      return { gatewayBaseUrl: defaults.gatewayBaseUrl, accessToken: defaults.accessToken };
+    }
+    const parsed: unknown = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { gatewayBaseUrl: defaults.gatewayBaseUrl, accessToken: defaults.accessToken };
+    }
+    const obj = parsed as Record<string, unknown>;
+    return {
+      gatewayBaseUrl:
+        typeof obj.gatewayBaseUrl === 'string'
+          ? canonicalGateway(obj.gatewayBaseUrl)
+          : defaults.gatewayBaseUrl,
+      accessToken:
+        typeof obj.accessToken === 'string' ? obj.accessToken : defaults.accessToken,
+    };
+  } catch {
+    return { gatewayBaseUrl: defaults.gatewayBaseUrl, accessToken: defaults.accessToken };
+  }
+}
+
+/**
+ * Reads preferences still held only by the browser (pre-migration blob), so they
+ * can be conditionally imported into the gateway. Null means there is nothing to
+ * import; the caller decides whether the gateways current values may be seeded.
+ */
+export function readLegacyPreferences(
+  explicitStorage?: Storage | null,
+): AppPreferences | null {
+  const storage = safeStorage(explicitStorage);
+  if (!storage) return null;
+  try {
+    const raw = storage.getItem(SETTINGS_STORAGE_KEY);
+    if (raw) {
+      return pickAppPreferences(normalizeSettings(JSON.parse(raw)));
+    }
+    const flutterRaw = storage.getItem(LEGACY_FLUTTER_SETTINGS_KEY);
+    if (flutterRaw) {
+      return pickAppPreferences(
+        normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),
+      );
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+/** Removes browser preference copies once the gateway is authoritative. */
+export function clearLegacyPreferences(explicitStorage?: Storage | null): void {
+  const storage = safeStorage(explicitStorage);
+  if (!storage) return;
+  try {
+    storage.removeItem(SETTINGS_STORAGE_KEY);
+    storage.removeItem(LEGACY_FLUTTER_SETTINGS_KEY);
+    storage.removeItem(SETTINGS_MIGRATED_KEY);
+  } catch {
+    // Cleanup is best-effort; stale copies no longer affect behaviour.
+  }
+}
+
 export function saveSettings(
   next: AppSettings,
   explicitStorage?: Storage | null,
 ): SettingsSaveResult {
   const normalized = normalizeSettings(next);
-  const storage = getSafeStorage(explicitStorage);
+  const storage = safeStorage(explicitStorage);
   if (!storage) {
     return {
       settings: normalized,

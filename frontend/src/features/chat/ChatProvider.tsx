@@ -10,11 +10,6 @@ import {
 } from 'react';
 import { useApp } from '../../app/AppProvider';
 import { GatewayError } from '../../core/gateway';
-import { applyLocalAuth } from '../../core/localProvider';
-import {
-  getLocalProviderKey,
-  getLocalProviderKeyVersion,
-} from '../../core/localProviderKeys';
 import { decodeUpstreamSseStream } from '../../core/localStreamDecoders';
 import { decodeSseByteStream, parseStreamEventFrame } from '../../core/sse';
 import type {
@@ -103,15 +98,6 @@ function formatError(err: unknown): { code: string; message: string } {
   return { code: 'NETWORK_ERROR', message: '请求失败' };
 }
 
-function hashInMemoryString(input: string): string {
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= input.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0).toString(16);
-}
-
 function buildLocalCacheKey(
   connectionEpoch: number,
   provider: ProviderConfig | undefined,
@@ -119,8 +105,8 @@ function buildLocalCacheKey(
   model: ModelConfig | undefined,
   modelId: string,
 ): string {
-  const keyVer = getLocalProviderKeyVersion(providerId);
-  const keyDigest = hashInMemoryString(getLocalProviderKey(providerId));
+  // Credentials live in the gateway now: its provider revision changes whenever
+  // the stored key does, which is what invalidates prepared cache state.
   const hdrs = provider?.headers
     ? Object.entries(provider.headers)
         .sort(([a], [b]) => a.localeCompare(b))
@@ -133,8 +119,7 @@ function buildLocalCacheKey(
     provider?.baseURL ?? '',
     provider?.authType ?? '',
     hdrs,
-    keyVer,
-    keyDigest,
+    provider?.updatedAt ?? '',
     model?.apiFormat ?? '',
     modelId,
     model?.compat?.pathOverride ?? '',
@@ -560,27 +545,20 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const sendLocalHttpFetch = useCallback(
     async (
       preparedReq: PreparedLocalHTTPRequest,
-      provider: ProviderConfig | undefined,
-      providerId: string,
+      _provider: ProviderConfig | undefined,
+      _providerId: string,
       signal: AbortSignal,
     ): Promise<Response> => {
-      const localApiKey = getLocalProviderKey(providerId);
-      const authed = applyLocalAuth(
-        preparedReq.url,
-        preparedReq.headers ?? {},
-        preparedReq.authType,
-        localApiKey,
-        provider?.headers,
-      );
       const serializedBody =
         typeof preparedReq.body === 'string'
           ? preparedReq.body
           : JSON.stringify(preparedReq.body ?? {});
 
       try {
-        return await gateway.fetchImpl(authed.url, {
+        // The gateway already bound the saved credential to this request envelope.
+        return await gateway.fetchImpl(preparedReq.url, {
           method: preparedReq.method || 'POST',
-          headers: authed.headers,
+          headers: preparedReq.headers ?? {},
           body: serializedBody,
           signal,
         });
@@ -627,6 +605,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       const buildInput = (extra?: Partial<StreamChatInput>): StreamChatInput => ({
         ...baseInput,
+        // Direct requests carry the gateway-bound credential instead of a browser key.
+        credentialEnvelope: true,
         ...(searchTracker.settled
           ? { preparedSearch: { block: searchTracker.block } satisfies PreparedSearchInput }
           : {}),
@@ -697,6 +677,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             conversationId,
             {
               ...baseInput,
+              credentialEnvelope: true,
               ...(searchTracker.settled
                 ? { preparedSearch: { block: searchTracker.block } }
                 : {}),

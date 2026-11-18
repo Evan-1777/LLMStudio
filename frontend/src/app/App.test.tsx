@@ -6,8 +6,24 @@ import { MemoryRouter } from 'react-router-dom';
 import { AppProvider, useApp } from './AppProvider';
 import { ConnectionGate } from './ConnectionGate';
 import { AppRoutes } from './routes';
+import { SettingsLayout } from '../features/settings/SettingsLayout';
 import { Modal, ConfirmDialog } from '../components/ui';
 import { chatReducer, initialChatState } from '../features/chat/chatReducer';
+import {
+  CONNECTION_STORAGE_KEY,
+  DEFAULT_APPLE_BLUE,
+  SETTINGS_STORAGE_KEY,
+  defaultSettings,
+  readThemeHint,
+} from '../core/settings';
+
+// Mirrors the gateway's GET /api/v1/settings envelope with server defaults.
+function settingsEnvelope(overrides: Record<string, unknown> = {}) {
+  const { gatewayBaseUrl, accessToken, ...preferences } = defaultSettings();
+  void gatewayBaseUrl;
+  void accessToken;
+  return { preferences: { ...preferences, ...overrides }, initialized: false };
+}
 
 describe('AppProvider, ConnectionGate, and Routing', () => {
   beforeEach(() => {
@@ -32,6 +48,11 @@ describe('AppProvider, ConnectionGate, and Routing', () => {
           JSON.stringify({ code: 'UNAUTHORIZED', message: 'bad token' }),
           { status: 401 },
         );
+      }
+      if (url.endsWith('/api/v1/settings')) {
+        return new Response(JSON.stringify(settingsEnvelope()), {
+          status: 200,
+        });
       }
       if (url.endsWith('/api/v1/formats')) {
         return new Response(JSON.stringify({ formats: [], adapters: [] }), {
@@ -93,6 +114,178 @@ describe('AppProvider, ConnectionGate, and Routing', () => {
       expect(
         screen.getByRole('button', { name: '默认助手', current: true }),
       ).toBeInTheDocument();
+    });
+  });
+
+  it('hydrates preferences from the gateway and patches single fields without reconnecting', async () => {
+    const patchBodies: Array<Record<string, unknown>> = [];
+    const serverPreferences: Record<string, unknown> = {
+      themeMode: 'dark',
+      seedColorValue: 0xff3f5f90,
+      enterToSend: false,
+      visualHtmlRender: true,
+      defaultHtmlPreview: false,
+      chatDisplayMode: 'feed',
+      autoCollapseEnabled: true,
+      autoCollapseThinkingOnComplete: true,
+      autoCollapseToolsOnComplete: true,
+      autoCreateCache: false,
+      collapseLineThreshold: 24,
+      collapseCharThreshold: 1200,
+    };
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/healthz')) {
+        return new Response(
+          JSON.stringify({ status: 'ok', version: '1.0.0', authRequired: false }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/settings')) {
+        if ((init?.method ?? 'GET').toUpperCase() === 'PATCH') {
+          const body = JSON.parse(String(init?.body ?? '{}')) as Record<
+            string,
+            unknown
+          >;
+          patchBodies.push(body);
+          Object.assign(serverPreferences, body);
+        }
+        return new Response(
+          JSON.stringify({
+            preferences: { ...serverPreferences },
+            initialized: true,
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter initialEntries={['/settings/appearance']}>
+          <SettingsLayout section="appearance" />
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => {
+      expect(document.documentElement.dataset.theme).toBe('dark');
+    });
+
+    const healthCalls = () =>
+      fetchMock.mock.calls.filter(([input]) =>
+        String(input).endsWith('/healthz'),
+      ).length;
+    const healthBefore = healthCalls();
+
+    await user.click(screen.getByRole('radio', { name: '浅色' }));
+    await waitFor(() => {
+      expect(document.documentElement.dataset.theme).toBe('light');
+    });
+
+    // A single field is submitted, without reconnecting the gateway.
+    expect(patchBodies).toContainEqual({ themeMode: 'light' });
+    expect(healthCalls()).toBe(healthBefore);
+
+    // A rejected write rolls back to the last confirmed value.
+    fetchMock.mockImplementationOnce(async () =>
+      new Response(
+        JSON.stringify({ code: 'INTERNAL_ERROR', message: '写入失败' }),
+        { status: 500 },
+      ),
+    );
+    await user.click(screen.getByRole('radio', { name: '深色' }));
+    await waitFor(() => {
+      expect(screen.getByText(/设置保存失败/)).toBeInTheDocument();
+    });
+    expect(document.documentElement.dataset.theme).toBe('light');
+  });
+
+  it('imports legacy browser preferences once and keeps a first-paint theme hint', async () => {
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({
+        ...defaultSettings(),
+        themeMode: 'dark',
+        enterToSend: false,
+      }),
+    );
+
+    let importBody: Record<string, unknown> | null = null;
+    let importAuthorized = false;
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/healthz')) {
+        return new Response(
+          JSON.stringify({ status: 'ok', version: '1.0.0', authRequired: true }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/settings/import')) {
+        importBody = JSON.parse(String(init?.body ?? '{}')) as Record<
+          string,
+          unknown
+        >;
+        importAuthorized =
+          (init?.headers as Record<string, string>)?.Authorization ===
+          'Bearer legacy-token';
+        return new Response(
+          JSON.stringify({
+            preferences: {
+              ...defaultSettings(),
+              themeMode: 'dark',
+              enterToSend: false,
+            },
+            initialized: true,
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/settings')) {
+        return new Response(
+          JSON.stringify({ preferences: defaultSettings(), initialized: false }),
+          { status: 200 },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    const user = userEvent.setup();
+    localStorage.setItem(
+      CONNECTION_STORAGE_KEY,
+      JSON.stringify({ gatewayBaseUrl: '/', accessToken: '' }),
+    );
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter initialEntries={['/chat']}>
+          <ConnectionGate>
+            <AppRoutes />
+          </ConnectionGate>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByText('需要访问令牌')).toBeInTheDocument();
+    });
+    await user.type(screen.getByLabelText('访问令牌'), 'legacy-token');
+    await user.click(screen.getByRole('button', { name: '连接' }));
+
+    await waitFor(() => {
+      expect(importBody).not.toBeNull();
+    });
+    expect(importBody).toMatchObject({ themeMode: 'dark', enterToSend: false });
+    expect(importAuthorized).toBe(true);
+    // The imported values are authoritative and the browser copy is gone.
+    await waitFor(() => {
+      expect(document.documentElement.dataset.theme).toBe('dark');
+    });
+    expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).toBeNull();
+    expect(readThemeHint('/')).toEqual({
+      themeMode: 'dark',
+      seedColorValue: DEFAULT_APPLE_BLUE,
     });
   });
 
