@@ -16,10 +16,29 @@ function generateNonce(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+const INLINE_PREVIEW_MAX_HEIGHT = 8192;
+
+// Shared inline responsive rules: constrain top-level containers and scalable
+// media to the chat column without breaking author media queries, min-widths,
+// or intentional nested horizontal scrollers.
+const INLINE_RESPONSIVE_STYLE = `
+  :where(html, body) {
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  body > :where(div, section, article, main, header, footer, aside, nav, form, table, pre, blockquote, figure, ul, ol, dl, p, fieldset, details, hr, h1, h2, h3, h4, h5, h6) {
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  :where(img, svg, video, canvas) {
+    max-width: 100%;
+    height: auto;
+  }`;
+
 // Reports the intrinsic height of the document content, never the iframe viewport:
 // measuring documentElement.scrollHeight returns at least the current frame height,
-// so a shortened document could never shrink. Body margins and padding are added
-// back explicitly, and viewport-sized bodies fall back to their content extent.
+// so a shortened document could never shrink. Measure body/root box extents and
+// visible content overflow in unified document coordinates.
 const HEIGHT_BRIDGE = (safeNonce: string) => `
 <script>
 (function() {
@@ -33,30 +52,90 @@ const HEIGHT_BRIDGE = (safeNonce: string) => `
   }
 
   function contentHeight() {
+    var docEl = document.documentElement;
     var body = document.body;
     if (!body || !body.getBoundingClientRect) return 0;
-    var rect = body.getBoundingClientRect();
+    var scrollY = window.scrollY || window.pageYOffset || (docEl && docEl.scrollTop) || 0;
+    var docStyle = docEl ? getComputedStyle(docEl) : null;
     var bodyStyle = getComputedStyle(body);
-    var bottom = 0;
-    var hasChild = false;
+    var bodyRect = body.getBoundingClientRect();
+    var bodyTop = bodyRect.top + scrollY;
+    var bodyPadTop = px(bodyStyle, "paddingTop");
+    var bodyPadBottom = px(bodyStyle, "paddingBottom");
+    var bodyBorderTop = px(bodyStyle, "borderTopWidth");
+    var bodyBorderBottom = px(bodyStyle, "borderBottomWidth");
+    var bodyMarginBottom = Math.max(0, px(bodyStyle, "marginBottom"));
+    var docPadBottom = docStyle ? px(docStyle, "paddingBottom") : 0;
+    var docBorderBottom = docStyle ? px(docStyle, "borderBottomWidth") : 0;
+    var docMarginBottom = docStyle ? Math.max(0, px(docStyle, "marginBottom")) : 0;
+
+    var canCollapseBottom =
+      bodyPadBottom === 0 &&
+      bodyBorderBottom === 0 &&
+      bodyStyle.overflowY === "visible" &&
+      bodyStyle.display !== "flex" &&
+      bodyStyle.display !== "grid" &&
+      bodyStyle.display !== "flow-root";
+
+    var flowBottom = bodyTop + bodyBorderTop + bodyPadTop;
+    var absBottom = 0;
+    var overflowBottom = 0;
+    var hasFlowContent = false;
+
     for (var i = 0; i < body.children.length; i++) {
       var child = body.children[i];
       var childStyle = getComputedStyle(child);
       if (childStyle.display === "none" || childStyle.position === "fixed") continue;
       var childRect = child.getBoundingClientRect();
-      var edge = childRect.bottom + px(childStyle, "marginBottom") - rect.top;
-      if (edge > bottom) bottom = edge;
-      hasChild = true;
+      var childBoxBottom = childRect.bottom + scrollY;
+
+      if (childStyle.position === "absolute") {
+        if (childBoxBottom > absBottom) absBottom = childBoxBottom;
+      } else {
+        hasFlowContent = true;
+        var childMb = Math.max(0, px(childStyle, "marginBottom"));
+        var childEdge = canCollapseBottom && childStyle.float === "none"
+          ? childBoxBottom + Math.max(childMb, bodyMarginBottom)
+          : childBoxBottom + childMb;
+        if (childEdge > flowBottom) flowBottom = childEdge;
+      }
+
+      if (childStyle.overflowY === "visible" && child.scrollHeight > child.clientHeight) {
+        var childOverflow = childRect.top + scrollY + child.clientTop + child.scrollHeight;
+        if (childOverflow > overflowBottom) overflowBottom = childOverflow;
+      }
     }
-    if (!hasChild) {
-      bottom = Math.max(0, body.scrollHeight - px(bodyStyle, "paddingTop"));
+
+    for (var j = 0; j < body.childNodes.length; j++) {
+      var node = body.childNodes[j];
+      if (node.nodeType === 3 && /\\S/.test(node.nodeValue || "")) {
+        var range = document.createRange();
+        range.selectNodeContents(node);
+        var textBottom = range.getBoundingClientRect().bottom + scrollY;
+        hasFlowContent = true;
+        var textEdge = canCollapseBottom ? textBottom + bodyMarginBottom : textBottom;
+        if (textEdge > flowBottom) flowBottom = textEdge;
+      }
     }
-    return Math.ceil(
-      bottom +
-      px(bodyStyle, "paddingBottom") +
-      px(bodyStyle, "marginTop") +
-      px(bodyStyle, "marginBottom")
-    );
+
+    var bodyBoxBottom = hasFlowContent
+      ? (canCollapseBottom
+          ? flowBottom
+          : flowBottom + bodyPadBottom + bodyBorderBottom + bodyMarginBottom)
+      : bodyTop + bodyBorderTop + bodyPadTop + bodyPadBottom + bodyBorderBottom + bodyMarginBottom;
+
+    var docBottom = bodyBoxBottom + docPadBottom + docBorderBottom + docMarginBottom;
+
+    if (
+      bodyStyle.overflowY !== "hidden" &&
+      bodyStyle.overflowY !== "clip" &&
+      body.scrollHeight > body.clientHeight
+    ) {
+      var bodyOverflow = bodyTop + body.clientTop + body.scrollHeight;
+      if (bodyOverflow > overflowBottom) overflowBottom = bodyOverflow;
+    }
+
+    return Math.ceil(Math.max(docBottom, absBottom, overflowBottom));
   }
 
   function report() {
@@ -95,18 +174,32 @@ export function buildSandboxedSrcDoc(
   options?: { seamless?: boolean; theme?: 'light' | 'dark'; measure?: boolean },
 ): string {
   const safeNonce = JSON.stringify(nonce);
-  const bridgeScript = options?.measure === false ? '' : HEIGHT_BRIDGE(safeNonce);
+  const isInline = options?.measure !== false;
+  const bridgeScript = isInline ? HEIGHT_BRIDGE(safeNonce) : '';
+  const inlineStyleTag = isInline ? `<style>${INLINE_RESPONSIVE_STYLE}\n</style>` : '';
 
   const lower = rawHtml.toLowerCase();
   const hasDocRoot = lower.includes('<!doctype') || lower.includes('<html');
   if (hasDocRoot) {
-    const closeBody = lower.lastIndexOf('</body>');
-    if (closeBody >= 0) {
-      return (
-        rawHtml.slice(0, closeBody) + bridgeScript + rawHtml.slice(closeBody)
-      );
+    let doc = rawHtml;
+    if (inlineStyleTag) {
+      const closeHead = lower.indexOf('</head>');
+      const bodyMatch = /<body(?:\s|>)/i.exec(doc);
+      const openBody = bodyMatch ? bodyMatch.index : -1;
+      if (closeHead >= 0 && (openBody < 0 || closeHead < openBody)) {
+        doc = doc.slice(0, closeHead) + inlineStyleTag + doc.slice(closeHead);
+      } else if (openBody >= 0) {
+        doc = doc.slice(0, openBody) + inlineStyleTag + doc.slice(openBody);
+      } else {
+        doc = `${inlineStyleTag}\n${doc}`;
+      }
     }
-    return `${rawHtml}\n${bridgeScript}`;
+    if (!bridgeScript) return doc;
+    const closeBody = doc.toLowerCase().lastIndexOf('</body>');
+    if (closeBody >= 0) {
+      return doc.slice(0, closeBody) + bridgeScript + doc.slice(closeBody);
+    }
+    return `${doc}\n${bridgeScript}`;
   }
 
   const isSeamless = Boolean(options?.seamless);
@@ -135,7 +228,7 @@ export function buildSandboxedSrcDoc(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<style>${styleBlock}
+<style>${styleBlock}${isInline ? INLINE_RESPONSIVE_STYLE : ''}
 </style>
 </head>
 <body>
@@ -148,7 +241,7 @@ ${bridgeScript}
 export function SandboxedIframe({
   html,
   minHeight = 140,
-  maxHeight = 680,
+  maxHeight = INLINE_PREVIEW_MAX_HEIGHT,
   fillAvailable = false,
   seamless = false,
 }: {

@@ -1,10 +1,11 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { AppProvider } from '../app/AppProvider';
 import { SETTINGS_STORAGE_KEY, defaultSettings } from '../core/settings';
 import { CollapseStateProvider } from './CollapsibleBlock';
 import { ContentRenderer } from './ContentRenderer';
+import { SandboxedIframe, buildSandboxedSrcDoc } from './HtmlPreview';
 
 describe('ContentRenderer and HTML sandbox', () => {
   beforeEach(() => {
@@ -408,5 +409,64 @@ describe('ContentRenderer and HTML sandbox', () => {
     } finally {
       window.requestAnimationFrame = origRaf;
     }
+  });
+
+  it('injects inline responsive style and height bridge for fragments and full docs, omits both for fullscreen, and clamps inline height at 8192 px', () => {
+    const fragInline = buildSandboxedSrcDoc('<div style="width:600px">hi</div>', 'n1');
+    expect(fragInline).toContain('llmstudio-html-height');
+    expect(fragInline).toContain(':where(img, svg, video, canvas)');
+
+    const docInline = buildSandboxedSrcDoc(
+      '<!DOCTYPE html><html><head><title>Doc</title></head><body><div>hi</div></body></html>',
+      'n2',
+    );
+    expect(docInline).toContain('llmstudio-html-height');
+    expect(docInline).toContain(':where(html, body)');
+
+    const docFullscreen = buildSandboxedSrcDoc(
+      '<!DOCTYPE html><html><head><title>Doc</title></head><body><div>hi</div></body></html>',
+      'n3',
+      { measure: false },
+    );
+    expect(docFullscreen).not.toContain('llmstudio-html-height');
+    expect(docFullscreen).not.toContain(':where(html, body)');
+
+    const { rerender } = render(
+      <AppProvider skipInitialBootstrap>
+        <SandboxedIframe html="<div>tall</div>" />
+      </AppProvider>,
+    );
+    const frame = screen.getByTitle('HTML 预览') as HTMLIFrameElement;
+    const srcDoc = frame.getAttribute('srcdoc') ?? '';
+    const nonceMatch = /var nonce = "([^"]+)"/.exec(srcDoc);
+    expect(nonceMatch).not.toBeNull();
+    const nonce = nonceMatch![1];
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: frame.contentWindow,
+          data: { type: 'llmstudio-html-height', nonce, height: 900 },
+        }),
+      );
+    });
+    expect(frame.style.height).toBe('900px');
+
+    act(() => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          source: frame.contentWindow,
+          data: { type: 'llmstudio-html-height', nonce, height: 9500 },
+        }),
+      );
+    });
+    expect(frame.style.height).toBe('8192px');
+
+    rerender(
+      <AppProvider skipInitialBootstrap>
+        <SandboxedIframe html="<div>tall</div>" fillAvailable />
+      </AppProvider>,
+    );
+    expect(frame.style.height).toBe('min(70dvh, 640px)');
   });
 });

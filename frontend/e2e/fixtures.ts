@@ -332,6 +332,48 @@ async function startMockUpstream(): Promise<{
         return;
       }
 
+      if (prompt.includes('[HTML_ADAPTIVE]')) {
+        const reply = [
+          '自适应说明',
+          '',
+          '<div id="adaptive-card" style="width:600px;padding:12px;background:#eef3ff;">',
+          '<div>固定宽度顶层容器在窄屏按列宽自动收缩与换行，不触发横向滚动。</div>',
+          '<svg id="adaptive-svg" width="600" height="200" viewBox="0 0 600 200" style="display:block;margin-top:8px;background:#f2f8ff;"><rect width="600" height="200" fill="#dbeafe"/></svg>',
+          '<div style="height:460px;background:#f7f8fa;"></div>',
+          '<div id="nested-host" style="position:relative;height:200px;background:#eef9f2;"><div id="nested-tail" style="position:absolute;top:200px;left:0;right:0;height:120px;line-height:120px;background:#dcfce7;">嵌套定位尾部</div></div>',
+          '</div>',
+          '',
+          '自适应尾部说明',
+        ].join('\n');
+        writeChunk({ choices: [{ delta: { content: reply } }] });
+        writeChunk({
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        });
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      if (prompt.includes('[HTML_TALL_CAP]')) {
+        const reply = [
+          '超长上限说明',
+          '',
+          '```html',
+          '<div style="height:8600px;background:linear-gradient(#f8fafc,#e2e8f0);"></div>',
+          '<div id="tall-tail" style="height:40px;line-height:40px;">超长文档尾部</div>',
+          '```',
+        ].join('\n');
+        writeChunk({ choices: [{ delta: { content: reply } }] });
+        writeChunk({
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        });
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
       if (prompt.includes('[HTML_SANDBOX]')) {
         const htmlReply = [
           '### Markdown Title',

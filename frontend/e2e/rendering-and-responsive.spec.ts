@@ -106,31 +106,33 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     const composer = page.getByLabel('消息输入框');
     const frameHeight = (locator: Locator) =>
       locator.evaluate((el) => el.getBoundingClientRect().height);
-    const frameContentHeight = async (locator: Locator) => {
+    const frameGeometry = async (locator: Locator, tailSelector: string) => {
       const handle = await locator.elementHandle();
       const frame = await handle?.contentFrame();
       if (!frame) throw new Error('sandboxed frame is not available');
-      return frame.evaluate(() => {
-        const body = document.body;
-        const rect = body.getBoundingClientRect();
-        const bodyStyle = getComputedStyle(body);
-        let bottom = 0;
-        for (const child of Array.from(body.children)) {
-          const style = getComputedStyle(child);
-          if (style.display === 'none') continue;
-          const childRect = child.getBoundingClientRect();
-          bottom = Math.max(
-            bottom,
-            childRect.bottom - rect.top + (parseFloat(style.marginBottom) || 0),
-          );
+      return frame.evaluate((sel) => {
+        const se = document.scrollingElement;
+        const tail = document.querySelector(sel);
+        if (!se || !tail) {
+          return {
+            scrollHeight: 0,
+            clientHeight: 0,
+            scrollWidth: 0,
+            clientWidth: 0,
+            tailBottom: -1,
+            tailRight: -1,
+          };
         }
-        return Math.ceil(
-          bottom +
-            (parseFloat(bodyStyle.paddingBottom) || 0) +
-            (parseFloat(bodyStyle.marginTop) || 0) +
-            (parseFloat(bodyStyle.marginBottom) || 0),
-        );
-      });
+        const tailRect = tail.getBoundingClientRect();
+        return {
+          scrollHeight: se.scrollHeight,
+          clientHeight: se.clientHeight,
+          scrollWidth: se.scrollWidth,
+          clientWidth: se.clientWidth,
+          tailBottom: tailRect.bottom,
+          tailRight: tailRect.right,
+        };
+      }, tailSelector);
     };
 
     // 1. Raw HTML: a 514 px document shrinks to 194 px inside the same frame.
@@ -149,8 +151,11 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
 
     await expect.poll(() => frameHeight(inlineFrame), { timeout: 6000 }).toBeLessThan(240);
     const shrunkHeight = await frameHeight(inlineFrame);
-    const contentHeight = await frameContentHeight(inlineFrame);
-    expect(Math.abs(shrunkHeight - contentHeight)).toBeLessThanOrEqual(2);
+    const shrunkGeo = await frameGeometry(inlineFrame, '#height-tail');
+    expect(shrunkGeo.scrollHeight).toBeLessThanOrEqual(shrunkGeo.clientHeight + 1);
+    expect(shrunkGeo.scrollWidth).toBeLessThanOrEqual(shrunkGeo.clientWidth + 1);
+    expect(shrunkGeo.tailBottom).toBeGreaterThan(170);
+    expect(shrunkGeo.tailBottom).toBeLessThanOrEqual(shrunkGeo.clientHeight + 1);
     expect(
       await childFrame?.evaluate(
         () => (window as unknown as Record<string, unknown>).__heightProbe ?? null,
@@ -176,7 +181,7 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     await page.waitForTimeout(1000);
     expect(Math.abs((await frameHeight(inlineFrame)) - idleA)).toBeLessThanOrEqual(1);
     console.log(
-      `[HEIGHT] raw iframe=${shrunkHeight.toFixed(1)} content=${contentHeight} idleDelta=${(
+      `[HEIGHT] raw iframe=${shrunkHeight.toFixed(1)} tailBottom=${shrunkGeo.tailBottom.toFixed(1)} idleDelta=${(
         (await frameHeight(inlineFrame)) - idleA
       ).toFixed(1)}`,
     );
@@ -206,7 +211,7 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     expect(Math.abs(docHeightB - docHeightA)).toBeLessThanOrEqual(1);
     expect(docHeightB).toBeLessThan(520);
 
-    // 3. Fenced HTML preview switches to the same content-driven height.
+    // 3. Fenced HTML preview preserves html+body padding (340 px) before shrinking to 160 px.
     await composer.fill('[HTML_HEIGHT_FENCED]');
     await page.getByRole('button', { name: '发送消息' }).click();
     const fencedMessage = page
@@ -216,7 +221,148 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     const fencedFrame = fencedMessage.locator('iframe[title="HTML 预览"]');
     await expect(fencedFrame).toBeVisible();
     await expect.poll(() => frameHeight(fencedFrame), { timeout: 6000 }).toBeGreaterThan(300);
+    const fencedBeforeShrink = await frameGeometry(fencedFrame, '#fenced-card');
+    expect(fencedBeforeShrink.scrollHeight).toBeLessThanOrEqual(
+      fencedBeforeShrink.clientHeight + 1,
+    );
+    expect(fencedBeforeShrink.tailBottom).toBeLessThanOrEqual(
+      fencedBeforeShrink.clientHeight + 1,
+    );
     await expect.poll(() => frameHeight(fencedFrame), { timeout: 6000 }).toBeLessThan(220);
+    const fencedAfterShrink = await frameGeometry(fencedFrame, '#fenced-card');
+    expect(fencedAfterShrink.scrollHeight).toBeLessThanOrEqual(
+      fencedAfterShrink.clientHeight + 1,
+    );
+
+    // 4. Raw HTML >680 px with nested absolute tail and 600 px block expands & reflows without rebuilding on 390 px.
+    await composer.fill('[HTML_ADAPTIVE]');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await expect(seamless).toHaveCount(3);
+    const adaptiveFrame = seamless.nth(2);
+    await expect.poll(() => frameHeight(adaptiveFrame), { timeout: 6000 }).toBeGreaterThan(900);
+
+    const adaptiveDesktopGeo = await frameGeometry(adaptiveFrame, '#nested-tail');
+    expect(adaptiveDesktopGeo.scrollHeight).toBeLessThanOrEqual(
+      adaptiveDesktopGeo.clientHeight + 1,
+    );
+    expect(adaptiveDesktopGeo.scrollWidth).toBeLessThanOrEqual(
+      adaptiveDesktopGeo.clientWidth + 1,
+    );
+    expect(adaptiveDesktopGeo.tailBottom).toBeLessThanOrEqual(
+      adaptiveDesktopGeo.clientHeight + 1,
+    );
+    expect(adaptiveDesktopGeo.tailRight).toBeLessThanOrEqual(
+      adaptiveDesktopGeo.clientWidth + 1,
+    );
+
+    // Scroll outer chat container to verify the tail and following prose are reachable.
+    const trailingProse = page.getByText('自适应尾部说明');
+    await trailingProse.scrollIntoViewIfNeeded();
+    await expect(trailingProse).toBeVisible();
+    const adaptiveFrameBox = await adaptiveFrame.boundingBox();
+    expect(adaptiveFrameBox).not.toBeNull();
+    expect(adaptiveFrameBox!.y + adaptiveFrameBox!.height).toBeLessThanOrEqual(801);
+    const adaptiveHandle = await adaptiveFrame.elementHandle();
+    const adaptiveChild = await adaptiveHandle?.contentFrame();
+    if (!adaptiveChild) throw new Error('adaptive child frame missing');
+    await adaptiveChild.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__adaptiveProbe = 'kept';
+    });
+    const tailInFrameViewport = await adaptiveChild
+      .locator('#nested-tail')
+      .evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return r.height > 0 && r.bottom <= window.innerHeight + 1;
+      });
+    expect(tailInFrameViewport).toBe(true);
+
+    // Resize to 390 px narrow mobile viewport: same iframe reflows with zero horizontal overflow.
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect
+      .poll(
+        async () => {
+          const g = await frameGeometry(adaptiveFrame, '#nested-tail');
+          return g.clientWidth <= 370 && g.scrollWidth <= g.clientWidth + 1;
+        },
+        { timeout: 6000 },
+      )
+      .toBe(true);
+
+    const adaptiveMobileGeo = await frameGeometry(adaptiveFrame, '#nested-tail');
+    expect(adaptiveMobileGeo.scrollHeight).toBeLessThanOrEqual(
+      adaptiveMobileGeo.clientHeight + 1,
+    );
+    expect(adaptiveMobileGeo.tailBottom).toBeLessThanOrEqual(
+      adaptiveMobileGeo.clientHeight + 1,
+    );
+    expect(adaptiveMobileGeo.tailRight).toBeLessThanOrEqual(
+      adaptiveMobileGeo.clientWidth + 1,
+    );
+    const mobileMetrics = await adaptiveChild.evaluate(() => {
+      const card = document.getElementById('adaptive-card')!.getBoundingClientRect();
+      const svg = document.getElementById('adaptive-svg')!.getBoundingClientRect();
+      return {
+        probe: (window as unknown as Record<string, unknown>).__adaptiveProbe ?? null,
+        clientW: document.scrollingElement!.clientWidth,
+        cardW: card.width,
+        svgW: svg.width,
+        svgRatio: svg.width / svg.height,
+      };
+    });
+    expect(mobileMetrics.probe).toBe('kept');
+    expect(mobileMetrics.cardW).toBeLessThanOrEqual(mobileMetrics.clientW + 1);
+    expect(mobileMetrics.svgW).toBeLessThanOrEqual(mobileMetrics.clientW + 1);
+    expect(Math.abs(mobileMetrics.svgRatio - 3)).toBeLessThan(0.1);
+    const pageOverflow = await page.evaluate(
+      () => document.documentElement.scrollWidth <= window.innerWidth,
+    );
+    expect(pageOverflow).toBe(true);
+
+    // 5. Inline preview caps at 8192 px with native scroll to tail; fullscreen keeps modal viewport height.
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await composer.fill('[HTML_TALL_CAP]');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    const tallMessage = page
+      .locator('.wb-asst-msg')
+      .filter({ hasText: '超长上限说明' });
+    await tallMessage.getByRole('button', { name: '预览 HTML' }).click();
+    const tallFrame = tallMessage.locator('iframe[title="HTML 预览"]');
+    await expect(tallFrame).toBeVisible();
+    await expect.poll(() => frameHeight(tallFrame), { timeout: 6000 }).toBeGreaterThan(8000);
+    expect(await frameHeight(tallFrame)).toBeLessThanOrEqual(8192);
+    const tallHandle = await tallFrame.elementHandle();
+    const tallChild = await tallHandle?.contentFrame();
+    if (!tallChild) throw new Error('tall child frame missing');
+    const inlineTailReachable = await tallChild.evaluate(() => {
+      const se = document.scrollingElement!;
+      const canScroll = se.scrollHeight > se.clientHeight;
+      document.getElementById('tall-tail')!.scrollIntoView();
+      const r = document.getElementById('tall-tail')!.getBoundingClientRect();
+      return canScroll && r.bottom <= se.clientHeight + 1 && r.top >= -1;
+    });
+    expect(inlineTailReachable).toBe(true);
+
+    await tallMessage.getByRole('button', { name: '全屏预览' }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
+    const fullFrame = dialog.locator('iframe[title="HTML 预览"]');
+    await expect(fullFrame).toBeVisible();
+    const fullH = await frameHeight(fullFrame);
+    expect(fullH).toBeLessThanOrEqual(800 * 0.7 + 2);
+    expect(fullH).toBeLessThanOrEqual(641);
+    const fullHandle = await fullFrame.elementHandle();
+    const fullChild = await fullHandle?.contentFrame();
+    if (!fullChild) throw new Error('fullscreen child frame missing');
+    const fullTailReachable = await fullChild.evaluate(() => {
+      const se = document.scrollingElement!;
+      const canScroll = se.scrollHeight > se.clientHeight;
+      document.getElementById('tall-tail')!.scrollIntoView();
+      const r = document.getElementById('tall-tail')!.getBoundingClientRect();
+      return canScroll && r.bottom <= se.clientHeight + 1 && r.top >= -1;
+    });
+    expect(fullTailReachable).toBe(true);
+    await page.keyboard.press('Escape');
+    await expect(dialog).toBeHidden();
   });
 
   test('bounds long thinking container height with internal scrolling across desktop, tablet, and mobile viewports', async ({
