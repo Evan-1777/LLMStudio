@@ -452,7 +452,10 @@ describe('chatReducer and ChatProvider', () => {
       SETTINGS_STORAGE_KEY,
       JSON.stringify({ ...defaultSettings(), chatDisplayMode: 'feed' }),
     );
-    const onUpdate = vi.fn().mockResolvedValue(true);
+    let finishSave!: (success: boolean) => void;
+    const onUpdate = vi.fn(() => new Promise<boolean>((resolve) => {
+      finishSave = resolve;
+    }));
     const user = userEvent.setup();
     render(
       <AppProvider skipInitialBootstrap>
@@ -505,6 +508,14 @@ describe('chatReducer and ChatProvider', () => {
       { type: 'thinking', thinking: 't1' },
       { type: 'text', text: 'A1-updated' },
     ]);
+    const nextEdit = editBtns[3];
+    expect(editor).toBeDisabled();
+    expect(nextEdit).toBeDisabled();
+
+    finishSave(true);
+    await waitFor(() => expect(nextEdit).toBeEnabled());
+    await user.click(nextEdit);
+    expect(screen.getByLabelText('编辑消息内容')).toHaveValue('A2');
   });
 
   it('routes localRequest providers via prepare-local -> direct upstream -> createMessage and preserves reply on persist failure', async () => {

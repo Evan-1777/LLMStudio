@@ -114,6 +114,7 @@ export function ChatCanvas({
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState('');
   const [savingEdit, setSavingEdit] = useState(false);
+  const isBusy = savingEdit || state.runState === 'loading' || state.runState === 'streaming';
 
   const visibleMessages = useMemo(() => {
     if (!state.streaming || !state.conversation) {
@@ -315,8 +316,6 @@ export function ChatCanvas({
               const isStreamingThis =
                 Boolean(state.streaming) &&
                 msg.id === state.streaming?.messageId;
-              const isBusy =
-                state.runState === 'loading' || state.runState === 'streaming';
               const isEditingThis = editingMessageId === msg.id;
 
               if (displayMode === 'feed') {
