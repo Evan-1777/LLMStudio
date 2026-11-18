@@ -187,8 +187,8 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     await page.getByRole('radio', { name: '信息流模式' }).click();
     await page.getByRole('button', { name: '返回工作台' }).click();
     const feedFrame = page.locator('iframe.html-sandbox-frame--seamless').first();
+    await expect.poll(() => frameHeight(feedFrame), { timeout: 6000 }).toBeGreaterThan(150);
     await expect.poll(() => frameHeight(feedFrame), { timeout: 6000 }).toBeLessThan(240);
-    expect(await frameHeight(feedFrame)).toBeGreaterThan(150);
     await page.getByRole('link', { name: '设置' }).click();
     await page.getByRole('button', { name: '外观与显示' }).click();
     await page.getByRole('radio', { name: '气泡模式' }).click();
