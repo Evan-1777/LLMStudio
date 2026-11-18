@@ -65,19 +65,21 @@ func DefaultPreferences() Preferences {
 }
 
 // PreferencesPatch carries a partial preference update; nil fields remain unchanged.
+// JSON tags must mirror Preferences: two field names carry an extra "On" that the
+// client contract uses, so case-insensitive decoding alone would drop them.
 type PreferencesPatch struct {
-	ThemeMode                    *string
-	SeedColorValue               *uint32
-	EnterToSend                  *bool
-	VisualHTMLRender             *bool
-	DefaultHTMLPreview           *bool
-	ChatDisplayMode              *string
-	AutoCollapseEnabled          *bool
-	AutoCollapseThinkingComplete *bool
-	AutoCollapseToolsComplete    *bool
-	AutoCreateCache              *bool
-	CollapseLineThreshold        *int
-	CollapseCharThreshold        *int
+	ThemeMode                    *string `json:"themeMode"`
+	SeedColorValue               *uint32 `json:"seedColorValue"`
+	EnterToSend                  *bool   `json:"enterToSend"`
+	VisualHTMLRender             *bool   `json:"visualHtmlRender"`
+	DefaultHTMLPreview           *bool   `json:"defaultHtmlPreview"`
+	ChatDisplayMode              *string `json:"chatDisplayMode"`
+	AutoCollapseEnabled          *bool   `json:"autoCollapseEnabled"`
+	AutoCollapseThinkingComplete *bool   `json:"autoCollapseThinkingOnComplete"`
+	AutoCollapseToolsComplete    *bool   `json:"autoCollapseToolsOnComplete"`
+	AutoCreateCache              *bool   `json:"autoCreateCache"`
+	CollapseLineThreshold        *int    `json:"collapseLineThreshold"`
+	CollapseCharThreshold        *int    `json:"collapseCharThreshold"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.

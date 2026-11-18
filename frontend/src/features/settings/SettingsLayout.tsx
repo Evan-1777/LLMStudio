@@ -17,6 +17,7 @@ import { ConnectionPage } from './ConnectionPage';
 import { McpPage } from './McpPage';
 import { PluginsPage } from './PluginsPage';
 import { ProvidersPage } from './ProvidersPage';
+import { StoragePage } from './StoragePage';
 import './settings.css';
 
 interface SettingsNavItem {
@@ -31,6 +32,7 @@ const NAV_ITEMS: readonly SettingsNavItem[] = [
   { id: 'connection', label: '连接', icon: 'link' },
   { id: 'appearance', label: '外观与显示', icon: 'sun' },
   { id: 'mcp', label: 'MCP 配置', icon: 'wrench' },
+  { id: 'storage', label: '存储', icon: 'folder' },
   { id: 'about', label: '关于', icon: 'info' },
 ];
 
@@ -59,6 +61,8 @@ function renderSectionContent(section: SettingsSection): ReactNode {
       return <AppearancePage />;
     case 'mcp':
       return <McpPage />;
+    case 'storage':
+      return <StoragePage />;
     case 'about':
       return <AboutPage />;
   }

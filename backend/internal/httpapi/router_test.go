@@ -68,7 +68,32 @@ func setupTestRouter(t *testing.T, token string, devMode bool) http.Handler {
 			WithAssistants(assistantStore).
 			WithSearch(searchReg, searchStore),
 		PreferenceService: service.NewPreferenceService(prefStore),
+		StorageService:    service.NewStorageService(store.NewStorageMaintenance(db, ":memory:")),
 	})
+}
+
+func TestStorageEndpoints(t *testing.T) {
+	const tok = "test-token"
+	router := setupTestRouter(t, tok, false)
+
+	if rec := doJSONReq(t, router, http.MethodGet, "/api/v1/storage", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated GET /storage status=%d", rec.Code)
+	}
+	rec := doJSONReq(t, router, http.MethodGet, "/api/v1/storage", tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /storage status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var usage domain.StorageUsage
+	if err := json.Unmarshal(rec.Body.Bytes(), &usage); err != nil {
+		t.Fatalf("decode storage usage: %v", err)
+	}
+	if usage.Compactable || usage.TotalBytes != 0 {
+		t.Fatalf("memory test database must not report compactable files: %+v", usage)
+	}
+	rec = doJSONReq(t, router, http.MethodPost, "/api/v1/storage/compact", tok, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("compaction of a memory database must fail with 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
 }
 
 func doJSONReq(t *testing.T, h http.Handler, method, path, token string, body any) *httptest.ResponseRecorder {
@@ -205,6 +230,19 @@ func TestPreferenceEndpoints(t *testing.T) {
 	prefs, initialized = fetchPreferences(t, router, tok)
 	if !initialized || prefs.ThemeMode != domain.ThemeModeDark || prefs.EnterToSend || prefs.CollapseLineThreshold != 40 {
 		t.Fatalf("settings not preserved across updates: %+v initialized=%v", prefs, initialized)
+	}
+
+	// The two auto-collapse switches use an "On" suffix in the wire contract and
+	// must not be silently dropped by the patch decoder.
+	if rec := doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, map[string]any{
+		"autoCollapseThinkingOnComplete": false,
+		"autoCollapseToolsOnComplete":    false,
+	}); rec.Code != http.StatusOK {
+		t.Fatalf("collapse PATCH status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	prefs, _ = fetchPreferences(t, router, tok)
+	if prefs.AutoCollapseThinkingComplete || prefs.AutoCollapseToolsComplete {
+		t.Fatalf("auto-collapse preferences were dropped: %+v", prefs)
 	}
 
 	invalid := []map[string]any{

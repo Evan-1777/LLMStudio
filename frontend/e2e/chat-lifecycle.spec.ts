@@ -47,7 +47,9 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
 
     await expect(page.getByText(/Reply #1 to:/)).toBeVisible();
     await expect(page.getByText(/思考过程/)).toBeVisible();
-    await expect(page.getByText(/联网搜索/)).toBeVisible();
+    await expect(
+      page.getByRole('button', { name: /联网搜索 · First turn question/ }),
+    ).toBeVisible();
 
     // Verify reasoning_effort was sent to upstream.
     expect(upstream.lastChatBodies[0]?.reasoning_effort).toBe('high');

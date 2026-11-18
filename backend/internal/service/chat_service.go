@@ -36,6 +36,13 @@ type LocalCacheResultData struct {
 	ErrorMessage string `json:"errorMessage,omitempty"`
 }
 
+// LocalMainFailureInput carries a rejected browser-direct main request back to
+// the gateway for the same cache failure classification used on the server path.
+type LocalMainFailureInput struct {
+	Status int    `json:"status"`
+	Body   string `json:"body,omitempty"`
+}
+
 // LocalCacheResolutionInput supplies the browser-side cache pre-request outcome for stateless verification.
 type LocalCacheResolutionInput struct {
 	PlanKey string               `json:"planKey"`
@@ -54,11 +61,13 @@ type StreamChatInput struct {
 	RegenerateMessageID string                     `json:"regenerateMessageId"`
 	WebSearch           bool                       `json:"webSearch"`
 	SearchEngineID      string                     `json:"searchEngineId,omitempty"`
-	AutoCreateCache     bool                       `json:"autoCreateCache,omitempty"`
 	LocalContinuation   *LocalContinuationInput    `json:"localContinuation,omitempty"`
 	PreparedSearch      *PreparedSearchInput       `json:"preparedSearch,omitempty"`
 	CacheState          *plugin.PromptCacheState   `json:"cacheState,omitempty"`
 	CacheResolution     *LocalCacheResolutionInput `json:"cacheResolution,omitempty"`
+	// LocalMainFailure reports a rejected browser-direct main request so the
+	// gateway classifies it with the server-side cache rules.
+	LocalMainFailure *LocalMainFailureInput `json:"localMainFailure,omitempty"`
 	// CredentialEnvelope opts a browser-direct request into receiving the stored
 	// provider credential inside the encoded request envelope. Older clients omit
 	// it and keep receiving the credential-free shape.
@@ -79,6 +88,7 @@ type ChatService struct {
 	mcpStore    *store.MCPServerStore
 	mcpClient   plugin.MCPClientBoundary
 	cacheStore  *promptCacheStore
+	preferences *PreferenceService
 }
 
 // NewChatService constructs a ChatService. If httpClient is nil, a default client with no overall request timeout is used.
@@ -115,6 +125,25 @@ func (s *ChatService) WithSearch(searchReg *plugin.SearchRegistry, searchStore *
 	s.searchReg = searchReg
 	s.searchStore = searchStore
 	return s
+}
+
+// WithPreferences injects the gateway-managed preferences used to resolve the
+// automatic caching policy for each generation.
+func (s *ChatService) WithPreferences(preferences *PreferenceService) *ChatService {
+	s.preferences = preferences
+	return s
+}
+
+// autoCreateCachePreference reads the gateway-managed automatic caching preference.
+func (s *ChatService) autoCreateCachePreference(ctx context.Context) bool {
+	if s.preferences == nil {
+		return false
+	}
+	prefs, _, err := s.preferences.Get(ctx)
+	if err != nil {
+		return false
+	}
+	return prefs.AutoCreateCache
 }
 
 // WithMCP injects MCP server metadata and runtime boundary for tool discovery and execution.
@@ -174,6 +203,9 @@ type PreparedLocalRequest struct {
 	InsertAfterMessageID string                   `json:"insertAfterMessageId,omitempty"`
 	CacheStep            *PreparedLocalCacheStep  `json:"cacheStep,omitempty"`
 	CacheState           *plugin.PromptCacheState `json:"cacheState,omitempty"`
+	// CacheRetry marks a prepared request that resends once without the rejected
+	// cache resource.
+	CacheRetry bool `json:"cacheRetry,omitempty"`
 }
 
 type preparedUpstream struct {
@@ -210,23 +242,20 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	}
 
 	chatInput := prep.chatInput
-	var usedInlineCache bool
-	if prep.autoCreateCache {
-		currentCache := s.cacheStore.Get(prep.cacheScope)
-		activeCache, plan, planErr := s.executeCachePlan(
-			ctx,
-			chatInput,
-			prep.apiFormat,
-			prep.adapter,
-			prep.cacheScope,
-			currentCache,
-		)
-		if planErr != nil {
-			return nil, planErr
-		}
-		chatInput.PromptCache = activeCache
-		usedInlineCache = plan.InlineCache
+	currentCache := s.cacheStore.Get(prep.cacheScope)
+	activeCache, plan, planErr := s.executeCachePlan(
+		ctx,
+		chatInput,
+		prep.apiFormat,
+		prep.adapter,
+		prep.cacheScope,
+		currentCache,
+	)
+	if planErr != nil {
+		return nil, planErr
 	}
+	chatInput.PromptCache = activeCache
+	usedInlineCache := plan.InlineCache
 
 	resp, _, err := s.encodeAndOpenMainRequest(
 		ctx,
@@ -302,73 +331,122 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 	var (
 		cacheStep     *PreparedLocalCacheStep
 		outCacheState *plugin.PromptCacheState
+		cacheRetry    bool
 	)
+	planner, hasPlanner := prep.apiFormat.(plugin.PromptCachePlanner)
 
-	if prep.autoCreateCache {
-		if planner, ok := prep.apiFormat.(plugin.PromptCachePlanner); ok {
-			plan, planErr := planner.PlanCache(ctx, chatInput, in.CacheState)
-			if planErr != nil {
-				return PreparedLocalRequest{}, planErr
-			}
-			fullPlanKey := ""
-			if plan.PlanKey != "" {
-				fullPlanKey = buildLocalPlanKey(prep.cacheScope, prep.systemPrompt, prep.tools, plan.PlanKey)
-			}
-
-			if in.CacheResolution != nil {
-				if plan.CreateRequest != nil && fullPlanKey != "" && in.CacheResolution.PlanKey == fullPlanKey {
-					resBody := sanitizeLocalCacheResolutionBody(*in.CacheResolution)
-					res, resErr := planner.ResolveCache(ctx, chatInput, plan, plugin.CacheResolutionInput{
-						StatusCode: in.CacheResolution.Status,
-						Body:       resBody,
-						PlanKey:    plan.PlanKey,
-					})
-					if resErr != nil {
-						return PreparedLocalRequest{}, resErr
-					}
-					if res.HardError != nil {
-						return PreparedLocalRequest{}, res.HardError
-					}
-					outCacheState = res.State
-					chatInput.PromptCache = res.State
-				} else if plan.CreateRequest == nil && plan.ReuseState != nil {
-					outCacheState = plan.ReuseState
-					chatInput.PromptCache = plan.ReuseState
-				}
-			} else if plan.CreateRequest != nil {
-				createEndpoint, epErr := resolveEndpointForCacheCreate(
-					prep.adapter,
-					localEndpointProvider(prep, prep.credentialEnvelope),
-					prep.model,
-					*plan.CreateRequest,
-					prep.compat,
-				)
-				if epErr != nil {
-					return PreparedLocalRequest{}, epErr
-				}
-				createBody := json.RawMessage(plan.CreateRequest.Body)
-				if len(createBody) == 0 {
-					createBody = json.RawMessage("{}")
-				}
-				cacheStep = &PreparedLocalCacheStep{
-					PlanKey: fullPlanKey,
-					Request: PreparedLocalHTTPRequest{
-						Method:   plan.CreateRequest.Method,
-						URL:      createEndpoint.URL,
-						Headers:  headersToStringMap(mergeRequestHeaders(plan.CreateRequest.Headers, createEndpoint.Headers)),
-						Body:     createBody,
-						AuthType: authType,
-					},
-				}
-			} else {
-				outCacheState = plan.ReuseState
-				chatInput.PromptCache = plan.ReuseState
+	// A rejected browser-direct main request is classified by the same rules as
+	// the server path, allowing at most one cache-less resend.
+	if hasPlanner && in.LocalMainFailure != nil {
+		used := in.CacheState
+		if used == nil {
+			used = s.cacheStore.Get(prep.cacheScope)
+		}
+		if used != nil && strings.TrimSpace(used.ResourceName) != "" {
+			action := planner.ClassifyCacheError(in.LocalMainFailure.Status, []byte(in.LocalMainFailure.Body), used)
+			switch {
+			case action.InvalidateScope:
+				s.cacheStore.Delete(prep.cacheScope)
+				cacheRetry = true
+			case action.MarkUnsupported:
+				s.cacheStore.Set(prep.cacheScope, plugin.PromptCacheState{Unsupported: true})
+				cacheRetry = true
+			case action.RetryWithoutCache:
+				cacheRetry = true
 			}
 		}
 	}
 
+	if hasPlanner && !cacheRetry {
+		// The gateway owns the reusable state; the browser only echoes the state of
+		// the request it just executed.
+		current := in.CacheState
+		if current == nil {
+			current = s.cacheStore.Get(prep.cacheScope)
+		}
+		plan, planErr := planner.PlanCache(ctx, chatInput, current)
+		if planErr != nil {
+			return PreparedLocalRequest{}, planErr
+		}
+		fullPlanKey := ""
+		if plan.PlanKey != "" {
+			fullPlanKey = buildLocalPlanKey(prep.cacheScope, prep.systemPrompt, prep.tools, plan.PlanKey)
+		}
+
+		switch {
+		case in.CacheResolution != nil:
+			// A resolution only registers when it labels the candidate planned for this
+			// scope; stale or foreign resolutions are discarded.
+			if plan.CreateRequest != nil && fullPlanKey != "" && in.CacheResolution.PlanKey == fullPlanKey {
+				resBody := sanitizeLocalCacheResolutionBody(*in.CacheResolution)
+				res, resErr := planner.ResolveCache(ctx, chatInput, plan, plugin.CacheResolutionInput{
+					StatusCode: in.CacheResolution.Status,
+					Body:       resBody,
+					PlanKey:    plan.PlanKey,
+				})
+				if resErr != nil {
+					return PreparedLocalRequest{}, resErr
+				}
+				if res.HardError != nil {
+					return PreparedLocalRequest{}, res.HardError
+				}
+				s.cacheStore.FinishCreate(prep.cacheScope, plan.PlanKey, res.State)
+				if res.State != nil {
+					s.cacheStore.Set(prep.cacheScope, *res.State)
+				}
+				outCacheState = res.State
+				chatInput.PromptCache = res.State
+			} else if plan.CreateRequest == nil && plan.ReuseState != nil {
+				outCacheState = plan.ReuseState
+				chatInput.PromptCache = plan.ReuseState
+			}
+		case plan.CreateRequest != nil:
+			claim := s.cacheStore.ClaimCreate(prep.cacheScope, plan.PlanKey, promptCachePendingTTL)
+			if !claim.leader {
+				// The same candidate is already handed out elsewhere; this overlapping
+				// request proceeds without the cache resource.
+				break
+			}
+			createEndpoint, epErr := resolveEndpointForCacheCreate(
+				prep.adapter,
+				localEndpointProvider(prep, prep.credentialEnvelope),
+				prep.model,
+				*plan.CreateRequest,
+				prep.compat,
+			)
+			if epErr != nil {
+				return PreparedLocalRequest{}, epErr
+			}
+			createBody := json.RawMessage(plan.CreateRequest.Body)
+			if len(createBody) == 0 {
+				createBody = json.RawMessage("{}")
+			}
+			cacheStep = &PreparedLocalCacheStep{
+				PlanKey: fullPlanKey,
+				Request: PreparedLocalHTTPRequest{
+					Method:   plan.CreateRequest.Method,
+					URL:      createEndpoint.URL,
+					Headers:  headersToStringMap(mergeRequestHeaders(plan.CreateRequest.Headers, createEndpoint.Headers)),
+					Body:     createBody,
+					AuthType: authType,
+				},
+			}
+		default:
+			outCacheState = plan.ReuseState
+			chatInput.PromptCache = plan.ReuseState
+		}
+	}
+
+	if cacheRetry {
+		outCacheState = &plugin.PromptCacheState{Unsupported: true}
+		chatInput.PromptCache = outCacheState
+	}
+
 	encoded, encErr := prep.apiFormat.EncodeRequest(ctx, chatInput)
 	if encErr != nil {
+		if appErr, ok := domain.AsAppError(encErr); ok {
+			return PreparedLocalRequest{}, appErr
+		}
 		return PreparedLocalRequest{}, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", encErr)
 	}
 	endpoint, epErr := prep.adapter.ResolveEndpoint(
@@ -398,6 +476,7 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 		InsertAfterMessageID: prep.insertAfterMessageID,
 		CacheStep:            cacheStep,
 		CacheState:           outCacheState,
+		CacheRetry:           cacheRetry,
 	}, nil
 }
 
@@ -600,6 +679,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	}
 
 	mergedCompat := format.MergeCompat(apiFormat.DefaultCompat(), model.Compat)
+	autoCreateCache := s.autoCreateCachePreference(ctx)
 	chatInput := plugin.ChatInput{
 		ConversationID:  conv.ID,
 		Provider:        prov,
@@ -609,9 +689,9 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		Params:          effectiveParams,
 		Compat:          mergedCompat,
 		Tools:           tools,
-		AutoCreateCache: in.AutoCreateCache,
+		AutoCreateCache: autoCreateCache,
 	}
-	cacheScope := buildPromptCacheScope(prov, model, apiFormat.ID(), mergedCompat)
+	cacheScope := buildPromptCacheScope(prov, model, apiFormat.ID(), mergedCompat, conv.ID)
 
 	resolveProv := prov
 	if allowMissingLocalKey {
@@ -629,6 +709,12 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		// Never emit server-stored API keys in pre-encoded browser-direct responses.
 		resolveProv.AuthType = domain.AuthTypeNone
 		resolveProv.APIKey = ""
+	}
+	// Resolve the generation URL once with the same adapter and compatibility
+	// override used for the real request, so format plugins can tell documented
+	// official routes from compatibility endpoints.
+	if resolved, rErr := adapter.ResolveEndpoint(resolveProv, model, apiFormat.DefaultPath(), nil, mergedCompat); rErr == nil {
+		chatInput.GenerationURL = resolved.URL
 	}
 
 	return preparedUpstream{
@@ -650,7 +736,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		historyLen:           len(history),
 		replaceMessageID:     replaceMessageID,
 		insertAfterMessageID: insertAfterMessageID,
-		autoCreateCache:      in.AutoCreateCache,
+		autoCreateCache:      autoCreateCache,
 		credentialEnvelope:   in.CredentialEnvelope,
 		cacheScope:           cacheScope,
 		chatInput:            chatInput,

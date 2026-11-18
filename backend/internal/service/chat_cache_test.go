@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -200,7 +201,8 @@ func TestPromptCachePlannerExecutionOrderReuseScopeAndCancel(t *testing.T) {
 
 	provSvc := NewProviderService(provStore, formats, adapters)
 	convSvc := NewConversationService(convStore, msgStore)
-	chatSvc := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{})
+	chatSvc := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
+		WithPreferences(NewPreferenceService(store.NewPreferenceStore(db)))
 
 	var sequence []string
 	var createHits atomic.Int32
@@ -263,11 +265,11 @@ func TestPromptCachePlannerExecutionOrderReuseScopeAndCancel(t *testing.T) {
 		t.Fatalf("create conv: %v", err)
 	}
 
-	// 1. Default AutoCreateCache=false: zero PlanCache/create requests, single main request.
+	// 1. Gateway preference off: the planner is consulted but plans nothing, so a
+	// single uncached main request is sent.
 	prepOff, err := chatSvc.Prepare(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "turn 0",
-		AutoCreateCache: false,
+		ConversationID: conv.ID,
+		Text:           "turn 0",
 	})
 	if err != nil {
 		t.Fatalf("Prepare off: %v", err)
@@ -275,15 +277,15 @@ func TestPromptCachePlannerExecutionOrderReuseScopeAndCancel(t *testing.T) {
 	if err := prepOff.Stream(ctx, func(domain.StreamEvent) error { return nil }); err != nil {
 		t.Fatalf("Stream off: %v", err)
 	}
-	if createHits.Load() != 0 || mainHits.Load() != 1 || fakeFmt.planCount.Load() != 0 {
-		t.Fatalf("unexpected hits when AutoCreateCache=false: create=%d main=%d plan=%d", createHits.Load(), mainHits.Load(), fakeFmt.planCount.Load())
+	if createHits.Load() != 0 || mainHits.Load() != 1 {
+		t.Fatalf("unexpected hits when the cache preference is off: create=%d main=%d", createHits.Load(), mainHits.Load())
 	}
 
-	// 2. AutoCreateCache=true: executes create before main, then reuses cached ref on next turn.
+	// 2. Gateway preference on: executes create before main, then reuses cached ref on next turn.
+	setAutoCache(t, chatSvc, true)
 	prep1, err := chatSvc.Prepare(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "turn 1",
-		AutoCreateCache: true,
+		ConversationID: conv.ID,
+		Text:           "turn 1",
 	})
 	if err != nil {
 		t.Fatalf("Prepare 1: %v", err)
@@ -292,9 +294,8 @@ func TestPromptCachePlannerExecutionOrderReuseScopeAndCancel(t *testing.T) {
 		t.Fatalf("Stream 1: %v", err)
 	}
 	prep2, err := chatSvc.Prepare(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "turn 2",
-		AutoCreateCache: true,
+		ConversationID: conv.ID,
+		Text:           "turn 2",
 	})
 	if err != nil {
 		t.Fatalf("Prepare 2: %v", err)
@@ -315,9 +316,8 @@ func TestPromptCachePlannerExecutionOrderReuseScopeAndCancel(t *testing.T) {
 		t.Fatalf("update api key: %v", err)
 	}
 	prep3, err := chatSvc.Prepare(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "turn 3",
-		AutoCreateCache: true,
+		ConversationID: conv.ID,
+		Text:           "turn 3",
 	})
 	if err != nil {
 		t.Fatalf("Prepare 3: %v", err)
@@ -344,9 +344,8 @@ func TestPromptCachePlannerExecutionOrderReuseScopeAndCancel(t *testing.T) {
 	doneCh := make(chan error, 1)
 	go func() {
 		_, pErr := chatSvc.Prepare(cancelCtx, StreamChatInput{
-			ConversationID:  conv.ID,
-			Text:            "canceled turn",
-			AutoCreateCache: true,
+			ConversationID: conv.ID,
+			Text:           "canceled turn",
 		})
 		doneCh <- pErr
 	}()
@@ -369,6 +368,7 @@ func TestPromptCachePlannerExecutionOrderReuseScopeAndCancel(t *testing.T) {
 func TestOpenAIExplicitFromPersistedModelAndSingleFallback(t *testing.T) {
 	ctx := context.Background()
 	provSvc, _, convSvc, _, chatSvc, _ := setupServiceTestEnv(t)
+	setAutoCache(t, chatSvc, true)
 
 	var seenBodies []map[string]any
 	var rejectNext atomic.Bool
@@ -446,9 +446,8 @@ func TestOpenAIExplicitFromPersistedModelAndSingleFallback(t *testing.T) {
 	seenBodies = nil
 
 	prep, err := chatSvc.Prepare(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "turn 1",
-		AutoCreateCache: true,
+		ConversationID: conv.ID,
+		Text:           "turn 1",
 	})
 	if err != nil {
 		t.Fatalf("Prepare fallback failed: %v", err)
@@ -465,9 +464,8 @@ func TestOpenAIExplicitFromPersistedModelAndSingleFallback(t *testing.T) {
 
 	// Second turn remembers negative capability for this scope -> does not re-send prompt_cache_options.
 	prep2, err := chatSvc.Prepare(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "turn 2",
-		AutoCreateCache: true,
+		ConversationID: conv.ID,
+		Text:           "turn 2",
 	})
 	if err != nil {
 		t.Fatalf("Prepare turn 2 failed: %v", err)
@@ -514,9 +512,8 @@ func TestOpenAIExplicitFromPersistedModelAndSingleFallback(t *testing.T) {
 		statusToReturn.Store(int32(tc.code))
 		errPayload.Store(tc.body)
 		if _, pErr := chatSvc.Prepare(ctx, StreamChatInput{
-			ConversationID:  convErr.ID,
-			Text:            "fail",
-			AutoCreateCache: true,
+			ConversationID: convErr.ID,
+			Text:           "fail",
 		}); pErr == nil {
 			t.Fatalf("expected HTTP %d to fail visibly without fallback", tc.code)
 		}
@@ -529,6 +526,7 @@ func TestOpenAIExplicitFromPersistedModelAndSingleFallback(t *testing.T) {
 func TestGeminiExplicitCachingLifecycleReuseExpiryEditSmallPrefixAndPathOverride(t *testing.T) {
 	ctx := context.Background()
 	provSvc, _, convSvc, _, chatSvc, msgStore := setupServiceTestEnv(t)
+	setAutoCache(t, chatSvc, true)
 
 	var (
 		createCount    atomic.Int32
@@ -645,9 +643,8 @@ func TestGeminiExplicitCachingLifecycleReuseExpiryEditSmallPrefixAndPathOverride
 	runTurn := func(text string) {
 		t.Helper()
 		prep, pErr := chatSvc.Prepare(ctx, StreamChatInput{
-			ConversationID:  conv.ID,
-			Text:            text,
-			AutoCreateCache: true,
+			ConversationID: conv.ID,
+			Text:           text,
 		})
 		if pErr != nil {
 			t.Fatalf("Prepare(%q) failed: %v", text, pErr)
@@ -707,14 +704,14 @@ func TestGeminiExplicitCachingLifecycleReuseExpiryEditSmallPrefixAndPathOverride
 	convExp, _ := convSvc.Create(ctx, CreateConversationInput{ProviderID: provExp.ID, ModelID: "gemini-2.5-pro", SystemPrompt: "SysExp"})
 	nextExpire.Store(time.Now().Add(40 * time.Millisecond).UTC())
 	cBefore := createCount.Load()
-	pExp1, err := chatSvc.Prepare(ctx, StreamChatInput{ConversationID: convExp.ID, Text: "e1", AutoCreateCache: true})
+	pExp1, err := chatSvc.Prepare(ctx, StreamChatInput{ConversationID: convExp.ID, Text: "e1"})
 	if err != nil {
 		t.Fatalf("Prepare exp1: %v", err)
 	}
 	_ = pExp1.Stream(ctx, func(domain.StreamEvent) error { return nil })
 	time.Sleep(60 * time.Millisecond)
 	nextExpire.Store(time.Now().Add(5 * time.Minute).UTC())
-	pExp2, err := chatSvc.Prepare(ctx, StreamChatInput{ConversationID: convExp.ID, Text: "e2", AutoCreateCache: true})
+	pExp2, err := chatSvc.Prepare(ctx, StreamChatInput{ConversationID: convExp.ID, Text: "e2"})
 	if err != nil {
 		t.Fatalf("Prepare exp2: %v", err)
 	}
@@ -732,9 +729,8 @@ func TestGeminiExplicitCachingLifecycleReuseExpiryEditSmallPrefixAndPathOverride
 	createStatus.Store(http.StatusBadRequest)
 	createErrBody.Store(`{"error":{"message":"CachedContent token count 10 is too small; minimum is 1024"}}`)
 	prepSmall, err := chatSvc.Prepare(ctx, StreamChatInput{
-		ConversationID:  convSmall.ID,
-		Text:            "hi",
-		AutoCreateCache: true,
+		ConversationID: convSmall.ID,
+		Text:           "hi",
 	})
 	if err != nil {
 		t.Fatalf("small prefix should degrade cleanly, got err=%v", err)
@@ -756,9 +752,8 @@ func TestGeminiExplicitCachingLifecycleReuseExpiryEditSmallPrefixAndPathOverride
 	createStatus.Store(http.StatusUnauthorized)
 	createErrBody.Store(`{"error":{"message":"API key not valid"}}`)
 	if _, aErr := chatSvc.Prepare(ctx, StreamChatInput{
-		ConversationID:  convAuth.ID,
-		Text:            "hi",
-		AutoCreateCache: true,
+		ConversationID: convAuth.ID,
+		Text:           "hi",
 	}); aErr == nil {
 		t.Fatal("expected 401 on cachedContents to return visible error")
 	}
@@ -817,12 +812,17 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 	convSvc := NewConversationService(convStore, msgStore).WithAssistants(assistStore)
 
 	// Two completely independent ChatService instances (no shared memory snapshot!).
+	prefStore := store.NewPreferenceStore(db)
 	chatSvcA := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithAssistants(assistStore).
-		WithSearch(searchReg, searchStore)
+		WithSearch(searchReg, searchStore).
+		WithPreferences(NewPreferenceService(prefStore))
 	chatSvcB := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithAssistants(assistStore).
-		WithSearch(searchReg, searchStore)
+		WithSearch(searchReg, searchStore).
+		WithPreferences(NewPreferenceService(prefStore))
+	setAutoCache(t, chatSvcA, true)
+	setAutoCache(t, chatSvcB, true)
 
 	prov, err := provSvc.Create(ctx, ProviderInput{
 		ID:           "p-loc-gem",
@@ -851,10 +851,9 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 
 	// 1. Instance A runs initial PrepareLocal -> runs webSearch ONCE, returns CacheStep + fallback main request, saves ZERO messages.
 	prep1, err := chatSvcA.PrepareLocal(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "first local query",
-		WebSearch:       true,
-		AutoCreateCache: true,
+		ConversationID: conv.ID,
+		Text:           "first local query",
+		WebSearch:      true,
 	})
 	if err != nil {
 		t.Fatalf("PrepareLocal 1: %v", err)
@@ -874,11 +873,10 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 
 	// 2. Instance B resolves cacheResolution + preparedSearch -> NO second search, encodes cachedContent + identical searchPrompt!
 	prep2, err := chatSvcB.PrepareLocal(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "first local query",
-		WebSearch:       true,
-		AutoCreateCache: true,
-		PreparedSearch:  &PreparedSearchInput{Block: prep1.WebSearchBlock},
+		ConversationID: conv.ID,
+		Text:           "first local query",
+		WebSearch:      true,
+		PreparedSearch: &PreparedSearchInput{Block: prep1.WebSearchBlock},
 		CacheResolution: &LocalCacheResolutionInput{
 			PlanKey: prep1.CacheStep.PlanKey,
 			Status:  http.StatusOK,
@@ -913,14 +911,14 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 		t.Fatalf("expected the search projection in the current user turn: %s", string(prep1.Body))
 	}
 
-	// 3. A stale PlanKey (cache prefix changed during cache creation) discards the
-	// resolution and returns an uncached main request without looping.
+	// 3. A stale PlanKey discards the reported creation result, never starts a
+	// second create from the same request, and falls back to the gateway-owned
+	// resource instead of dropping to an uncached request.
 	prepMismatch, err := chatSvcB.PrepareLocal(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		Text:            "changed query mid-flight",
-		WebSearch:       true,
-		AutoCreateCache: true,
-		PreparedSearch:  &PreparedSearchInput{Block: nil}, // empty/nil preparedSearch must NOT trigger second search!
+		ConversationID: conv.ID,
+		Text:           "changed query mid-flight",
+		WebSearch:      true,
+		PreparedSearch: &PreparedSearchInput{Block: nil}, // empty/nil preparedSearch must NOT trigger second search!
 		CacheResolution: &LocalCacheResolutionInput{
 			PlanKey: "stale-plan-key",
 			Status:  http.StatusOK,
@@ -933,13 +931,16 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 	if searchHits.Load() != 1 {
 		t.Fatalf("nil preparedSearch.block must still skip second search, hits=%d", searchHits.Load())
 	}
-	if prepMismatch.CacheStep != nil || prepMismatch.CacheState != nil {
-		t.Fatalf("planKey mismatch must discard cache and avoid loop-creating: %+v", prepMismatch)
+	if prepMismatch.CacheStep != nil {
+		t.Fatalf("planKey mismatch must not start another create: %+v", prepMismatch)
+	}
+	if prepMismatch.CacheState == nil || prepMismatch.CacheState.ResourceName != "cachedContents/local-1" {
+		t.Fatalf("planKey mismatch must fall back to the gateway-owned resource: %+v", prepMismatch)
 	}
 	var mismatchBody map[string]any
 	_ = json.Unmarshal(prepMismatch.Body, &mismatchBody)
-	if _, hasRef := mismatchBody["cachedContent"]; hasRef {
-		t.Fatalf("planKey mismatch must not emit stale cachedContent: %+v", mismatchBody)
+	if mismatchBody["cachedContent"] != "cachedContents/local-1" {
+		t.Fatalf("expected the gateway-owned resource on the fallback request: %+v", mismatchBody)
 	}
 
 	// 4. Saved user message + tool continuation reuses CacheState without extra search or create.
@@ -953,11 +954,10 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 		t.Fatalf("create user msg: %v", err)
 	}
 	prepToolCont, err := chatSvcB.PrepareLocal(ctx, StreamChatInput{
-		ConversationID:  conv.ID,
-		WebSearch:       true,
-		AutoCreateCache: true,
-		PreparedSearch:  &PreparedSearchInput{Block: prep1.WebSearchBlock},
-		CacheState:      prep2.CacheState,
+		ConversationID: conv.ID,
+		WebSearch:      true,
+		PreparedSearch: &PreparedSearchInput{Block: prep1.WebSearchBlock},
+		CacheState:     prep2.CacheState,
 		LocalContinuation: &LocalContinuationInput{
 			UserMessageID: savedUser.ID,
 			Blocks: []domain.ContentBlock{
@@ -976,5 +976,405 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 	_ = json.Unmarshal(prepToolCont.Body, &contBody)
 	if contBody["cachedContent"] != "cachedContents/local-1" {
 		t.Fatalf("expected cachedContent on tool continuation: %+v", contBody)
+	}
+}
+
+type captureUpstreamTransport struct {
+	mu     sync.Mutex
+	urls   []string
+	bodies []map[string]any
+}
+
+func (t *captureUpstreamTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	raw, _ := io.ReadAll(req.Body)
+	var body map[string]any
+	_ = json.Unmarshal(raw, &body)
+	t.mu.Lock()
+	t.urls = append(t.urls, req.URL.String())
+	t.bodies = append(t.bodies, body)
+	t.mu.Unlock()
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")),
+		Request:    req,
+	}, nil
+}
+
+func (t *captureUpstreamTransport) lastBody() map[string]any {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.bodies) == 0 {
+		return nil
+	}
+	return t.bodies[len(t.bodies)-1]
+}
+
+// TestOfficialOpenAICacheFieldsFollowResolvedTarget proves the cache fields are
+// chosen from the URL the adapter actually resolves for both request paths.
+func TestOfficialOpenAICacheFieldsFollowResolvedTarget(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	provStore := store.NewProviderStore(db)
+	convStore := store.NewConversationStore(db)
+	msgStore := store.NewMessageStore(db)
+	formats := plugin.NewFormatRegistry()
+	formats.MustRegister(format.NewOpenAICompletionsFormat())
+	adapters := plugin.NewProviderRegistry()
+	adapters.MustRegister(provider.NewGenericHTTPAdapter())
+
+	transport := &captureUpstreamTransport{}
+	chatSvc := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{Transport: transport}).
+		WithPreferences(NewPreferenceService(store.NewPreferenceStore(db)))
+	setAutoCache(t, chatSvc, true)
+	provSvc := NewProviderService(provStore, formats, adapters)
+
+	official, err := provSvc.Create(ctx, ProviderInput{
+		ID: "p-official", Name: "Official", Adapter: "generic-http",
+		BaseURL: "https://api.openai.com/v1", AuthType: domain.AuthTypeBearer, APIKey: "sk-1",
+		Models: []domain.ModelConfig{{ID: "gpt-4.1", Name: "GPT", APIFormat: "openai-completions"}},
+	})
+	if err != nil {
+		t.Fatalf("create official provider: %v", err)
+	}
+	proxy, err := provSvc.Create(ctx, ProviderInput{
+		ID: "p-proxy", Name: "Proxy", Adapter: "generic-http",
+		BaseURL: "https://proxy.example/v1", AuthType: domain.AuthTypeBearer, APIKey: "sk-2",
+		Models: []domain.ModelConfig{
+			{ID: "gpt-auto", Name: "Auto", APIFormat: "openai-completions"},
+			{ID: "gpt-explicit", Name: "Explicit", APIFormat: "openai-completions", Compat: domain.CompatConfig{CacheMode: domain.CacheModeExplicit}},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create proxy provider: %v", err)
+	}
+
+	convOfficial, _ := convStore.Create(ctx, domain.Conversation{ProviderID: official.ID, ModelID: "gpt-4.1", AssistantID: domain.DefaultAssistantID})
+	runTurn := func(convID string) {
+		t.Helper()
+		prep, pErr := chatSvc.Prepare(ctx, StreamChatInput{ConversationID: convID, Text: "hello"})
+		if pErr != nil {
+			t.Fatalf("Prepare: %v", pErr)
+		}
+		if sErr := prep.Stream(ctx, func(domain.StreamEvent) error { return nil }); sErr != nil {
+			t.Fatalf("Stream: %v", sErr)
+		}
+	}
+
+	runTurn(convOfficial.ID)
+	body := transport.lastBody()
+	if body["prompt_cache_key"] == nil || body["prompt_cache_options"] != nil {
+		t.Fatalf("official endpoint must use only prompt_cache_key, got %+v", body)
+	}
+	if !strings.HasPrefix(transport.urls[len(transport.urls)-1], "https://api.openai.com/v1/chat/completions") {
+		t.Fatalf("unexpected resolved URL %q", transport.urls[len(transport.urls)-1])
+	}
+
+	convProxyAuto, _ := convStore.Create(ctx, domain.Conversation{ProviderID: proxy.ID, ModelID: "gpt-auto", AssistantID: domain.DefaultAssistantID})
+	runTurn(convProxyAuto.ID)
+	if body = transport.lastBody(); body["prompt_cache_key"] != nil || body["prompt_cache_options"] != nil {
+		t.Fatalf("auto mode on a compatibility endpoint must add no fields, got %+v", body)
+	}
+
+	convProxyExplicit, _ := convStore.Create(ctx, domain.Conversation{ProviderID: proxy.ID, ModelID: "gpt-explicit", AssistantID: domain.DefaultAssistantID})
+	runTurn(convProxyExplicit.ID)
+	if body = transport.lastBody(); body["prompt_cache_options"] == nil || body["prompt_cache_key"] != nil {
+		t.Fatalf("explicit mode on a compatibility endpoint must use the compat extension, got %+v", body)
+	}
+
+	local, err := provSvc.Create(ctx, ProviderInput{
+		ID: "p-local", Name: "Local", Adapter: "generic-http",
+		BaseURL: "https://api.openai.com/v1", AuthType: domain.AuthTypeNone,
+		LocalRequest: domain.BoolPtr(true),
+		Models:       []domain.ModelConfig{{ID: "gpt-4.1", Name: "GPT", APIFormat: "openai-completions"}},
+	})
+	if err != nil {
+		t.Fatalf("create local provider: %v", err)
+	}
+	convLocal, _ := convStore.Create(ctx, domain.Conversation{ProviderID: local.ID, ModelID: "gpt-4.1", AssistantID: domain.DefaultAssistantID})
+	prepared, err := chatSvc.PrepareLocal(ctx, StreamChatInput{ConversationID: convLocal.ID, Text: "hello"})
+	if err != nil {
+		t.Fatalf("PrepareLocal: %v", err)
+	}
+	var localBody map[string]any
+	_ = json.Unmarshal(prepared.Body, &localBody)
+	if localBody["prompt_cache_key"] == nil || localBody["prompt_cache_options"] != nil {
+		t.Fatalf("local path must use the same official route key, got %+v", localBody)
+	}
+}
+
+func TestPromptCacheStoreScopingNegativesAndBound(t *testing.T) {
+	cache := newPromptCacheStore(4)
+	scope := func(topic string) plugin.PromptCacheScope {
+		return plugin.PromptCacheScope{ProviderID: "p", TopicID: topic, FormatID: "f", ModelID: "m"}
+	}
+	// A negative marker never replaces a valid resource.
+	cache.Set(scope("a"), plugin.PromptCacheState{ResourceName: "r-a", ExpireTime: time.Now().Add(time.Minute)})
+	cache.Set(scope("a"), plugin.PromptCacheState{FailedPrefixHash: "cand-1"})
+	if got := cache.Get(scope("a")); got == nil || got.ResourceName != "r-a" || got.FailedPrefixHash != "" || got.Unsupported {
+		t.Fatalf("resource must survive negative markers, got %+v", got)
+	}
+	// Without a resource the marker is visible, scoped and time bounded.
+	cache.Set(scope("b"), plugin.PromptCacheState{Unsupported: true})
+	if got := cache.Get(scope("b")); got == nil || !got.Unsupported {
+		t.Fatalf("expected unsupported marker, got %+v", got)
+	}
+	if got := cache.Get(scope("c")); got != nil {
+		t.Fatalf("topics must not share state, got %+v", got)
+	}
+
+	// Capacity stays bounded no matter how many scopes appear.
+	for i := 0; i < 20; i++ {
+		cache.Set(scope(fmt.Sprintf("t%d", i)), plugin.PromptCacheState{
+			ResourceName: fmt.Sprintf("r-%d", i),
+			ExpireTime:   time.Now().Add(time.Minute),
+		})
+	}
+	if len(cache.entries) > 4 {
+		t.Fatalf("expected at most 4 entries, got %d", len(cache.entries))
+	}
+
+	// Concurrent callers share one candidate creation result.
+	claim := cache.ClaimCreate(scope("x"), "candidate", 0)
+	if !claim.leader {
+		t.Fatal("first claim must lead")
+	}
+	waiter := cache.ClaimCreate(scope("x"), "candidate", 0)
+	if waiter.leader || waiter.blocked || waiter.wait == nil {
+		t.Fatalf("second claim for the same candidate must wait, got %+v", waiter)
+	}
+	cache.FinishCreate(scope("x"), "candidate", &plugin.PromptCacheState{ResourceName: "r-x"})
+	shared, ok := waiter.wait(context.Background())
+	if !ok || shared == nil || shared.ResourceName != "r-x" {
+		t.Fatalf("waiter must observe the shared result, got %+v ok=%v", shared, ok)
+	}
+
+	// A different candidate while one is in flight is turned away uncached.
+	if claim = cache.ClaimCreate(scope("y"), "candidate-1", 0); !claim.leader {
+		t.Fatal("first candidate must lead")
+	}
+	if other := cache.ClaimCreate(scope("y"), "candidate-2", 0); !other.blocked {
+		t.Fatalf("a different candidate must not join the flight, got %+v", other)
+	}
+
+	// A browser-executed create that never reports back expires.
+	if claim = cache.ClaimCreate(scope("z"), "candidate", time.Millisecond); !claim.leader {
+		t.Fatal("first pending create must lead")
+	}
+	time.Sleep(5 * time.Millisecond)
+	if again := cache.ClaimCreate(scope("z"), "candidate", 0); !again.leader {
+		t.Fatalf("expired pending create must be released, got %+v", again)
+	}
+}
+
+func TestGeminiCacheTopicIsolationAcrossAlternatingConversations(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	provStore := store.NewProviderStore(db)
+	convStore := store.NewConversationStore(db)
+	msgStore := store.NewMessageStore(db)
+	formats := plugin.NewFormatRegistry()
+	formats.MustRegister(format.NewGoogleGenAIFormat())
+	adapters := plugin.NewProviderRegistry()
+	adapters.MustRegister(provider.NewGenericHTTPAdapter())
+
+	var creates atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ":streamGenerateContent"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, `data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"totalTokenCount":12}}`+"\n\n")
+		case strings.HasSuffix(r.URL.Path, "/cachedContents"):
+			n := creates.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name":       fmt.Sprintf("cachedContents/c-%d", n),
+				"expireTime": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	provSvc := NewProviderService(provStore, formats, adapters)
+	chatSvc := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
+		WithPreferences(NewPreferenceService(store.NewPreferenceStore(db)))
+	setAutoCache(t, chatSvc, true)
+
+	prov, err := provSvc.Create(ctx, ProviderInput{
+		ID: "p-topics", Name: "Topics", Adapter: "generic-http",
+		BaseURL: srv.URL + "/v1beta", AuthType: domain.AuthTypeQueryKey, APIKey: "gk",
+		Models: []domain.ModelConfig{{ID: "gemini-2.5-pro", Name: "Gemini", APIFormat: "google-generative-ai"}},
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	createConv := func(systemPrompt string) string {
+		t.Helper()
+		conv, cErr := convStore.Create(ctx, domain.Conversation{
+			ProviderID: prov.ID, ModelID: "gemini-2.5-pro", SystemPrompt: systemPrompt, AssistantID: domain.DefaultAssistantID,
+		})
+		if cErr != nil {
+			t.Fatalf("create conversation: %v", cErr)
+		}
+		return conv.ID
+	}
+	convA := createConv("System A")
+	convB := createConv("System B")
+	runTurn := func(convID, text string) {
+		t.Helper()
+		prep, pErr := chatSvc.Prepare(ctx, StreamChatInput{ConversationID: convID, Text: text})
+		if pErr != nil {
+			t.Fatalf("Prepare(%s): %v", convID, pErr)
+		}
+		if sErr := prep.Stream(ctx, func(domain.StreamEvent) error { return nil }); sErr != nil {
+			t.Fatalf("Stream(%s): %v", convID, sErr)
+		}
+	}
+
+	runTurn(convA, "a1")
+	if got := creates.Load(); got != 1 {
+		t.Fatalf("expected topic A to create once, got %d", got)
+	}
+	runTurn(convB, "b1")
+	if got := creates.Load(); got != 2 {
+		t.Fatalf("expected topic B to create its own resource, got %d creates", got)
+	}
+	runTurn(convA, "a2")
+	runTurn(convB, "b2")
+	if got := creates.Load(); got != 2 {
+		t.Fatalf("alternating topics must keep reusing their own resources, got %d creates", got)
+	}
+
+	// A resource the upstream later rejects belongs to its topic only: B's
+	// unsupported response must not invalidate A's reusable resource.
+	scopeA := buildPromptCacheScope(prov, prov.Models[0], format.FormatIDGoogleGenAI, domain.CompatConfig{}, convA)
+	scopeB := buildPromptCacheScope(prov, prov.Models[0], format.FormatIDGoogleGenAI, domain.CompatConfig{}, convB)
+	chatSvc.cacheStore.Set(scopeB, plugin.PromptCacheState{Unsupported: true})
+	if got := chatSvc.cacheStore.Get(scopeA); got == nil || got.ResourceName == "" {
+		t.Fatalf("topic A resource must survive topic B failure, got %+v", got)
+	}
+	runTurn(convA, "a3")
+	if got := creates.Load(); got != 2 {
+		t.Fatalf("topic A must keep reusing after topic B failed, got %d creates", got)
+	}
+}
+
+func TestGeminiCacheConcurrentCandidateCreatesOnce(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	provStore := store.NewProviderStore(db)
+	convStore := store.NewConversationStore(db)
+	msgStore := store.NewMessageStore(db)
+	formats := plugin.NewFormatRegistry()
+	formats.MustRegister(format.NewGoogleGenAIFormat())
+	adapters := plugin.NewProviderRegistry()
+	adapters.MustRegister(provider.NewGenericHTTPAdapter())
+
+	var (
+		creates       atomic.Int32
+		mu            sync.Mutex
+		mainBodies    []map[string]any
+		releaseCreate = make(chan struct{})
+		createStarted = make(chan struct{}, 4)
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, ":streamGenerateContent"):
+			raw, _ := io.ReadAll(r.Body)
+			var body map[string]any
+			_ = json.Unmarshal(raw, &body)
+			mu.Lock()
+			mainBodies = append(mainBodies, body)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, `data: {"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":2,"totalTokenCount":12}}`+"\n\n")
+		case strings.HasSuffix(r.URL.Path, "/cachedContents"):
+			creates.Add(1)
+			createStarted <- struct{}{}
+			<-releaseCreate
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name":       "cachedContents/concurrent-1",
+				"expireTime": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	provSvc := NewProviderService(provStore, formats, adapters)
+	chatSvc := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
+		WithPreferences(NewPreferenceService(store.NewPreferenceStore(db)))
+	setAutoCache(t, chatSvc, true)
+
+	prov, err := provSvc.Create(ctx, ProviderInput{
+		ID: "p-conc", Name: "Concurrent", Adapter: "generic-http",
+		BaseURL: srv.URL + "/v1beta", AuthType: domain.AuthTypeQueryKey, APIKey: "gk",
+		Models: []domain.ModelConfig{{ID: "gemini-2.5-pro", Name: "Gemini", APIFormat: "google-generative-ai"}},
+	})
+	if err != nil {
+		t.Fatalf("create provider: %v", err)
+	}
+	conv, err := convStore.Create(ctx, domain.Conversation{
+		ProviderID: prov.ID, ModelID: "gemini-2.5-pro", SystemPrompt: "Sys", AssistantID: domain.DefaultAssistantID,
+	})
+	if err != nil {
+		t.Fatalf("create conversation: %v", err)
+	}
+
+	prepared := make([]*PreparedStream, 2)
+	failures := make([]error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			prepared[idx], failures[idx] = chatSvc.Prepare(ctx, StreamChatInput{ConversationID: conv.ID, Text: "same candidate"})
+		}(i)
+	}
+	select {
+	case <-createStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("cache creation never started")
+	}
+	close(releaseCreate)
+	wg.Wait()
+
+	if creates.Load() != 1 {
+		t.Fatalf("expected exactly one create for one candidate, got %d", creates.Load())
+	}
+	for i, p := range prepared {
+		if failures[i] != nil {
+			t.Fatalf("Prepare #%d: %v", i, failures[i])
+		}
+		if sErr := p.Stream(ctx, func(domain.StreamEvent) error { return nil }); sErr != nil {
+			t.Fatalf("Stream #%d: %v", i, sErr)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(mainBodies) != 2 {
+		t.Fatalf("expected two main requests, got %d", len(mainBodies))
+	}
+	for i, body := range mainBodies {
+		if body["cachedContent"] != "cachedContents/concurrent-1" {
+			t.Fatalf("request #%d must reuse the shared resource: %+v", i, body)
+		}
 	}
 }

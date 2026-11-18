@@ -67,9 +67,11 @@ func main() {
 	convSvc := service.NewConversationService(convStore, msgStore).WithAssistants(assistantStore)
 	pluginSvc := service.NewPluginService(searchEngines, searchStore, mcpStore).WithMCPClient(mcpRuntime)
 	prefSvc := service.NewPreferenceService(prefStore)
+	storageSvc := service.NewStorageService(store.NewStorageMaintenance(db, cfg.DBPath))
 	chatSvc := service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithAssistants(assistantStore).
 		WithSearch(searchEngines, searchStore).
+		WithPreferences(prefSvc).
 		WithMCP(mcpStore, mcpRuntime)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
@@ -82,6 +84,7 @@ func main() {
 		PluginService:       pluginSvc,
 		ChatService:         chatSvc,
 		PreferenceService:   prefSvc,
+		StorageService:      storageSvc,
 	})
 
 	srv := &http.Server{

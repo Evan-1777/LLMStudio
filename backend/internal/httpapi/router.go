@@ -23,6 +23,7 @@ type RouterDeps struct {
 	PluginService       *service.PluginService
 	ChatService         *service.ChatService
 	PreferenceService   *service.PreferenceService
+	StorageService      *service.StorageService
 }
 
 // NewRouter constructs the root HTTP handler with CORS, authentication, API routes, and optional static assets.
@@ -86,6 +87,11 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("GET /api/v1/settings", prefHandler.Get)
 		mux.HandleFunc("PATCH /api/v1/settings", prefHandler.Patch)
 		mux.HandleFunc("POST /api/v1/settings/import", prefHandler.ImportOnce)
+	}
+	if deps.StorageService != nil {
+		sh := NewStorageHandler(deps.StorageService)
+		mux.HandleFunc("GET /api/v1/storage", sh.Get)
+		mux.HandleFunc("POST /api/v1/storage/compact", sh.Compact)
 	}
 	if deps.ChatService != nil {
 		chatHandler := NewChatHandler(deps.ChatService)

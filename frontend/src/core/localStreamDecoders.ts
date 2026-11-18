@@ -173,6 +173,9 @@ async function decodeOpenAICompletions(
         prompt_tokens?: number;
         completion_tokens?: number;
         total_tokens?: number;
+        // DeepSeek-compatible endpoints report cache hits and misses at the top level.
+        prompt_cache_hit_tokens?: number;
+        prompt_cache_miss_tokens?: number;
         prompt_tokens_details?: {
           cached_tokens?: number;
           cache_write_tokens?: number;
@@ -200,7 +203,15 @@ async function decodeOpenAICompletions(
     }
 
     if (chunk.usage) {
-      const inputTokens = chunk.usage.prompt_tokens ?? 0;
+      const hitTokens = chunk.usage.prompt_cache_hit_tokens;
+      const missTokens = chunk.usage.prompt_cache_miss_tokens;
+      // A miss is an uncached prompt, never a cache write; hit plus miss only
+      // reconstructs the input total when the endpoint omits prompt_tokens.
+      const inputTokens =
+        chunk.usage.prompt_tokens ??
+        (hitTokens !== undefined && missTokens !== undefined
+          ? hitTokens + missTokens
+          : 0);
       const outputTokens = chunk.usage.completion_tokens ?? 0;
       const totalTokens =
         chunk.usage.total_tokens && chunk.usage.total_tokens > 0
@@ -209,7 +220,7 @@ async function decodeOpenAICompletions(
       const thinkingTokens =
         chunk.usage.completion_tokens_details?.reasoning_tokens ?? 0;
       const cacheReadInputTokens =
-        chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;
+        chunk.usage.prompt_tokens_details?.cached_tokens ?? hitTokens ?? 0;
       const cacheCreationInputTokens =
         (chunk.usage.prompt_tokens_details?.cache_write_tokens ?? 0) > 0
           ? (chunk.usage.prompt_tokens_details?.cache_write_tokens ?? 0)
@@ -780,6 +791,31 @@ async function decodeAnthropicMessages(
   const blockOrder: number[] = [];
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0, totalTokens: 0 };
   let hasUsage = false;
+  let rawInputTokens = 0;
+
+  // Anthropic reports uncached input separately from the cached portions, and
+  // later frames may omit fields the first frame carried.
+  const mergeUsage = (frame: {
+    input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+    output_tokens?: number;
+  }) => {
+    if (frame.input_tokens !== undefined) rawInputTokens = frame.input_tokens;
+    if (frame.cache_creation_input_tokens !== undefined) {
+      usage.cacheCreationInputTokens = frame.cache_creation_input_tokens;
+    }
+    if (frame.cache_read_input_tokens !== undefined) {
+      usage.cacheReadInputTokens = frame.cache_read_input_tokens;
+    }
+    usage.inputTokens =
+      rawInputTokens +
+      (usage.cacheCreationInputTokens ?? 0) +
+      (usage.cacheReadInputTokens ?? 0);
+    if (frame.output_tokens !== undefined) {
+      usage.outputTokens = frame.output_tokens;
+    }
+  };
   let stopReason = '';
   let hasToolCall = false;
   let emittedEnd = false;
@@ -907,13 +943,7 @@ async function decodeAnthropicMessages(
       case 'message_start': {
         const u = ev.message?.usage;
         if (u) {
-          usage.inputTokens =
-            (u.input_tokens ?? 0) +
-            (u.cache_creation_input_tokens ?? 0) +
-            (u.cache_read_input_tokens ?? 0);
-          usage.cacheCreationInputTokens = u.cache_creation_input_tokens ?? 0;
-          usage.cacheReadInputTokens = u.cache_read_input_tokens ?? 0;
-          usage.outputTokens = u.output_tokens ?? 0;
+          mergeUsage(u);
           hasUsage = true;
         }
         break;
@@ -1034,22 +1064,7 @@ async function decodeAnthropicMessages(
           stopReason = mapAnthropicStopReason(ev.delta.stop_reason);
         }
         if (ev.usage) {
-          if (
-            (ev.usage.input_tokens ?? 0) > 0 ||
-            (ev.usage.cache_creation_input_tokens ?? 0) > 0 ||
-            (ev.usage.cache_read_input_tokens ?? 0) > 0
-          ) {
-            usage.inputTokens =
-              (ev.usage.input_tokens ?? 0) +
-              (ev.usage.cache_creation_input_tokens ?? 0) +
-              (ev.usage.cache_read_input_tokens ?? 0);
-            usage.cacheCreationInputTokens =
-              ev.usage.cache_creation_input_tokens ?? 0;
-            usage.cacheReadInputTokens = ev.usage.cache_read_input_tokens ?? 0;
-          }
-          if (ev.usage.output_tokens !== undefined) {
-            usage.outputTokens = ev.usage.output_tokens;
-          }
+          mergeUsage(ev.usage);
           hasUsage = true;
         }
         break;

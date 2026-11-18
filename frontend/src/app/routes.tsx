@@ -8,6 +8,7 @@ export const SETTINGS_SECTIONS = [
   'connection',
   'appearance',
   'mcp',
+  'storage',
   'about',
 ] as const;
 

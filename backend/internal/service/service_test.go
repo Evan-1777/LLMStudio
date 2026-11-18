@@ -53,14 +53,32 @@ func setupServiceTestEnv(t *testing.T) (
 	searchReg.MustRegister(search.NewTavilyEngine(nil))
 	searchReg.MustRegister(search.NewSearXNGEngine(nil))
 
+	prefStore := store.NewPreferenceStore(db)
+
 	return NewProviderService(provStore, formats, adapters),
 		NewAssistantService(assistStore),
 		NewConversationService(convStore, msgStore).WithAssistants(assistStore),
 		NewPluginService(searchReg, searchStore, mcpStore),
 		NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
 			WithAssistants(assistStore).
-			WithSearch(searchReg, searchStore),
+			WithSearch(searchReg, searchStore).
+			WithPreferences(NewPreferenceService(prefStore)),
 		msgStore
+}
+
+// setAutoCache flips the gateway-managed automatic caching preference for tests.
+func setAutoCache(t *testing.T, chatSvc *ChatService, enabled bool) {
+	t.Helper()
+	if chatSvc.preferences == nil {
+		t.Fatal("chat service has no preference store")
+	}
+	if _, _, err := chatSvc.preferences.store.Update(
+		context.Background(),
+		domain.PreferencesPatch{AutoCreateCache: domain.BoolPtr(enabled)},
+		false,
+	); err != nil {
+		t.Fatalf("set auto cache preference: %v", err)
+	}
 }
 
 func TestProviderProbeAndModelDiscoveryThreeFormats(t *testing.T) {

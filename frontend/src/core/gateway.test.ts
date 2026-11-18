@@ -314,20 +314,17 @@ describe('GatewayClient', () => {
       providerId: 'p1',
       modelId: 'm-explicit',
       text: 'hi',
-      autoCreateCache: true,
     });
     expect(calls[5].body).toMatchObject({
       providerId: 'p1',
       modelId: 'm-explicit',
       text: 'hi',
-      autoCreateCache: true,
     });
 
     await client.prepareLocalChat('c1', {
       providerId: 'p1',
       modelId: 'm-explicit',
       text: 'hi',
-      autoCreateCache: true,
       preparedSearch: { block: null },
       cacheState: { resourceName: 'cachedContents/1', prefixCount: 0 },
       cacheResolution: {
@@ -337,7 +334,6 @@ describe('GatewayClient', () => {
       },
     });
     expect(calls[6].body).toMatchObject({
-      autoCreateCache: true,
       preparedSearch: { block: null },
       cacheState: { resourceName: 'cachedContents/1', prefixCount: 0 },
       cacheResolution: {

@@ -59,6 +59,8 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 	msgStore := store.NewMessageStore(db)
 	searchStore := store.NewSearchConfigStore(db)
 	mcpStore := store.NewMCPServerStore(db)
+	prefStore := store.NewPreferenceStore(db)
+	prefSvc := service.NewPreferenceService(prefStore)
 
 	if _, err := searchStore.Upsert(ctx, domain.SearchEngineConfig{
 		EngineID:   "tavily",
@@ -100,9 +102,11 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 			AssistantService:    service.NewAssistantService(assistStore),
 			ConversationService: service.NewConversationService(convStore, msgStore).WithAssistants(assistStore),
 			PluginService:       service.NewPluginService(searchReg, searchStore, mcpStore).WithMCPClient(rt),
+			PreferenceService:   prefSvc,
 			ChatService: service.NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
 				WithAssistants(assistStore).
 				WithSearch(searchReg, searchStore).
+				WithPreferences(prefSvc).
 				WithMCP(mcpStore, rt),
 		})
 	}
@@ -226,15 +230,15 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 
 	// Mock multi-format upstream server tracking bodies and cache creations.
 	var (
-		upMu           sync.Mutex
-		gemCreates     int
-		gemGenerates   int
-		gemMode        string // "normal", "small", "unsupported", "auth", "ratelimit", "expire_once"
-		gemStore       = make(map[string]map[string]any)
-		oaiChatBodies  []map[string]any
-		oaiRespBodies  []map[string]any
-		antBodies      []map[string]any
-		gemBodies      []map[string]any
+		upMu          sync.Mutex
+		gemCreates    int
+		gemGenerates  int
+		gemMode       string // "normal", "small", "unsupported", "auth", "ratelimit", "expire_once"
+		gemStore      = make(map[string]map[string]any)
+		oaiChatBodies []map[string]any
+		oaiRespBodies []map[string]any
+		antBodies     []map[string]any
+		gemBodies     []map[string]any
 	)
 	gemMode = "normal"
 
@@ -476,14 +480,23 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 		t.Fatalf("create local gem provider=%d", code)
 	}
 
+	// setAutoCache toggles the gateway-managed automatic caching preference that
+	// every generation reads; the browser no longer sends a per-request flag.
+	setAutoCache := func(enabled bool) {
+		t.Helper()
+		if code := callGW(gwA.URL, http.MethodPatch, "/api/v1/settings", map[string]any{"autoCreateCache": enabled}, nil); code != http.StatusOK {
+			t.Fatalf("set autoCreateCache=%v: status %d", enabled, code)
+		}
+	}
+
 	// Helper to stream server-forward chat and collect message_end event.
 	streamForward := func(convID, provID, modelID, text string, autoCache bool) (int, domain.Message) {
 		t.Helper()
+		setAutoCache(autoCache)
 		payload, _ := json.Marshal(map[string]any{
-			"providerId":      provID,
-			"modelId":         modelID,
-			"text":            text,
-			"autoCreateCache": autoCache,
+			"providerId": provID,
+			"modelId":    modelID,
+			"text":       text,
 		})
 		req, _ := http.NewRequest(http.MethodPost, gwA.URL+"/api/v1/conversations/"+convID+"/messages/stream", bytes.NewReader(payload))
 		req.Header.Set("Authorization", "Bearer "+gwToken)
@@ -527,10 +540,10 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 	}
 	upMu.Lock()
 	if antBodies[0]["system"].(string) != "AntSys" {
-		t.Fatalf("expected plain string system when autoCreateCache=false")
+		t.Fatalf("expected plain string system when the cache preference is off")
 	}
 	if _, isArr := antBodies[1]["system"].([]any); !isArr {
-		t.Fatalf("expected array cache_control system when autoCreateCache=true")
+		t.Fatalf("expected array cache_control system when the cache preference is on")
 	}
 	upMu.Unlock()
 
@@ -560,7 +573,7 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 	_, _ = streamForward(cGem, pGemResp.Provider.ID, "gemini-2.5-pro", "t1", false) // off
 	upMu.Lock()
 	if gemCreates != 0 {
-		t.Fatalf("autoCreateCache=false must not create cache")
+		t.Fatalf("cache preference off must not create cache")
 	}
 	upMu.Unlock()
 	_, _ = streamForward(cGem, pGemResp.Provider.ID, "gemini-2.5-pro", "t2", true)
@@ -662,6 +675,7 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 	// 5. Stateless localRequest Gemini + webSearch across two independent gateways (gwA -> gwB):
 	//    search hits once, cache creates once, user persists once.
 	cLocal := newConv(pGemLocalResp.Provider.ID, "gemini-2.5-pro", "LocalSys")
+	setAutoCache(true)
 	searchHits.Store(0)
 	upMu.Lock()
 	createsBeforeLocal := gemCreates
@@ -669,9 +683,8 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 
 	var prep1 service.PreparedLocalRequest
 	if c := callGW(gwA.URL, http.MethodPost, "/api/v1/conversations/"+cLocal+"/messages/prepare-local", map[string]any{
-		"text":            "local cached search",
-		"webSearch":       true,
-		"autoCreateCache": true,
+		"text":      "local cached search",
+		"webSearch": true,
 	}, &prep1); c != http.StatusOK || prep1.CacheStep == nil || prep1.WebSearchBlock == nil {
 		t.Fatalf("gwA prepare-local 1 unexpected: status=%d prep=%+v", c, prep1)
 	}
@@ -692,10 +705,9 @@ func TestCachingFourFormatsTwoPathsAndMCPCoexistenceMatrix(t *testing.T) {
 	// Call gwB (completely separate ChatService instance!) with preparedSearch + cacheResolution.
 	var prep2 service.PreparedLocalRequest
 	if c := callGW(gwB.URL, http.MethodPost, "/api/v1/conversations/"+cLocal+"/messages/prepare-local", map[string]any{
-		"text":            "local cached search",
-		"webSearch":       true,
-		"autoCreateCache": true,
-		"preparedSearch":  map[string]any{"block": prep1.WebSearchBlock},
+		"text":           "local cached search",
+		"webSearch":      true,
+		"preparedSearch": map[string]any{"block": prep1.WebSearchBlock},
 		"cacheResolution": map[string]any{
 			"planKey": prep1.CacheStep.PlanKey,
 			"status":  cResp.StatusCode,

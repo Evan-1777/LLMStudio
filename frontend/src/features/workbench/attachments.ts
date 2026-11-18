@@ -65,6 +65,59 @@ function getExtension(filename: string): string {
   return idx >= 0 ? filename.slice(idx + 1).toLowerCase() : '';
 }
 
+const IMAGE_MIME_EXTENSIONS: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/webp': 'webp',
+  'image/gif': 'gif',
+};
+
+// defaultAttachmentName gives clipboard images without a filename a stable name.
+export function defaultAttachmentName(file: Pick<File, 'name' | 'type'>): string {
+  const name = file.name?.trim();
+  if (name) return name;
+  const ext = IMAGE_MIME_EXTENSIONS[file.type];
+  return ext ? `pasted-image.${ext}` : 'pasted-file';
+}
+
+function clipboardFileKey(file: File): string {
+  return `${file.name}\u0000${file.size}\u0000${file.lastModified}\u0000${file.type}`;
+}
+
+// collectClipboardImageFiles reads image files from one paste event, preferring
+// clipboardData.items and falling back to clipboardData.files without appending
+// the same file twice.
+export function collectClipboardImageFiles(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  const images: File[] = [];
+  const seen = new Set<string>();
+  const push = (file: File | null | undefined) => {
+    if (!file || !file.type.startsWith('image/')) return;
+    const key = clipboardFileKey(file);
+    if (seen.has(key)) return;
+    seen.add(key);
+    images.push(file);
+  };
+  for (const item of Array.from(data.items ?? [])) {
+    if (item.kind !== 'file') continue;
+    push(item.getAsFile());
+  }
+  for (const file of Array.from(data.files ?? [])) {
+    push(file);
+  }
+  return images;
+}
+
+// clipboardHasPlainText reports whether the clipboard also carries plain text,
+// in which case the browser's native insertion, caret and undo stay untouched.
+export function clipboardHasPlainText(data: DataTransfer | null): boolean {
+  if (!data) return false;
+  return (
+    Array.from(data.types ?? []).includes('text/plain') &&
+    data.getData('text/plain').length > 0
+  );
+}
+
 export function classifyFile(
   file: Pick<File, 'name' | 'type'>,
 ): 'image' | 'text' | 'unsupported' {
@@ -108,12 +161,13 @@ export function readAttachmentFile(
   },
 ): PendingAttachment {
   const id = `att-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const name = defaultAttachmentName(file);
   const classified = classifyFile(file);
 
   if (classified === 'unsupported') {
     return {
       id,
-      name: file.name,
+      name,
       mimeType: file.type || 'application/octet-stream',
       size: file.size,
       kind: 'text',
@@ -125,7 +179,7 @@ export function readAttachmentFile(
   if (classified === 'image' && !opts.supportsImageInput) {
     return {
       id,
-      name: file.name,
+      name,
       mimeType: file.type || 'image/png',
       size: file.size,
       kind: 'image',
@@ -137,7 +191,7 @@ export function readAttachmentFile(
   if (file.size > MAX_ATTACHMENT_BYTES) {
     return {
       id,
-      name: file.name,
+      name,
       mimeType: file.type || 'application/octet-stream',
       size: file.size,
       kind: classified,
@@ -155,7 +209,7 @@ export function readAttachmentFile(
 
   const initial: PendingAttachment = {
     id,
-    name: file.name,
+    name,
     mimeType:
       file.type || (classified === 'image' ? 'image/png' : 'text/plain'),
     size: file.size,

@@ -18,17 +18,40 @@ import (
 	"llmstudio/backend/internal/plugin"
 )
 
-const defaultPromptCacheMaxEntries = 64
+const (
+	defaultPromptCacheMaxEntries = 64
+	// promptCacheUnsupportedTTL bounds how long a declined capability is remembered.
+	promptCacheUnsupportedTTL = 5 * time.Minute
+	// promptCacheSmallPrefixTTL bounds the per-candidate too-short suppression.
+	promptCacheSmallPrefixTTL = 2 * time.Minute
+	// promptCachePendingTTL bounds a browser-executed create that never reports back.
+	promptCachePendingTTL = 2 * time.Minute
+)
 
-type cacheStoreEntry struct {
-	state    plugin.PromptCacheState
-	lastUsed time.Time
+// cacheCreateFlight tracks one in-flight cache creation per scope so concurrent
+// requests for the same candidate execute it once and share the result.
+type cacheCreateFlight struct {
+	planKey   string
+	done      chan struct{}
+	state     *plugin.PromptCacheState
+	expiresAt time.Time
+}
+
+// cacheScopeEntry keeps at most one valid resource per scope plus time-bounded
+// negative markers. A negative marker never replaces a valid resource.
+type cacheScopeEntry struct {
+	resource         plugin.PromptCacheState
+	unsupportedUntil time.Time
+	failedPlanKey    string
+	failedUntil      time.Time
+	flight           *cacheCreateFlight
+	lastUsed         time.Time
 }
 
 type promptCacheStore struct {
 	mu         sync.Mutex
 	maxEntries int
-	entries    map[plugin.PromptCacheScope]cacheStoreEntry
+	entries    map[plugin.PromptCacheScope]cacheScopeEntry
 }
 
 func newPromptCacheStore(maxEntries int) *promptCacheStore {
@@ -37,10 +60,12 @@ func newPromptCacheStore(maxEntries int) *promptCacheStore {
 	}
 	return &promptCacheStore{
 		maxEntries: maxEntries,
-		entries:    make(map[plugin.PromptCacheScope]cacheStoreEntry),
+		entries:    make(map[plugin.PromptCacheScope]cacheScopeEntry),
 	}
 }
 
+// Get returns the valid resource for a scope, or the active negative marker when
+// no reusable resource exists.
 func (s *promptCacheStore) Get(scope plugin.PromptCacheScope) *plugin.PromptCacheState {
 	if s == nil {
 		return nil
@@ -53,16 +78,26 @@ func (s *promptCacheStore) Get(scope plugin.PromptCacheScope) *plugin.PromptCach
 	if !ok {
 		return nil
 	}
-	if !entry.state.ExpireTime.IsZero() && !now.Before(entry.state.ExpireTime) {
-		delete(s.entries, scope)
+	if entry.resource.ResourceName != "" && (entry.resource.ExpireTime.IsZero() || now.Before(entry.resource.ExpireTime)) {
+		entry.lastUsed = now
+		s.entries[scope] = entry
+		cp := entry.resource
+		return &cp
+	}
+	res := plugin.PromptCacheState{}
+	if !entry.unsupportedUntil.IsZero() && now.Before(entry.unsupportedUntil) {
+		res.Unsupported = true
+	}
+	if entry.failedPlanKey != "" && now.Before(entry.failedUntil) {
+		res.FailedPrefixHash = entry.failedPlanKey
+	}
+	if res.ResourceName == "" && !res.Unsupported && res.FailedPrefixHash == "" {
 		return nil
 	}
-	entry.lastUsed = now
-	s.entries[scope] = entry
-	cp := entry.state
-	return &cp
+	return &res
 }
 
+// Set records a resource or a time-bounded negative marker for a scope.
 func (s *promptCacheStore) Set(scope plugin.PromptCacheScope, state plugin.PromptCacheState) {
 	if s == nil {
 		return
@@ -71,46 +106,145 @@ func (s *promptCacheStore) Set(scope plugin.PromptCacheScope, state plugin.Promp
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if !state.ExpireTime.IsZero() && !now.Before(state.ExpireTime) {
-		delete(s.entries, scope)
+	entry := s.entries[scope]
+	switch {
+	case strings.TrimSpace(state.ResourceName) != "":
+		entry.resource = state
+		entry.unsupportedUntil = time.Time{}
+		entry.failedPlanKey = ""
+		entry.failedUntil = time.Time{}
+	case state.Unsupported:
+		entry.unsupportedUntil = now.Add(promptCacheUnsupportedTTL)
+	case state.FailedPrefixHash != "":
+		entry.failedPlanKey = state.FailedPrefixHash
+		entry.failedUntil = now.Add(promptCacheSmallPrefixTTL)
+	default:
 		return
 	}
-	if _, exists := s.entries[scope]; !exists && len(s.entries) >= s.maxEntries {
-		// Lazy eviction of expired entries before evicting least-recently-used.
-		for k, v := range s.entries {
-			if !v.state.ExpireTime.IsZero() && !now.Before(v.state.ExpireTime) {
-				delete(s.entries, k)
-			}
-		}
-		if len(s.entries) >= s.maxEntries {
-			var oldestKey plugin.PromptCacheScope
-			var oldestTime time.Time
-			first := true
-			for k, v := range s.entries {
-				if first || v.lastUsed.Before(oldestTime) {
-					oldestKey = k
-					oldestTime = v.lastUsed
-					first = false
-				}
-			}
-			if !first {
-				delete(s.entries, oldestKey)
-			}
-		}
-	}
-	s.entries[scope] = cacheStoreEntry{
-		state:    state,
-		lastUsed: now,
-	}
+	entry.lastUsed = now
+	s.putLocked(scope, entry)
 }
 
+// Delete drops a scope, releasing any waiter with an unknown result.
 func (s *promptCacheStore) Delete(scope plugin.PromptCacheScope) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	entry, ok := s.entries[scope]
+	if !ok {
+		return
+	}
+	if flight := entry.flight; flight != nil {
+		flight.state = nil
+		close(flight.done)
+	}
 	delete(s.entries, scope)
+}
+
+// cacheCreateClaim tells a caller how to participate in a candidate's creation.
+type cacheCreateClaim struct {
+	leader  bool
+	blocked bool
+	wait    func(context.Context) (*plugin.PromptCacheState, bool)
+}
+
+// ClaimCreate registers an in-flight creation for a scope and candidate. The
+// leader executes the create; a concurrent caller for the same candidate waits
+// for the shared result, while a different candidate is turned away uncached.
+// A positive ttl bounds a create that another party (the browser) executes.
+func (s *promptCacheStore) ClaimCreate(scope plugin.PromptCacheScope, planKey string, ttl time.Duration) cacheCreateClaim {
+	if s == nil {
+		return cacheCreateClaim{leader: true}
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry := s.entries[scope]
+	if flight := entry.flight; flight != nil {
+		if !flight.expiresAt.IsZero() && !now.Before(flight.expiresAt) {
+			entry.flight = nil
+			close(flight.done)
+		} else if flight.planKey == planKey {
+			return cacheCreateClaim{wait: func(ctx context.Context) (*plugin.PromptCacheState, bool) {
+				select {
+				case <-flight.done:
+					return flight.state, true
+				case <-ctx.Done():
+					return nil, false
+				}
+			}}
+		} else {
+			return cacheCreateClaim{blocked: true}
+		}
+	}
+
+	flight := &cacheCreateFlight{planKey: planKey, done: make(chan struct{})}
+	if ttl > 0 {
+		flight.expiresAt = now.Add(ttl)
+	}
+	entry.flight = flight
+	entry.lastUsed = now
+	if !s.putLocked(scope, entry) {
+		// Capacity is exhausted; skip the creation rather than evicting live state.
+		entry.flight = nil
+		close(flight.done)
+		return cacheCreateClaim{blocked: true}
+	}
+	return cacheCreateClaim{leader: true}
+}
+
+// FinishCreate releases the in-flight marker and publishes the shared result.
+func (s *promptCacheStore) FinishCreate(scope plugin.PromptCacheScope, planKey string, state *plugin.PromptCacheState) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entry, ok := s.entries[scope]
+	if !ok || entry.flight == nil || entry.flight.planKey != planKey {
+		return
+	}
+	entry.flight.state = state
+	close(entry.flight.done)
+	entry.flight = nil
+	entry.lastUsed = time.Now().UTC()
+	s.entries[scope] = entry
+}
+
+// putLocked stores an entry, evicting expired then least-recently-used state.
+// It reports false when no room can be made.
+func (s *promptCacheStore) putLocked(scope plugin.PromptCacheScope, entry cacheScopeEntry) bool {
+	if _, exists := s.entries[scope]; !exists && len(s.entries) >= s.maxEntries {
+		now := time.Now().UTC()
+		for key, candidate := range s.entries {
+			expired := candidate.resource.ResourceName == "" ||
+				(!candidate.resource.ExpireTime.IsZero() && !now.Before(candidate.resource.ExpireTime))
+			if expired && candidate.flight == nil {
+				delete(s.entries, key)
+			}
+		}
+		for len(s.entries) >= s.maxEntries {
+			oldestKey, oldest := plugin.PromptCacheScope{}, time.Time{}
+			found := false
+			for key, candidate := range s.entries {
+				if candidate.flight != nil {
+					continue
+				}
+				if !found || candidate.lastUsed.Before(oldest) {
+					oldestKey, oldest, found = key, candidate.lastUsed, true
+				}
+			}
+			if !found {
+				return false
+			}
+			delete(s.entries, oldestKey)
+		}
+	}
+	s.entries[scope] = entry
+	return true
 }
 
 func buildPromptCacheScope(
@@ -118,6 +252,7 @@ func buildPromptCacheScope(
 	model domain.ModelConfig,
 	formatID string,
 	compat domain.CompatConfig,
+	topicID string,
 ) plugin.PromptCacheScope {
 	endpoint := strings.TrimRight(strings.TrimSpace(prov.BaseURL), "/") + "|" + strings.TrimSpace(compat.PathOverride)
 
@@ -132,6 +267,7 @@ func buildPromptCacheScope(
 
 	return plugin.PromptCacheScope{
 		ProviderID: prov.ID,
+		TopicID:    topicID,
 		Endpoint:   endpoint,
 		AuthHash:   hex.EncodeToString(h.Sum(nil)),
 		FormatID:   formatID,
@@ -178,7 +314,6 @@ func buildLocalPlanKey(
 	_, _ = io.WriteString(h, scope.Endpoint)
 	_, _ = h.Write([]byte{0})
 	_, _ = io.WriteString(h, scope.FormatID)
-	_, _ = h.Write([]byte{0})
 	_, _ = io.WriteString(h, scope.ModelID)
 	_, _ = h.Write([]byte{0})
 	_, _ = io.WriteString(h, systemPrompt)
@@ -245,7 +380,7 @@ func (s *ChatService) executeCachePlan(
 	current *plugin.PromptCacheState,
 ) (*plugin.PromptCacheState, plugin.CachePlan, error) {
 	planner, ok := apiFormat.(plugin.PromptCachePlanner)
-	if !ok || !chatInput.AutoCreateCache {
+	if !ok {
 		return nil, plugin.CachePlan{}, nil
 	}
 
@@ -257,6 +392,34 @@ func (s *ChatService) executeCachePlan(
 		return plan.ReuseState, plan, nil
 	}
 
+	claim := s.cacheStore.ClaimCreate(scope, plan.PlanKey, 0)
+	if claim.blocked {
+		// Another candidate for this topic is being created; send uncached once.
+		return plan.ReuseState, plugin.CachePlan{ReuseState: plan.ReuseState, InlineCache: plan.InlineCache}, nil
+	}
+	if !claim.leader {
+		// A concurrent request already creates this candidate; reuse its result.
+		shared, ok := claim.wait(ctx)
+		if !ok {
+			return nil, plan, domain.NewError(domain.ErrCodeUpstreamError, "waiting for cache creation canceled", ctx.Err())
+		}
+		return shared, plugin.CachePlan{ReuseState: shared, InlineCache: plan.InlineCache}, nil
+	}
+
+	state, createErr := s.runCacheCreate(ctx, chatInput, planner, adapter, scope, plan)
+	s.cacheStore.FinishCreate(scope, plan.PlanKey, state)
+	return state, plan, createErr
+}
+
+// runCacheCreate executes one planned cache creation request and records its result.
+func (s *ChatService) runCacheCreate(
+	ctx context.Context,
+	chatInput plugin.ChatInput,
+	planner plugin.PromptCachePlanner,
+	adapter plugin.ProviderAdapter,
+	scope plugin.PromptCacheScope,
+	plan plugin.CachePlan,
+) (*plugin.PromptCacheState, error) {
 	endpoint, err := resolveEndpointForCacheCreate(
 		adapter,
 		chatInput.Provider,
@@ -265,7 +428,7 @@ func (s *ChatService) executeCachePlan(
 		chatInput.Compat,
 	)
 	if err != nil {
-		return nil, plan, err
+		return nil, err
 	}
 
 	req, err := http.NewRequestWithContext(
@@ -275,21 +438,21 @@ func (s *ChatService) executeCachePlan(
 		bytes.NewReader(plan.CreateRequest.Body),
 	)
 	if err != nil {
-		return nil, plan, domain.NewError(domain.ErrCodeInternalError, "construct cache create request failed", err)
+		return nil, domain.NewError(domain.ErrCodeInternalError, "construct cache create request failed", err)
 	}
 	req.Header = mergeRequestHeaders(plan.CreateRequest.Headers, endpoint.Headers)
 
 	resp, doErr := s.httpClient.Do(req)
 	if doErr != nil {
 		if ctx.Err() != nil {
-			return nil, plan, domain.NewError(domain.ErrCodeUpstreamError, "request canceled", ctx.Err())
+			return nil, domain.NewError(domain.ErrCodeUpstreamError, "request canceled", ctx.Err())
 		}
-		return nil, plan, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("cache create request failed: %v", doErr), doErr)
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("cache create request failed: %v", doErr), doErr)
 	}
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	_ = resp.Body.Close()
 	if readErr != nil {
-		return nil, plan, domain.NewError(domain.ErrCodeUpstreamError, "failed to read cache create response", readErr)
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, "failed to read cache create response", readErr)
 	}
 
 	res, resErr := planner.ResolveCache(ctx, chatInput, plan, plugin.CacheResolutionInput{
@@ -298,18 +461,15 @@ func (s *ChatService) executeCachePlan(
 		PlanKey:    plan.PlanKey,
 	})
 	if resErr != nil {
-		return nil, plan, resErr
+		return nil, resErr
 	}
 	if res.State != nil {
 		s.cacheStore.Set(scope, *res.State)
 	}
 	if res.HardError != nil {
-		return nil, plan, res.HardError
+		return nil, res.HardError
 	}
-	if res.Degrade {
-		return res.State, plan, nil
-	}
-	return res.State, plan, nil
+	return res.State, nil
 }
 
 func (s *ChatService) encodeAndOpenMainRequest(
@@ -324,6 +484,9 @@ func (s *ChatService) encodeAndOpenMainRequest(
 	sendOnce := func(in plugin.ChatInput) (*http.Response, int, []byte, error) {
 		encoded, err := apiFormat.EncodeRequest(ctx, in)
 		if err != nil {
+			if appErr, ok := domain.AsAppError(err); ok {
+				return nil, 0, nil, appErr
+			}
 			return nil, 0, nil, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", err)
 		}
 		endpoint, err := adapter.ResolveEndpoint(in.Provider, in.Model, encoded.DefaultPath, encoded.Query, in.Compat)

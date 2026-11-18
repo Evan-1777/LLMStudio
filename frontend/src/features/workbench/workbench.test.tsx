@@ -7,6 +7,9 @@ import { MAX_ATTACHMENT_BYTES, MAX_GATEWAY_BODY_BYTES } from '../../core/types';
 import {
   attachmentToContentBlock,
   classifyFile,
+  clipboardHasPlainText,
+  collectClipboardImageFiles,
+  defaultAttachmentName,
   isWithinRequestLimit,
   readAttachmentFile,
 } from './attachments';
@@ -340,6 +343,106 @@ describe('Workbench flows and attachments', () => {
         blocks: [{ type: 'text', text: 'a'.repeat(MAX_GATEWAY_BODY_BYTES) }],
       }),
     ).toBe(false);
+
+    // Clipboard collection prefers items, falls back to files, and never stacks
+    // the same file twice within one paste.
+    const itemImage = new File(['a'], '', { type: 'image/png' });
+    const fileImage = new File(['b'], 'second.webp', { type: 'image/webp' });
+    const clipboard = {
+      items: [
+        { kind: 'file', type: 'image/png', getAsFile: () => itemImage },
+        { kind: 'string', type: 'text/plain', getAsFile: () => null },
+        new File(['t'], 'notes.txt', { type: 'text/plain' }),
+      ],
+      files: [itemImage, fileImage],
+      types: ['Files'],
+      getData: () => '',
+    } as unknown as DataTransfer;
+    expect(collectClipboardImageFiles(clipboard)).toEqual([itemImage, fileImage]);
+    expect(
+      collectClipboardImageFiles({ ...clipboard, items: [] } as unknown as DataTransfer),
+    ).toEqual([itemImage, fileImage]);
+    expect(collectClipboardImageFiles(null)).toEqual([]);
+    expect(clipboardHasPlainText(clipboard)).toBe(false);
+    expect(
+      clipboardHasPlainText({
+        ...clipboard,
+        types: ['Files', 'text/plain'],
+        getData: (type: string) => (type === 'text/plain' ? 'hello' : ''),
+      } as unknown as DataTransfer),
+    ).toBe(true);
+
+    // Clipboard images without a filename get a stable generic name; a file at
+    // the exact 8 MiB boundary is still accepted.
+    expect(defaultAttachmentName({ name: '', type: 'image/png' })).toBe('pasted-image.png');
+    expect(defaultAttachmentName({ name: '  ', type: 'image/webp' })).toBe('pasted-image.webp');
+    expect(defaultAttachmentName({ name: 'keep.png', type: 'image/png' })).toBe('keep.png');
+    const boundaryFile = new File(['x'], 'limit.png', { type: 'image/png' });
+    Object.defineProperty(boundaryFile, 'size', { value: MAX_ATTACHMENT_BYTES });
+    expect(
+      readAttachmentFile(boundaryFile, { supportsImageInput: true, onUpdate: () => {} }).status,
+    ).toBe('reading');
+  });
+
+  it('adds pasted clipboard images to the attachment pipeline without disturbing the draft', async () => {
+    const { fetchMock } = makeWorkbenchFetch();
+    const user = userEvent.setup();
+
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter initialEntries={['/chat']}>
+          <Routes>
+            <Route path="/chat" element={<WorkbenchPage />} />
+            <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-4.1');
+    });
+    const box = screen.getByLabelText('消息输入框');
+
+    const fakeClipboard = (files: File[], text = ''): DataTransfer =>
+      ({
+        items: files.map((file) => ({
+          kind: 'file',
+          type: file.type,
+          getAsFile: () => file,
+        })),
+        files,
+        types: [...(text ? ['text/plain'] : []), ...(files.length ? ['Files'] : [])],
+        getData: (type: string) => (type === 'text/plain' ? text : ''),
+      }) as unknown as DataTransfer;
+
+    // 1. No image: the native paste path stays untouched and nothing is attached.
+    expect(fireEvent.paste(box, { clipboardData: fakeClipboard([], 'plain') })).toBe(true);
+    expect(screen.queryByRole('button', { name: /^移除 / })).not.toBeInTheDocument();
+
+    // 2. One image without a filename: default is consumed, a stable chip appears.
+    const pasted = new File(['abc'], '', { type: 'image/png' });
+    expect(fireEvent.paste(box, { clipboardData: fakeClipboard([pasted]) })).toBe(false);
+    await waitFor(() => expect(screen.getByText('pasted-image.png')).toBeInTheDocument());
+    expect(box).toHaveValue('');
+
+    // 3. Multiple images append in order.
+    const second = new File(['def'], 'second.gif', { type: 'image/gif' });
+    fireEvent.paste(box, { clipboardData: fakeClipboard([second]) });
+    await waitFor(() => expect(screen.getByText('second.gif')).toBeInTheDocument());
+
+    // 4. Mixed image and text is not consumed, so the browser still inserts text.
+    const mixedImage = new File(['ghi'], 'mixed.png', { type: 'image/png' });
+    expect(
+      fireEvent.paste(box, { clipboardData: fakeClipboard([mixedImage], 'typed') }),
+    ).toBe(true);
+    await waitFor(() => expect(screen.getByText('mixed.png')).toBeInTheDocument());
+
+    // 5. Removing a chip drops it from the composer.
+    await user.click(screen.getByRole('button', { name: '移除 second.gif' }));
+    expect(screen.queryByText('second.gif')).not.toBeInTheDocument();
+    expect(screen.getByText('pasted-image.png')).toBeInTheDocument();
+    expect(screen.getByText('mixed.png')).toBeInTheDocument();
   });
 
   it('supports assistant CRUD, prevents deleting default assistant, and keeps topic items on failed rename/delete', async () => {

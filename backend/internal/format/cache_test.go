@@ -85,7 +85,8 @@ func TestAnthropicInlinePromptCaching(t *testing.T) {
 		}
 	}
 
-	// 4. AutoCreateCache=true + auto -> breakpoints on system, last tool, and stable prefix before last user turn (not on thinking or current turn).
+	// 4. Preference on + auto -> breakpoints on system, last tool, the previous
+	// turn tail (anchor) and the current turn tail (cache for the next round).
 	onReq, err := f.EncodeRequest(context.Background(), plugin.ChatInput{
 		Model:           domain.ModelConfig{ID: "claude-sonnet-4-5"},
 		SystemPrompt:    "System instructions",
@@ -112,12 +113,19 @@ func TestAnthropicInlinePromptCaching(t *testing.T) {
 	if assistantParts[0].(map[string]any)["cache_control"] != nil || assistantParts[0].(map[string]any)["signature"] != "sig_valid" {
 		t.Fatalf("thinking block must not receive cache_control or lose signature: %+v", assistantParts[0])
 	}
-	if assistantParts[1].(map[string]any)["cache_control"] == nil {
-		t.Fatalf("expected cache_control on stable assistant text prefix: %+v", assistantParts[1])
+	firstUserParts := encodedMsgs[0].(map[string]any)["content"].([]any)
+	if firstUserParts[0].(map[string]any)["cache_control"] == nil {
+		t.Fatalf("expected cache_control on the previous turn boundary anchor: %+v", firstUserParts[0])
 	}
 	lastUserParts := encodedMsgs[2].(map[string]any)["content"].([]any)
-	if lastUserParts[0].(map[string]any)["cache_control"] != nil {
-		t.Fatalf("current turn user input must not be marked with cache_control: %+v", lastUserParts[0])
+	if lastUserParts[0].(map[string]any)["cache_control"] == nil {
+		t.Fatalf("current turn tail must be marked so the next round can read it: %+v", lastUserParts[0])
+	}
+	if total := countAnthropicBreakpoints(onBody); total > 4 {
+		t.Fatalf("expected at most 4 cache breakpoints, got %d", total)
+	}
+	if total := countAnthropicBreakpoints(onBody); total != 4 {
+		t.Fatalf("expected system + tool + anchor + tail breakpoints, got %d", total)
 	}
 
 	// 5. No system prompt -> omits system, still adds valid tool + history breakpoints.
@@ -283,8 +291,8 @@ func TestGoogleGenAICachePlanningMutuallyExclusiveAndPrefix(t *testing.T) {
 	compat := domain.CompatConfig{
 		PathOverride: "/v1beta/models/{model}:customGenerate",
 		ExtraBody: map[string]any{
-			"toolConfig":      map[string]any{"functionCallingConfig": map[string]any{"mode": "AUTO"}},
-			"safetySettings":  []map[string]any{{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}},
+			"toolConfig":     map[string]any{"functionCallingConfig": map[string]any{"mode": "AUTO"}},
+			"safetySettings": []map[string]any{{"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}},
 		},
 	}
 

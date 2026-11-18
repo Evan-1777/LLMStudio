@@ -36,14 +36,22 @@ func (f *OpenAIResponsesFormat) DefaultCompat() domain.CompatConfig {
 
 func (f *OpenAIResponsesFormat) PlanCache(_ context.Context, input plugin.ChatInput, current *plugin.PromptCacheState) (plugin.CachePlan, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
-	inline := shouldApplyInlineCache(input, compat, false)
-	if current != nil && current.Unsupported {
-		inline = false
-	}
+	inline := f.appliesCacheFields(input, compat) && !cacheStateUnsupported(current)
 	return plugin.CachePlan{
 		ReuseState:  current,
 		InlineCache: inline,
 	}, nil
+}
+
+// appliesCacheFields reports whether this format adds its own cache fields for
+// the resolved generation target. Documented OpenAI endpoints follow the shared
+// preference; compatibility endpoints only honour an explicit model mode.
+func (f *OpenAIResponsesFormat) appliesCacheFields(input plugin.ChatInput, compat domain.CompatConfig) bool {
+	policy := resolveCachePolicy(input, compat)
+	if isOpenAIOfficialEndpoint(input.GenerationURL, f.DefaultPath()) {
+		return policy.autoManaged()
+	}
+	return policy.explicitOnly()
 }
 
 func (f *OpenAIResponsesFormat) ResolveCache(_ context.Context, _ plugin.ChatInput, _ plugin.CachePlan, _ plugin.CacheResolutionInput) (plugin.CacheResolutionResult, error) {
@@ -57,7 +65,10 @@ func (f *OpenAIResponsesFormat) ClassifyCacheError(statusCode int, body []byte, 
 func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.ChatInput) (plugin.EncodedRequest, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
 	params := resolveGenerationParams(input.Model, input.Params)
-	inlineExplicit := shouldApplyInlineCache(input, compat, false)
+	policy := resolveCachePolicy(input, compat)
+	officialEndpoint := isOpenAIOfficialEndpoint(input.GenerationURL, f.DefaultPath())
+	cacheFields := policy.autoManaged() && !cacheStateUnsupported(input.PromptCache)
+	compatFields := policy.explicitOnly() && !cacheStateUnsupported(input.PromptCache)
 
 	items := make([]map[string]any, 0, len(input.Messages))
 	for _, msg := range input.Messages {
@@ -156,7 +167,7 @@ func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.Ch
 	}
 	hasSysItem := false
 	if strings.TrimSpace(input.SystemPrompt) != "" {
-		if inlineExplicit && !hasExtraBodyKey(compat.ExtraBody, "instructions") && !hasExtraBodyKey(compat.ExtraBody, "input") {
+		if !officialEndpoint && compatFields && !hasExtraBodyKey(compat.ExtraBody, "instructions") && !hasExtraBodyKey(compat.ExtraBody, "input") {
 			sysRole := "developer"
 			if compat.SupportsDeveloperRole != nil && !*compat.SupportsDeveloperRole {
 				sysRole = "system"
@@ -209,7 +220,18 @@ func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.Ch
 		}
 		body["tools"] = encodedTools
 	}
-	if inlineExplicit {
+	if officialEndpoint {
+		if policy.mode == domain.CacheModeExplicit && (hasExtraBodyKey(compat.ExtraBody, "prompt_cache_options") || hasExtraBodyKey(compat.ExtraBody, "prompt_cache_breakpoint")) {
+			return plugin.EncodedRequest{}, domain.NewError(
+				domain.ErrCodeInvalidArgument,
+				"prompt_cache_options/prompt_cache_breakpoint are not supported on the OpenAI API; remove them from compat.extraBody",
+				nil,
+			)
+		}
+		if cacheFields {
+			body["prompt_cache_key"] = openAIPromptCacheKey(input, f.ID())
+		}
+	} else if compatFields {
 		if !hasExtraBodyKey(compat.ExtraBody, "prompt_cache_options") {
 			body["prompt_cache_options"] = map[string]any{"mode": "explicit"}
 		}
@@ -289,13 +311,13 @@ type responsesStreamItem struct {
 }
 
 type responsesStreamPayload struct {
-	Type           string                 `json:"type"`
-	SequenceNumber *int                   `json:"sequence_number,omitempty"`
-	OutputIndex    int                    `json:"output_index"`
-	ItemID         string                 `json:"item_id"`
-	Delta          string                 `json:"delta"`
-	Text           string                 `json:"text"`
-	Arguments      string                 `json:"arguments"`
+	Type           string               `json:"type"`
+	SequenceNumber *int                 `json:"sequence_number,omitempty"`
+	OutputIndex    int                  `json:"output_index"`
+	ItemID         string               `json:"item_id"`
+	Delta          string               `json:"delta"`
+	Text           string               `json:"text"`
+	Arguments      string               `json:"arguments"`
 	Item           *responsesStreamItem `json:"item"`
 	Response       *struct {
 		Status string                `json:"status"`
@@ -305,10 +327,10 @@ type responsesStreamPayload struct {
 			Message string `json:"message"`
 		} `json:"error"`
 		Usage *struct {
-			InputTokens         int `json:"input_tokens"`
-			OutputTokens        int `json:"output_tokens"`
-			TotalTokens         int `json:"total_tokens"`
-			InputTokensDetails  *struct {
+			InputTokens        int `json:"input_tokens"`
+			OutputTokens       int `json:"output_tokens"`
+			TotalTokens        int `json:"total_tokens"`
+			InputTokensDetails *struct {
 				CachedTokens        int `json:"cached_tokens"`
 				CacheWriteTokens    int `json:"cache_write_tokens"`
 				CacheCreationTokens int `json:"cache_creation_tokens"`

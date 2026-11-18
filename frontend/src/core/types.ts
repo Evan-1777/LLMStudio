@@ -510,6 +510,13 @@ export interface LocalCacheResolutionInput {
   result: LocalCacheResultData;
 }
 
+// A rejected browser-direct main request, classified by the gateway with the
+// same cache rules as the server path.
+export interface LocalMainFailureInput {
+  status: number;
+  body?: string;
+}
+
 export interface LocalContinuationInput {
   userMessageId?: string;
   blocks: ContentBlock[];
@@ -524,11 +531,11 @@ export interface StreamChatInput {
   regenerateMessageId?: string;
   webSearch?: boolean;
   searchEngineId?: string;
-  autoCreateCache?: boolean;
   localContinuation?: LocalContinuationInput;
   preparedSearch?: PreparedSearchInput;
   cacheState?: PromptCacheState;
   cacheResolution?: LocalCacheResolutionInput;
+  localMainFailure?: LocalMainFailureInput;
   // Asks the gateway to embed the stored provider credential in the prepared envelope.
   credentialEnvelope?: boolean;
 }
@@ -574,6 +581,8 @@ export interface PreparedLocalRequest {
   insertAfterMessageId?: string;
   cacheStep?: PreparedLocalCacheStep;
   cacheState?: PromptCacheState;
+  // Marks a prepared request that resends once without the rejected cache resource.
+  cacheRetry?: boolean;
 }
 
 export interface HealthResponse {
@@ -611,3 +620,17 @@ export interface ServerPreferencesEnvelope {
 
 /** Full preference payload used for the one-shot legacy browser import. */
 export type ServerPreferencesImport = ServerPreferences;
+
+export interface StorageUsage {
+  mainBytes: number;
+  walBytes: number;
+  totalBytes: number;
+  compactable: boolean;
+}
+
+export interface StorageCompactResult {
+  beforeBytes: number;
+  afterBytes: number;
+  freedBytes: number;
+  usage: StorageUsage;
+}

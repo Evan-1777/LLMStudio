@@ -1239,7 +1239,7 @@ describe('chatReducer and ChatProvider', () => {
     expect(upstreamTurn).toBe(turnBeforeAbort + 1);
   });
 
-  it('executes localRequest Gemini cache pre-request with the gateway credential, reuses in-memory CacheState, and follows credential rotation', async () => {
+  it('executes localRequest Gemini cache pre-request with the gateway credential, reuses gateway-owned CacheState, and follows credential rotation', async () => {
     localStorage.setItem(
       SETTINGS_STORAGE_KEY,
       JSON.stringify({ ...defaultSettings(), autoCreateCache: true }),
@@ -1251,6 +1251,9 @@ describe('chatReducer and ChatProvider', () => {
     const upstreamRequests: Array<{ url: string; body: string }> = [];
     let cacheCreateCount = 0;
     let mainGenerateCount = 0;
+    // The gateway, not the browser, owns the reusable cache state.
+    let serverCacheState: { resourceName?: string; prefixCount?: number } | null = null;
+    let failNextMainWith: { status: number; body: string } | null = null;
 
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = typeof input === 'string' ? input : input.toString();
@@ -1313,10 +1316,25 @@ describe('chatReducer and ChatProvider', () => {
           extra: { query: 'q', engineId: 'tavily', results: [{ title: 'T', url: 'https://t.example' }] },
         };
         const resolution = payload.cacheResolution as { planKey: string; status: number; result: { name?: string } } | undefined;
-        const incomingState = payload.cacheState as { resourceName?: string } | undefined;
+        const mainFailure = payload.localMainFailure as { status: number } | undefined;
+
+        if (mainFailure) {
+          // The gateway classified the rejection, dropped the stale resource and
+          // allows exactly one cache-less resend.
+          serverCacheState = null;
+          return withCredential(200, {
+            method: 'POST',
+            url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
+            headers: { 'Content-Type': 'application/json' },
+            body: { contents: [{ role: 'user', parts: [{ text: 'uncached-retry' }] }] },
+            authType: 'query-key',
+            cacheRetry: true,
+          });
+        }
 
         if (resolution) {
           if (resolution.status >= 400) {
+            serverCacheState = null;
             return withCredential(200, {
               method: 'POST',
               url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
@@ -1326,24 +1344,25 @@ describe('chatReducer and ChatProvider', () => {
               cacheState: { failedPrefixHash: resolution.planKey },
             });
           }
+          serverCacheState = { resourceName: resolution.result.name, prefixCount: 0 };
           return withCredential(200, {
             method: 'POST',
             url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
             headers: { 'Content-Type': 'application/json' },
             body: { cachedContent: resolution.result.name, contents: [{ role: 'user', parts: [{ text: 'q' }] }] },
             authType: 'query-key',
-            cacheState: { resourceName: resolution.result.name, prefixCount: 0 },
+            cacheState: serverCacheState,
           });
         }
 
-        if (incomingState?.resourceName) {
+        if (serverCacheState?.resourceName) {
           return withCredential(200, {
             method: 'POST',
             url: 'http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse',
             headers: { 'Content-Type': 'application/json' },
-            body: { cachedContent: incomingState.resourceName, contents: [{ role: 'user', parts: [{ text: 'q2' }] }] },
+            body: { cachedContent: serverCacheState.resourceName, contents: [{ role: 'user', parts: [{ text: 'q2' }] }] },
             authType: 'query-key',
-            cacheState: incomingState,
+            cacheState: serverCacheState,
           });
         }
 
@@ -1380,6 +1399,11 @@ describe('chatReducer and ChatProvider', () => {
       if (url.startsWith('http://127.0.0.1:18888/v1beta/models/gemini-2.5-pro:streamGenerateContent')) {
         mainGenerateCount += 1;
         upstreamRequests.push({ url, body: rawBody });
+        if (failNextMainWith) {
+          const failure = failNextMainWith;
+          failNextMainWith = null;
+          return new Response(failure.body, { status: failure.status });
+        }
         const sse = 'data: {"candidates":[{"content":{"parts":[{"text":"gem-ok"}]},"finishReason":"STOP"}]}\n\n';
         return new Response(
           new ReadableStream<Uint8Array>({
@@ -1467,13 +1491,13 @@ describe('chatReducer and ChatProvider', () => {
     expect(preparePayloads[1]).toHaveProperty('preparedSearch');
     expect(preparePayloads[1]).toHaveProperty('cacheResolution');
 
-    // 2. Second send reuses in-memory cacheState without a second cachedContents create.
+    // 2. Second send reuses the gateway-owned state without a second cachedContents create.
     await user.click(screen.getByRole('button', { name: 'send' }));
     await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('idle'));
     expect(cacheCreateCount).toBe(1);
     expect(mainGenerateCount).toBe(2);
 
-    // 3. A gateway-side credential rotation reuses the in-memory cacheState while
+    // 3. A gateway-side credential rotation keeps the gateway-owned state while
     // the prepared envelope immediately carries the new credential.
     credentialKey = 'sk-gem-key-2';
     await user.click(screen.getByRole('button', { name: 'send' }));
@@ -1486,6 +1510,19 @@ describe('chatReducer and ChatProvider', () => {
     expect(preparePayloads[preparePayloads.length - 1].credentialEnvelope).toBe(
       true,
     );
+
+    // 4. A rejected cached resource is classified by the gateway and resent once
+    // without the cache resource.
+    const createsBeforeRejection = cacheCreateCount;
+    failNextMainWith = {
+      status: 404,
+      body: JSON.stringify({ error: { message: 'cachedContent not found' } }),
+    };
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(screen.getByTestId('gem-run')).toHaveTextContent('idle'));
+    expect(cacheCreateCount).toBe(createsBeforeRejection);
+    expect(preparePayloads[preparePayloads.length - 1]).toHaveProperty('localMainFailure');
+    expect(upstreamRequests[upstreamRequests.length - 1].body).not.toContain('cachedContent');
   });
 
   it('displays real cache read/write counts on demand in MessageActions Popover without fabricating savings or zero hits', async () => {

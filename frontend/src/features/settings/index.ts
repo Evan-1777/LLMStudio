@@ -8,6 +8,7 @@ export { ModelImportDialog, type ModelImportDialogProps } from './ModelImportDia
 export { PluginsPage } from './PluginsPage';
 export { ProviderEditor, type ProviderEditorProps } from './ProviderEditor';
 export { ProvidersPage } from './ProvidersPage';
+export { StoragePage } from './StoragePage';
 export {
   SettingsLayout,
   SettingsPage,

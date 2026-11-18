@@ -37,6 +37,8 @@ import {
   type ServerPreferences,
   type ServerPreferencesEnvelope,
   type ServerPreferencesImport,
+  type StorageCompactResult,
+  type StorageUsage,
   type StreamChatInput,
   type ToolCallExecutionInput,
 } from './types';
@@ -301,9 +303,6 @@ function buildStreamChatPayload(input: StreamChatInput): Record<string, unknown>
   if (input.searchEngineId) {
     payload.searchEngineId = input.searchEngineId;
   }
-  if (input.autoCreateCache) {
-    payload.autoCreateCache = true;
-  }
   if (input.preparedSearch !== undefined) {
     payload.preparedSearch = {
       block: input.preparedSearch.block ?? null,
@@ -314,6 +313,9 @@ function buildStreamChatPayload(input: StreamChatInput): Record<string, unknown>
   }
   if (input.cacheResolution) {
     payload.cacheResolution = input.cacheResolution;
+  }
+  if (input.localMainFailure) {
+    payload.localMainFailure = input.localMainFailure;
   }
   if (input.credentialEnvelope) {
     payload.credentialEnvelope = true;
@@ -468,6 +470,18 @@ export class GatewayClient {
       'POST',
       '/api/v1/settings/import',
       { body: preferences, signal },
+    );
+  }
+
+  getStorage(signal?: AbortSignal): Promise<StorageUsage> {
+    return this.requestJson<StorageUsage>('GET', '/api/v1/storage', { signal });
+  }
+
+  compactStorage(signal?: AbortSignal): Promise<StorageCompactResult> {
+    return this.requestJson<StorageCompactResult>(
+      'POST',
+      '/api/v1/storage/compact',
+      { signal },
     );
   }
 

@@ -99,22 +99,31 @@ func NormalizeToolSchema(raw json.RawMessage) any {
 
 // ChatInput holds all inputs needed by an APIFormat plugin to encode an upstream request.
 type ChatInput struct {
-	ConversationID  string
-	MessageID       string
-	Provider        domain.ProviderConfig
-	Model           domain.ModelConfig
-	SystemPrompt    string
-	Messages        []domain.Message
-	Params          domain.GenerationParams
-	Compat          domain.CompatConfig
-	Tools           []ChatTool
+	ConversationID string
+	MessageID      string
+	Provider       domain.ProviderConfig
+	Model          domain.ModelConfig
+	SystemPrompt   string
+	Messages       []domain.Message
+	Params         domain.GenerationParams
+	Compat         domain.CompatConfig
+	Tools          []ChatTool
+	// AutoCreateCache is the gateway-side automatic caching preference snapshot
+	// for one generation; it is shared by every tool-continuation round.
 	AutoCreateCache bool
-	PromptCache     *PromptCacheState
+	// GenerationURL is the endpoint the provider adapter resolves for this format
+	// and compatibility override. Format plugins use it to tell documented
+	// official routes apart from compatibility endpoints.
+	GenerationURL string
+	PromptCache   *PromptCacheState
 }
 
-// PromptCacheScope isolates cached references by provider, endpoint, auth material, format, and model.
+// PromptCacheScope isolates cached references by provider, endpoint, auth
+// material, format, model, and conversation topic. Competing topics therefore
+// keep independent resources under the shared runtime bound.
 type PromptCacheScope struct {
 	ProviderID string `json:"providerId"`
+	TopicID    string `json:"topicId"`
 	Endpoint   string `json:"endpoint"`
 	AuthHash   string `json:"authHash"`
 	FormatID   string `json:"formatId"`

@@ -505,7 +505,17 @@ test.describe('MCP End-to-End Integration', () => {
 
       // Turn OFF autoCollapseToolsOnComplete and verify narrow mobile 375px scrolling.
       await page.getByRole('button', { name: '外观与显示' }).click();
-      await page.getByRole('switch', { name: '工具执行完成后自动折叠' }).click();
+      const toolCollapseSwitch = page.getByRole('switch', {
+        name: '工具执行完成后自动折叠',
+      });
+      const collapsePrefsPatch = page.waitForResponse(
+        (res) =>
+          res.url().endsWith('/api/v1/settings') &&
+          res.request().method() === 'PATCH',
+      );
+      await toolCollapseSwitch.click();
+      await collapsePrefsPatch;
+      await expect(toolCollapseSwitch).not.toBeChecked();
 
       await page.getByRole('button', { name: '返回工作台' }).click();
       await page.setViewportSize({ width: 375, height: 812 });
@@ -541,6 +551,9 @@ test.describe('MCP End-to-End Integration', () => {
         adapter: 'generic-http',
         baseURL: mockSrv.baseUrl,
         authType: 'bearer',
+        // The gateway owns direct-request credentials; the browser receives a
+        // per-request envelope instead of reading a local key.
+        apiKey: 'sk-gateway-local-key',
         localRequest: true,
         enabled: true,
         models: [
@@ -550,13 +563,6 @@ test.describe('MCP End-to-End Integration', () => {
             apiFormat: 'openai-completions',
           },
         ],
-      });
-      await page.reload({ waitUntil: 'networkidle' });
-      await page.evaluate(() => {
-        localStorage.setItem(
-          'llmstudio.localProviderKeys.v1',
-          JSON.stringify({ 'mcp-local-prov': 'sk-e2e-browser-local-key' }),
-        );
       });
       await page.reload({ waitUntil: 'networkidle' });
 
@@ -569,9 +575,7 @@ test.describe('MCP End-to-End Integration', () => {
 
       await expect(page.getByText('MCP Final Reply (count=2)')).toBeVisible();
       expect(
-        mockSrv.llmCalls.some(
-          (c) => c.auth === 'Bearer sk-e2e-browser-local-key',
-        ),
+        mockSrv.llmCalls.some((c) => c.auth === 'Bearer sk-gateway-local-key'),
       ).toBe(true);
 
       // Ensure browser key is absent from SQLite conversation detail API response.
@@ -583,7 +587,7 @@ test.describe('MCP End-to-End Integration', () => {
         { headers: { Authorization: `Bearer ${E2E_TOKEN}` } },
       );
       const rawDetail = await detailRes.text();
-      expect(rawDetail).not.toContain('sk-e2e-browser-local-key');
+      expect(rawDetail).not.toContain('sk-gateway-local-key');
       const parsedDetail = JSON.parse(rawDetail) as {
         messages: Array<{ role: string; blocks: unknown[]; usage?: { totalTokens: number } }>;
       };

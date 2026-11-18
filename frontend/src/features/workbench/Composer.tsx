@@ -4,6 +4,7 @@ import {
   useRef,
   useState,
   type ChangeEvent,
+  type ClipboardEvent,
   type FormEvent,
   type KeyboardEvent,
 } from 'react';
@@ -27,6 +28,8 @@ import { AttachmentChips } from './AttachmentChips';
 import {
   FILE_INPUT_ACCEPT,
   attachmentToContentBlock,
+  clipboardHasPlainText,
+  collectClipboardImageFiles,
   isWithinRequestLimit,
   readAttachmentFile,
   revokeAttachmentResources,
@@ -128,27 +131,42 @@ export function Composer({
     el.style.height = `${Math.min(180, Math.max(40, el.scrollHeight))}px`;
   };
 
+  const addFiles = (files: Iterable<File>) => {
+    const added: PendingAttachment[] = [];
+    for (const file of files) {
+      if (!file) continue;
+      added.push(
+        readAttachmentFile(file, {
+          supportsImageInput,
+          onUpdate: (updated) => {
+            setAttachments((prev) =>
+              prev.map((p) => (p.id === updated.id ? updated : p)),
+            );
+          },
+        }),
+      );
+    }
+    if (added.length === 0) return;
+    setAttachments((prev) => [...prev, ...added]);
+    setBodyError(null);
+  };
+
   const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
-
-    const added: PendingAttachment[] = [];
-    for (let i = 0; i < files.length; i++) {
-      const file = files.item(i);
-      if (!file) continue;
-      const item = readAttachmentFile(file, {
-        supportsImageInput,
-        onUpdate: (updated) => {
-          setAttachments((prev) =>
-            prev.map((p) => (p.id === updated.id ? updated : p)),
-          );
-        },
-      });
-      added.push(item);
-    }
-    setAttachments((prev) => [...prev, ...added]);
-    setBodyError(null);
+    addFiles(Array.from(files));
     e.target.value = '';
+  };
+
+  const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const images = collectClipboardImageFiles(e.clipboardData);
+    if (images.length === 0) return;
+    // An image-only clipboard is consumed; mixed content keeps the native text
+    // insertion, caret and undo behaviour alongside the added images.
+    if (!clipboardHasPlainText(e.clipboardData)) {
+      e.preventDefault();
+    }
+    addFiles(images);
   };
 
   const handleRemoveAttachment = (id: string) => {
@@ -278,6 +296,7 @@ export function Composer({
             adjustHeight();
           }}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
         />
 
         <div className="wb-composer__tools">

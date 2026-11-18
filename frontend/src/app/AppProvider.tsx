@@ -12,6 +12,7 @@ import { GatewayClient, GatewayError, validateGatewayUrl } from '../core/gateway
 import {
   clearLegacyPreferences,
   defaultAppPreferences,
+  loadConnectionSettings,
   loadSettings,
   normalizeSettings,
   pickAppPreferences,
@@ -204,7 +205,16 @@ export function AppProvider({
   fetchImpl?: typeof fetch;
   skipInitialBootstrap?: boolean;
 }) {
-  const initialLoad = useMemo(() => loadSettings(), []);
+  const initialLoad = useMemo(() => {
+    const loaded = loadSettings();
+    // Connection info lives in its own key so the workspace can reconnect after
+    // a reload without re-entering the gateway token.
+    const connection = loadConnectionSettings();
+    return {
+      ...loaded,
+      settings: { ...loaded.settings, ...connection },
+    };
+  }, []);
   const [settings, setSettings] = useState<AppSettings>(initialLoad.settings);
   const settingsRef = useRef<AppSettings>(initialLoad.settings);
   const [settingsNotice, setSettingsNotice] = useState<string | null>(

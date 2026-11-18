@@ -452,4 +452,74 @@ describe('decodeUpstreamSseStream golden parity with Go formats', () => {
       totalTokens: 925,
     });
   });
+
+  it('keeps DeepSeek-compatible and split Anthropic cache usage consistent with Go', async () => {
+    const collectUsage = async (apiFormat: string, sse: string) => {
+      const evs: StreamEvent[] = [];
+      await decodeUpstreamSseStream(apiFormat, sseStreamFromText(sse), meta, (ev) => evs.push(ev));
+      return evs.find((e) => e.type === 'message_delta')?.usage;
+    };
+
+    expect(
+      await collectUsage(
+        'openai-completions',
+        [
+          'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+          '',
+          'data: {"choices":[],"usage":{"prompt_cache_hit_tokens":900,"prompt_cache_miss_tokens":100,"completion_tokens":20}}',
+          '',
+          'data: [DONE]',
+          '',
+        ].join('\n'),
+      ),
+    ).toEqual({ inputTokens: 1000, outputTokens: 20, cacheReadInputTokens: 900, totalTokens: 1020 });
+
+    expect(
+      await collectUsage(
+        'openai-completions',
+        [
+          'data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}',
+          '',
+          'data: {"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":20,"total_tokens":1020,"prompt_cache_hit_tokens":950,"prompt_tokens_details":{"cached_tokens":800}}}',
+          '',
+          'data: [DONE]',
+          '',
+        ].join('\n'),
+      ),
+    ).toEqual({ inputTokens: 1000, outputTokens: 20, cacheReadInputTokens: 800, totalTokens: 1020 });
+
+    expect(
+      await collectUsage(
+        'anthropic-messages',
+        [
+          'event: message_start',
+          'data: {"type":"message_start","message":{"usage":{"input_tokens":50,"cache_creation_input_tokens":200,"cache_read_input_tokens":750,"output_tokens":0}}}',
+          '',
+          'event: message_delta',
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"cache_read_input_tokens":800}}',
+          '',
+          'event: message_stop',
+          'data: {"type":"message_stop"}',
+          '',
+        ].join('\n'),
+      ),
+    ).toEqual({ inputTokens: 1050, outputTokens: 0, cacheReadInputTokens: 800, cacheCreationInputTokens: 200, totalTokens: 1050 });
+
+    expect(
+      await collectUsage(
+        'anthropic-messages',
+        [
+          'event: message_start',
+          'data: {"type":"message_start","message":{"usage":{"input_tokens":50,"cache_creation_input_tokens":200,"cache_read_input_tokens":750,"output_tokens":0}}}',
+          '',
+          'event: message_delta',
+          'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"cache_read_input_tokens":0,"output_tokens":40}}',
+          '',
+          'event: message_stop',
+          'data: {"type":"message_stop"}',
+          '',
+        ].join('\n'),
+      ),
+    ).toEqual({ inputTokens: 250, outputTokens: 40, cacheCreationInputTokens: 200, totalTokens: 290 });
+  });
 });

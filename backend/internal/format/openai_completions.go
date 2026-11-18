@@ -38,14 +38,22 @@ func (f *OpenAICompletionsFormat) DefaultCompat() domain.CompatConfig {
 
 func (f *OpenAICompletionsFormat) PlanCache(_ context.Context, input plugin.ChatInput, current *plugin.PromptCacheState) (plugin.CachePlan, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
-	inline := shouldApplyInlineCache(input, compat, false)
-	if current != nil && current.Unsupported {
-		inline = false
-	}
+	inline := f.appliesCacheFields(input, compat) && !cacheStateUnsupported(current)
 	return plugin.CachePlan{
 		ReuseState:  current,
 		InlineCache: inline,
 	}, nil
+}
+
+// appliesCacheFields reports whether this format adds its own cache fields for
+// the resolved generation target. Documented OpenAI endpoints follow the shared
+// preference; compatibility endpoints only honour an explicit model mode.
+func (f *OpenAICompletionsFormat) appliesCacheFields(input plugin.ChatInput, compat domain.CompatConfig) bool {
+	policy := resolveCachePolicy(input, compat)
+	if isOpenAIOfficialEndpoint(input.GenerationURL, f.DefaultPath()) {
+		return policy.autoManaged()
+	}
+	return policy.explicitOnly()
 }
 
 func (f *OpenAICompletionsFormat) ResolveCache(_ context.Context, _ plugin.ChatInput, _ plugin.CachePlan, _ plugin.CacheResolutionInput) (plugin.CacheResolutionResult, error) {
@@ -59,7 +67,9 @@ func (f *OpenAICompletionsFormat) ClassifyCacheError(statusCode int, body []byte
 func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.ChatInput) (plugin.EncodedRequest, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
 	params := resolveGenerationParams(input.Model, input.Params)
-	inlineExplicit := shouldApplyInlineCache(input, compat, false)
+	policy := resolveCachePolicy(input, compat)
+	cacheFields := policy.autoManaged() && !cacheStateUnsupported(input.PromptCache)
+	compatFields := policy.explicitOnly() && !cacheStateUnsupported(input.PromptCache)
 
 	messages := make([]map[string]any, 0, len(input.Messages)+1)
 	hasSystem := false
@@ -135,7 +145,18 @@ func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.
 		}
 		body["tools"] = encodedTools
 	}
-	if inlineExplicit {
+	if isOpenAIOfficialEndpoint(input.GenerationURL, f.DefaultPath()) {
+		if policy.mode == domain.CacheModeExplicit && (hasExtraBodyKey(compat.ExtraBody, "prompt_cache_options") || hasExtraBodyKey(compat.ExtraBody, "prompt_cache_breakpoint")) {
+			return plugin.EncodedRequest{}, domain.NewError(
+				domain.ErrCodeInvalidArgument,
+				"prompt_cache_options/prompt_cache_breakpoint are not supported on the OpenAI API; remove them from compat.extraBody",
+				nil,
+			)
+		}
+		if cacheFields {
+			body["prompt_cache_key"] = openAIPromptCacheKey(input, f.ID())
+		}
+	} else if compatFields {
 		if !hasExtraBodyKey(compat.ExtraBody, "prompt_cache_options") {
 			body["prompt_cache_options"] = map[string]any{"mode": "explicit"}
 		}
@@ -319,10 +340,14 @@ type openAICompletionsChunk struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
-		PromptTokens            int `json:"prompt_tokens"`
-		CompletionTokens        int `json:"completion_tokens"`
-		TotalTokens             int `json:"total_tokens"`
-		PromptTokensDetails     *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		TotalTokens      int `json:"total_tokens"`
+		// DeepSeek-compatible endpoints report cache hits and misses at the top
+		// level; pointers keep an explicit zero apart from an omitted field.
+		PromptCacheHitTokens  *int `json:"prompt_cache_hit_tokens"`
+		PromptCacheMissTokens *int `json:"prompt_cache_miss_tokens"`
+		PromptTokensDetails   *struct {
 			CachedTokens        int `json:"cached_tokens"`
 			CacheWriteTokens    int `json:"cache_write_tokens"`
 			CacheCreationTokens int `json:"cache_creation_tokens"`
@@ -456,12 +481,21 @@ func (f *OpenAICompletionsFormat) DecodeStream(ctx context.Context, body io.Read
 		}
 
 		if chunk.Usage != nil {
+			promptTokens := chunk.Usage.PromptTokens
+			hit := chunk.Usage.PromptCacheHitTokens
+			miss := chunk.Usage.PromptCacheMissTokens
+			if promptTokens == 0 && hit != nil && miss != nil {
+				// DeepSeek-compatible endpoints may omit prompt_tokens; the hit
+				// plus miss split reconstructs the input total. A miss is an
+				// uncached prompt, never a cache write.
+				promptTokens = *hit + *miss
+			}
 			total := chunk.Usage.TotalTokens
 			if total == 0 {
-				total = chunk.Usage.PromptTokens + chunk.Usage.CompletionTokens
+				total = promptTokens + chunk.Usage.CompletionTokens
 			}
 			u := &domain.Usage{
-				InputTokens:  chunk.Usage.PromptTokens,
+				InputTokens:  promptTokens,
 				OutputTokens: chunk.Usage.CompletionTokens,
 				TotalTokens:  total,
 			}
@@ -472,6 +506,9 @@ func (f *OpenAICompletionsFormat) DecodeStream(ctx context.Context, body io.Read
 				} else {
 					u.CacheCreationInputTokens = chunk.Usage.PromptTokensDetails.CacheCreationTokens
 				}
+			} else if hit != nil {
+				// Never add the compatible field on top of a reported detail.
+				u.CacheReadInputTokens = *hit
 			}
 			if chunk.Usage.CompletionTokensDetails != nil {
 				u.ThinkingTokens = chunk.Usage.CompletionTokensDetails.ReasoningTokens

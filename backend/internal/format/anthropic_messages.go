@@ -39,10 +39,7 @@ func (f *AnthropicMessagesFormat) DefaultCompat() domain.CompatConfig {
 
 func (f *AnthropicMessagesFormat) PlanCache(_ context.Context, input plugin.ChatInput, current *plugin.PromptCacheState) (plugin.CachePlan, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
-	inline := shouldApplyInlineCache(input, compat, true)
-	if current != nil && current.Unsupported {
-		inline = false
-	}
+	inline := resolveCachePolicy(input, compat).autoManaged() && !cacheStateUnsupported(current)
 	return plugin.CachePlan{
 		ReuseState:  current,
 		InlineCache: inline,
@@ -60,7 +57,7 @@ func (f *AnthropicMessagesFormat) ClassifyCacheError(statusCode int, body []byte
 func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.ChatInput) (plugin.EncodedRequest, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
 	params := resolveGenerationParams(input.Model, input.Params)
-	inlineCache := shouldApplyInlineCache(input, compat, true)
+	inlineCache := resolveCachePolicy(input, compat).autoManaged() && !cacheStateUnsupported(input.PromptCache)
 
 	maxTokens := defaultAnthropicMaxTokens
 	if params.MaxTokens != nil && *params.MaxTokens > 0 {
@@ -225,8 +222,8 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 		}
 		body["tools"] = encodedTools
 	}
-	if inlineCache && !hasExtraBodyKey(compat.ExtraBody, "messages") && usedBreakpoints < 4 && len(encodedMsgs) >= 2 {
-		applyAnthropicMessageCacheBreakpoint(encodedMsgs)
+	if inlineCache && !hasExtraBodyKey(compat.ExtraBody, "messages") && usedBreakpoints < 4 && len(encodedMsgs) > 0 {
+		usedBreakpoints += applyAnthropicConversationCacheBreakpoints(encodedMsgs, 4-usedBreakpoints)
 	}
 	if len(compat.ExtraBody) > 0 {
 		MergeBodyMap(body, compat.ExtraBody)
@@ -247,29 +244,70 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 	}, nil
 }
 
-func applyAnthropicMessageCacheBreakpoint(encodedMsgs []map[string]any) {
-	for i := len(encodedMsgs) - 2; i >= 0; i-- {
-		parts, ok := encodedMsgs[i]["content"].([]map[string]any)
-		if !ok {
+// applyAnthropicConversationCacheBreakpoints marks the tail of the current turn
+// so the next round can read it, then keeps the previous turn boundary marked as
+// an anchor. Anthropic searches only the 20 content blocks before a breakpoint for
+// a previously cached prefix, so the anchor keeps long or tool-heavy rounds inside
+// that window instead of writing a fresh cache without a hit. Returns the number
+// of markers written or already present.
+func applyAnthropicConversationCacheBreakpoints(encodedMsgs []map[string]any, budget int) int {
+	last := len(encodedMsgs) - 1
+	candidates := []int{last, lastAnthropicUserIndex(encodedMsgs, last-1), last - 1}
+	marked := 0
+	seen := make(map[int]struct{}, len(candidates))
+	for _, idx := range candidates {
+		if budget <= 0 {
+			break
+		}
+		if idx < 0 {
 			continue
 		}
-		for j := len(parts) - 1; j >= 0; j-- {
-			partType, _ := parts[j]["type"].(string)
-			if partType == "thinking" || partType == "redacted_thinking" {
-				continue
-			}
-			if partType == "text" {
-				txt, _ := parts[j]["text"].(string)
-				if strings.TrimSpace(txt) == "" {
-					continue
-				}
-			}
-			if _, exists := parts[j]["cache_control"]; !exists {
-				parts[j]["cache_control"] = map[string]any{"type": "ephemeral"}
-			}
-			return
+		if _, dup := seen[idx]; dup {
+			continue
+		}
+		seen[idx] = struct{}{}
+		if markAnthropicMessageTail(encodedMsgs[idx]) {
+			budget--
+			marked++
 		}
 	}
+	return marked
+}
+
+// lastAnthropicUserIndex returns the closest user-role message at or before from,
+// which is the conversation boundary written by the previous round.
+func lastAnthropicUserIndex(encodedMsgs []map[string]any, from int) int {
+	for i := from; i >= 0; i-- {
+		if role, _ := encodedMsgs[i]["role"].(string); role == "user" {
+			return i
+		}
+	}
+	return -1
+}
+
+// markAnthropicMessageTail marks the last cacheable part of one encoded message,
+// skipping empty text and thinking blocks, and never overwriting an existing marker.
+func markAnthropicMessageTail(msg map[string]any) bool {
+	parts, ok := msg["content"].([]map[string]any)
+	if !ok {
+		return false
+	}
+	for j := len(parts) - 1; j >= 0; j-- {
+		switch parts[j]["type"] {
+		case "thinking", "redacted_thinking":
+			continue
+		case "text":
+			txt, _ := parts[j]["text"].(string)
+			if strings.TrimSpace(txt) == "" {
+				continue
+			}
+		}
+		if _, exists := parts[j]["cache_control"]; !exists {
+			parts[j]["cache_control"] = map[string]any{"type": "ephemeral"}
+		}
+		return true
+	}
+	return false
 }
 
 func encodeAnthropicImage(b domain.ContentBlock) (map[string]any, bool) {
@@ -326,16 +364,20 @@ func anthropicThinkingBudget(effort string) int {
 	}
 }
 
+// anthropicUsageFrame keeps the distinction between an omitted usage field and
+// an explicit zero, so a later frame never erases a known value.
+type anthropicUsageFrame struct {
+	InputTokens              *int `json:"input_tokens"`
+	CacheCreationInputTokens *int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     *int `json:"cache_read_input_tokens"`
+	OutputTokens             *int `json:"output_tokens"`
+}
+
 type anthropicStreamEvent struct {
 	Type    string `json:"type"`
 	Index   int    `json:"index"`
 	Message *struct {
-		Usage *struct {
-			InputTokens              int `json:"input_tokens"`
-			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-			OutputTokens             int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage *anthropicUsageFrame `json:"usage"`
 	} `json:"message"`
 	ContentBlock *struct {
 		Type      string          `json:"type"`
@@ -355,12 +397,7 @@ type anthropicStreamEvent struct {
 		PartialJSON string `json:"partial_json"`
 		StopReason  string `json:"stop_reason"`
 	} `json:"delta"`
-	Usage *struct {
-		InputTokens              int `json:"input_tokens"`
-		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-		OutputTokens             int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage *anthropicUsageFrame `json:"usage"`
 	Error *struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
@@ -385,12 +422,35 @@ func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Read
 		blocks       = make(map[int]*blockState)
 		blockOrder   []int
 		usage        = &domain.Usage{}
+		rawInput     int
 		hasUsage     bool
 		stopReason   string
 		hasToolCall  bool
 		emittedEnd   bool
 		emittedError bool
 	)
+
+	// mergeUsage folds one usage frame into the accumulated usage. Anthropic
+	// reports uncached input separately from the cached portions, so the unified
+	// input total is their sum over the latest known values.
+	mergeUsage := func(frame *anthropicUsageFrame) {
+		if frame == nil {
+			return
+		}
+		if frame.InputTokens != nil {
+			rawInput = *frame.InputTokens
+		}
+		if frame.CacheCreationInputTokens != nil {
+			usage.CacheCreationInputTokens = *frame.CacheCreationInputTokens
+		}
+		if frame.CacheReadInputTokens != nil {
+			usage.CacheReadInputTokens = *frame.CacheReadInputTokens
+		}
+		usage.InputTokens = rawInput + usage.CacheCreationInputTokens + usage.CacheReadInputTokens
+		if frame.OutputTokens != nil {
+			usage.OutputTokens = *frame.OutputTokens
+		}
+	}
 
 	closeBlock := func(st *blockState) error {
 		if st == nil || st.closed {
@@ -476,11 +536,7 @@ func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Read
 		switch evType {
 		case "message_start":
 			if ev.Message != nil && ev.Message.Usage != nil {
-				u := ev.Message.Usage
-				usage.InputTokens = u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
-				usage.CacheCreationInputTokens = u.CacheCreationInputTokens
-				usage.CacheReadInputTokens = u.CacheReadInputTokens
-				usage.OutputTokens = u.OutputTokens
+				mergeUsage(ev.Message.Usage)
 				hasUsage = true
 			}
 
@@ -574,12 +630,7 @@ func (f *AnthropicMessagesFormat) DecodeStream(ctx context.Context, body io.Read
 				stopReason = mapAnthropicStopReason(ev.Delta.StopReason)
 			}
 			if ev.Usage != nil {
-				if ev.Usage.InputTokens > 0 || ev.Usage.CacheCreationInputTokens > 0 || ev.Usage.CacheReadInputTokens > 0 {
-					usage.InputTokens = ev.Usage.InputTokens + ev.Usage.CacheCreationInputTokens + ev.Usage.CacheReadInputTokens
-					usage.CacheCreationInputTokens = ev.Usage.CacheCreationInputTokens
-					usage.CacheReadInputTokens = ev.Usage.CacheReadInputTokens
-				}
-				usage.OutputTokens = ev.Usage.OutputTokens
+				mergeUsage(ev.Usage)
 				hasUsage = true
 			}
 

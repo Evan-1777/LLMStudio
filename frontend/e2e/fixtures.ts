@@ -540,6 +540,7 @@ export async function connectWithToken(page: Page, appUrl: string): Promise<void
 export async function seedMockProviderViaApi(
   appUrl: string,
   upstreamUrl: string,
+  models?: Array<Record<string, unknown>>,
 ): Promise<string> {
   const providerId = 'e2e-mock-provider';
   const res = await fetch(`${appUrl}/api/v1/providers`, {
@@ -556,7 +557,7 @@ export async function seedMockProviderViaApi(
       authType: 'bearer',
       apiKey: 'sk-e2e-upstream-secret',
       enabled: true,
-      models: [
+      models: models ?? [
         {
           id: 'mock-chat',
           name: 'Mock Chat',

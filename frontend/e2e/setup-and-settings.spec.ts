@@ -153,11 +153,9 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await localDialog.getByRole('button', { name: '添加' }).click();
     await expect(page.getByRole('heading', { name: 'Direct Local' })).toBeVisible();
 
-    const directProbeReqPromise = page.waitForRequest(
-      (req) => req.url() === `${upstream.url}/v1/models` && req.method() === 'GET',
-    );
+    // The gateway owns local-request credentials, so probing and model
+    // discovery go through the authenticated API instead of browser-direct.
     await page.getByRole('button', { name: '测试连接' }).click();
-    await directProbeReqPromise;
     await expect(page.getByText(/连接正常.*2 个模型/)).toBeVisible();
 
     await page.getByRole('button', { name: '获取模型' }).first().click();

@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	FormatIDGoogleGenAI     = "google-generative-ai"
+	FormatIDGoogleGenAI      = "google-generative-ai"
 	geminiCachedContentsPath = "/v1beta/cachedContents"
 )
 
@@ -44,19 +44,10 @@ func (f *GoogleGenAIFormat) DefaultCompat() domain.CompatConfig {
 	}
 }
 
-func isGeminiExplicitCacheEnabled(input plugin.ChatInput, compat domain.CompatConfig) bool {
-	if !input.AutoCreateCache {
-		return false
-	}
-	mode := strings.ToLower(strings.TrimSpace(compat.CacheMode))
-	switch mode {
-	case domain.CacheModeDisabled, domain.CacheModeImplicit:
-		return false
-	case "", domain.CacheModeAuto, domain.CacheModeExplicit:
-		return true
-	default:
-		return false
-	}
+// geminiCacheManaged reports whether the gateway may own an explicit
+// cachedContents resource for this generation.
+func geminiCacheManaged(input plugin.ChatInput, compat domain.CompatConfig) bool {
+	return resolveCachePolicy(input, compat).autoManaged()
 }
 
 type geminiCacheInputs struct {
@@ -135,7 +126,7 @@ func prepareGeminiCacheInputs(input plugin.ChatInput, compat domain.CompatConfig
 
 func (f *GoogleGenAIFormat) PlanCache(_ context.Context, input plugin.ChatInput, current *plugin.PromptCacheState) (plugin.CachePlan, error) {
 	compat := MergeCompat(f.DefaultCompat(), input.Compat)
-	if !isGeminiExplicitCacheEnabled(input, compat) {
+	if !geminiCacheManaged(input, compat) {
 		return plugin.CachePlan{}, nil
 	}
 	if hasExtraBodyKey(compat.ExtraBody, "cachedContent") {
@@ -473,7 +464,7 @@ func (f *GoogleGenAIFormat) EncodeRequest(_ context.Context, input plugin.ChatIn
 	params := resolveGenerationParams(input.Model, input.Params)
 
 	contents := buildGeminiContents(input.Messages)
-	usingCachedContent := isGeminiExplicitCacheEnabled(input, compat) &&
+	usingCachedContent := geminiCacheManaged(input, compat) &&
 		input.PromptCache != nil &&
 		!input.PromptCache.Unsupported &&
 		input.PromptCache.ResourceName != "" &&

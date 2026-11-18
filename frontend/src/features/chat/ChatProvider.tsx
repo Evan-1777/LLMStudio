@@ -19,11 +19,9 @@ import type {
   GenerationParams,
   LocalCacheResultData,
   Message,
-  ModelConfig,
   PreparedLocalHTTPRequest,
   PreparedLocalRequest,
   PreparedSearchInput,
-  PromptCacheState,
   ProviderConfig,
   ReasoningEffort,
   StreamChatInput,
@@ -98,35 +96,6 @@ function formatError(err: unknown): { code: string; message: string } {
   return { code: 'NETWORK_ERROR', message: '请求失败' };
 }
 
-function buildLocalCacheKey(
-  connectionEpoch: number,
-  provider: ProviderConfig | undefined,
-  providerId: string,
-  model: ModelConfig | undefined,
-  modelId: string,
-): string {
-  // Credentials live in the gateway now: its provider revision changes whenever
-  // the stored key does, which is what invalidates prepared cache state.
-  const hdrs = provider?.headers
-    ? Object.entries(provider.headers)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([k, v]) => `${k}:${v}`)
-        .join(';')
-    : '';
-  return [
-    connectionEpoch,
-    providerId,
-    provider?.baseURL ?? '',
-    provider?.authType ?? '',
-    hdrs,
-    provider?.updatedAt ?? '',
-    model?.apiFormat ?? '',
-    modelId,
-    model?.compat?.pathOverride ?? '',
-    model?.compat?.cacheMode ?? '',
-  ].join('|');
-}
-
 function extractSafeCacheResult(
   status: number,
   rawText: string,
@@ -172,55 +141,9 @@ function extractSafeCacheResult(
   return out;
 }
 
-function classifyLocalMainCacheError(
-  status: number,
-  bodyText: string,
-  hadCachedRef: boolean,
-): 'none' | 'unsupported' | 'expired' {
-  const lower = bodyText.toLowerCase();
-  if (
-    lower.includes('api key') ||
-    lower.includes('api_key') ||
-    lower.includes('invalid key')
-  ) {
-    return 'none';
-  }
-  if (status === 400 || status === 422) {
-    const hasInlineKw =
-      lower.includes('cache_control') ||
-      lower.includes('prompt_cache_options') ||
-      lower.includes('prompt_cache_breakpoint') ||
-      lower.includes('ephemeral');
-    const hasReject =
-      lower.includes('unsupported') ||
-      lower.includes('not supported') ||
-      lower.includes('unknown') ||
-      lower.includes('unrecognized') ||
-      lower.includes('invalid') ||
-      lower.includes('unexpected') ||
-      lower.includes('not permitted');
-    if (hasInlineKw && hasReject) {
-      return 'unsupported';
-    }
-  }
-  if (
-    hadCachedRef &&
-    (status === 404 || status === 400 || status === 403) &&
-    (lower.includes('cachedcontent') ||
-      lower.includes('cached_content') ||
-      lower.includes('not found') ||
-      lower.includes('expired') ||
-      lower.includes('does not exist'))
-  ) {
-    return lower.includes('unsupported') ? 'unsupported' : 'expired';
-  }
-  return 'none';
-}
-
 export function ChatProvider({ children }: { children: ReactNode }) {
   const {
     gateway,
-    settings,
     resources,
     connectionEpoch,
     upsertLocalConversation,
@@ -236,7 +159,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const activeAbortRef = useRef<AbortController | null>(null);
   const manualAbortRef = useRef(false);
   const sendingRef = useRef(false);
-  const localCacheRef = useRef<Map<string, PromptCacheState>>(new Map());
 
   const cancelActiveStream = useCallback((quiet: boolean) => {
     epochRef.current += 1;
@@ -251,7 +173,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (prevConnectionEpochRef.current === connectionEpoch) return;
     prevConnectionEpochRef.current = connectionEpoch;
-    localCacheRef.current.clear();
     cancelActiveStream(true);
     dispatch({ type: 'CLEAR_SESSION' });
   }, [connectionEpoch, cancelActiveStream]);
@@ -380,7 +301,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         regenerateMessageId?: string;
         webSearch?: boolean;
         searchEngineId?: string;
-        autoCreateCache?: boolean;
       };
       optimisticUserId?: string;
       regenerateTargetId?: string;
@@ -582,27 +502,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       baseInput: StreamChatInput,
       provider: ProviderConfig | undefined,
       providerId: string,
-      model: ModelConfig | undefined,
-      modelId: string,
       searchTracker: { settled: boolean; block: ContentBlock | null },
       signal: AbortSignal,
     ): Promise<{ prepared: PreparedLocalRequest; response: Response }> => {
-      const cacheKey = buildLocalCacheKey(
-        connectionEpoch,
-        provider,
-        providerId,
-        model,
-        modelId,
-      );
-      let currentCache = localCacheRef.current.get(cacheKey);
-      if (currentCache?.expireTime) {
-        const expMs = Date.parse(currentCache.expireTime);
-        if (Number.isFinite(expMs) && expMs <= Date.now()) {
-          localCacheRef.current.delete(cacheKey);
-          currentCache = undefined;
-        }
-      }
-
       const buildInput = (extra?: Partial<StreamChatInput>): StreamChatInput => ({
         ...baseInput,
         // Direct requests carry the gateway-bound credential instead of a browser key.
@@ -610,7 +512,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         ...(searchTracker.settled
           ? { preparedSearch: { block: searchTracker.block } satisfies PreparedSearchInput }
           : {}),
-        ...(currentCache ? { cacheState: currentCache } : {}),
         ...extra,
       });
 
@@ -624,7 +525,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         searchTracker.block = prepared.webSearchBlock ?? null;
       }
 
-      const hadCacheStep = Boolean(prepared.cacheStep);
       if (prepared.cacheStep) {
         const cacheRes = await sendLocalHttpFetch(
           prepared.cacheStep.request,
@@ -647,12 +547,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         );
       }
 
-      if (prepared.cacheState) {
-        localCacheRef.current.set(cacheKey, prepared.cacheState);
-      } else if (hadCacheStep) {
-        localCacheRef.current.delete(cacheKey);
-      }
-
+      // The gateway owns the reusable cache state; this request only reports the
+      // state it executed plus any rejection so the gateway can classify both.
       let mainRes = await sendLocalHttpFetch(
         prepared,
         provider,
@@ -661,47 +557,24 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       );
       if (!mainRes.ok) {
         const snippet = await mainRes.text().catch(() => '');
-        const errKind = classifyLocalMainCacheError(
-          mainRes.status,
-          snippet,
-          Boolean(prepared.cacheState?.resourceName),
-        );
-        if (errKind !== 'none') {
-          const fallbackState: PromptCacheState = { unsupported: true };
-          if (errKind === 'unsupported') {
-            localCacheRef.current.set(cacheKey, fallbackState);
-          } else {
-            localCacheRef.current.delete(cacheKey);
-          }
-          prepared = await gateway.prepareLocalChat(
+        const retry = await gateway
+          .prepareLocalChat(
             conversationId,
-            {
-              ...baseInput,
-              credentialEnvelope: true,
-              ...(searchTracker.settled
-                ? { preparedSearch: { block: searchTracker.block } }
-                : {}),
-              cacheState: fallbackState,
-            },
+            buildInput({
+              ...(prepared.cacheState ? { cacheState: prepared.cacheState } : {}),
+              localMainFailure: {
+                status: mainRes.status,
+                body: snippet.slice(0, 2000),
+              },
+            }),
             signal,
-          );
-          mainRes = await sendLocalHttpFetch(
-            prepared,
-            provider,
-            providerId,
-            signal,
-          );
-          if (!mainRes.ok) {
-            const retrySnippet = await mainRes.text().catch(() => '');
-            throw new GatewayError(
-              `HTTP_${mainRes.status}`,
-              retrySnippet.trim()
-                ? `上游返回 HTTP ${mainRes.status}: ${retrySnippet.trim().slice(0, 300)}`
-                : `上游返回 HTTP ${mainRes.status}`,
-              mainRes.status,
-            );
+          )
+          .catch(() => null);
+        if (retry?.cacheRetry) {
+          mainRes = await sendLocalHttpFetch(retry, provider, providerId, signal);
+          if (mainRes.ok) {
+            return { prepared: retry, response: mainRes };
           }
-          return { prepared, response: mainRes };
         }
         throw new GatewayError(
           `HTTP_${mainRes.status}`,
@@ -713,9 +586,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       }
       return { prepared, response: mainRes };
     },
-    [connectionEpoch, gateway, sendLocalHttpFetch],
+    [gateway, sendLocalHttpFetch],
   );
-
   const executeLocalStream = useCallback(
     async (opts: {
       conversationId: string;
@@ -728,7 +600,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         regenerateMessageId?: string;
         webSearch?: boolean;
         searchEngineId?: string;
-        autoCreateCache?: boolean;
       };
       optimisticUserId?: string;
       regenerateTargetId?: string;
@@ -758,8 +629,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           opts.input,
           provider,
           opts.input.providerId,
-          model,
-          opts.input.modelId,
           searchTracker,
           ctrl.signal,
         );
@@ -1203,8 +1072,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             },
             provider,
             opts.input.providerId,
-            model,
-            opts.input.modelId,
             searchTracker,
             ctrl.signal,
           );
@@ -1360,19 +1227,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           params: mergedParams,
           webSearch: opts.webSearch,
           searchEngineId: opts.searchEngineId,
-          autoCreateCache: settings.autoCreateCache,
         },
         optimisticUserId: optimisticId,
         expectedCountOnAbort: expectedAfterAbort,
         onStreamAccepted: opts.onStreamAccepted,
       });
     },
-    [
-      executeLocalStream,
-      executeStream,
-      resources.providers,
-      settings.autoCreateCache,
-    ],
+    [executeLocalStream, executeStream, resources.providers],
   );
 
   const regenerateMessage = useCallback(
@@ -1416,19 +1277,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           regenerateMessageId: opts.targetMessageId,
           webSearch: opts.webSearch,
           searchEngineId: opts.searchEngineId,
-          autoCreateCache: settings.autoCreateCache,
         },
         regenerateTargetId: opts.targetMessageId,
         expectedCountOnAbort,
       });
     },
-    [
-      executeLocalStream,
-      executeStream,
-      resources.providers,
-      settings.autoCreateCache,
-      toast,
-    ],
+    [executeLocalStream, executeStream, resources.providers, toast],
   );
 
   const stopStreaming = useCallback(() => {

@@ -117,6 +117,73 @@ describe('AppProvider, ConnectionGate, and Routing', () => {
     });
   });
 
+  it('restores the stored connection token on startup and reaches the workspace without re-entering it', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/healthz')) {
+        return new Response(
+          JSON.stringify({ status: 'ok', version: '0.1.0', authRequired: true }),
+          { status: 200 },
+        );
+      }
+      const auth = (init?.headers as Record<string, string>)?.Authorization;
+      if (auth !== 'Bearer stored-token') {
+        return new Response(
+          JSON.stringify({ code: 'UNAUTHORIZED', message: 'bad token' }),
+          { status: 401 },
+        );
+      }
+      if (url.endsWith('/api/v1/settings')) {
+        return new Response(JSON.stringify(settingsEnvelope()), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(JSON.stringify({ providers: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return new Response(
+          JSON.stringify({
+            assistants: [{ id: 'default', name: '默认助手', params: {}, isDefault: true }],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations')) {
+        return new Response(JSON.stringify({ conversations: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/plugins/search')) {
+        return new Response(JSON.stringify({ engines: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ servers: [] }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    localStorage.setItem(
+      CONNECTION_STORAGE_KEY,
+      JSON.stringify({ gatewayBaseUrl: '/', accessToken: 'stored-token' }),
+    );
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter initialEntries={['/chat']}>
+          <ConnectionGate>
+            <AppRoutes />
+          </ConnectionGate>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('button', { name: '默认助手', current: true }),
+      ).toBeInTheDocument();
+    });
+    expect(screen.queryByText('需要访问令牌')).not.toBeInTheDocument();
+  });
+
   it('hydrates preferences from the gateway and patches single fields without reconnecting', async () => {
     const patchBodies: Array<Record<string, unknown>> = [];
     const serverPreferences: Record<string, unknown> = {
