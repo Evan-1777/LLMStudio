@@ -140,6 +140,8 @@ export interface Assistant {
   defaultProviderId?: string;
   defaultModelId?: string;
   params: GenerationParams;
+  /** Empty or missing means the built-in avatar. */
+  avatarDataUrl?: string;
   isDefault: boolean;
   createdAt?: string;
   updatedAt?: string;
@@ -152,6 +154,8 @@ export interface AssistantUpsertPayload {
   defaultProviderId?: string;
   defaultModelId?: string;
   params?: GenerationParams;
+  /** Omit to keep the stored avatar; "" clears it. */
+  avatarDataUrl?: string;
 }
 
 export interface TextBlock {
@@ -611,6 +615,7 @@ export interface ServerPreferences {
   autoCreateCache: boolean;
   collapseLineThreshold: number;
   collapseCharThreshold: number;
+  userAvatarDataUrl: string;
 }
 
 export interface ServerPreferencesEnvelope {

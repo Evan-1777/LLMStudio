@@ -695,3 +695,52 @@ a {
     transition: none;
   }
 }
+
+/* Avatar */
+.ui-avatar {
+  display: grid;
+  place-items: center;
+  flex: none;
+  overflow: hidden;
+  border-radius: 50%;
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-surface-secondary);
+  color: var(--text-secondary);
+}
+
+.ui-avatar__img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
+.ui-avatar-field {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ui-avatar-field__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ui-avatar-field__input {
+  display: none;
+}
+
+.ui-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}

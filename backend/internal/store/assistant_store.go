@@ -25,7 +25,7 @@ func NewAssistantStore(db *sql.DB) *AssistantStore {
 // List returns all assistants with the default assistant first, followed by creation order.
 func (s *AssistantStore) List(ctx context.Context) ([]domain.Assistant, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, system_prompt, default_provider_id, default_model_id, params_json, is_default, created_at, updated_at
+		SELECT id, name, system_prompt, default_provider_id, default_model_id, params_json, avatar_data_url, is_default, created_at, updated_at
 		FROM assistants
 		ORDER BY is_default DESC, created_at ASC, name ASC
 	`)
@@ -51,7 +51,7 @@ func (s *AssistantStore) List(ctx context.Context) ([]domain.Assistant, error) {
 // Get fetches an assistant by ID.
 func (s *AssistantStore) Get(ctx context.Context, id string) (domain.Assistant, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, system_prompt, default_provider_id, default_model_id, params_json, is_default, created_at, updated_at
+		SELECT id, name, system_prompt, default_provider_id, default_model_id, params_json, avatar_data_url, is_default, created_at, updated_at
 		FROM assistants
 		WHERE id = ?
 	`, id)
@@ -84,9 +84,9 @@ func (s *AssistantStore) Create(ctx context.Context, a domain.Assistant) (domain
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO assistants (
-			id, name, system_prompt, default_provider_id, default_model_id, params_json, is_default, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, a.ID, a.Name, a.SystemPrompt, a.DefaultProviderID, a.DefaultModelID, string(paramsBytes),
+			id, name, system_prompt, default_provider_id, default_model_id, params_json, avatar_data_url, is_default, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, a.ID, a.Name, a.SystemPrompt, a.DefaultProviderID, a.DefaultModelID, string(paramsBytes), a.AvatarDataURL,
 		boolToInt(a.IsDefault), formatTime(a.CreatedAt), formatTime(a.UpdatedAt))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -107,9 +107,9 @@ func (s *AssistantStore) Update(ctx context.Context, a domain.Assistant) (domain
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE assistants
-		SET name = ?, system_prompt = ?, default_provider_id = ?, default_model_id = ?, params_json = ?, updated_at = ?
+		SET name = ?, system_prompt = ?, default_provider_id = ?, default_model_id = ?, params_json = ?, avatar_data_url = ?, updated_at = ?
 		WHERE id = ?
-	`, a.Name, a.SystemPrompt, a.DefaultProviderID, a.DefaultModelID, string(paramsBytes), formatTime(a.UpdatedAt), a.ID)
+	`, a.Name, a.SystemPrompt, a.DefaultProviderID, a.DefaultModelID, string(paramsBytes), a.AvatarDataURL, formatTime(a.UpdatedAt), a.ID)
 	if err != nil {
 		return domain.Assistant{}, fmt.Errorf("update assistant %s: %w", a.ID, err)
 	}
@@ -177,7 +177,7 @@ func scanAssistant(row rowScanner) (domain.Assistant, error) {
 	)
 	if err := row.Scan(
 		&a.ID, &a.Name, &a.SystemPrompt, &a.DefaultProviderID, &a.DefaultModelID,
-		&paramsJSON, &isDefault, &createdRaw, &updatedRaw,
+		&paramsJSON, &a.AvatarDataURL, &isDefault, &createdRaw, &updatedRaw,
 	); err != nil {
 		return domain.Assistant{}, err
 	}

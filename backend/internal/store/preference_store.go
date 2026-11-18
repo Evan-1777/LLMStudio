@@ -12,15 +12,15 @@ import (
 const preferencesSelect = "SELECT theme_mode, seed_color_value, enter_to_send, visual_html_render, default_html_preview, " +
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
-	"collapse_char_threshold, imported " +
+	"collapse_char_threshold, user_avatar_data_url, imported " +
 	"FROM user_preferences WHERE id = 1"
 
 const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"id, theme_mode, seed_color_value, enter_to_send, visual_html_render, default_html_preview, " +
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
-	"collapse_char_threshold, imported, updated_at" +
-	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
+	"collapse_char_threshold, user_avatar_data_url, imported, updated_at" +
+	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
 	"ON CONFLICT(id) DO UPDATE SET " +
 	"theme_mode = excluded.theme_mode, " +
 	"seed_color_value = excluded.seed_color_value, " +
@@ -34,6 +34,7 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"auto_create_cache = excluded.auto_create_cache, " +
 	"collapse_line_threshold = excluded.collapse_line_threshold, " +
 	"collapse_char_threshold = excluded.collapse_char_threshold, " +
+	"user_avatar_data_url = excluded.user_avatar_data_url, " +
 	"imported = 1, " +
 	"updated_at = excluded.updated_at"
 
@@ -62,9 +63,16 @@ func (s *PreferenceStore) Get(ctx context.Context) (domain.Preferences, bool, er
 }
 
 // Update merges patch into the stored preferences and marks the row initialized.
+// Merging, validation and the write share one transaction so concurrent patchers
+// touching disjoint fields cannot overwrite each other with a stale snapshot.
 // When onlyIfUninitialized is true the write is skipped once the row exists, so a
 // late legacy import cannot overwrite committed values.
-func (s *PreferenceStore) Update(ctx context.Context, patch domain.PreferencesPatch, onlyIfUninitialized bool) (domain.Preferences, bool, error) {
+func (s *PreferenceStore) Update(
+	ctx context.Context,
+	patch domain.PreferencesPatch,
+	onlyIfUninitialized bool,
+	validate func(domain.Preferences) error,
+) (domain.Preferences, bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.Preferences{}, false, fmt.Errorf("begin preferences update: %w", err)
@@ -85,7 +93,12 @@ func (s *PreferenceStore) Update(ctx context.Context, patch domain.PreferencesPa
 		return prefs, true, nil
 	}
 
-	next := patch.Merge(prefs)
+	next := patch.Merge(prefs).Normalize()
+	if validate != nil {
+		if err := validate(next); err != nil {
+			return domain.Preferences{}, false, err
+		}
+	}
 	if _, err := tx.ExecContext(ctx, preferencesUpsert,
 		next.ThemeMode,
 		int64(next.SeedColorValue),
@@ -99,6 +112,7 @@ func (s *PreferenceStore) Update(ctx context.Context, patch domain.PreferencesPa
 		boolToInt(next.AutoCreateCache),
 		next.CollapseLineThreshold,
 		next.CollapseCharThreshold,
+		next.UserAvatarDataURL,
 		formatTime(time.Now().UTC()),
 	); err != nil {
 		return domain.Preferences{}, false, fmt.Errorf("write preferences: %w", err)
@@ -139,6 +153,7 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 		&autoCache,
 		&prefs.CollapseLineThreshold,
 		&prefs.CollapseCharThreshold,
+		&prefs.UserAvatarDataURL,
 		&initialized,
 	)
 	if err != nil {

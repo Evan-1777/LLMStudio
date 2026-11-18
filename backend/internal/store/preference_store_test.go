@@ -33,7 +33,7 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 
 	theme := domain.ThemeModeDark
 	enter := false
-	if _, initialized, err = prefs.Update(ctx, domain.PreferencesPatch{ThemeMode: &theme, EnterToSend: &enter}, false); err != nil {
+	if _, initialized, err = prefs.Update(ctx, domain.PreferencesPatch{ThemeMode: &theme, EnterToSend: &enter}, false, validatePrefs); err != nil {
 		t.Fatalf("partial update: %v", err)
 	} else if !initialized {
 		t.Fatal("expected update to report initialized=true")
@@ -64,7 +64,7 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	prefs = NewPreferenceStore(db)
 
 	preview := false
-	if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{DefaultHTMLPreview: &preview}, false); err != nil {
+	if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{DefaultHTMLPreview: &preview}, false, validatePrefs); err != nil {
 		t.Fatalf("explicit false update: %v", err)
 	}
 	got, _, err = prefs.Get(ctx)
@@ -78,7 +78,7 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	// A late legacy import is ignored once the row is initialized.
 	legacy := domain.DefaultPreferences()
 	legacy.ThemeMode = domain.ThemeModeLight
-	stored, initialized, err := prefs.Update(ctx, patchFromPreferences(legacy), true)
+	stored, initialized, err := prefs.Update(ctx, patchFromPreferences(legacy), true, validatePrefs)
 	if err != nil {
 		t.Fatalf("legacy import on initialized row: %v", err)
 	}
@@ -90,14 +90,14 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "UPDATE user_preferences SET imported = 0"); err != nil {
 		t.Fatalf("reset imported flag: %v", err)
 	}
-	stored, _, err = prefs.Update(ctx, patchFromPreferences(legacy), true)
+	stored, _, err = prefs.Update(ctx, patchFromPreferences(legacy), true, validatePrefs)
 	if err != nil {
 		t.Fatalf("legacy import: %v", err)
 	}
 	if stored.ThemeMode != domain.ThemeModeLight {
 		t.Fatalf("legacy import not applied: %+v", stored)
 	}
-	stored, _, err = prefs.Update(ctx, domain.PreferencesPatch{ThemeMode: &theme}, true)
+	stored, _, err = prefs.Update(ctx, domain.PreferencesPatch{ThemeMode: &theme}, true, validatePrefs)
 	if err != nil {
 		t.Fatalf("second legacy import: %v", err)
 	}
@@ -157,6 +157,10 @@ func TestMigration005BackfillsManagedAPIKeys(t *testing.T) {
 	assertManaged("without-key", false)
 }
 
+func validatePrefs(p domain.Preferences) error {
+	return p.Validate()
+}
+
 func patchFromPreferences(p domain.Preferences) domain.PreferencesPatch {
 	return domain.PreferencesPatch{
 		ThemeMode:             &p.ThemeMode,
@@ -169,5 +173,6 @@ func patchFromPreferences(p domain.Preferences) domain.PreferencesPatch {
 		AutoCreateCache:       &p.AutoCreateCache,
 		CollapseLineThreshold: &p.CollapseLineThreshold,
 		CollapseCharThreshold: &p.CollapseCharThreshold,
+		UserAvatarDataURL:     &p.UserAvatarDataURL,
 	}
 }

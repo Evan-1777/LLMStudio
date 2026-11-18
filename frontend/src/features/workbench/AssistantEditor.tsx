@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
+  AvatarField,
   Button,
   ConfirmDialog,
   ErrorBanner,
@@ -48,6 +49,9 @@ export function AssistantEditor({
   const [temperature, setTemperature] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
   const [reasoningEffort, setReasoningEffort] = useState<string>('');
+  const [avatarDataUrl, setAvatarDataUrl] = useState('');
+  const [avatarTouched, setAvatarTouched] = useState(false);
+  const [avatarError, setAvatarError] = useState<string | null>(null);
 
   const [nameError, setNameError] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
@@ -93,6 +97,9 @@ export function AssistantEditor({
         : '',
     );
     setReasoningEffort(assistant?.params.reasoningEffort ?? '');
+    setAvatarDataUrl(assistant?.avatarDataUrl ?? '');
+    setAvatarTouched(false);
+    setAvatarError(null);
     setNameError(null);
     setApiError(null);
   }, [open, assistant]);
@@ -147,6 +154,8 @@ export function AssistantEditor({
           ? { reasoningEffort: reasoningEffort as ReasoningEffort }
           : {}),
       },
+      // Editing keeps the stored avatar unless the draft was actually changed.
+      ...(assistant && !avatarTouched ? {} : { avatarDataUrl }),
     };
 
     setSaving(true);
@@ -237,15 +246,36 @@ export function AssistantEditor({
         >
           {apiError ? <ErrorBanner message={apiError} /> : null}
 
-          <Field label="名称" htmlFor="assistant-name" error={nameError}>
-            <Input
-              id="assistant-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              maxLength={80}
-              required
+          <div className="wb-assistant-identity">
+            <AvatarField
+              value={avatarDataUrl}
+              kind="assistant"
+              label="助手头像"
+              busy={saving}
+              onChange={(next) => {
+                setAvatarDataUrl(next);
+                setAvatarTouched(true);
+                setAvatarError(null);
+              }}
+              onError={setAvatarError}
             />
-          </Field>
+            <div className="wb-assistant-identity__name">
+              <Field label="名称" htmlFor="assistant-name" error={nameError}>
+                <Input
+                  id="assistant-name"
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  maxLength={80}
+                  required
+                />
+              </Field>
+            </div>
+          </div>
+          {avatarError ? (
+            <span className="ui-field__error" role="alert">
+              {avatarError}
+            </span>
+          ) : null}
 
           <Field label="系统提示词" htmlFor="assistant-system-prompt">
             <Textarea

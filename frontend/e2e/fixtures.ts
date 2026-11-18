@@ -268,6 +268,70 @@ async function startMockUpstream(): Promise<{
         return;
       }
 
+      if (prompt.includes('[HTML_HEIGHT]')) {
+        const reply = [
+          '高度说明',
+          '',
+          '<div id="height-root">',
+          '<div id="height-card" style="height:490px;background:#eef3ff;"></div>',
+          '<div id="height-tail" style="height:24px;line-height:24px;">高度尾部</div>',
+          '<script>setTimeout(function(){document.getElementById("height-card").style.height="170px";}, 1500);</script>',
+          '</div>',
+          '',
+          '尾部说明',
+        ].join('\n');
+        writeChunk({ choices: [{ delta: { content: reply } }] });
+        writeChunk({
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        });
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      if (prompt.includes('[HTML_HEIGHT_DOC]')) {
+        const reply = [
+          '<!DOCTYPE html>',
+          '<html>',
+          '<head><style>body{margin:0;background:#faf7ff}</style></head>',
+          '<body>',
+          '<div style="min-height:100vh">',
+          '<div style="height:400px;background:#efe9ff"></div>',
+          '<div style="height:20px;line-height:20px">视口文档尾部</div>',
+          '</div>',
+          '</body>',
+          '</html>',
+        ].join('\n');
+        writeChunk({ choices: [{ delta: { content: reply } }] });
+        writeChunk({
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        });
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
+      if (prompt.includes('[HTML_HEIGHT_FENCED]')) {
+        const reply = [
+          '围栏高度说明',
+          '',
+          '```html',
+          '<div id="fenced-card" style="height:300px;background:#e9f7ef;"></div>',
+          '<script>setTimeout(function(){document.getElementById("fenced-card").style.height="120px";}, 1500);</script>',
+          '```',
+        ].join('\n');
+        writeChunk({ choices: [{ delta: { content: reply } }] });
+        writeChunk({
+          choices: [{ delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+        });
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+
       if (prompt.includes('[HTML_SANDBOX]')) {
         const htmlReply = [
           '### Markdown Title',

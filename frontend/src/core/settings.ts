@@ -114,6 +114,8 @@ export interface AppSettings {
   autoCreateCache: boolean;
   collapseLineThreshold: number;
   collapseCharThreshold: number;
+  // User avatar owned by the gateway; empty means the built-in avatar.
+  userAvatarDataUrl: string;
 }
 
 export interface SettingsLoadResult {
@@ -143,6 +145,7 @@ export const APP_PREFERENCE_KEYS = [
   'autoCreateCache',
   'collapseLineThreshold',
   'collapseCharThreshold',
+  'userAvatarDataUrl',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -163,6 +166,7 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     autoCreateCache: settings.autoCreateCache,
     collapseLineThreshold: settings.collapseLineThreshold,
     collapseCharThreshold: settings.collapseCharThreshold,
+    userAvatarDataUrl: settings.userAvatarDataUrl,
   };
 }
 
@@ -187,6 +191,7 @@ export function defaultSettings(): AppSettings {
     autoCreateCache: false,
     collapseLineThreshold: 24,
     collapseCharThreshold: 1200,
+    userAvatarDataUrl: '',
   };
 }
 
@@ -276,7 +281,25 @@ export function normalizeSettings(raw: unknown): AppSettings {
       20000,
       defaults.collapseCharThreshold,
     ),
+    userAvatarDataUrl:
+      typeof obj.userAvatarDataUrl === 'string'
+        ? obj.userAvatarDataUrl
+        : defaults.userAvatarDataUrl,
   };
+}
+
+/**
+ * Fills the server-managed preference subset from defaults, so a gateway that
+ * predates a field reports that field empty instead of inheriting the previous
+ * connection's value.
+ */
+export function normalizeServerPreferences(raw: unknown): AppPreferences {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return defaultAppPreferences();
+  }
+  return pickAppPreferences(
+    normalizeSettings({ ...defaultSettings(), ...(raw as Record<string, unknown>) }),
+  );
 }
 
 function parseLegacyDoubleEncoded(raw: string): Record<string, unknown> {

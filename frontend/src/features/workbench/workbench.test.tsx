@@ -850,7 +850,10 @@ describe('Workbench flows and attachments', () => {
     holdPatch = true;
     await user.click(screen.getByRole('button', { name: '选择模型' }));
     await user.click(screen.getAllByRole('option')[0]);
-    expect(screen.getByRole('button', { name: '选择模型' })).toBeDisabled();
+    const busyPicker = screen.getByRole('button', { name: '选择模型' });
+    expect(busyPicker).toHaveAttribute('aria-busy', 'true');
+    expect(busyPicker).toHaveAttribute('aria-disabled', 'true');
+    expect(busyPicker).toHaveClass('wb-model-btn--busy');
 
     // Open drawer and switch to cC (whose model is gpt-4.1); cC's picker is enabled even while cA's PATCH is pending.
     await user.click(screen.getByRole('button', { name: '切换话题栏' }));
@@ -858,7 +861,9 @@ describe('Workbench flows and attachments', () => {
     await waitFor(() => {
       expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-4.1');
     });
-    expect(screen.getByRole('button', { name: '选择模型' })).not.toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: '选择模型' }),
+    ).not.toHaveAttribute('aria-disabled', 'true');
 
     // Resolve cA's slow PATCH returning gpt-4.1-mini -> must NOT pollute cC!
     releasePatch(

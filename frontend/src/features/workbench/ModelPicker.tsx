@@ -1,6 +1,6 @@
-import { useMemo, useState } from 'react';
+import { useId, useMemo, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
-import { Icon, Input, Popover } from '../../components/ui';
+import { Input, Popover } from '../../components/ui';
 import type { ModelConfig, ProviderConfig } from '../../core/types';
 
 export interface SelectedModelRef {
@@ -55,6 +55,7 @@ export function ModelPicker({
   onSelect: (providerId: string, modelId: string) => void;
 }) {
   const location = useLocation();
+  const descriptionId = useId();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
 
@@ -87,6 +88,8 @@ export function ModelPicker({
       .filter((g) => g.models.length > 0);
   }, [enabledProviders, query]);
 
+  const label = current ? current.model.name : '选择模型';
+
   return (
     <Popover
       open={open}
@@ -98,29 +101,18 @@ export function ModelPicker({
       trigger={
         <button
           type="button"
-          className="wb-model-btn"
+          className={`wb-model-btn ${busy ? 'wb-model-btn--busy' : ''}`.trim()}
           aria-label="选择模型"
+          aria-describedby={descriptionId}
           aria-busy={busy || undefined}
-          disabled={disabled || busy}
+          aria-disabled={disabled || busy || undefined}
+          disabled={disabled}
+          title="选择模型"
         >
-          {busy ? (
-            <span
-              className="ui-spinner"
-              style={{ width: 13, height: 13 }}
-              aria-hidden="true"
-            />
-          ) : (
-            <Icon name="cpu" size={14} />
-          )}
-          <span className="wb-model-btn__name">
-            {current ? current.model.name : '选择模型'}
+          <span className="wb-model-btn__name">{label}</span>
+          <span id={descriptionId} className="ui-visually-hidden">
+            {current ? `当前模型 ${current.model.name}` : '未选择模型'}
           </span>
-          {current ? (
-            <span className="wb-model-btn__prov wb-desktop-only">
-              {current.provider.name}
-            </span>
-          ) : null}
-          <Icon name="chevronsUpDown" size={13} />
         </button>
       }
     >
@@ -136,17 +128,10 @@ export function ModelPicker({
         />
 
         <div className="wb-model-list" role="listbox" aria-label="可用模型">
-          {filteredGroups.length === 0 ? (
-            <div
-              style={{
-                padding: '18px 8px',
-                textAlign: 'center',
-                fontSize: 12,
-                color: 'var(--text-tertiary)',
-              }}
-            >
-              无可用模型
-            </div>
+          {enabledProviders.length === 0 ? (
+            <div className="wb-model-empty">尚未配置模型服务</div>
+          ) : filteredGroups.length === 0 ? (
+            <div className="wb-model-empty">没有匹配的模型</div>
           ) : (
             filteredGroups.map(({ provider, models }) => (
               <div key={provider.id}>
@@ -169,28 +154,10 @@ export function ModelPicker({
                         setQuery('');
                       }}
                     >
-                      <span
-                        style={{
-                          minWidth: 0,
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                        }}
-                      >
-                        {model.name}
-                      </span>
+                      <span className="wb-model-option__name">{model.name}</span>
                       <span className="wb-model-option__meta">
-                        {hasVision ? (
-                          <span title="视觉输入">
-                            <Icon name="image" size={13} />
-                          </span>
-                        ) : null}
-                        {model.reasoning ? (
-                          <span title="推理模型">
-                            <Icon name="lightbulb" size={13} />
-                          </span>
-                        ) : null}
-                        {active ? <Icon name="check" size={14} /> : null}
+                        {hasVision ? <span>视觉</span> : null}
+                        {model.reasoning ? <span>推理</span> : null}
                       </span>
                     </button>
                   );
@@ -200,22 +167,14 @@ export function ModelPicker({
           )}
         </div>
 
-        <div
-          style={{
-            marginTop: 6,
-            paddingTop: 6,
-            borderTop: '1px solid var(--border-hairline)',
-          }}
-        >
+        <div className="wb-model-footer">
           <Link
             to="/settings/providers"
             state={{ from: `${location.pathname}${location.search}` }}
             className="ui-menu-item"
-            style={{ fontSize: 12, color: 'var(--text-secondary)' }}
             onClick={() => setOpen(false)}
           >
-            <Icon name="settings" size={14} />
-            <span>管理模型服务</span>
+            管理模型服务
           </Link>
         </div>
       </div>

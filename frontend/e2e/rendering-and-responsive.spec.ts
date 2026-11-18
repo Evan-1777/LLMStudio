@@ -1,3 +1,4 @@
+import type { Locator } from '@playwright/test';
 import {
   connectWithToken,
   expect,
@@ -89,6 +90,133 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
       innerW: window.innerWidth,
     }));
     expect(overflow.scrollW).toBeLessThanOrEqual(overflow.innerW);
+  });
+
+  test('drives inline HTML preview height from the document content instead of the iframe viewport', async ({
+    appUrl,
+    upstream,
+    page,
+  }) => {
+    await seedMockProviderViaApi(appUrl, upstream.url);
+    await connectWithToken(page, appUrl);
+
+    await page.getByRole('button', { name: '选择模型' }).click();
+    await page.getByRole('option', { name: /Mock Chat/ }).click();
+
+    const composer = page.getByLabel('消息输入框');
+    const frameHeight = (locator: Locator) =>
+      locator.evaluate((el) => el.getBoundingClientRect().height);
+    const frameContentHeight = async (locator: Locator) => {
+      const handle = await locator.elementHandle();
+      const frame = await handle?.contentFrame();
+      if (!frame) throw new Error('sandboxed frame is not available');
+      return frame.evaluate(() => {
+        const body = document.body;
+        const rect = body.getBoundingClientRect();
+        const bodyStyle = getComputedStyle(body);
+        let bottom = 0;
+        for (const child of Array.from(body.children)) {
+          const style = getComputedStyle(child);
+          if (style.display === 'none') continue;
+          const childRect = child.getBoundingClientRect();
+          bottom = Math.max(
+            bottom,
+            childRect.bottom - rect.top + (parseFloat(style.marginBottom) || 0),
+          );
+        }
+        return Math.ceil(
+          bottom +
+            (parseFloat(bodyStyle.paddingBottom) || 0) +
+            (parseFloat(bodyStyle.marginTop) || 0) +
+            (parseFloat(bodyStyle.marginBottom) || 0),
+        );
+      });
+    };
+
+    // 1. Raw HTML: a 514 px document shrinks to 194 px inside the same frame.
+    await composer.fill('[HTML_HEIGHT]');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    const seamless = page.locator('iframe.html-sandbox-frame--seamless');
+    await expect(seamless).toHaveCount(1);
+    const inlineFrame = seamless.first();
+    await expect.poll(() => frameHeight(inlineFrame), { timeout: 6000 }).toBeGreaterThan(480);
+
+    const frameHandle = await inlineFrame.elementHandle();
+    const childFrame = await frameHandle?.contentFrame();
+    await childFrame?.evaluate(() => {
+      (window as unknown as Record<string, unknown>).__heightProbe = 'kept';
+    });
+
+    await expect.poll(() => frameHeight(inlineFrame), { timeout: 6000 }).toBeLessThan(240);
+    const shrunkHeight = await frameHeight(inlineFrame);
+    const contentHeight = await frameContentHeight(inlineFrame);
+    expect(Math.abs(shrunkHeight - contentHeight)).toBeLessThanOrEqual(2);
+    expect(
+      await childFrame?.evaluate(
+        () => (window as unknown as Record<string, unknown>).__heightProbe ?? null,
+      ),
+    ).toBe('kept');
+
+    // The following prose keeps only the normal stack gap (no stale iframe height).
+    const gap = await page.evaluate(() => {
+      const article = Array.from(document.querySelectorAll('.wb-asst-msg')).find((el) =>
+        el.textContent?.includes('尾部说明'),
+      );
+      const wrap = article?.querySelector('.html-sandbox-wrap');
+      const prose = Array.from(article?.querySelectorAll('.prose') ?? []).find((el) =>
+        el.textContent?.includes('尾部说明'),
+      );
+      if (!wrap || !prose) return -1;
+      return prose.getBoundingClientRect().top - wrap.getBoundingClientRect().bottom;
+    });
+    expect(gap).toBeGreaterThanOrEqual(0);
+    expect(gap).toBeLessThan(40);
+
+    const idleA = await frameHeight(inlineFrame);
+    await page.waitForTimeout(1000);
+    expect(Math.abs((await frameHeight(inlineFrame)) - idleA)).toBeLessThanOrEqual(1);
+    console.log(
+      `[HEIGHT] raw iframe=${shrunkHeight.toFixed(1)} content=${contentHeight} idleDelta=${(
+        (await frameHeight(inlineFrame)) - idleA
+      ).toFixed(1)}`,
+    );
+
+    // The same measurement keeps working in the feed layout.
+    await page.getByRole('link', { name: '设置' }).click();
+    await page.getByRole('button', { name: '外观与显示' }).click();
+    await page.getByRole('radio', { name: '信息流模式' }).click();
+    await page.getByRole('button', { name: '返回工作台' }).click();
+    const feedFrame = page.locator('iframe.html-sandbox-frame--seamless').first();
+    await expect.poll(() => frameHeight(feedFrame), { timeout: 6000 }).toBeLessThan(240);
+    expect(await frameHeight(feedFrame)).toBeGreaterThan(150);
+    await page.getByRole('link', { name: '设置' }).click();
+    await page.getByRole('button', { name: '外观与显示' }).click();
+    await page.getByRole('radio', { name: '气泡模式' }).click();
+    await page.getByRole('button', { name: '返回工作台' }).click();
+
+    // 2. Full document with min-height:100vh must follow its content and stay stable.
+    await composer.fill('[HTML_HEIGHT_DOC]');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await expect(seamless).toHaveCount(2);
+    const docFrame = seamless.nth(1);
+    await expect.poll(() => frameHeight(docFrame), { timeout: 6000 }).toBeGreaterThan(380);
+    const docHeightA = await frameHeight(docFrame);
+    await page.waitForTimeout(1000);
+    const docHeightB = await frameHeight(docFrame);
+    expect(Math.abs(docHeightB - docHeightA)).toBeLessThanOrEqual(1);
+    expect(docHeightB).toBeLessThan(520);
+
+    // 3. Fenced HTML preview switches to the same content-driven height.
+    await composer.fill('[HTML_HEIGHT_FENCED]');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    const fencedMessage = page
+      .locator('.wb-asst-msg')
+      .filter({ hasText: '围栏高度说明' });
+    await fencedMessage.getByRole('button', { name: '预览 HTML' }).click();
+    const fencedFrame = fencedMessage.locator('iframe[title="HTML 预览"]');
+    await expect(fencedFrame).toBeVisible();
+    await expect.poll(() => frameHeight(fencedFrame), { timeout: 6000 }).toBeGreaterThan(300);
+    await expect.poll(() => frameHeight(fencedFrame), { timeout: 6000 }).toBeLessThan(220);
   });
 
   test('bounds long thinking container height with internal scrolling across desktop, tablet, and mobile viewports', async ({

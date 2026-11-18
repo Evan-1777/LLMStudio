@@ -76,6 +76,7 @@ func setAutoCache(t *testing.T, chatSvc *ChatService, enabled bool) {
 		context.Background(),
 		domain.PreferencesPatch{AutoCreateCache: domain.BoolPtr(enabled)},
 		false,
+		validatePreferences,
 	); err != nil {
 		t.Fatalf("set auto cache preference: %v", err)
 	}

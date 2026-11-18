@@ -16,6 +16,8 @@ type AssistantInput struct {
 	DefaultProviderID string                  `json:"defaultProviderId"`
 	DefaultModelID    string                  `json:"defaultModelId"`
 	Params            domain.GenerationParams `json:"params"`
+	// AvatarDataURL is omitted to keep the stored avatar; "" clears it.
+	AvatarDataURL *string `json:"avatarDataUrl"`
 }
 
 // AssistantService manages assistant presets and enforces default assistant invariants.
@@ -44,6 +46,13 @@ func (s *AssistantService) Create(ctx context.Context, in AssistantInput) (domai
 	if name == "" {
 		return domain.Assistant{}, domain.NewError(domain.ErrCodeInvalidArgument, "assistant name is required", nil)
 	}
+	avatar := ""
+	if in.AvatarDataURL != nil {
+		avatar = *in.AvatarDataURL
+	}
+	if err := domain.ValidateAvatarDataURL(avatar); err != nil {
+		return domain.Assistant{}, err
+	}
 	return s.store.Create(ctx, domain.Assistant{
 		ID:                strings.TrimSpace(in.ID),
 		Name:              name,
@@ -51,6 +60,7 @@ func (s *AssistantService) Create(ctx context.Context, in AssistantInput) (domai
 		DefaultProviderID: strings.TrimSpace(in.DefaultProviderID),
 		DefaultModelID:    strings.TrimSpace(in.DefaultModelID),
 		Params:            in.Params,
+		AvatarDataURL:     avatar,
 		IsDefault:         false,
 	})
 }
@@ -70,6 +80,12 @@ func (s *AssistantService) Update(ctx context.Context, id string, in AssistantIn
 	existing.DefaultProviderID = strings.TrimSpace(in.DefaultProviderID)
 	existing.DefaultModelID = strings.TrimSpace(in.DefaultModelID)
 	existing.Params = in.Params
+	if in.AvatarDataURL != nil {
+		if err := domain.ValidateAvatarDataURL(*in.AvatarDataURL); err != nil {
+			return domain.Assistant{}, err
+		}
+		existing.AvatarDataURL = *in.AvatarDataURL
+	}
 	return s.store.Update(ctx, existing)
 }
 

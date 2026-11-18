@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import {
+  Avatar,
   Button,
   EmptyState,
   ErrorBanner,
@@ -333,14 +334,11 @@ export function ChatCanvas({
                     }`.trim()}
                   >
                     <div className="wb-feed-head">
-                      <span
-                        className={`wb-feed-avatar ${
-                          isUser ? 'wb-feed-avatar--user' : 'wb-feed-avatar--asst'
-                        }`.trim()}
-                        aria-hidden="true"
-                      >
-                        <Icon name={isUser ? 'user' : 'bot'} size={17} />
-                      </span>
+                      <Avatar
+                        kind={isUser ? 'user' : 'assistant'}
+                        src={isUser ? settings.userAvatarDataUrl : assistant.avatarDataUrl}
+                        size={32}
+                      />
                       <div className="wb-feed-meta">
                         <span className="wb-feed-author">{authorLabel}</span>
                         {timestamp ? (
@@ -415,12 +413,19 @@ export function ChatCanvas({
                       renderInlineEditor(msg)
                     ) : (
                       <>
-                        <div className="wb-user-bubble">
-                          <ContentRenderer
-                            messageId={msg.id}
-                            collapsePrefix={uiKey}
-                            blocks={msg.blocks}
-                            isUser
+                        <div className="wb-user-row">
+                          <div className="wb-user-bubble">
+                            <ContentRenderer
+                              messageId={msg.id}
+                              collapsePrefix={uiKey}
+                              blocks={msg.blocks}
+                              isUser
+                            />
+                          </div>
+                          <Avatar
+                            kind="user"
+                            src={settings.userAvatarDataUrl}
+                            size={32}
                           />
                         </div>
                         <MessageActions
@@ -439,9 +444,11 @@ export function ChatCanvas({
               return (
                 <article key={uiKey} className="wb-asst-msg">
                   <div className="wb-asst-head">
-                    <span className="wb-asst-avatar" aria-hidden="true">
-                      <Icon name="bot" size={13} />
-                    </span>
+                    <Avatar
+                      kind="assistant"
+                      src={assistant.avatarDataUrl}
+                      size={32}
+                    />
                     <span className="wb-asst-name">{assistant.name}</span>
                     {msg.modelId ? (
                       <span className="wb-asst-tag">{msg.modelId}</span>

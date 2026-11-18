@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { Icon, IconButton } from '../../components/ui';
+import { Avatar, Icon, IconButton } from '../../components/ui';
 import type { Assistant } from '../../core/types';
 
 export function AssistantSidebar({
@@ -60,7 +60,7 @@ export function AssistantSidebar({
                 aria-current={active ? 'true' : undefined}
                 onClick={() => onSelectAssistant(assistant.id)}
               >
-                <Icon name="bot" size={16} />
+                <Avatar kind="assistant" src={assistant.avatarDataUrl} size={24} />
                 <span className="wb-nav-row__label">{assistant.name}</span>
               </button>
               <div className="wb-nav-row__actions">

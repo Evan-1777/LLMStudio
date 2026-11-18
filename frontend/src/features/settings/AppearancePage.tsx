@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
+  AvatarField,
   Button,
   ErrorBanner,
   Icon,
@@ -31,6 +32,8 @@ export function AppearancePage() {
   );
   const [lineError, setLineError] = useState<string | null>(null);
   const [charError, setCharError] = useState<string | null>(null);
+  const [avatarError, setAvatarError] = useState<string | null>(null);
+  const [savingAvatar, setSavingAvatar] = useState(false);
 
   useEffect(() => {
     setLineInput(String(settings.collapseLineThreshold));
@@ -41,6 +44,16 @@ export function AppearancePage() {
     setCharInput(String(settings.collapseCharThreshold));
     setCharError(null);
   }, [settings.collapseCharThreshold]);
+
+  const handleAvatarChange = async (next: string) => {
+    setSavingAvatar(true);
+    setAvatarError(null);
+    const result = await updatePreferences({ userAvatarDataUrl: next });
+    setSavingAvatar(false);
+    if (!result.ok) {
+      setAvatarError(result.error ?? '保存头像失败');
+    }
+  };
 
   const handleLineChange = (raw: string) => {
     setLineInput(raw);
@@ -81,6 +94,30 @@ export function AppearancePage() {
             }
           />
         ) : null}
+
+        <section>
+          <h3 className="st-subhead">用户</h3>
+          <div className="st-group">
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">头像</span>
+              <AvatarField
+                value={settings.userAvatarDataUrl}
+                kind="user"
+                label="用户头像"
+                busy={savingAvatar}
+                onChange={(next) => void handleAvatarChange(next)}
+                onError={setAvatarError}
+              />
+            </div>
+            {avatarError ? (
+              <div className="st-row">
+                <span className="ui-field__error" role="alert">
+                  {avatarError}
+                </span>
+              </div>
+            ) : null}
+          </div>
+        </section>
 
         <section>
           <h3 className="st-subhead">主题</h3>

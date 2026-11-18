@@ -169,9 +169,11 @@ test.describe('Motion transitions, reduced-motion, 5s slow network feedback, and
     await page.getByRole('button', { name: '返回工作台' }).click();
 
     const modelBtn = page.getByRole('button', { name: '选择模型' });
+    expect(await modelBtn.locator('svg').count()).toBe(0);
     await modelBtn.click();
     const popoverContent = page.locator('.ui-popover-content');
     await expect(popoverContent).toBeVisible();
+    expect(await popoverContent.locator('svg').count()).toBe(0);
     const popoverAnim = await popoverContent.evaluate((el) => ({
       animationName: getComputedStyle(el).animationName,
       transitionDuration: getComputedStyle(el).transitionDuration,
@@ -239,7 +241,12 @@ test.describe('Motion transitions, reduced-motion, 5s slow network feedback, and
       opt.click();
       return await new Promise<number>((resolve) => {
         const tick = () => {
-          if (btn.getAttribute('aria-busy') === 'true' && btn.querySelector('.ui-spinner')) {
+          const busyPaint =
+            btn.getAttribute('aria-busy') === 'true' &&
+            btn.getAttribute('aria-disabled') === 'true' &&
+            btn.classList.contains('wb-model-btn--busy') &&
+            Number(getComputedStyle(btn).opacity) < 1;
+          if (busyPaint) {
             resolve(performance.now() - t0);
           } else {
             requestAnimationFrame(tick);

@@ -1,3 +1,4 @@
+export { Avatar, AvatarField, type AvatarKind } from './Avatar';
 export { Button, type ButtonProps } from './Button';
 export {
   Field,

@@ -44,6 +44,7 @@ type Preferences struct {
 	AutoCreateCache              bool   `json:"autoCreateCache"`
 	CollapseLineThreshold        int    `json:"collapseLineThreshold"`
 	CollapseCharThreshold        int    `json:"collapseCharThreshold"`
+	UserAvatarDataURL            string `json:"userAvatarDataUrl"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -80,6 +81,7 @@ type PreferencesPatch struct {
 	AutoCreateCache              *bool   `json:"autoCreateCache"`
 	CollapseLineThreshold        *int    `json:"collapseLineThreshold"`
 	CollapseCharThreshold        *int    `json:"collapseCharThreshold"`
+	UserAvatarDataURL            *string `json:"userAvatarDataUrl"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -121,6 +123,9 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	if p.CollapseCharThreshold != nil {
 		out.CollapseCharThreshold = *p.CollapseCharThreshold
 	}
+	if p.UserAvatarDataURL != nil {
+		out.UserAvatarDataURL = *p.UserAvatarDataURL
+	}
 	return out
 }
 
@@ -159,5 +164,5 @@ func (p Preferences) Validate() error {
 	if p.CollapseCharThreshold < MinCollapseCharThreshold || p.CollapseCharThreshold > MaxCollapseCharThreshold {
 		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("collapseCharThreshold must be between %d and %d", MinCollapseCharThreshold, MaxCollapseCharThreshold), nil)
 	}
-	return nil
+	return ValidateAvatarDataURL(p.UserAvatarDataURL)
 }

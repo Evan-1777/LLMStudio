@@ -54,6 +54,7 @@ describe('settings storage and migration', () => {
       autoCreateCache: false,
       collapseLineThreshold: 200,
       collapseCharThreshold: 120,
+      userAvatarDataUrl: '',
     });
 
     expect(defaultSettings()).toMatchObject({

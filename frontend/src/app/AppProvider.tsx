@@ -14,12 +14,14 @@ import {
   defaultAppPreferences,
   loadConnectionSettings,
   loadSettings,
+  normalizeServerPreferences,
   normalizeSettings,
   pickAppPreferences,
   readLegacyPreferences,
   resolveAccentColors,
   saveConnectionSettings,
   writeThemeHint,
+  type AppPreferenceKey,
   type AppPreferences,
   type AppSettings,
   type SettingsSaveResult,
@@ -221,10 +223,10 @@ export function AppProvider({
     initialLoad.notice,
   );
   const [systemDark, setSystemDark] = useState<boolean>(getSystemPrefersDark);
-  // Last values confirmed by the gateway; failed writes roll back to this snapshot.
-  const [serverPreferences, setServerPreferences] = useState<AppPreferences>(
-    defaultAppPreferences,
-  );
+  // Latest values confirmed by the gateway; failed writes roll back to this
+  // snapshot. Each write applies and rolls back only the fields it patched, so a
+  // slow avatar save cannot revert a newer theme change.
+  const serverPreferencesRef = useRef<AppPreferences>(defaultAppPreferences());
 
   const [connectionEpoch, setConnectionEpoch] = useState(1);
   const epochRef = useRef(1);
@@ -361,10 +363,10 @@ export function AppProvider({
       }
 
       const next = resolved.initialized
-        ? resolved.preferences
+        ? normalizeServerPreferences(resolved.preferences)
         : (legacy ?? pickAppPreferences(settingsRef.current));
       settingsRef.current = { ...settingsRef.current, ...next };
-      setServerPreferences(next);
+      serverPreferencesRef.current = next;
       setSettings(settingsRef.current);
       writeThemeHint(settingsRef.current.gatewayBaseUrl, {
         themeMode: next.themeMode,
@@ -377,43 +379,52 @@ export function AppProvider({
     [gateway],
   );
 
+  const applyPreferenceFields = useCallback((values: Partial<AppPreferences>) => {
+    settingsRef.current = { ...settingsRef.current, ...values };
+    setSettings(settingsRef.current);
+  }, []);
+
   const updatePreferences = useCallback(
     async (
       patch: Partial<AppPreferences>,
     ): Promise<{ ok: boolean; error?: string }> => {
       const epoch = epochRef.current;
-      const previous = serverPreferences;
-      const optimistic = { ...previous, ...patch };
-      settingsRef.current = { ...settingsRef.current, ...optimistic };
-      setSettings(settingsRef.current);
+      const confirmedBefore = serverPreferencesRef.current;
+      const patchedKeys = Object.keys(patch) as AppPreferenceKey[];
+      applyPreferenceFields(patch);
       try {
         const envelope = await gateway.updatePreferences(
           patch as Partial<ServerPreferences>,
         );
         if (epoch !== epochRef.current) return { ok: true };
         const confirmed = envelope.initialized
-          ? (envelope.preferences as AppPreferences)
-          : optimistic;
-        settingsRef.current = { ...settingsRef.current, ...confirmed };
-        setServerPreferences(confirmed);
-        setSettings(settingsRef.current);
+          ? normalizeServerPreferences(envelope.preferences)
+          : { ...confirmedBefore, ...patch };
+        // Responses may settle out of order: only the fields this call patched
+        // move forward, so a slower request cannot revert a newer value.
+        const applied = Object.fromEntries(
+          patchedKeys.map((key) => [key, confirmed[key]]),
+        ) as Partial<AppPreferences>;
+        serverPreferencesRef.current = { ...serverPreferencesRef.current, ...applied };
+        applyPreferenceFields(applied);
         writeThemeHint(settingsRef.current.gatewayBaseUrl, {
-          themeMode: confirmed.themeMode,
-          seedColorValue: confirmed.seedColorValue,
+          themeMode: settingsRef.current.themeMode,
+          seedColorValue: settingsRef.current.seedColorValue,
         });
         setSettingsNotice(null);
         return { ok: true };
       } catch (err) {
         if (epoch !== epochRef.current) return { ok: true };
-        settingsRef.current = { ...settingsRef.current, ...previous };
-        setServerPreferences(previous);
-        setSettings(settingsRef.current);
+        const rollback = Object.fromEntries(
+          patchedKeys.map((key) => [key, confirmedBefore[key]]),
+        ) as Partial<AppPreferences>;
+        applyPreferenceFields(rollback);
         const message = errorMessageOf(err);
         setSettingsNotice(`设置保存失败：${message}`);
         return { ok: false, error: message };
       }
     },
-    [gateway, serverPreferences],
+    [applyPreferenceFields, gateway],
   );
 
   const trackSignal = useCallback((): {

@@ -16,38 +16,86 @@ function generateNonce(): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function buildSandboxedSrcDoc(
-  rawHtml: string,
-  nonce: string,
-  options?: { seamless?: boolean; theme?: 'light' | 'dark' },
-): string {
-  const safeNonce = JSON.stringify(nonce);
-  const bridgeScript = `
+// Reports the intrinsic height of the document content, never the iframe viewport:
+// measuring documentElement.scrollHeight returns at least the current frame height,
+// so a shortened document could never shrink. Body margins and padding are added
+// back explicitly, and viewport-sized bodies fall back to their content extent.
+const HEIGHT_BRIDGE = (safeNonce: string) => `
 <script>
 (function() {
   var nonce = ${safeNonce};
-  function postHeight() {
+  var last = -1;
+  var frame = 0;
+
+  function px(style, prop) {
+    var value = parseFloat(style[prop]);
+    return isFinite(value) ? value : 0;
+  }
+
+  function contentHeight() {
+    var body = document.body;
+    if (!body || !body.getBoundingClientRect) return 0;
+    var rect = body.getBoundingClientRect();
+    var bodyStyle = getComputedStyle(body);
+    var bottom = 0;
+    var hasChild = false;
+    for (var i = 0; i < body.children.length; i++) {
+      var child = body.children[i];
+      var childStyle = getComputedStyle(child);
+      if (childStyle.display === "none" || childStyle.position === "fixed") continue;
+      var childRect = child.getBoundingClientRect();
+      var edge = childRect.bottom + px(childStyle, "marginBottom") - rect.top;
+      if (edge > bottom) bottom = edge;
+      hasChild = true;
+    }
+    if (!hasChild) {
+      bottom = Math.max(0, body.scrollHeight - px(bodyStyle, "paddingTop"));
+    }
+    return Math.ceil(
+      bottom +
+      px(bodyStyle, "paddingBottom") +
+      px(bodyStyle, "marginTop") +
+      px(bodyStyle, "marginBottom")
+    );
+  }
+
+  function report() {
     try {
-      var docEl = document.documentElement;
-      var body = document.body;
-      var h = Math.max(
-        docEl ? docEl.scrollHeight : 0,
-        body ? body.scrollHeight : 0
-      );
+      var height = contentHeight();
+      if (!(height > 0) || Math.abs(height - last) < 1) return;
+      last = height;
       window.parent.postMessage({
         type: "llmstudio-html-height",
         nonce: nonce,
-        height: h
+        height: height
       }, "*");
     } catch (_) {}
   }
-  window.addEventListener("load", postHeight);
-  if (typeof ResizeObserver !== "undefined") {
-    new ResizeObserver(postHeight).observe(document.documentElement);
+
+  function schedule() {
+    if (frame) return;
+    frame = requestAnimationFrame(function() {
+      frame = 0;
+      report();
+    });
   }
-  setTimeout(postHeight, 40);
+
+  window.addEventListener("load", schedule);
+  window.addEventListener("resize", schedule);
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(schedule).observe(document.body);
+  }
+  schedule();
 })();
 </script>`;
+
+export function buildSandboxedSrcDoc(
+  rawHtml: string,
+  nonce: string,
+  options?: { seamless?: boolean; theme?: 'light' | 'dark'; measure?: boolean },
+): string {
+  const safeNonce = JSON.stringify(nonce);
+  const bridgeScript = options?.measure === false ? '' : HEIGHT_BRIDGE(safeNonce);
 
   const lower = rawHtml.toLowerCase();
   const hasDocRoot = lower.includes('<!doctype') || lower.includes('<html');
@@ -113,22 +161,25 @@ export function SandboxedIframe({
   const { resolvedTheme } = useApp();
   const effectiveMinHeight = seamless && minHeight === 140 ? 24 : minHeight;
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
-  const nonce = useMemo(() => generateNonce(), []);
+  // A new document invalidates the previous height; theme changes keep the nonce.
+  const nonce = useMemo(() => generateNonce(), [html]);
   const srcDoc = useMemo(
     () =>
       buildSandboxedSrcDoc(html, nonce, {
         seamless,
         theme: resolvedTheme,
+        measure: !fillAvailable,
       }),
-    [html, nonce, seamless, resolvedTheme],
+    [fillAvailable, html, nonce, resolvedTheme, seamless],
   );
   const [height, setHeight] = useState(effectiveMinHeight);
 
   useEffect(() => {
     setHeight(effectiveMinHeight);
-  }, [effectiveMinHeight]);
+  }, [effectiveMinHeight, html]);
 
   useEffect(() => {
+    if (fillAvailable) return;
     const onMessage = (event: MessageEvent) => {
       const iframeWin = iframeRef.current?.contentWindow;
       if (!iframeWin || event.source !== iframeWin) return;
@@ -152,7 +203,7 @@ export function SandboxedIframe({
     };
     window.addEventListener('message', onMessage);
     return () => window.removeEventListener('message', onMessage);
-  }, [effectiveMinHeight, maxHeight, nonce]);
+  }, [effectiveMinHeight, fillAvailable, maxHeight, nonce]);
 
   return (
     <div

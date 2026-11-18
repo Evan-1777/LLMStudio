@@ -290,6 +290,7 @@ type Assistant struct {
 	DefaultProviderID string           `json:"defaultProviderId,omitempty"`
 	DefaultModelID    string           `json:"defaultModelId,omitempty"`
 	Params            GenerationParams `json:"params"`
+	AvatarDataURL     string           `json:"avatarDataUrl"`
 	IsDefault         bool             `json:"isDefault"`
 	CreatedAt         time.Time        `json:"createdAt"`
 	UpdatedAt         time.Time        `json:"updatedAt"`
