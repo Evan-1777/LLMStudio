@@ -22,11 +22,11 @@ import (
 )
 
 type stubMCPClient struct {
-	mu           sync.Mutex
-	toolsBySrv   map[string][]plugin.MCPToolDescriptor
-	calls        []string
-	callFunc     func(ctx context.Context, server domain.MCPServerConfig, name string, arguments json.RawMessage) (plugin.MCPCallToolResult, error)
-	closedIDs    []string
+	mu         sync.Mutex
+	toolsBySrv map[string][]plugin.MCPToolDescriptor
+	calls      []string
+	callFunc   func(ctx context.Context, server domain.MCPServerConfig, name string, arguments json.RawMessage) (plugin.MCPCallToolResult, error)
+	closedIDs  []string
 }
 
 func (c *stubMCPClient) ID() string { return "stub-mcp" }
@@ -320,7 +320,13 @@ func TestChatServiceMCPErrorsAbortRoundLimitAndMidHistoryPreserve(t *testing.T) 
 	if err := prep.Stream(ctx, func(domain.StreamEvent) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if len(seenToolContents) != 3 || !strings.Contains(seenToolContents[0], "unknown") || !strings.Contains(seenToolContents[1], "mcp disconnected") || seenToolContents[2] != "good-output" {
+	// Every sibling result is reported once; tool results are keyed by call ID, so
+	// their replay order is not part of the contract.
+	joined := strings.Join(seenToolContents, "|")
+	if len(seenToolContents) != 3 ||
+		!strings.Contains(joined, "unknown") ||
+		!strings.Contains(joined, "mcp disconnected") ||
+		!strings.Contains(joined, "good-output") {
 		t.Fatalf("expected all 3 tool results (2 errors + 1 ok sibling), got %v", seenToolContents)
 	}
 

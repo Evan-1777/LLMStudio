@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -38,10 +39,9 @@ func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatToo
 	var tools []plugin.ChatTool
 	var bindings map[string]mcpToolBinding
 
-	for _, srv := range servers {
-		if !srv.Enabled {
-			continue
-		}
+	// Upstream servers may report the same tool set in any order; sorting by server
+	// ID and tool name keeps aliases and the encoded tool block byte-stable.
+	for _, srv := range normalizedServers(servers) {
 		discCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
 		descriptors, listErr := s.mcpClient.ListTools(discCtx, srv)
 		cancel()
@@ -51,7 +51,7 @@ func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatToo
 			}
 			return nil, nil, listErr
 		}
-		for _, desc := range descriptors {
+		for _, desc := range normalizedDescriptors(descriptors) {
 			if bindings == nil {
 				bindings = make(map[string]mcpToolBinding)
 			}
@@ -72,6 +72,25 @@ func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatToo
 		}
 	}
 	return tools, bindings, nil
+}
+
+// normalizedServers returns enabled servers ordered by ID.
+func normalizedServers(servers []domain.MCPServerConfig) []domain.MCPServerConfig {
+	out := make([]domain.MCPServerConfig, 0, len(servers))
+	for _, srv := range servers {
+		if srv.Enabled {
+			out = append(out, srv)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// normalizedDescriptors returns upstream tools ordered by name.
+func normalizedDescriptors(descriptors []plugin.MCPToolDescriptor) []plugin.MCPToolDescriptor {
+	out := append([]plugin.MCPToolDescriptor(nil), descriptors...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 func (s *ChatService) filterEnabledTools(ctx context.Context, tools []plugin.ChatTool) []plugin.ChatTool {
@@ -347,10 +366,9 @@ func (s *ChatService) discoverActiveBindingsLenient(ctx context.Context) (map[st
 	bindings := make(map[string]mcpToolBinding)
 	var serverErrs []string
 
-	for _, srv := range servers {
-		if !srv.Enabled {
-			continue
-		}
+	// Execute the same deterministic ordering as discoverActiveTools so aliases
+	// produced while encoding the request resolve back to the same tool here.
+	for _, srv := range normalizedServers(servers) {
 		discCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
 		descriptors, listErr := s.mcpClient.ListTools(discCtx, srv)
 		cancel()
@@ -361,7 +379,7 @@ func (s *ChatService) discoverActiveBindingsLenient(ctx context.Context) (map[st
 			serverErrs = append(serverErrs, fmt.Sprintf("%s: %v", srv.Name, listErr))
 			continue
 		}
-		for _, desc := range descriptors {
+		for _, desc := range normalizedDescriptors(descriptors) {
 			alias := plugin.BuildChatToolAlias(srv.ID, desc.Name, usedAliases)
 			bindings[alias] = mcpToolBinding{
 				ServerID:   srv.ID,

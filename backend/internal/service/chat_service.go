@@ -59,6 +59,10 @@ type StreamChatInput struct {
 	PreparedSearch      *PreparedSearchInput       `json:"preparedSearch,omitempty"`
 	CacheState          *plugin.PromptCacheState   `json:"cacheState,omitempty"`
 	CacheResolution     *LocalCacheResolutionInput `json:"cacheResolution,omitempty"`
+	// CredentialEnvelope opts a browser-direct request into receiving the stored
+	// provider credential inside the encoded request envelope. Older clients omit
+	// it and keep receiving the credential-free shape.
+	CredentialEnvelope bool `json:"credentialEnvelope,omitempty"`
 }
 
 // ChatService orchestrates upstream LLM requests, SSE normalization, cancellation, and persistence.
@@ -192,6 +196,7 @@ type preparedUpstream struct {
 	replaceMessageID     string
 	insertAfterMessageID string
 	autoCreateCache      bool
+	credentialEnvelope   bool
 	cacheScope           plugin.PromptCacheScope
 	chatInput            plugin.ChatInput
 }
@@ -333,7 +338,7 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 			} else if plan.CreateRequest != nil {
 				createEndpoint, epErr := resolveEndpointForCacheCreate(
 					prep.adapter,
-					prep.resolveProv,
+					localEndpointProvider(prep, prep.credentialEnvelope),
 					prep.model,
 					*plan.CreateRequest,
 					prep.compat,
@@ -366,7 +371,13 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 	if encErr != nil {
 		return PreparedLocalRequest{}, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", encErr)
 	}
-	endpoint, epErr := prep.adapter.ResolveEndpoint(prep.resolveProv, prep.model, encoded.DefaultPath, encoded.Query, prep.compat)
+	endpoint, epErr := prep.adapter.ResolveEndpoint(
+		localEndpointProvider(prep, prep.credentialEnvelope),
+		prep.model,
+		encoded.DefaultPath,
+		encoded.Query,
+		prep.compat,
+	)
 	if epErr != nil {
 		return PreparedLocalRequest{}, epErr
 	}
@@ -562,37 +573,25 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	}
 	effectiveParams = mergeGenerationParams(effectiveParams, in.Params)
 
+	// Search results belong to the current user turn, not to the reusable system
+	// prompt: appending them after the user input keeps every earlier prefix stable.
 	var webSearchBlock *domain.ContentBlock
+	var searchPrompt string
 	if in.WebSearch {
 		if in.PreparedSearch != nil {
 			if in.PreparedSearch.Block != nil {
-				if searchPrompt := rebuildSearchPromptFromBlock(*in.PreparedSearch.Block); searchPrompt != "" {
-					if strings.TrimSpace(effectiveSystemPrompt) == "" {
-						effectiveSystemPrompt = searchPrompt
-					} else {
-						effectiveSystemPrompt = effectiveSystemPrompt + "\n\n" + searchPrompt
-					}
-				}
+				searchPrompt = rebuildSearchPromptFromBlock(*in.PreparedSearch.Block)
 			}
 		} else if isLocalCont {
-			if searchPrompt := rebuildSearchPromptFromBlocks(in.LocalContinuation.Blocks); searchPrompt != "" {
-				if strings.TrimSpace(effectiveSystemPrompt) == "" {
-					effectiveSystemPrompt = searchPrompt
-				} else {
-					effectiveSystemPrompt = effectiveSystemPrompt + "\n\n" + searchPrompt
-				}
-			}
+			searchPrompt = rebuildSearchPromptFromBlocks(in.LocalContinuation.Blocks)
 		} else {
-			block, searchPrompt := s.runWebSearch(ctx, in.SearchEngineID, latestUserQuery(history))
+			block, prompt := s.runWebSearch(ctx, in.SearchEngineID, latestUserQuery(history))
 			webSearchBlock = block
-			if searchPrompt != "" {
-				if strings.TrimSpace(effectiveSystemPrompt) == "" {
-					effectiveSystemPrompt = searchPrompt
-				} else {
-					effectiveSystemPrompt = effectiveSystemPrompt + "\n\n" + searchPrompt
-				}
-			}
+			searchPrompt = prompt
 		}
+	}
+	if searchPrompt != "" {
+		history = appendSearchContext(history, searchPrompt)
 	}
 
 	tools, toolBindings, err := s.discoverActiveTools(ctx)
@@ -652,9 +651,50 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		replaceMessageID:     replaceMessageID,
 		insertAfterMessageID: insertAfterMessageID,
 		autoCreateCache:      in.AutoCreateCache,
+		credentialEnvelope:   in.CredentialEnvelope,
 		cacheScope:           cacheScope,
 		chatInput:            chatInput,
 	}, nil
+}
+
+// localEndpointProvider selects the provider used to build a browser-direct request
+// envelope. Only an explicit credential request resolves against stored secrets;
+// otherwise the credential-free copy keeps prior behaviour.
+func localEndpointProvider(prep preparedUpstream, includeCredentials bool) domain.ProviderConfig {
+	if includeCredentials {
+		return prep.provider
+	}
+	return prep.resolveProv
+}
+
+// appendSearchContext projects search results onto the tail of the current turn.
+// They join the existing user message instead of creating a second consecutive
+// user turn, which some protocols reject or merge.
+func appendSearchContext(history []domain.Message, searchPrompt string) []domain.Message {
+	if len(history) > 0 && history[len(history)-1].Role == domain.RoleUser {
+		out := make([]domain.Message, len(history))
+		copy(out, history)
+		last := out[len(out)-1]
+		last.Blocks = append(append([]domain.ContentBlock(nil), last.Blocks...), domain.ContentBlock{
+			Type: domain.BlockTypeText,
+			Text: searchPrompt,
+		})
+		out[len(out)-1] = last
+		return out
+	}
+	return append(history, domain.Message{
+		ConversationID: historyConversationID(history),
+		Role:           domain.RoleUser,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: searchPrompt}},
+		CreatedAt:      time.Now().UTC(),
+	})
+}
+
+func historyConversationID(history []domain.Message) string {
+	if len(history) == 0 {
+		return ""
+	}
+	return history[0].ConversationID
 }
 
 func mergeRequestHeaders(encodedHeaders, endpointHeaders http.Header) http.Header {
@@ -738,12 +778,12 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 
 	for round := 0; ; round++ {
 		var (
-			streamErrMsg   string
-			roundUsage     *domain.Usage
-			roundStop      string
-			roundCalls     []domain.ContentBlock
-			roundCallIDs   = make(map[int]string)
-			maxSeenIdx     = indexOffset - 1
+			streamErrMsg string
+			roundUsage   *domain.Usage
+			roundStop    string
+			roundCalls   []domain.ContentBlock
+			roundCallIDs = make(map[int]string)
+			maxSeenIdx   = indexOffset - 1
 		)
 
 		decodeErr := p.apiFormat.DecodeStream(ctx, resp.Body, func(ev domain.StreamEvent) error {

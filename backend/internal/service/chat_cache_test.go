@@ -905,11 +905,16 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 	var createBody map[string]any
 	_ = json.Unmarshal(prep1.CacheStep.Request.Body, &createBody)
 	sysText := createBody["systemInstruction"].(map[string]any)["parts"].([]any)[0].(map[string]any)["text"].(string)
-	if !strings.Contains(sysText, "BaseSys") || !strings.Contains(sysText, "Query=first local query") {
-		t.Fatalf("expected create systemInstruction to contain base + search prompt: %q", sysText)
+	if !strings.Contains(sysText, "BaseSys") || strings.Contains(sysText, "Query=first local query") {
+		t.Fatalf("expected the reusable system prompt to stay search-free, got %q", sysText)
+	}
+	// The search projection belongs to the current user turn of the main request.
+	if !strings.Contains(string(prep1.Body), "Query=first local query") {
+		t.Fatalf("expected the search projection in the current user turn: %s", string(prep1.Body))
 	}
 
-	// 3. PlanKey mismatch (e.g., input text changed during cache creation) discards stale resolution and returns uncached main request without looping!
+	// 3. A stale PlanKey (cache prefix changed during cache creation) discards the
+	// resolution and returns an uncached main request without looping.
 	prepMismatch, err := chatSvcB.PrepareLocal(ctx, StreamChatInput{
 		ConversationID:  conv.ID,
 		Text:            "changed query mid-flight",
@@ -917,7 +922,7 @@ func TestStatelessPrepareLocalCacheContinuationAndSearchReuse(t *testing.T) {
 		AutoCreateCache: true,
 		PreparedSearch:  &PreparedSearchInput{Block: nil}, // empty/nil preparedSearch must NOT trigger second search!
 		CacheResolution: &LocalCacheResolutionInput{
-			PlanKey: prep1.CacheStep.PlanKey,
+			PlanKey: "stale-plan-key",
 			Status:  http.StatusOK,
 			Result:  LocalCacheResultData{Name: "cachedContents/local-1"},
 		},

@@ -192,6 +192,8 @@ func TestAssistantBranchingDeleteAndUserRetryWithSearch(t *testing.T) {
 			}
 			if m.Role == "user" {
 				seenUserTurns++
+				// Search projections ride on the user turn rather than the system prompt.
+				seenPrompts = append(seenPrompts, fmt.Sprint(m.Content))
 			}
 		}
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -292,8 +294,9 @@ func TestAssistantBranchingDeleteAndUserRetryWithSearch(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Stream failed: %v", err)
 	}
-	if seenUserTurns != 1 || len(seenPrompts) == 0 || !strings.Contains(seenPrompts[0], "Cite sources.") || !strings.Contains(seenPrompts[0], "Result 1") {
-		t.Fatalf("expected assistant prompt + search results injected and user m1 kept: turns=%d prompts=%v", seenUserTurns, seenPrompts)
+	joinedPrompts := strings.Join(seenPrompts, "\n")
+	if seenUserTurns != 1 || !strings.Contains(joinedPrompts, "Cite sources.") || !strings.Contains(joinedPrompts, "Result 1") {
+		t.Fatalf("expected assistant prompt plus search results in the user turn and user m1 kept: turns=%d prompts=%v", seenUserTurns, seenPrompts)
 	}
 	afterRetry, _ := convSvc.GetDetail(ctx, conv.ID)
 	if len(afterRetry.Messages) != 2 || afterRetry.Messages[0].ID != m1.ID || len(afterRetry.Messages[1].Blocks) < 2 || afterRetry.Messages[1].Blocks[0].Type != domain.BlockTypeWebSearch {
