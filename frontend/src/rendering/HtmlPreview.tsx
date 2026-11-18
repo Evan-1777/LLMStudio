@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { IconButton, Modal } from '../components/ui';
 import { useApp } from '../app/AppProvider';
 import { CollapsibleBlock } from './CollapsibleBlock';
@@ -159,7 +159,8 @@ const HEIGHT_BRIDGE = (safeNonce: string) => `
     });
   }
 
-  window.addEventListener("load", schedule);
+  // The first height must not depend on an animation frame.
+  window.addEventListener("load", report, { once: true });
   window.addEventListener("resize", schedule);
   if (typeof ResizeObserver !== "undefined") {
     new ResizeObserver(schedule).observe(document.body);
@@ -267,11 +268,11 @@ export function SandboxedIframe({
   );
   const [height, setHeight] = useState(effectiveMinHeight);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setHeight(effectiveMinHeight);
   }, [effectiveMinHeight, html]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (fillAvailable) return;
     const onMessage = (event: MessageEvent) => {
       const iframeWin = iframeRef.current?.contentWindow;

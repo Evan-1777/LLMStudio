@@ -239,7 +239,11 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     await page.getByRole('button', { name: '发送消息' }).click();
     await expect(seamless).toHaveCount(3);
     const adaptiveFrame = seamless.nth(2);
+    // The fixture parks child animation frames until the first height arrives.
     await expect.poll(() => frameHeight(adaptiveFrame), { timeout: 6000 }).toBeGreaterThan(900);
+    await adaptiveFrame.contentFrame().locator('#adaptive-card').evaluate((card) => {
+      card.ownerDocument.dispatchEvent(new Event('resume-preview-frames'));
+    });
 
     const adaptiveDesktopGeo = await frameGeometry(adaptiveFrame, '#nested-tail');
     expect(adaptiveDesktopGeo.scrollHeight).toBeLessThanOrEqual(
