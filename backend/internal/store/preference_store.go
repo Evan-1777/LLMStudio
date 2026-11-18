@@ -12,15 +12,15 @@ import (
 const preferencesSelect = "SELECT theme_mode, seed_color_value, enter_to_send, visual_html_render, default_html_preview, " +
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
-	"collapse_char_threshold, user_avatar_data_url, imported " +
+	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, imported " +
 	"FROM user_preferences WHERE id = 1"
 
 const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"id, theme_mode, seed_color_value, enter_to_send, visual_html_render, default_html_preview, " +
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
-	"collapse_char_threshold, user_avatar_data_url, imported, updated_at" +
-	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
+	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, imported, updated_at" +
+	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
 	"ON CONFLICT(id) DO UPDATE SET " +
 	"theme_mode = excluded.theme_mode, " +
 	"seed_color_value = excluded.seed_color_value, " +
@@ -35,6 +35,7 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"collapse_line_threshold = excluded.collapse_line_threshold, " +
 	"collapse_char_threshold = excluded.collapse_char_threshold, " +
 	"user_avatar_data_url = excluded.user_avatar_data_url, " +
+	"composer_reasoning_effort = excluded.composer_reasoning_effort, " +
 	"imported = 1, " +
 	"updated_at = excluded.updated_at"
 
@@ -113,6 +114,7 @@ func (s *PreferenceStore) Update(
 		next.CollapseLineThreshold,
 		next.CollapseCharThreshold,
 		next.UserAvatarDataURL,
+		next.ComposerReasoningEffort,
 		formatTime(time.Now().UTC()),
 	); err != nil {
 		return domain.Preferences{}, false, fmt.Errorf("write preferences: %w", err)
@@ -154,6 +156,7 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 		&prefs.CollapseLineThreshold,
 		&prefs.CollapseCharThreshold,
 		&prefs.UserAvatarDataURL,
+		&prefs.ComposerReasoningEffort,
 		&initialized,
 	)
 	if err != nil {

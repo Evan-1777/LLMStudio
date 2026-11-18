@@ -201,8 +201,9 @@ func TestPreferenceEndpoints(t *testing.T) {
 	}
 
 	rec := doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, map[string]any{
-		"themeMode":   "dark",
-		"enterToSend": false,
+		"themeMode":               "dark",
+		"enterToSend":             false,
+		"composerReasoningEffort": "high",
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("PATCH /settings status=%d body=%s", rec.Code, rec.Body.String())
@@ -228,7 +229,7 @@ func TestPreferenceEndpoints(t *testing.T) {
 		t.Fatalf("second PATCH status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	prefs, initialized = fetchPreferences(t, router, tok)
-	if !initialized || prefs.ThemeMode != domain.ThemeModeDark || prefs.EnterToSend || prefs.CollapseLineThreshold != 40 {
+	if !initialized || prefs.ThemeMode != domain.ThemeModeDark || prefs.EnterToSend || prefs.CollapseLineThreshold != 40 || prefs.ComposerReasoningEffort != domain.EffortHigh {
 		t.Fatalf("settings not preserved across updates: %+v initialized=%v", prefs, initialized)
 	}
 
@@ -245,7 +246,20 @@ func TestPreferenceEndpoints(t *testing.T) {
 		t.Fatalf("auto-collapse preferences were dropped: %+v", prefs)
 	}
 
+	if rec := doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, map[string]any{"composerReasoningEffort": "none"}); rec.Code != http.StatusOK {
+		t.Fatalf("explicit none status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	legacy := domain.DefaultPreferences()
+	legacy.ComposerReasoningEffort = domain.EffortMax
+	if rec := doJSONReq(t, router, http.MethodPost, "/api/v1/settings/import", tok, legacy); rec.Code != http.StatusOK {
+		t.Fatalf("legacy import status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if prefs, _ := fetchPreferences(t, router, tok); prefs.ComposerReasoningEffort != domain.EffortNone {
+		t.Fatalf("legacy import overwrote explicit none: %+v", prefs)
+	}
+
 	invalid := []map[string]any{
+		{"composerReasoningEffort": "ultra"},
 		{"themeMode": "sepia"},
 		{"chatDisplayMode": "grid"},
 		{"collapseLineThreshold": 1},

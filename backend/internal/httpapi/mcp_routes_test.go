@@ -134,6 +134,20 @@ func TestMCPProbeToolsAuthAndSessionInvalidation(t *testing.T) {
 	}
 	_ = json.NewDecoder(createResp.Body).Decode(&created)
 	id := created.Server.ID
+	if created.Server.DisabledTools == nil || len(created.Server.DisabledTools) != 0 {
+		t.Fatalf("expected empty disabledTools, got %#v", created.Server.DisabledTools)
+	}
+	updateTools := func(body map[string]any, want string) {
+		t.Helper()
+		resp := doReq(http.MethodPut, "/api/v1/mcp/servers/"+id, body, true)
+		defer resp.Body.Close()
+		var updated struct{ Server domain.MCPServerConfig }
+		if err := json.NewDecoder(resp.Body).Decode(&updated); err != nil || resp.StatusCode != http.StatusOK || updated.Server.DisabledTools == nil || strings.Join(updated.Server.DisabledTools, ",") != want {
+			t.Fatalf("PUT server: status=%d tools=%v err=%v", resp.StatusCode, updated.Server.DisabledTools, err)
+		}
+	}
+	updateTools(map[string]any{"disabledTools": []string{"search_docs", "read_doc", "search_docs"}}, "read_doc,search_docs")
+	updateTools(map[string]any{"name": "docs-mcp"}, "read_doc,search_docs")
 
 	// Auth protection enforced on /tools and /test.
 	if unauthTools := doReq(http.MethodGet, "/api/v1/mcp/servers/"+id+"/tools", nil, false); unauthTools.StatusCode != http.StatusUnauthorized {
@@ -158,6 +172,8 @@ func TestMCPProbeToolsAuthAndSessionInvalidation(t *testing.T) {
 	if !testBody.OK || testBody.ToolCount != 1 || len(testBody.Tools) != 1 || testBody.Tools[0].Name != "search_docs" {
 		t.Fatalf("unexpected probe response: %+v", testBody)
 	}
+
+	updateTools(map[string]any{"disabledTools": []string{}}, "")
 
 	// Valid empty tool list returns tools: [] and toolCount: 0 cleanly.
 	emptyTools = true

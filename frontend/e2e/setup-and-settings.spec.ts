@@ -115,7 +115,7 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await mcpDialog.getByLabel('启动命令').fill('npx');
     await mcpDialog.getByRole('button', { name: '保存' }).click();
     await expect(page.getByText('local-fs')).toBeVisible();
-    await expect(page.getByRole('button', { name: '探测 local-fs' })).toBeVisible();
+    await expect(page.getByRole('button', { name: '拉取工具 local-fs' })).toBeVisible();
 
     // 6. Appearance & About.
     await page.getByRole('button', { name: '外观与显示' }).click();

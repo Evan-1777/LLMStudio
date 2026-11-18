@@ -218,13 +218,14 @@ interface ToolResultExtraPayload {
 }
 
 interface PairedToolCallEntry {
-  key: string;
+  index: number;
   call?: ToolCallBlock;
   result?: ToolResultBlock;
+  resultIndex?: number;
 }
 
 interface ToolExecutionRound {
-  roundNumber: number;
+  roundNumber?: number;
   entries: PairedToolCallEntry[];
 }
 
@@ -233,90 +234,37 @@ function parseToolResultExtra(extra: unknown): ToolResultExtraPayload {
   return extra as ToolResultExtraPayload;
 }
 
-function buildToolExecutionTrace(blocks: ContentBlock[]): {
-  firstToolIndex: number;
-  rounds: ToolExecutionRound[];
-  callCount: number;
-  doneCount: number;
-  errorCount: number;
-} {
-  let firstToolIndex = -1;
-  const resultByCallId = new Map<string, { idx: number; block: ToolResultBlock }>();
-  blocks.forEach((b, idx) => {
-    if (b.type === 'toolCall' || b.type === 'toolResult') {
-      if (firstToolIndex < 0) firstToolIndex = idx;
-    }
-    if (b.type === 'toolResult') {
-      const tr = b as ToolResultBlock;
-      if (tr.toolCallId) {
-        resultByCallId.set(tr.toolCallId, { idx, block: tr });
+function buildToolExecutionTrace(blocks: ContentBlock[]) {
+  const rounds = new Map<number, ToolExecutionRound>();
+  let round: ToolExecutionRound | undefined;
+  let roundNumber = 0;
+  let sawResult = false;
+  const calls = new Map<string, PairedToolCallEntry>();
+  blocks.forEach((block, index) => {
+    if (block.type === 'toolCall') {
+      if (!round || sawResult) {
+        round = { roundNumber: ++roundNumber, entries: [] };
+        rounds.set(index, round);
+        calls.clear();
+        sawResult = false;
+      }
+      const call = block as ToolCallBlock;
+      const entry = { index, call };
+      round.entries.push(entry);
+      if (call.id) calls.set(call.id, entry);
+    } else if (block.type === 'toolResult') {
+      sawResult = true;
+      const result = block as ToolResultBlock;
+      const entry = result.toolCallId ? calls.get(result.toolCallId) : undefined;
+      if (entry && !entry.result) {
+        entry.result = result;
+        entry.resultIndex = index;
+      } else {
+        rounds.set(index, { entries: [{ index, result, resultIndex: index }] });
       }
     }
   });
-
-  if (firstToolIndex < 0) {
-    return { firstToolIndex: -1, rounds: [], callCount: 0, doneCount: 0, errorCount: 0 };
-  }
-
-  const matchedResultIndexes = new Set<number>();
-  const rounds: ToolExecutionRound[] = [];
-  let currentEntries: PairedToolCallEntry[] = [];
-  let sawResultSinceCall = false;
-
-  blocks.forEach((b, idx) => {
-    if (b.type === 'toolCall') {
-      if (sawResultSinceCall && currentEntries.length > 0) {
-        rounds.push({ roundNumber: rounds.length + 1, entries: currentEntries });
-        currentEntries = [];
-        sawResultSinceCall = false;
-      }
-      const call = b as ToolCallBlock;
-      const match = call.id ? resultByCallId.get(call.id) : undefined;
-      if (match) matchedResultIndexes.add(match.idx);
-      currentEntries.push({
-        key: `${idx}:${call.id || call.name}`,
-        call,
-        result: match?.block,
-      });
-    } else if (b.type === 'toolResult') {
-      if (currentEntries.length > 0) {
-        sawResultSinceCall = true;
-      }
-    }
-  });
-
-  if (currentEntries.length > 0) {
-    rounds.push({ roundNumber: rounds.length + 1, entries: currentEntries });
-  }
-
-  // Keep any standalone or unmatched toolResult blocks visible inside the same trace card.
-  const orphanEntries: PairedToolCallEntry[] = [];
-  blocks.forEach((b, idx) => {
-    if (b.type === 'toolResult' && !matchedResultIndexes.has(idx)) {
-      const tr = b as ToolResultBlock;
-      orphanEntries.push({
-        key: `orphan:${idx}:${tr.toolCallId || tr.toolName || ''}`,
-        result: tr,
-      });
-    }
-  });
-  if (orphanEntries.length > 0) {
-    rounds.push({ roundNumber: rounds.length + 1, entries: orphanEntries });
-  }
-
-  let callCount = 0;
-  let doneCount = 0;
-  let errorCount = 0;
-  for (const round of rounds) {
-    for (const entry of round.entries) {
-      callCount++;
-      if (entry.result) {
-        doneCount++;
-        if (entry.result.isError) errorCount++;
-      }
-    }
-  }
-  return { firstToolIndex, rounds, callCount, doneCount, errorCount };
+  return rounds;
 }
 
 export const ContentRenderer = memo(function ContentRenderer({
@@ -510,67 +458,38 @@ export const ContentRenderer = memo(function ContentRenderer({
     }
 
     if (block.type === 'toolCall' || block.type === 'toolResult') {
-      if (blockIndex !== toolTrace.firstToolIndex) {
-        return;
-      }
-      const { rounds, callCount, doneCount, errorCount } = toolTrace;
-      const hasIncompleteCalls = Boolean(isStreaming && doneCount < callCount);
-      const keepOpenForIncomplete =
-        stopReason === 'error' || stopReason === 'aborted';
-      const defaultCollapsed =
-        Boolean(isStreaming) ||
-        errorCount > 0 ||
-        keepOpenForIncomplete
-          ? false
-          : settings.autoCollapseToolsOnComplete;
-
-      const statusParts: string[] = [];
-      if (hasIncompleteCalls) {
-        statusParts.push(`执行中 (${doneCount}/${callCount})`);
-      } else if (isStreaming) {
-        statusParts.push(`${rounds.length} 轮 · ${callCount} 次 · 处理中`);
-      } else {
-        statusParts.push(`${rounds.length} 轮 · ${callCount} 次`);
-        if (errorCount > 0) {
-          statusParts.push(`${errorCount} 个失败`);
-        }
-      }
-      const traceTitle = `工具调用 · ${statusParts.join(' · ')}`;
+      const round = toolTrace.get(blockIndex);
+      if (!round) return;
+      const { entries, roundNumber } = round;
+      const ended = (entry: PairedToolCallEntry) => entry.resultIndex !== undefined &&
+        (!isStreaming || blockCompleted?.[entry.resultIndex] === true);
+      const done = entries.filter(ended).length;
+      const failed = entries.filter((entry) => ended(entry) && entry.result?.isError).length;
+      const successful = done === entries.length && failed === 0 &&
+        stopReason !== 'aborted' && stopReason !== 'error';
+      const status = done < entries.length
+        ? isStreaming ? `执行中 (${done}/${entries.length})` : '未完成'
+        : failed ? `${failed} 个失败` : '完成';
+      const title = roundNumber ? `工具调用 · 第 ${roundNumber} 轮` : '工具结果';
 
       otherNodes.push(
         <CollapsibleBlock
-          key={`${effectivePrefix}:tools`}
-          collapseKey={`${effectivePrefix}:tools`}
-          title={traceTitle}
-          icon={errorCount > 0 ? 'warning' : 'wrench'}
+          key={`${baseKey}:tools`}
+          collapseKey={`${baseKey}:tools`}
+          title={`${title} · ${entries.length} 次 · ${status}`}
+          icon={failed ? 'warning' : 'wrench'}
           subtle
-          defaultCollapsed={defaultCollapsed}
+          defaultCollapsed={successful && (!isStreaming || settings.autoCollapseToolsOnComplete)}
+          completion={successful ? (settings.autoCollapseToolsOnComplete ? 'collapse' : 'keep') : 'pending'}
         >
-          <div className="tool-trace-body" tabIndex={0} aria-label="工具调用详情">
-            {rounds.map((round) => (
-              <div key={round.roundNumber} className="tool-trace-round">
-                {rounds.length > 1 ? (
-                  <div className="tool-trace-round__label">第 {round.roundNumber} 轮</div>
-                ) : null}
-                {round.entries.map((entry) => {
-                  const toolName =
-                    entry.call?.name || entry.result?.toolName || 'tool';
+          <div className="tool-trace-body" tabIndex={0} aria-label={`${title}详情`}>
+            {entries.map((entry) => {
+                  const toolName = entry.call?.name || entry.result?.toolName || 'tool';
                   const isErr = Boolean(entry.result?.isError);
-                  const entryState = entry.result
-                    ? isErr
-                      ? 'error'
-                      : 'success'
-                    : isStreaming
-                      ? 'running'
-                      : 'pending';
-                  const statusLabel =
-                    entryState === 'running'
-                      ? '运行中'
-                      : entryState === 'success'
-                        ? '完成'
-                        : entryState === 'error'
-                          ? '失败'
-                          : '未完成';
+                  const entryState = ended(entry)
+                    ? isErr ? 'error' : 'success'
+                    : isStreaming ? 'running' : 'pending';
+                  const statusLabel = { running: '运行中', success: '完成', error: '失败', pending: '未完成' }[entryState];
                   const extra = entry.result
                     ? parseToolResultExtra(entry.result.extra)
                     : {};
@@ -580,18 +499,18 @@ export const ContentRenderer = memo(function ContentRenderer({
                   const hasStructured = extra.structuredContent !== undefined;
 
                   return (
-                    <div
-                      key={entry.key}
+                    <details
+                      key={entry.index}
                       className={`tool-trace-entry ${isErr ? 'tool-trace-entry--error' : ''}`.trim()}
                     >
-                      <div className="tool-trace-entry__head">
+                      <summary className="tool-trace-entry__head">
                         <span className="tool-trace-entry__name">{toolName}</span>
                         <span
                           className={`tool-trace-entry__status tool-trace-entry__status--${entryState}`}
                         >
                           {statusLabel}
                         </span>
-                      </div>
+                      </summary>
 
                       {entry.call ? (
                         <>
@@ -709,11 +628,9 @@ export const ContentRenderer = memo(function ContentRenderer({
                           ) : null}
                         </>
                       ) : null}
-                    </div>
+                    </details>
                   );
                 })}
-              </div>
-            ))}
           </div>
         </CollapsibleBlock>,
       );

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useLayoutEffect, useRef, useState } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
   Button,
@@ -15,10 +15,15 @@ import { McpEditor } from './McpEditor';
 import { errorMessageOf } from './jsonValidation';
 
 interface ServerProbeState {
-  probing: boolean;
-  expanded: boolean;
+  key: string;
+  probing?: boolean;
   result?: MCPServerTestResult;
   error?: string;
+}
+
+function catalogKey(epoch: number, s: MCPServerConfig) {
+  const pairs = (values?: Record<string, string>) => Object.entries(values ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify([epoch, s.id, s.transport, s.endpoint, s.command, s.args, pairs(s.env), pairs(s.headers)]);
 }
 
 function formatSchema(schema: unknown): string {
@@ -42,6 +47,7 @@ function summarizeTarget(server: MCPServerConfig): string {
 export function McpPage() {
   const {
     gateway,
+    connectionEpoch,
     resources,
     refreshPlugins,
     upsertLocalMcpServer,
@@ -59,73 +65,50 @@ export function McpPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [probeById, setProbeById] = useState<Record<string, ServerProbeState>>({});
 
-  // Clear cached probe results when a server is edited, toggled, or deleted.
-  const serverSignature = mcpServers
-    .map((s) => `${s.id}:${s.enabled}:${s.updatedAt ?? ''}:${s.endpoint ?? ''}:${s.command ?? ''}`)
-    .join('|');
-  useEffect(() => {
-    setProbeById((prev) => {
-      const validIds = new Set(mcpServers.map((s) => s.id));
-      const next: Record<string, ServerProbeState> = {};
-      for (const [id, st] of Object.entries(prev)) {
-        if (validIds.has(id) && st.probing) {
-          next[id] = st;
-        }
-      }
-      return Object.keys(next).length === 0 && Object.keys(prev).length === 0 ? prev : next;
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [serverSignature]);
+  const [savingIds, setSavingIds] = useState<ReadonlySet<string>>(new Set());
+  const pending = useRef(new Set<string>());
+  const keys = new Map(mcpServers.map((s) => [s.id, catalogKey(connectionEpoch, s)]));
+  const currentKeys = useRef(keys);
+  useLayoutEffect(() => {
+    currentKeys.current = keys;
+    return () => { currentKeys.current = new Map(); };
+  });
 
   const handleProbe = async (server: MCPServerConfig) => {
-    setProbeById((prev) => ({
-      ...prev,
-      [server.id]: {
-        ...prev[server.id],
-        probing: true,
-        expanded: true,
-      },
-    }));
+    const key = keys.get(server.id)!;
+    if (pending.current.has(key)) return;
+    pending.current.add(key);
+    const update = (state: Partial<ServerProbeState>) => {
+      if (currentKeys.current.get(server.id) !== key) return;
+      setProbeById((prev) => ({
+        ...prev,
+        [server.id]: { ...(prev[server.id]?.key === key ? prev[server.id] : {}), key, ...state },
+      }));
+    };
+    update({ probing: true, error: undefined });
     try {
-      const result = await gateway.testMcpServer(server.id);
-      setProbeById((prev) => ({
-        ...prev,
-        [server.id]: { probing: false, expanded: true, result },
-      }));
+      update({ probing: false, result: await gateway.testMcpServer(server.id) });
     } catch (err) {
-      setProbeById((prev) => ({
-        ...prev,
-        [server.id]: {
-          probing: false,
-          expanded: true,
-          error: errorMessageOf(err, '探测 MCP 工具目录失败'),
-        },
-      }));
+      update({ probing: false, error: errorMessageOf(err, '拉取工具失败') });
+    } finally {
+      pending.current.delete(key);
     }
   };
 
-  const handleToggle = async (server: MCPServerConfig, nextEnabled: boolean) => {
+  const handleSave = async (server: MCPServerConfig, patch: { enabled: boolean } | { disabledTools: string[] }) => {
+    const key = keys.get(server.id)!;
+    if (pending.current.has(key)) return;
+    pending.current.add(key);
+    setSavingIds((prev) => new Set(prev).add(key));
     setActionError(null);
     try {
-      const updated = await gateway.updateMcpServer(server.id, {
-        name: server.name,
-        transport: server.transport,
-        ...(server.transport === 'stdio'
-          ? {
-              command: server.command,
-              args: server.args,
-              env: server.env,
-            }
-          : {
-              endpoint: server.endpoint,
-              headers: server.headers,
-            }),
-        enabled: nextEnabled,
-      });
-      upsertLocalMcpServer(updated);
-      toast(nextEnabled ? '配置已启用' : '配置已停用');
+      const updated = await gateway.updateMcpServer(server.id, patch);
+      if (currentKeys.current.get(server.id) === key) upsertLocalMcpServer(updated);
     } catch (err) {
-      setActionError(errorMessageOf(err, '更新 MCP 配置失败'));
+      if (currentKeys.current.get(server.id) === key) setActionError(errorMessageOf(err, '更新 MCP 配置失败'));
+    } finally {
+      pending.current.delete(key);
+      setSavingIds((prev) => new Set([...prev].filter((id) => id !== key)));
     }
   };
 
@@ -207,7 +190,11 @@ export function McpPage() {
           <div className="st-group">
             {mcpServers.map((server) => {
               const target = summarizeTarget(server);
-              const probe = probeById[server.id];
+              const key = keys.get(server.id)!;
+              const probe = probeById[server.id]?.key === key ? probeById[server.id] : undefined;
+              const saving = savingIds.has(key);
+              const busy = saving || probe?.probing;
+              const disabledTools = server.disabledTools ?? [];
               return (
                 <div key={server.id} className="st-mcp-item">
                   <div className="st-model-row">
@@ -223,13 +210,11 @@ export function McpPage() {
                       >
                         <span className="st-model-name">{server.name}</span>
                         <span className="st-badge">{server.transport}</span>
-                        {probe?.result ? (
+                        {probe?.error ? (
+                          <span className="st-mcp-status st-mcp-status--err">拉取失败</span>
+                        ) : probe?.result ? (
                           <span className="st-mcp-status st-mcp-status--ok">
                             已连通 · {probe.result.toolCount} 个工具 · {probe.result.latencyMs}ms
-                          </span>
-                        ) : probe?.error ? (
-                          <span className="st-mcp-status st-mcp-status--err">
-                            探测失败
                           </span>
                         ) : null}
                       </div>
@@ -242,21 +227,24 @@ export function McpPage() {
                         size="sm"
                         variant="secondary"
                         loading={Boolean(probe?.probing)}
-                        aria-label={`探测 ${server.name}`}
+                        disabled={saving}
+                        aria-label={`拉取工具 ${server.name}`}
                         onClick={() => void handleProbe(server)}
                       >
-                        {probe?.probing ? '探测中…' : '探测'}
+                        拉取工具
                       </Button>
                       <Switch
                         checked={server.enabled}
+                        disabled={busy}
                         label={`启用 ${server.name}`}
                         onCheckedChange={(checked) =>
-                          void handleToggle(server, checked)
+                          void handleSave(server, { enabled: checked })
                         }
                       />
                       <IconButton
                         size="sm"
                         icon="edit"
+                        disabled={busy}
                         label={`编辑 ${server.name}`}
                         onClick={() => {
                           setEditing(server);
@@ -266,6 +254,7 @@ export function McpPage() {
                       <IconButton
                         size="sm"
                         icon="trash"
+                        disabled={busy}
                         tone="danger"
                         label={`删除 ${server.name}`}
                         onClick={() => setDeleteTarget(server)}
@@ -278,48 +267,36 @@ export function McpPage() {
                         <div className="st-mcp-probe__err" role="alert">
                           {probe.error}
                         </div>
-                      ) : probe.result && probe.result.tools.length === 0 ? (
+                      ) : null}
+                      {probe.result && probe.result.tools.length === 0 ? (
                         <div className="st-mcp-probe__empty">
                           {probe.result.message}（服务器未声明工具）
                         </div>
                       ) : probe.result ? (
-                        <div className="st-mcp-tool-list">
-                          {probe.result.tools.map((tool) => (
-                            <div key={tool.name} className="st-mcp-tool-card">
-                              <div className="st-mcp-tool-card__head">
-                                <span className="st-mcp-tool-card__name">{tool.name}</span>
-                                {tool.title && tool.title !== tool.name ? (
-                                  <span className="st-badge">{tool.title}</span>
-                                ) : null}
-                                {tool.annotations?.readOnlyHint ? (
-                                  <span className="st-badge">只读</span>
-                                ) : null}
-                                {tool.annotations?.destructiveHint ? (
-                                  <span className="st-badge">破坏性</span>
-                                ) : null}
+                        <details key={key} className="st-mcp-catalog" open>
+                          <summary>工具目录 · {probe.result.toolCount} 项</summary>
+                          <div className="st-mcp-tool-list">
+                            {probe.result.tools.map((tool) => (
+                              <div key={tool.name} className="st-mcp-tool-card">
+                                <details className="st-mcp-tool-card__details">
+                                  <summary className="st-mcp-tool-card__name">{tool.name}</summary>
+                                  {tool.title && tool.title !== tool.name && <div className="st-mcp-tool-card__desc">{tool.title}</div>}
+                                  {tool.description && <div className="st-mcp-tool-card__desc">{tool.description}</div>}
+                                  {tool.annotations?.readOnlyHint && <span className="st-badge">只读</span>}
+                                  {tool.annotations?.destructiveHint && <span className="st-badge">破坏性</span>}
+                                  {tool.inputSchema != null && <div className="st-mcp-tool-card__desc">参数 Schema<pre className="st-mcp-schema-pre"><code>{formatSchema(tool.inputSchema)}</code></pre></div>}
+                                  {tool.outputSchema != null && <div className="st-mcp-tool-card__desc">输出 Schema<pre className="st-mcp-schema-pre"><code>{formatSchema(tool.outputSchema)}</code></pre></div>}
+                                </details>
+                                <Switch checked={!disabledTools.includes(tool.name)}
+                                  disabled={!server.enabled || busy}
+                                  label={'启用 ' + tool.name + '（' + server.name + '）'}
+                                  onCheckedChange={(checked) => void handleSave(server, { disabledTools: checked
+                                    ? disabledTools.filter((name) => name !== tool.name)
+                                    : [...disabledTools, tool.name] })} />
                               </div>
-                              {tool.description ? (
-                                <div className="st-mcp-tool-card__desc">{tool.description}</div>
-                              ) : null}
-                              {tool.inputSchema ? (
-                                <details className="st-mcp-tool-card__schema">
-                                  <summary>参数 Schema</summary>
-                                  <pre className="st-mcp-schema-pre">
-                                    <code>{formatSchema(tool.inputSchema)}</code>
-                                  </pre>
-                                </details>
-                              ) : null}
-                              {tool.outputSchema ? (
-                                <details className="st-mcp-tool-card__schema">
-                                  <summary>输出 Schema</summary>
-                                  <pre className="st-mcp-schema-pre">
-                                    <code>{formatSchema(tool.outputSchema)}</code>
-                                  </pre>
-                                </details>
-                              ) : null}
-                            </div>
-                          ))}
-                        </div>
+                            ))}
+                          </div>
+                        </details>
                       ) : null}
                     </div>
                   ) : null}

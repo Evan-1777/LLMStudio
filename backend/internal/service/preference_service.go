@@ -29,7 +29,7 @@ func (s *PreferenceService) Update(ctx context.Context, patch domain.Preferences
 }
 
 // ImportLegacy seeds preferences from legacy browser storage exactly once.
-// The legacy payload carries no avatar, so the import never writes that field.
+// The legacy payload cannot set the avatar or composer reasoning preference.
 func (s *PreferenceService) ImportLegacy(ctx context.Context, input domain.Preferences) (domain.Preferences, bool, error) {
 	input.UserAvatarDataURL = ""
 	return s.store.Update(ctx, fullPatch(input.Normalize()), true, validatePreferences)

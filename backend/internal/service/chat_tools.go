@@ -52,10 +52,13 @@ func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatToo
 			return nil, nil, listErr
 		}
 		for _, desc := range normalizedDescriptors(descriptors) {
+			alias := plugin.BuildChatToolAlias(srv.ID, desc.Name, usedAliases)
+			if !srv.ToolEnabled(desc.Name) {
+				continue
+			}
 			if bindings == nil {
 				bindings = make(map[string]mcpToolBinding)
 			}
-			alias := plugin.BuildChatToolAlias(srv.ID, desc.Name, usedAliases)
 			bindings[alias] = mcpToolBinding{
 				ServerID:   srv.ID,
 				ServerName: srv.Name,
@@ -99,17 +102,15 @@ func (s *ChatService) filterEnabledTools(ctx context.Context, tools []plugin.Cha
 	}
 	servers, err := s.mcpStore.List(ctx)
 	if err != nil {
-		return tools
+		return nil
 	}
-	enabledIDs := make(map[string]struct{}, len(servers))
+	byID := make(map[string]domain.MCPServerConfig, len(servers))
 	for _, srv := range servers {
-		if srv.Enabled {
-			enabledIDs[srv.ID] = struct{}{}
-		}
+		byID[srv.ID] = srv
 	}
 	filtered := make([]plugin.ChatTool, 0, len(tools))
 	for _, t := range tools {
-		if _, ok := enabledIDs[t.ServerID]; ok {
+		if byID[t.ServerID].ToolEnabled(t.ToolName) {
 			filtered = append(filtered, t)
 		}
 	}
@@ -145,6 +146,12 @@ func (s *ChatService) executeToolCall(
 		_ = s.mcpClient.CloseServer(binding.ServerID)
 		resultBlock.IsError = true
 		resultBlock.Content = fmt.Sprintf("MCP server %q is unavailable or disabled", binding.ServerName)
+		return resultBlock, nil
+	}
+
+	if !srv.ToolEnabled(binding.ToolName) {
+		resultBlock.IsError = true
+		resultBlock.Content = fmt.Sprintf("MCP tool %q is disabled", binding.ToolName)
 		return resultBlock, nil
 	}
 
@@ -381,6 +388,9 @@ func (s *ChatService) discoverActiveBindingsLenient(ctx context.Context) (map[st
 		}
 		for _, desc := range normalizedDescriptors(descriptors) {
 			alias := plugin.BuildChatToolAlias(srv.ID, desc.Name, usedAliases)
+			if !srv.ToolEnabled(desc.Name) {
+				continue
+			}
 			bindings[alias] = mcpToolBinding{
 				ServerID:   srv.ID,
 				ServerName: srv.Name,

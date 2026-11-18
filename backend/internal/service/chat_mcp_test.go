@@ -355,6 +355,65 @@ func TestChatServiceMCPErrorsAbortRoundLimitAndMidHistoryPreserve(t *testing.T) 
 	}
 }
 
+func TestMCPDisabledToolsKeepSiblingAliasesAndRejectExecution(t *testing.T) {
+	ctx := t.Context()
+	stub := &stubMCPClient{toolsBySrv: map[string][]plugin.MCPToolDescriptor{
+		"srv-a": {{Name: "read"}, {Name: "search"}},
+		"srv-b": {{Name: "read"}},
+	}}
+	svc, _, _, mcps, conv, _ := setupChatMCPFixture(t, "http://127.0.0.1:1/v1", stub)
+	cfg := service.NewPluginService(nil, nil, mcps).WithMCPClient(stub)
+	for _, id := range []string{"srv-a", "srv-b"} {
+		if _, err := cfg.CreateMCPServer(ctx, service.MCPServerInput{ID: id, Name: id, Command: "mock"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	aliases := func() string {
+		t.Helper()
+		prep, err := svc.PrepareLocal(ctx, service.StreamChatInput{ConversationID: conv.ID, Text: "list tools"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body struct {
+			Tools []struct{ Function struct{ Name string } }
+		}
+		if err := json.Unmarshal(prep.Body, &body); err != nil {
+			t.Fatal(err)
+		}
+		var names []string
+		for _, tool := range body.Tools {
+			names = append(names, tool.Function.Name)
+		}
+		return strings.Join(names, ",")
+	}
+	before := strings.Split(aliases(), ",")
+	if len(before) != 3 {
+		t.Fatalf("expected three aliases, got %v", before)
+	}
+	if _, err := cfg.UpdateMCPServer(ctx, "srv-a", service.MCPServerInput{DisabledTools: []string{"read"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := aliases(); got != strings.Join(before[1:], ",") {
+		t.Fatalf("sibling aliases changed: %s -> %s", strings.Join(before, ","), got)
+	}
+	var results []bool
+	var calls []service.ToolCallInput
+	for _, name := range before {
+		calls = append(calls, service.ToolCallInput{ID: name, Name: name})
+	}
+	if err := svc.ExecuteTools(ctx, service.ExecuteToolsInput{ConversationID: conv.ID, Calls: calls}, func(e domain.StreamEvent) error {
+		if e.Type == domain.StreamEventBlockEnd {
+			results = append(results, e.Block.IsError)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(results) != "[true false false]" || strings.Join(stub.calls, ",") != "srv-a:search,srv-b:read" || len(stub.closedIDs) != 0 {
+		t.Fatalf("results=%v calls=%v closed=%v", results, stub.calls, stub.closedIDs)
+	}
+}
+
 func TestChatServiceMCPRoundLimitAbortAndPersistFailure(t *testing.T) {
 	ctx := context.Background()
 

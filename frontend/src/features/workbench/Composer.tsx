@@ -50,6 +50,7 @@ export function Composer({
   selectedProviderId,
   selectedModelId,
   reasoningEffort,
+  savingEffort,
   isBusy,
   onChangeReasoningEffort,
   onStop,
@@ -59,6 +60,7 @@ export function Composer({
   selectedProviderId: string;
   selectedModelId: string;
   reasoningEffort: ReasoningEffort;
+  savingEffort: boolean;
   isBusy: boolean;
   onChangeReasoningEffort: (effort: ReasoningEffort) => void;
   onStop: () => void;
@@ -119,6 +121,7 @@ export function Composer({
   const hasContent = draft.trim().length > 0 || readyAttachments.length > 0;
   const canSend =
     !isBusy &&
+    !savingEffort &&
     !submitting &&
     !hasReading &&
     hasContent &&
@@ -394,8 +397,9 @@ export function Composer({
                     : undefined
                 }
                 aria-label={`思考强度 (${EFFORT_LABELS[reasoningEffort]})`}
-                title={`思考强度 (${EFFORT_LABELS[reasoningEffort]})`}
-                disabled={isBusy}
+                title={savingEffort ? '正在保存思考强度' : `思考强度 (${EFFORT_LABELS[reasoningEffort]})`}
+                aria-busy={savingEffort}
+                disabled={isBusy || savingEffort}
               >
                 <Icon name="lightbulb" size={15} />
                 {reasoningEffort !== 'none' ? (

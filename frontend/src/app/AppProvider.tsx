@@ -350,9 +350,10 @@ export function AppProvider({
       // A gateway switch while the request was in flight must not apply stale values.
       if (connectionGateway !== settingsRef.current.gatewayBaseUrl) return;
 
+      const { composerReasoningEffort: _, ...fallback } = pickAppPreferences(settingsRef.current);
+      const seed = legacy ?? fallback;
       let resolved = envelope;
       if (!envelope.initialized) {
-        const seed = legacy ?? pickAppPreferences(settingsRef.current);
         try {
           resolved = await gateway.importLegacyPreferences(seed, signal);
         } catch {
@@ -364,7 +365,7 @@ export function AppProvider({
 
       const next = resolved.initialized
         ? normalizeServerPreferences(resolved.preferences)
-        : (legacy ?? pickAppPreferences(settingsRef.current));
+        : normalizeServerPreferences(seed);
       settingsRef.current = { ...settingsRef.current, ...next };
       serverPreferencesRef.current = next;
       setSettings(settingsRef.current);

@@ -1,3 +1,5 @@
+import { isReasoningEffort, type ReasoningEffort, type ServerPreferencesImport } from './types';
+
 // Legacy single-blob key: pre-migration browser state, removed once the gateway
 // confirms the import (or already holds server-owned preferences).
 export const SETTINGS_STORAGE_KEY = 'llmstudio.settings.v2';
@@ -116,6 +118,7 @@ export interface AppSettings {
   collapseCharThreshold: number;
   // User avatar owned by the gateway; empty means the built-in avatar.
   userAvatarDataUrl: string;
+  composerReasoningEffort: ReasoningEffort | '';
 }
 
 export interface SettingsLoadResult {
@@ -146,6 +149,7 @@ export const APP_PREFERENCE_KEYS = [
   'collapseLineThreshold',
   'collapseCharThreshold',
   'userAvatarDataUrl',
+  'composerReasoningEffort',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -167,6 +171,7 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     collapseLineThreshold: settings.collapseLineThreshold,
     collapseCharThreshold: settings.collapseCharThreshold,
     userAvatarDataUrl: settings.userAvatarDataUrl,
+    composerReasoningEffort: settings.composerReasoningEffort,
   };
 }
 
@@ -192,6 +197,7 @@ export function defaultSettings(): AppSettings {
     collapseLineThreshold: 24,
     collapseCharThreshold: 1200,
     userAvatarDataUrl: '',
+    composerReasoningEffort: '',
   };
 }
 
@@ -281,6 +287,7 @@ export function normalizeSettings(raw: unknown): AppSettings {
       20000,
       defaults.collapseCharThreshold,
     ),
+    composerReasoningEffort: isReasoningEffort(obj.composerReasoningEffort) ? obj.composerReasoningEffort : '',
     userAvatarDataUrl:
       typeof obj.userAvatarDataUrl === 'string'
         ? obj.userAvatarDataUrl
@@ -467,19 +474,21 @@ export function loadConnectionSettings(explicitStorage?: Storage | null): {
  */
 export function readLegacyPreferences(
   explicitStorage?: Storage | null,
-): AppPreferences | null {
+): ServerPreferencesImport | null {
   const storage = safeStorage(explicitStorage);
   if (!storage) return null;
   try {
     const raw = storage.getItem(SETTINGS_STORAGE_KEY);
     if (raw) {
-      return pickAppPreferences(normalizeSettings(JSON.parse(raw)));
+      const { composerReasoningEffort: _, ...legacy } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
+      return legacy;
     }
     const flutterRaw = storage.getItem(LEGACY_FLUTTER_SETTINGS_KEY);
     if (flutterRaw) {
-      return pickAppPreferences(
+      const { composerReasoningEffort: _, ...legacy } = pickAppPreferences(
         normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),
       );
+      return legacy;
     }
   } catch {
     return null;

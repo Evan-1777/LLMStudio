@@ -2,11 +2,9 @@ import type {
   ContentBlock,
   Conversation,
   Message,
-  ReasoningEffort,
   StreamEvent,
   TokenUsage,
 } from '../../core/types';
-import { REASONING_EFFORT_LEVELS } from '../../core/types';
 
 export type ChatRunState =
   | 'empty'
@@ -41,7 +39,6 @@ export interface ChatState {
   conversation: Conversation | null;
   messages: Message[];
   runState: ChatRunState;
-  reasoningEffort: ReasoningEffort;
   errorCode: string | null;
   errorMessage: string | null;
   needsReloadAfterAbort: boolean;
@@ -54,7 +51,6 @@ export const initialChatState: ChatState = {
   conversation: null,
   messages: [],
   runState: 'empty',
-  reasoningEffort: 'none',
   errorCode: null,
   errorMessage: null,
   needsReloadAfterAbort: false,
@@ -166,7 +162,6 @@ export type ChatAction =
   | { type: 'LOAD_START'; conversationId?: string }
   | { type: 'LOAD_SUCCESS'; conversation: Conversation; messages: Message[] }
   | { type: 'LOAD_ERROR'; code: string; message: string }
-  | { type: 'SET_EFFORT'; effort: ReasoningEffort }
   | { type: 'UPDATE_CONVERSATION_META'; conversation: Conversation }
   | { type: 'SEND_PREPARE_START'; optimisticUser: Message }
   | { type: 'SEND_PREPARE_FAILED'; optimisticUserId: string; code: string; message: string }
@@ -209,18 +204,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     }
 
     case 'LOAD_SUCCESS': {
-      const convEffort = action.conversation.params?.reasoningEffort;
-      const reasoningEffort = REASONING_EFFORT_LEVELS.includes(
-        convEffort as ReasoningEffort,
-      )
-        ? (convEffort as ReasoningEffort)
-        : 'none';
       const rest = deriveRestState(action.messages);
       return {
         ...state,
         conversation: action.conversation,
         messages: action.messages,
-        reasoningEffort,
         runState: rest.runState,
         errorCode: rest.errorCode,
         errorMessage: rest.errorMessage,
@@ -240,9 +228,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         pendingInsertIndex: null,
         streaming: null,
       };
-
-    case 'SET_EFFORT':
-      return { ...state, reasoningEffort: action.effort };
 
     case 'UPDATE_CONVERSATION_META':
       return { ...state, conversation: action.conversation };

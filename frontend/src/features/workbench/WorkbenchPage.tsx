@@ -6,7 +6,7 @@ import {
 } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import { Icon, IconButton } from '../../components/ui';
-import type { Assistant, ContentBlock, Message } from '../../core/types';
+import { isReasoningEffort, type Assistant, type ContentBlock, type Message, type ReasoningEffort } from '../../core/types';
 import { ChatProvider, useChat } from '../chat/ChatProvider';
 import { AssistantEditor } from './AssistantEditor';
 import { AssistantSidebar } from './AssistantSidebar';
@@ -32,13 +32,14 @@ function WorkbenchInner() {
     connectionEpoch,
     resources,
     upsertLocalConversation,
+    settings,
+    updatePreferences,
     toast,
   } = useApp();
 
   const {
     state: chatState,
     isBusy,
-    setReasoningEffort,
     updateConversationMeta,
     clearSession,
     loadConversation,
@@ -80,6 +81,9 @@ function WorkbenchInner() {
   activeConnEpochRef.current = connectionEpoch;
   const [savingModelKey, setSavingModelKey] = useState<string | null>(null);
   const modelSaveLockRef = useRef<string | null>(null);
+  const [effortSaveEpoch, setEffortSaveEpoch] = useState<number | null>(null);
+  const effortSaveLock = useRef<number | null>(null);
+  const savingEffort = effortSaveEpoch === connectionEpoch;
 
   const assistants = useMemo(
     () =>
@@ -168,6 +172,26 @@ function WorkbenchInner() {
       resources.conversations.find((c) => c.id === conversationId) ?? null
     );
   }, [chatState.conversation, conversationId, resources.conversations]);
+
+  const previousEffort = currentConversation?.params?.reasoningEffort;
+  const reasoningEffort = settings.composerReasoningEffort || (isReasoningEffort(previousEffort) ? previousEffort : 'none');
+
+  const saveReasoningEffort = async (effort: ReasoningEffort) => {
+    if (effortSaveLock.current === connectionEpoch || effort === settings.composerReasoningEffort) return;
+    effortSaveLock.current = connectionEpoch;
+    setEffortSaveEpoch(connectionEpoch);
+    try {
+      const result = await updatePreferences({ composerReasoningEffort: effort });
+      if (activeConnEpochRef.current === connectionEpoch && !result.ok) {
+        toast('思考强度保存失败：' + result.error, 'error');
+      }
+    } finally {
+      if (effortSaveLock.current === connectionEpoch) {
+        effortSaveLock.current = null;
+        setEffortSaveEpoch(null);
+      }
+    }
+  };
 
   const targetModel = useMemo(() => {
     const convProvider = currentConversation?.providerId ?? '';
@@ -364,6 +388,7 @@ function WorkbenchInner() {
     searchEngineId?: string;
     onAccepted: () => void;
   }): Promise<boolean> => {
+    if (effortSaveLock.current === connectionEpoch) return false;
     if (!selectedProviderId || !selectedModelId) {
       toast('请先配置可用模型', 'error');
       return false;
@@ -380,7 +405,7 @@ function WorkbenchInner() {
           systemPrompt: draftSessionParams.systemPrompt,
           params: {
             ...draftSessionParams.params,
-            reasoningEffort: chatState.reasoningEffort,
+            reasoningEffort,
           },
         });
         upsertLocalConversation(created);
@@ -401,7 +426,7 @@ function WorkbenchInner() {
       text: opts.text,
       providerId: selectedProviderId,
       modelId: selectedModelId,
-      params: { reasoningEffort: chatState.reasoningEffort },
+      params: { reasoningEffort },
       webSearch: opts.webSearch,
       searchEngineId: opts.searchEngineId,
       onStreamAccepted: opts.onAccepted,
@@ -413,7 +438,7 @@ function WorkbenchInner() {
       targetMessageId: message.id,
       providerId: selectedProviderId,
       modelId: selectedModelId,
-      params: { reasoningEffort: chatState.reasoningEffort },
+      params: { reasoningEffort },
     });
 
   const handleDeleteMessage = (message: Message) => deleteMessage(message.id);
@@ -559,9 +584,10 @@ function WorkbenchInner() {
           selectedModel={targetModel?.model ?? null}
           selectedProviderId={selectedProviderId}
           selectedModelId={selectedModelId}
-          reasoningEffort={chatState.reasoningEffort}
+          reasoningEffort={reasoningEffort}
+          savingEffort={savingEffort}
           isBusy={isBusy}
-          onChangeReasoningEffort={setReasoningEffort}
+          onChangeReasoningEffort={(effort) => void saveReasoningEffort(effort)}
           onStop={stopStreaming}
           onSend={handleSend}
         />

@@ -19,6 +19,10 @@ async function startE2EMcpAndLlmServer() {
   let sseClientRes: http.ServerResponse | null = null;
   const llmCalls: CapturedLLMCall[] = [];
   let flowTurn = 0;
+  const mcpCalls: string[] = [];
+  let roundGate: Promise<void> | undefined;
+  let releaseRound: (() => void) | undefined;
+  let attemptedAlias = '';
 
   const cors = (res: http.ServerResponse) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -111,6 +115,7 @@ async function startE2EMcpAndLlmServer() {
       }
       if (rpc.method === 'tools/call') {
         const name = rpc.params?.name;
+        if (name) mcpCalls.push(name);
         if (name === 'bump_state') {
           bumpCount += Number(rpc.params?.arguments?.delta ?? 1);
           res.end(
@@ -238,6 +243,23 @@ async function startE2EMcpAndLlmServer() {
         'Cache-Control': 'no-cache',
       });
 
+      const messages = (body.messages ?? []) as Array<{ role: string; content: unknown }>;
+      const latestUser = messages.findLast((msg) => msg.role === 'user');
+      if (JSON.stringify(latestUser ?? {}).includes('[POLICY_CHECK]')) {
+        if (!messages.some((msg) => msg.role === 'tool' && String(msg.content).includes('disabled'))) {
+          const noteAlias = toolNames.find((name) => name.startsWith('safe_note'));
+          res.write('data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [
+            { index: 0, id: 'disabled-attempt', function: { name: attemptedAlias, arguments: '{}' } },
+            { index: 1, id: 'enabled-sibling', function: { name: noteAlias, arguments: '{}' } },
+          ] } }] }) + '\n\n');
+          res.write('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+        } else {
+          res.write('data: {"choices":[{"delta":{"content":"Tool policy confirmed"},"finish_reason":"stop"}]}\n\n');
+        }
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+
       if (rawMsgs.includes('[LONG_TOOL]') && !rawMsgs.includes('Tool output line 1:')) {
         const safeAlias =
           toolNames.find((n) => n.startsWith('safe_note')) || toolNames[0];
@@ -267,6 +289,7 @@ async function startE2EMcpAndLlmServer() {
       }
 
       if (rawMsgs.includes('[LONG_TOOL]')) {
+        await roundGate;
         res.write(
           'data: {"choices":[{"delta":{"content":"Long tool complete"},"finish_reason":"stop"}]}\n\n',
         );
@@ -282,6 +305,7 @@ async function startE2EMcpAndLlmServer() {
         flowTurn += 1;
         const bumpAlias = toolNames.find((n) => n.startsWith('bump_state'))!;
         const noteAlias = toolNames.find((n) => n.startsWith('safe_note'))!;
+        attemptedAlias = bumpAlias;
         if (flowTurn % 3 === 1) {
           res.write(
             `data: ${JSON.stringify({
@@ -313,6 +337,7 @@ async function startE2EMcpAndLlmServer() {
           return;
         }
         if (flowTurn % 3 === 2) {
+          await roundGate;
           res.write(
             `data: ${JSON.stringify({
               choices: [
@@ -376,6 +401,9 @@ async function startE2EMcpAndLlmServer() {
   return {
     baseUrl: `http://127.0.0.1:${addr.port}`,
     llmCalls,
+    mcpCalls,
+    holdRound() { roundGate = new Promise<void>((resolve) => { releaseRound = resolve; }); },
+    releaseRound() { releaseRound?.(); roundGate = undefined; },
     setFailProbe(v: boolean) {
       failHttpProbe = v;
     },
@@ -385,6 +413,7 @@ async function startE2EMcpAndLlmServer() {
       llmCalls.length = 0;
     },
     async close() {
+      releaseRound?.();
       sseClientRes?.end();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
@@ -446,15 +475,19 @@ test.describe('MCP End-to-End Integration', () => {
       await page.getByRole('button', { name: 'MCP 配置' }).click();
       await expect(page.getByText('mcp-http', { exact: true })).toBeVisible();
 
-      await page.getByRole('button', { name: '探测 mcp-http' }).click();
+      await page.getByRole('button', { name: '拉取工具 mcp-http' }).click();
       await expect(page.getByText(/已连通 · 2 个工具/)).toBeVisible();
       await expect(page.getByText('bump_state', { exact: true })).toBeVisible();
       await expect(page.getByText('safe_note', { exact: true })).toBeVisible();
+      const noteDetails = page.locator('summary').filter({ hasText: /^safe_note$/ });
+      await expect(noteDetails.locator('..')).not.toHaveAttribute('open', '');
+      await noteDetails.focus();
+      await noteDetails.press('Enter');
       await expect(page.getByText('只读', { exact: true })).toBeVisible();
 
       mockSrv.setFailProbe(true);
-      await page.getByRole('button', { name: '探测 mcp-http' }).click();
-      await expect(page.getByText('探测失败', { exact: true })).toBeVisible();
+      await page.getByRole('button', { name: '拉取工具 mcp-http' }).click();
+      await expect(page.getByText('拉取失败', { exact: true })).toBeVisible();
       await expect(page.getByText(/401/)).toBeVisible();
       mockSrv.setFailProbe(false);
 
@@ -463,22 +496,24 @@ test.describe('MCP End-to-End Integration', () => {
       await page.getByRole('button', { name: '新建话题' }).click();
       await page.getByRole('button', { name: '选择模型' }).click();
       await page.getByRole('option', { name: 'Fwd Chat' }).click();
+      mockSrv.holdRound();
       await page.getByLabel('消息输入框').fill('[FORWARD_MULTI]');
       await page.getByLabel('发送消息').click();
 
-      await expect(
-        page.getByText('MCP Final Reply (count=2)', { exact: true }),
-      ).toBeVisible();
-      // Collapsed by default because autoCollapseToolsOnComplete=true.
-      const traceToggle = page.getByRole('button', { name: /工具调用/ });
-      await expect(traceToggle).toHaveCount(1);
-      await expect(traceToggle).toHaveAttribute('aria-expanded', 'false');
-
-      // Expand and inspect rounds + embedded resource + unexecuted script tag.
-      await traceToggle.click();
-      await expect(page.getByText('第 1 轮', { exact: true })).toBeVisible();
-      await expect(page.getByText('第 2 轮', { exact: true })).toBeVisible();
-      await expect(page.getByText('count=2', { exact: true })).toBeVisible();
+      const trace1 = page.getByRole('button', { name: /工具调用 · 第 1 轮/ });
+      const trace2 = page.getByRole('button', { name: /工具调用 · 第 2 轮/ });
+      await expect(trace1).toHaveAttribute('aria-expanded', 'false');
+      await expect(page.getByRole('button', { name: '停止生成' })).toBeVisible();
+      await expect(page.getByText('MCP Final Reply (count=2)', { exact: true })).toHaveCount(0);
+      await trace1.click();
+      mockSrv.releaseRound();
+      await expect(page.getByText('MCP Final Reply (count=2)', { exact: true })).toBeVisible();
+      await expect(trace1).toHaveAttribute('aria-expanded', 'true');
+      await expect(trace2).toHaveAttribute('aria-expanded', 'false');
+      const toolDetails = page.locator('.tool-trace-entry > summary');
+      await expect(toolDetails).toHaveCount(2);
+      for (const tool of await toolDetails.all()) await tool.click();
+      await expect(page.getByText('count=1', { exact: true })).toBeVisible();
       await expect(page.getByText(/doc:\/\/guide/)).toBeVisible();
       await expect(
         page.getByText('<script>window.__mcpE2EXss=1</script>safe-note-text', {
@@ -501,9 +536,38 @@ test.describe('MCP End-to-End Integration', () => {
       await page.getByRole('link', { name: '设置' }).click();
       await page.getByRole('button', { name: 'MCP 配置' }).click();
       await page.getByRole('switch', { name: '启用 mcp-sse' }).click();
-      await expect(page.getByText('配置已停用')).toBeVisible();
+      await expect(page.getByRole('switch', { name: '启用 mcp-sse' })).not.toBeChecked();
 
-      // Turn OFF autoCollapseToolsOnComplete and verify narrow mobile 375px scrolling.
+      await page.setViewportSize({ width: 375, height: 812 });
+      await page.getByRole('button', { name: '拉取工具 mcp-http' }).click();
+      const bumpSwitch = page.getByRole('switch', { name: '启用 bump_state（mcp-http）' });
+      await expect(bumpSwitch).toBeChecked();
+      await bumpSwitch.focus();
+      await bumpSwitch.press('Space');
+      await expect(bumpSwitch).not.toBeChecked();
+      await page.reload({ waitUntil: 'networkidle' });
+      await page.getByRole('button', { name: '拉取工具 mcp-http' }).click();
+      await expect(bumpSwitch).toBeVisible();
+      await expect(bumpSwitch).not.toBeChecked();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375);
+
+      const checkToolPolicy = async () => {
+        const firstRequest = mockSrv.llmCalls.length;
+        const firstToolCall = mockSrv.mcpCalls.length;
+        await page.getByLabel('消息输入框').fill('[POLICY_CHECK]');
+        await page.getByLabel('发送消息').click();
+        await expect(page.getByText('Tool policy confirmed')).toBeVisible();
+        const requests = mockSrv.llmCalls.slice(firstRequest);
+        expect(requests).toHaveLength(2);
+        for (const request of requests) {
+          expect(request.toolNames).toHaveLength(1);
+          expect(request.toolNames[0]).toMatch(/^safe_note/);
+        }
+        expect(mockSrv.mcpCalls.slice(firstToolCall)).toEqual(['safe_note']);
+      };
+
+      // Turn off auto-collapse in settings, then check narrow-screen scrolling.
+      await page.setViewportSize({ width: 1280, height: 800 });
       await page.getByRole('button', { name: '外观与显示' }).click();
       const toolCollapseSwitch = page.getByRole('switch', {
         name: '工具执行完成后自动折叠',
@@ -519,12 +583,19 @@ test.describe('MCP End-to-End Integration', () => {
 
       await page.getByRole('button', { name: '返回工作台' }).click();
       await page.setViewportSize({ width: 375, height: 812 });
+      await checkToolPolicy();
+      mockSrv.holdRound();
       await page.getByLabel('消息输入框').fill('[LONG_TOOL]');
       await page.getByLabel('发送消息').click();
-      await expect(page.getByText('Long tool complete')).toBeVisible();
+      const longRound = page.getByRole('button', { name: '工具调用 · 第 1 轮 · 1 次 · 完成' }).last();
+      await expect(longRound).toHaveAttribute('aria-expanded', 'true');
+      mockSrv.releaseRound();
+      const longReply = page.locator('article').filter({ hasText: 'Long tool complete' });
+      await expect(longReply).toBeVisible();
+      await expect(longReply.getByRole('button', { name: /工具调用/ })).toHaveAttribute('aria-expanded', 'true');
 
-      const traceBody = page.locator('.tool-trace-body').last();
-      await expect(traceBody).toBeVisible();
+      const traceBody = longReply.locator('.tool-trace-body');
+      await traceBody.locator('summary').click();
       const scrollMetrics = await traceBody.evaluate((el) => ({
         scrollHeight: el.scrollHeight,
         clientHeight: el.clientHeight,
@@ -570,6 +641,22 @@ test.describe('MCP End-to-End Integration', () => {
       await page.getByRole('button', { name: '新建话题' }).click();
       await page.getByRole('button', { name: '选择模型' }).click();
       await page.getByRole('option', { name: 'Local Chat' }).click();
+      await checkToolPolicy();
+
+      await page.getByRole('link', { name: '设置' }).click();
+      await page.getByRole('button', { name: 'MCP 配置' }).click();
+      await page.getByRole('button', { name: '拉取工具 mcp-http' }).click();
+      await expect(bumpSwitch).toBeVisible();
+      await bumpSwitch.click();
+      await expect(bumpSwitch).toBeChecked();
+      await page.getByRole('button', { name: '返回工作台' }).click();
+      await page.getByRole('button', { name: '新建话题' }).click();
+      await page.getByRole('button', { name: '选择模型' }).click();
+      await page.getByRole('option', { name: 'Local Chat' }).click();
+      await page.getByRole('button', { name: /思考强度/ }).click();
+      await page.getByRole('radio', { name: '高', exact: true }).click();
+      await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeEnabled();
+      mockSrv.resetTurns();
       await page.getByLabel('消息输入框').fill('[LOCAL_MULTI]');
       await page.getByLabel('发送消息').click();
 
@@ -577,6 +664,9 @@ test.describe('MCP End-to-End Integration', () => {
       expect(
         mockSrv.llmCalls.some((c) => c.auth === 'Bearer sk-gateway-local-key'),
       ).toBe(true);
+
+      expect(mockSrv.llmCalls).toHaveLength(3);
+      expect(mockSrv.llmCalls.every((call) => call.body.reasoning_effort === 'high')).toBe(true);
 
       // Ensure browser key is absent from SQLite conversation detail API response.
       const match = page.url().match(/\/chat\/([^/?]+)/);

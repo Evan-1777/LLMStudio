@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
@@ -42,6 +43,7 @@ export function CollapsibleBlock({
   title,
   icon,
   defaultCollapsed,
+  completion,
   subtle = false,
   actions,
   children,
@@ -50,6 +52,7 @@ export function CollapsibleBlock({
   title: string;
   icon?: IconName;
   defaultCollapsed: boolean;
+  completion?: 'pending' | 'collapse' | 'keep';
   subtle?: boolean;
   actions?: ReactNode;
   children: ReactNode;
@@ -59,11 +62,14 @@ export function CollapsibleBlock({
     undefined,
   );
 
+  const [initialCollapsed] = useState(defaultCollapsed);
   const manual = ctx ? ctx.getManual(collapseKey) : localOverride;
-  const collapsed = manual !== undefined ? manual : defaultCollapsed;
+  const collapsed = manual ?? (completion === undefined ? defaultCollapsed : initialCollapsed);
 
-  const toggle = () => {
-    const next = !collapsed;
+  const completed = useRef(completion !== 'pending');
+  const card = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const setCollapsed = (next: boolean) => {
     if (ctx) {
       ctx.setManual(collapseKey, next);
     } else {
@@ -71,13 +77,24 @@ export function CollapsibleBlock({
     }
   };
 
+  useLayoutEffect(() => {
+    if (!completion || completion === 'pending' || completed.current) return;
+    completed.current = true;
+    if (completion !== 'collapse' || collapsed) return;
+    if (card.current?.contains(document.activeElement)) trigger.current?.focus();
+    setCollapsed(true);
+  });
+
+  const toggle = () => setCollapsed(!collapsed);
+
   return (
-    <div className={`block-card ${subtle ? 'block-card--subtle' : ''}`.trim()}>
+    <div ref={card} className={`block-card ${subtle ? 'block-card--subtle' : ''}`.trim()}>
       <div
         className={`block-card__head ${collapsed ? 'block-card__head--collapsed' : ''}`.trim()}
       >
         <button
           type="button"
+          ref={trigger}
           className="block-card__toggle"
           aria-expanded={!collapsed}
           onClick={toggle}

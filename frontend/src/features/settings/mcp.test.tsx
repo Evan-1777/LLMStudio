@@ -100,6 +100,8 @@ function makeFetchMock(state: McpMockState) {
                   parsedBody.headers && typeof parsedBody.headers === 'object'
                     ? (parsedBody.headers as Record<string, string>)
                     : s.headers,
+                disabledTools: (parsedBody.disabledTools as string[] | undefined) ?? s.disabledTools,
+                updatedAt: String(state.updateBodies.length),
                 enabled:
                   typeof parsedBody.enabled === 'boolean'
                     ? parsedBody.enabled
@@ -280,7 +282,7 @@ describe('McpPage and McpEditor', () => {
     ).toBe(true);
   });
 
-  it('probes saved server tool catalog, distinguishes empty list from errors, and clears stale state on toggle', async () => {
+  it('pulls the catalog once, persists tool switches, and preserves the last successful catalog on failure', async () => {
     const user = userEvent.setup();
     let probeMode: 'ok' | 'empty' | 'error' = 'ok';
     const state: McpMockState = {
@@ -298,10 +300,12 @@ describe('McpPage and McpEditor', () => {
       updateBodies: [],
       requestedUrls: [],
     };
+    let pulls = 0;
     const baseMock = makeFetchMock(state);
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = typeof input === 'string' ? input : input.toString();
       if (url.endsWith('/api/v1/mcp/servers/srv-probe/test')) {
+        pulls++;
         if (probeMode === 'error') {
           return new Response(
             JSON.stringify({ code: 'UPSTREAM_ERROR', message: 'HTTP 401 unauthorized' }),
@@ -345,33 +349,36 @@ describe('McpPage and McpEditor', () => {
 
     await waitFor(() => expect(screen.getByText('docs-server')).toBeInTheDocument());
 
-    // 1. Probe with 1 tool shows schema and annotations.
-    await user.click(screen.getByRole('button', { name: '探测 docs-server' }));
-    await waitFor(() => expect(screen.getByText('read_doc')).toBeInTheDocument());
-    expect(screen.getByText('只读')).toBeInTheDocument();
-    expect(screen.getByText('参数 Schema')).toBeInTheDocument();
-    expect(screen.getByText('输出 Schema')).toBeInTheDocument();
+    const pull = screen.getByRole('button', { name: '拉取工具 docs-server' });
+    await user.click(pull);
+    const detail = await screen.findByText('read_doc');
+    expect(pulls).toBe(1);
+    expect(detail.closest('details')).not.toHaveAttribute('open');
+    await user.click(detail);
+    expect(screen.getByText('参数 Schema')).toBeVisible();
+    const tool = screen.getByRole('switch', { name: '启用 read_doc（docs-server）' });
+    await user.click(tool);
+    await waitFor(() => expect(tool).not.toBeChecked());
+    expect(state.updateBodies[0].body).toEqual({ disabledTools: ['read_doc'] });
+    expect(detail).toBeVisible();
+    expect(pulls).toBe(1);
 
-    // 2. Legitimate empty list shows 0 tools clearly without error.
-    probeMode = 'empty';
-    await user.click(screen.getByRole('button', { name: '探测 docs-server' }));
-    await waitFor(() =>
-      expect(screen.getByText(/服务器未声明工具/)).toBeInTheDocument(),
-    );
-    expect(screen.getByText(/已连通 · 0 个工具/)).toBeInTheDocument();
-
-    // 3. Real failure shows actual error and never pretends 0 tools.
-    probeMode = 'error';
-    await user.click(screen.getByRole('button', { name: '探测 docs-server' }));
-    await waitFor(() =>
-      expect(screen.getByText(/HTTP 401 unauthorized/)).toBeInTheDocument(),
-    );
-    expect(screen.getByText('探测失败')).toBeInTheDocument();
-
-    // 4. Toggling server clears stale probe state.
     await user.click(screen.getByRole('switch', { name: '启用 docs-server' }));
-    await waitFor(() =>
-      expect(screen.queryByText(/HTTP 401 unauthorized/)).not.toBeInTheDocument(),
-    );
+    await waitFor(() => expect(tool).toBeDisabled());
+    expect(tool).not.toBeChecked();
+
+    probeMode = 'error';
+    await user.click(pull);
+    expect(await screen.findByText(/HTTP 401 unauthorized/)).toBeInTheDocument();
+    expect(tool).toBeVisible();
+    probeMode = 'ok';
+    await user.click(pull);
+    await waitFor(() => expect(pull).toBeEnabled());
+    expect(tool).not.toBeChecked();
+
+    probeMode = 'empty';
+    await user.click(pull);
+    expect(await screen.findByText(/服务器未声明工具/)).toBeVisible();
+    expect(screen.queryByText('read_doc')).not.toBeInTheDocument();
   });
 });

@@ -866,7 +866,7 @@ export class GatewayClient {
 
   updateMcpServer(
     id: string,
-    input: MCPServerInput,
+    input: Partial<MCPServerInput>,
     signal?: AbortSignal,
   ): Promise<MCPServerConfig> {
     return this.requestJson<{ server: MCPServerConfig }>(

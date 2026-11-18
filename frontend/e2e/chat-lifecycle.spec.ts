@@ -59,6 +59,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     const convId = new URL(page.url()).pathname.split('/').pop()!;
     await page.reload({ waitUntil: 'networkidle' });
     await expect(page.getByText(/Reply #1 to:/)).toBeVisible();
+    await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeVisible();
 
     // 2. Abort streaming: receive partial content first, click stop, verify upstream disconnect & Go aborted record.
     await composer.fill('[SLOW_ABORT] please stream slowly');
@@ -122,6 +123,8 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     await expect(
       page.getByText(/Reply #(?:[2-9]|\d{2,}) to: First turn question/),
     ).toBeVisible();
+
+    expect(upstream.lastChatBodies.at(-1)?.reasoning_effort).toBe('high');
 
     // Confirm via Go API that only index 1 was replaced, trailing turns stayed, and updatedAt moved forward.
     await expect
@@ -254,5 +257,44 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
 
     await page.reload({ waitUntil: 'networkidle' });
     await expect(page.getByText('Edited second reply')).toBeVisible();
+
+    await page.getByRole('button', { name: '新建话题' }).click();
+    await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeVisible();
+    await composer.fill('New topic inherits effort');
+    const created = page.waitForResponse((res) =>
+      res.url().endsWith('/api/v1/conversations') && res.request().method() === 'POST');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    expect((await created).request().postDataJSON().params.reasoningEffort).toBe('high');
+    await expect(page.getByText(/to: New topic inherits effort/)).toBeVisible();
+    expect(upstream.lastChatBodies.at(-1)?.reasoning_effort).toBe('high');
+
+    await page.goto(appUrl + '/chat/' + encodeURIComponent(convId));
+    await expect(page.getByText('Edited second reply')).toBeVisible();
+    await composer.fill('Keep draft when preference save fails');
+    const failSave = async (route: import('@playwright/test').Route) => {
+      if (route.request().method() !== 'PATCH') return route.continue();
+      await route.fulfill({ status: 500, json: { code: 'INTERNAL_ERROR', message: '写入失败' } });
+    };
+    await page.route('**/api/v1/settings', failSave);
+    await page.getByRole('button', { name: '思考强度 (高)' }).click();
+    await page.getByRole('radio', { name: '关闭', exact: true }).click();
+    await expect(page.getByText(/思考强度保存失败/)).toBeVisible();
+    await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeEnabled();
+    await expect(composer).toHaveValue('Keep draft when preference save fails');
+    await page.unroute('**/api/v1/settings', failSave);
+
+    await page.getByRole('button', { name: '思考强度 (高)' }).click();
+    await page.getByRole('radio', { name: '关闭', exact: true }).click();
+    await expect(page.getByRole('button', { name: '思考强度 (关闭)' })).toBeEnabled();
+    await page.reload({ waitUntil: 'networkidle' });
+    await expect(page.getByRole('button', { name: '思考强度 (关闭)' })).toBeEnabled();
+
+    const resetPreference = await fetch(appUrl + '/api/v1/settings', {
+      method: 'PATCH', headers: { Authorization: 'Bearer ' + E2E_TOKEN, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ composerReasoningEffort: '' }),
+    });
+    expect(resetPreference.ok).toBe(true);
+    await page.reload({ waitUntil: 'networkidle' });
+    await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeEnabled();
   });
 });

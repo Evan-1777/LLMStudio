@@ -55,6 +55,7 @@ describe('settings storage and migration', () => {
       collapseLineThreshold: 200,
       collapseCharThreshold: 120,
       userAvatarDataUrl: '',
+      composerReasoningEffort: '',
     });
 
     expect(defaultSettings()).toMatchObject({
@@ -139,13 +140,15 @@ describe('settings storage and migration', () => {
   it('imports legacy preferences once and clears browser copies afterwards', () => {
     localStorage.setItem(
       SETTINGS_STORAGE_KEY,
-      JSON.stringify({ ...defaultSettings(), themeMode: 'light', enterToSend: false }),
+      JSON.stringify({ ...defaultSettings(), themeMode: 'light', enterToSend: false, composerReasoningEffort: 'high' }),
     );
 
     expect(readLegacyPreferences()).toMatchObject({
       themeMode: 'light',
       enterToSend: false,
     });
+
+    expect(readLegacyPreferences()).not.toHaveProperty('composerReasoningEffort');
 
     clearLegacyPreferences();
     expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).toBeNull();

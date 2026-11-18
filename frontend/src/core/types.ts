@@ -18,6 +18,10 @@ export const REASONING_EFFORT_LEVELS: readonly ReasoningEffort[] = [
   'max',
 ];
 
+export function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return REASONING_EFFORT_LEVELS.some((level) => level === value);
+}
+
 export type AuthType =
   | 'bearer'
   | 'x-api-key'
@@ -392,6 +396,7 @@ export interface SearchEngineTestResult {
 }
 
 export interface MCPServerConfig {
+  disabledTools?: string[];
   id: string;
   name: string;
   transport: MCPTransport | string;
@@ -406,6 +411,7 @@ export interface MCPServerConfig {
 }
 
 export interface MCPServerInput {
+  disabledTools?: string[];
   id?: string;
   name: string;
   transport: MCPTransport | string;
@@ -603,6 +609,7 @@ export interface ApiErrorEnvelope {
 // Server-managed application preferences. Gateway address and access token stay
 // in browser connection storage and are not part of this contract.
 export interface ServerPreferences {
+  composerReasoningEffort: ReasoningEffort | '';
   themeMode: 'system' | 'light' | 'dark';
   seedColorValue: number;
   enterToSend: boolean;
@@ -624,7 +631,7 @@ export interface ServerPreferencesEnvelope {
 }
 
 /** Full preference payload used for the one-shot legacy browser import. */
-export type ServerPreferencesImport = ServerPreferences;
+export type ServerPreferencesImport = Omit<ServerPreferences, 'composerReasoningEffort'>;
 
 export interface StorageUsage {
   mainBytes: number;

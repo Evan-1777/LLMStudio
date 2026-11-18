@@ -45,6 +45,7 @@ type Preferences struct {
 	CollapseLineThreshold        int    `json:"collapseLineThreshold"`
 	CollapseCharThreshold        int    `json:"collapseCharThreshold"`
 	UserAvatarDataURL            string `json:"userAvatarDataUrl"`
+	ComposerReasoningEffort      string `json:"composerReasoningEffort"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -82,6 +83,7 @@ type PreferencesPatch struct {
 	CollapseLineThreshold        *int    `json:"collapseLineThreshold"`
 	CollapseCharThreshold        *int    `json:"collapseCharThreshold"`
 	UserAvatarDataURL            *string `json:"userAvatarDataUrl"`
+	ComposerReasoningEffort      *string `json:"composerReasoningEffort"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -126,6 +128,9 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	if p.UserAvatarDataURL != nil {
 		out.UserAvatarDataURL = *p.UserAvatarDataURL
 	}
+	if p.ComposerReasoningEffort != nil {
+		out.ComposerReasoningEffort = *p.ComposerReasoningEffort
+	}
 	return out
 }
 
@@ -140,6 +145,7 @@ func (p Preferences) Normalize() Preferences {
 	if p.ChatDisplayMode == "" {
 		p.ChatDisplayMode = defaults.ChatDisplayMode
 	}
+	p.ComposerReasoningEffort = strings.ToLower(strings.TrimSpace(p.ComposerReasoningEffort))
 	return p
 }
 
@@ -163,6 +169,11 @@ func (p Preferences) Validate() error {
 	}
 	if p.CollapseCharThreshold < MinCollapseCharThreshold || p.CollapseCharThreshold > MaxCollapseCharThreshold {
 		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("collapseCharThreshold must be between %d and %d", MinCollapseCharThreshold, MaxCollapseCharThreshold), nil)
+	}
+	switch p.ComposerReasoningEffort {
+	case "", EffortNone, EffortLow, EffortMedium, EffortHigh, EffortXHigh, EffortMax:
+	default:
+		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("unsupported composerReasoningEffort %q", p.ComposerReasoningEffort), nil)
 	}
 	return ValidateAvatarDataURL(p.UserAvatarDataURL)
 }

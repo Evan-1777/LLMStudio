@@ -25,7 +25,7 @@ func NewMCPServerStore(db *sql.DB) *MCPServerStore {
 // List returns all configured MCP servers ordered by creation time and name.
 func (s *MCPServerStore) List(ctx context.Context) ([]domain.MCPServerConfig, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, transport, endpoint, command, args_json, env_json, headers_json, enabled, created_at, updated_at
+		SELECT id, name, transport, endpoint, command, args_json, env_json, headers_json, enabled, disabled_tools_json, created_at, updated_at
 		FROM mcp_servers
 		ORDER BY created_at ASC, name ASC
 	`)
@@ -51,7 +51,7 @@ func (s *MCPServerStore) List(ctx context.Context) ([]domain.MCPServerConfig, er
 // Get fetches a single MCP server configuration by ID.
 func (s *MCPServerStore) Get(ctx context.Context, id string) (domain.MCPServerConfig, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, transport, endpoint, command, args_json, env_json, headers_json, enabled, created_at, updated_at
+		SELECT id, name, transport, endpoint, command, args_json, env_json, headers_json, enabled, disabled_tools_json, created_at, updated_at
 		FROM mcp_servers
 		WHERE id = ?
 	`, id)
@@ -84,10 +84,10 @@ func (s *MCPServerStore) Create(ctx context.Context, srv domain.MCPServerConfig)
 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO mcp_servers (
-			id, name, transport, endpoint, command, args_json, env_json, headers_json, enabled, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			id, name, transport, endpoint, command, args_json, env_json, headers_json, enabled, disabled_tools_json, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, '[]'), ?, ?)
 	`, srv.ID, srv.Name, srv.Transport, srv.Endpoint, srv.Command, argsJSON, envJSON, headersJSON,
-		boolToInt(srv.Enabled), formatTime(srv.CreatedAt), formatTime(srv.UpdatedAt))
+		boolToInt(srv.Enabled), encodeDisabledTools(srv.DisabledTools), formatTime(srv.CreatedAt), formatTime(srv.UpdatedAt))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return domain.MCPServerConfig{}, domain.NewError(domain.ErrCodeConflict, "mcp server already exists", err)
@@ -107,10 +107,10 @@ func (s *MCPServerStore) Update(ctx context.Context, srv domain.MCPServerConfig)
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE mcp_servers
-		SET name = ?, transport = ?, endpoint = ?, command = ?, args_json = ?, env_json = ?, headers_json = ?, enabled = ?, updated_at = ?
+		SET name = ?, transport = ?, endpoint = ?, command = ?, args_json = ?, env_json = ?, headers_json = ?, enabled = ?, disabled_tools_json = COALESCE(?, disabled_tools_json), updated_at = ?
 		WHERE id = ?
 	`, srv.Name, srv.Transport, srv.Endpoint, srv.Command, argsJSON, envJSON, headersJSON,
-		boolToInt(srv.Enabled), formatTime(srv.UpdatedAt), srv.ID)
+		boolToInt(srv.Enabled), encodeDisabledTools(srv.DisabledTools), formatTime(srv.UpdatedAt), srv.ID)
 	if err != nil {
 		return domain.MCPServerConfig{}, fmt.Errorf("update mcp server %s: %w", srv.ID, err)
 	}
@@ -142,21 +142,25 @@ func (s *MCPServerStore) Delete(ctx context.Context, id string) error {
 
 func scanMCPServer(row rowScanner) (domain.MCPServerConfig, error) {
 	var (
-		srv         domain.MCPServerConfig
-		argsJSON    string
-		envJSON     string
-		headersJSON string
-		enabledInt  int
-		createdRaw  string
-		updatedRaw  string
+		srv          domain.MCPServerConfig
+		argsJSON     string
+		envJSON      string
+		headersJSON  string
+		disabledJSON string
+		enabledInt   int
+		createdRaw   string
+		updatedRaw   string
 	)
 	if err := row.Scan(
 		&srv.ID, &srv.Name, &srv.Transport, &srv.Endpoint, &srv.Command,
-		&argsJSON, &envJSON, &headersJSON, &enabledInt, &createdRaw, &updatedRaw,
+		&argsJSON, &envJSON, &headersJSON, &enabledInt, &disabledJSON, &createdRaw, &updatedRaw,
 	); err != nil {
 		return domain.MCPServerConfig{}, err
 	}
 	srv.Enabled = enabledInt != 0
+	if err := json.Unmarshal([]byte(disabledJSON), &srv.DisabledTools); err != nil {
+		return domain.MCPServerConfig{}, fmt.Errorf("decode disabled MCP tools: %w", err)
+	}
 	if argsJSON == "" {
 		srv.Args = []string{}
 	} else if err := json.Unmarshal([]byte(argsJSON), &srv.Args); err != nil {
@@ -183,6 +187,15 @@ func scanMCPServer(row rowScanner) (domain.MCPServerConfig, error) {
 		return domain.MCPServerConfig{}, fmt.Errorf("parse mcp updated_at: %w", err)
 	}
 	return srv, nil
+}
+
+// A nil list preserves the stored value on update; an empty list clears it.
+func encodeDisabledTools(tools []string) any {
+	if tools == nil {
+		return nil
+	}
+	b, _ := json.Marshal(tools)
+	return string(b)
 }
 
 func encodeMCPJSON(args []string, env, headers map[string]string) (string, string, string, error) {

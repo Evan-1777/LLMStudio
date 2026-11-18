@@ -23,7 +23,6 @@ import type {
   PreparedLocalRequest,
   PreparedSearchInput,
   ProviderConfig,
-  ReasoningEffort,
   StreamChatInput,
   StreamEvent,
   TokenUsage,
@@ -63,7 +62,6 @@ export interface RegenerateOptions {
 export interface ChatContextValue {
   state: ChatState;
   isBusy: boolean;
-  setReasoningEffort: (effort: ReasoningEffort) => void;
   updateConversationMeta: (conversation: Conversation) => void;
   clearSession: () => void;
   loadConversation: (conversationId: string) => Promise<ConversationDetail | null>;
@@ -185,10 +183,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   const isBusy =
     state.runState === 'loading' || state.runState === 'streaming';
-
-  const setReasoningEffort = useCallback((effort: ReasoningEffort) => {
-    dispatch({ type: 'SET_EFFORT', effort });
-  }, []);
 
   const updateConversationMeta = useCallback((conversation: Conversation) => {
     if (stateRef.current.conversation?.id !== conversation.id) {
@@ -1188,11 +1182,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return false;
       }
       const optimisticId = `local-user-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      const mergedParams: GenerationParams = {
-        ...opts.params,
-        reasoningEffort:
-          opts.params?.reasoningEffort ?? stateRef.current.reasoningEffort,
-      };
       const expectedAfterAbort = stateRef.current.messages.length + 2;
 
       if (opts.conversation) {
@@ -1224,7 +1213,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           text: opts.text,
           providerId: opts.providerId,
           modelId: opts.modelId,
-          params: mergedParams,
+          params: opts.params,
           webSearch: opts.webSearch,
           searchEngineId: opts.searchEngineId,
         },
@@ -1256,11 +1245,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         ? stateRef.current.messages.length
         : stateRef.current.messages.length + 1;
 
-      const mergedParams: GenerationParams = {
-        ...opts.params,
-        reasoningEffort:
-          opts.params?.reasoningEffort ?? stateRef.current.reasoningEffort,
-      };
 
       dispatch({ type: 'REGEN_PREPARE_START' });
 
@@ -1273,7 +1257,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         input: {
           providerId: opts.providerId,
           modelId: opts.modelId,
-          params: mergedParams,
+          params: opts.params,
           regenerateMessageId: opts.targetMessageId,
           webSearch: opts.webSearch,
           searchEngineId: opts.searchEngineId,
@@ -1384,7 +1368,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     () => ({
       state,
       isBusy,
-      setReasoningEffort,
       updateConversationMeta,
       clearSession,
       loadConversation,
@@ -1400,7 +1383,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [
       state,
       isBusy,
-      setReasoningEffort,
       updateConversationMeta,
       clearSession,
       loadConversation,

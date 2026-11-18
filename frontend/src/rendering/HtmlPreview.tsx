@@ -152,6 +152,8 @@ const HEIGHT_BRIDGE = (safeNonce: string) => `
   }
 
   function schedule() {
+    // Layout can still measure zero at load. Publish the first measurable size immediately.
+    if (last < 0) { report(); return; }
     if (frame) return;
     frame = requestAnimationFrame(function() {
       frame = 0;

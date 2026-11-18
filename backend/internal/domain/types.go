@@ -2,6 +2,7 @@ package domain
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"time"
 )
@@ -335,17 +336,23 @@ func (s SearchEngineConfig) MarshalJSON() ([]byte, error) {
 
 // MCPServerConfig defines a configured MCP server connection.
 type MCPServerConfig struct {
-	ID        string            `json:"id"`
-	Name      string            `json:"name"`
-	Transport string            `json:"transport"`
-	Endpoint  string            `json:"endpoint,omitempty"`
-	Command   string            `json:"command,omitempty"`
-	Args      []string          `json:"args"`
-	Env       map[string]string `json:"env,omitempty"`
-	Headers   map[string]string `json:"headers,omitempty"`
-	Enabled   bool              `json:"enabled"`
-	CreatedAt time.Time         `json:"createdAt"`
-	UpdatedAt time.Time         `json:"updatedAt"`
+	DisabledTools []string          `json:"disabledTools"`
+	ID            string            `json:"id"`
+	Name          string            `json:"name"`
+	Transport     string            `json:"transport"`
+	Endpoint      string            `json:"endpoint,omitempty"`
+	Command       string            `json:"command,omitempty"`
+	Args          []string          `json:"args"`
+	Env           map[string]string `json:"env,omitempty"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	Enabled       bool              `json:"enabled"`
+	CreatedAt     time.Time         `json:"createdAt"`
+	UpdatedAt     time.Time         `json:"updatedAt"`
+}
+
+// ToolEnabled combines the server switch and its per-tool policy.
+func (s MCPServerConfig) ToolEnabled(name string) bool {
+	return s.Enabled && !slices.Contains(s.DisabledTools, name)
 }
 
 // DiscoveredModel represents a model normalized from an upstream provider listing.

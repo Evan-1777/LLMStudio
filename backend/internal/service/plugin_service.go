@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -66,15 +67,16 @@ type MCPServerTestResult struct {
 
 // MCPServerInput defines create or update fields for an MCP server configuration.
 type MCPServerInput struct {
-	ID        string            `json:"id,omitempty"`
-	Name      string            `json:"name"`
-	Transport string            `json:"transport"`
-	Endpoint  string            `json:"endpoint,omitempty"`
-	Command   string            `json:"command,omitempty"`
-	Args      []string          `json:"args,omitempty"`
-	Env       map[string]string `json:"env,omitempty"`
-	Headers   map[string]string `json:"headers,omitempty"`
-	Enabled   *bool             `json:"enabled,omitempty"`
+	DisabledTools []string          `json:"disabledTools,omitempty"`
+	ID            string            `json:"id,omitempty"`
+	Name          string            `json:"name"`
+	Transport     string            `json:"transport"`
+	Endpoint      string            `json:"endpoint,omitempty"`
+	Command       string            `json:"command,omitempty"`
+	Args          []string          `json:"args,omitempty"`
+	Env           map[string]string `json:"env,omitempty"`
+	Headers       map[string]string `json:"headers,omitempty"`
+	Enabled       *bool             `json:"enabled,omitempty"`
 }
 
 // PluginService manages search engine plugin configuration/testing and MCP server presets.
@@ -290,16 +292,18 @@ func (s *PluginService) ListMCPServers(ctx context.Context) ([]domain.MCPServerC
 
 // CreateMCPServer validates and persists a new MCP server configuration.
 func (s *PluginService) CreateMCPServer(ctx context.Context, in MCPServerInput) (domain.MCPServerConfig, error) {
+	slices.Sort(in.DisabledTools)
 	srv := domain.MCPServerConfig{
-		ID:        strings.TrimSpace(in.ID),
-		Name:      strings.TrimSpace(in.Name),
-		Transport: strings.TrimSpace(in.Transport),
-		Endpoint:  strings.TrimSpace(in.Endpoint),
-		Command:   strings.TrimSpace(in.Command),
-		Args:      in.Args,
-		Env:       in.Env,
-		Headers:   in.Headers,
-		Enabled:   true,
+		DisabledTools: slices.Compact(in.DisabledTools),
+		ID:            strings.TrimSpace(in.ID),
+		Name:          strings.TrimSpace(in.Name),
+		Transport:     strings.TrimSpace(in.Transport),
+		Endpoint:      strings.TrimSpace(in.Endpoint),
+		Command:       strings.TrimSpace(in.Command),
+		Args:          in.Args,
+		Env:           in.Env,
+		Headers:       in.Headers,
+		Enabled:       true,
 	}
 	if in.Enabled != nil {
 		srv.Enabled = *in.Enabled
@@ -343,11 +347,13 @@ func (s *PluginService) UpdateMCPServer(ctx context.Context, id string, in MCPSe
 	if err := validateMCPServer(&existing); err != nil {
 		return domain.MCPServerConfig{}, err
 	}
+	slices.Sort(in.DisabledTools)
+	existing.DisabledTools = slices.Compact(in.DisabledTools)
 	updated, err := s.mcpStore.Update(ctx, existing)
 	if err != nil {
 		return domain.MCPServerConfig{}, err
 	}
-	if s.mcpClient != nil {
+	if s.mcpClient != nil && (in.Name != "" || in.Transport != "" || in.Endpoint != "" || in.Command != "" || in.Args != nil || in.Env != nil || in.Headers != nil || in.Enabled != nil) {
 		_ = s.mcpClient.CloseServer(id)
 	}
 	return updated, nil
@@ -399,6 +405,10 @@ func (s *PluginService) TestMCPServer(ctx context.Context, id string) (MCPServer
 	// Force a live handshake + list probe instead of returning a cached catalog.
 	_ = s.mcpClient.CloseServer(id)
 
+	if !srv.Enabled {
+		srv.Enabled = true // Probe only; chat still reads the saved server switch.
+		defer s.mcpClient.CloseServer(id)
+	}
 	start := time.Now()
 	tools, err := s.mcpClient.ListTools(probeCtx, srv)
 	latency := time.Since(start).Milliseconds()

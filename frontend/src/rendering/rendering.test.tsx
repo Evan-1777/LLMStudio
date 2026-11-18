@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { AppProvider } from '../app/AppProvider';
 import { SETTINGS_STORAGE_KEY, defaultSettings } from '../core/settings';
+import type { ContentBlock } from '../core/types';
 import { CollapseStateProvider } from './CollapsibleBlock';
 import { ContentRenderer } from './ContentRenderer';
 import { SandboxedIframe, buildSandboxedSrcDoc } from './HtmlPreview';
@@ -223,10 +224,12 @@ describe('ContentRenderer and HTML sandbox', () => {
     expect(screen.getByText('<div>raw-disabled</div>')).toBeInTheDocument();
   });
 
-  it('consolidates multi-round tool calls and results into one scrollable trace, auto-collapses on success while honoring manual reopen, keeps errors open, and never executes tool HTML', async () => {
+  it('keeps tool rounds in order and folds a successful round only after its final result ends', async () => {
     const user = userEvent.setup();
-    const multiRoundBlocks = [
+    const blocks: ContentBlock[] = [
+      { type: 'text', text: 'First text' },
       { type: 'toolCall', id: 'tc-1', name: 'lookup', arguments: { q: 'alpha' } },
+      { type: 'toolCall', id: 'tc-b', name: 'lookup_more' },
       {
         type: 'toolResult',
         toolCallId: 'tc-1',
@@ -244,91 +247,71 @@ describe('ContentRenderer and HTML sandbox', () => {
           structuredContent: { count: 2 },
         },
       },
+      { type: 'toolResult', toolCallId: 'tc-b', content: 'more' },
+      { type: 'text', text: 'Between rounds' },
       { type: 'toolCall', id: 'tc-2', name: 'summarize', arguments: { depth: 1 } },
       { type: 'toolResult', toolCallId: 'tc-2', toolName: 'summarize', content: 'done' },
+      { type: 'toolResult', toolCallId: 'orphan', toolName: 'orphan', content: 'unmatched' },
       { type: 'text', text: 'Final answer' },
     ];
 
-    // 1. Expanded during streaming, single summary card, safe HTML & embedded resource display.
-    const { container, rerender } = render(
+    const view = (count: number, completed: boolean[], isStreaming = true, messageId = 'local-assistant-1') => (
       <AppProvider skipInitialBootstrap>
         <CollapseStateProvider>
-          <ContentRenderer
-            messageId="local-assistant-1"
-            collapsePrefix="ui-trace-1"
-            isStreaming
-            blocks={multiRoundBlocks}
-          />
+          <ContentRenderer messageId={messageId} collapsePrefix="stable-ui-id"
+            isStreaming={isStreaming} blocks={blocks.slice(0, count)} blockCompleted={completed} />
         </CollapseStateProvider>
-      </AppProvider>,
+      </AppProvider>
     );
-
-    expect(container.querySelectorAll('.block-card')).toHaveLength(1);
-    expect(screen.getByText(/第 1 轮/)).toBeInTheDocument();
-    expect(screen.getByText(/第 2 轮/)).toBeInTheDocument();
-    expect(screen.getByText('<script>window.__xss=1</script><b>safe text</b>')).toBeInTheDocument();
-    expect(screen.getByText(/doc:\/\/readme/)).toBeInTheDocument();
-    expect(screen.getByText(/"count": 2/)).toBeInTheDocument();
+    const { rerender } = render(view(5, [true, true, true, true, false]));
+    const first = screen.getByRole('button', { name: /工具调用 · 第 1 轮/ });
+    expect(first).toHaveAttribute('aria-expanded', 'true');
+    expect(first).toHaveTextContent('执行中 (1/2)');
+    expect(screen.getByText('lookup_more')).toBeVisible();
+    const detail = screen.getByText('lookup').closest('summary')!;
+    expect(detail.closest('details')).not.toHaveAttribute('open');
+    await user.click(detail);
+    expect(screen.getByText('<script>window.__xss=1</script><b>safe text</b>')).toBeVisible();
+    expect(screen.getByText(/doc:\/\/readme/)).toBeVisible();
+    expect(screen.getByText(/"count": 2/)).toBeVisible();
     expect(screen.queryByTitle('HTML 预览')).not.toBeInTheDocument();
+    detail.focus();
+    rerender(view(5, Array(5).fill(true)));
+    expect(first).toHaveAttribute('aria-expanded', 'false');
+    expect(first).toHaveFocus();
 
-    // 2. Overall completion collapses once when autoCollapseToolsOnComplete=true.
-    rerender(
-      <AppProvider skipInitialBootstrap>
-        <CollapseStateProvider>
-          <ContentRenderer
-            messageId="srv-1"
-            collapsePrefix="ui-trace-1"
-            isStreaming={false}
-            stopReason="stop"
-            blocks={multiRoundBlocks}
-          />
-        </CollapseStateProvider>
-      </AppProvider>,
-    );
-    expect(screen.queryByText(/第 1 轮/)).not.toBeInTheDocument();
-    expect(screen.getByText('Final answer')).toBeInTheDocument();
+    await user.click(first);
+    rerender(view(7, Array(7).fill(true)));
+    const second = screen.getByRole('button', { name: /工具调用 · 第 2 轮/ });
+    expect(second).toHaveAttribute('aria-expanded', 'true');
+    expect(second).toHaveTextContent('执行中 (0/1)');
+    rerender(view(blocks.length, [], false, 'server-message'));
+    const orphan = screen.getByRole('button', { name: /工具结果/ });
+    const inOrder = [screen.getByText('First text'), first, screen.getByText('Between rounds'), second, orphan, screen.getByText('Final answer')];
+    inOrder.slice(1).forEach((node, i) => expect(inOrder[i].compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy());
+    expect(first).toHaveAttribute('aria-expanded', 'true');
+    expect(second).toHaveAttribute('aria-expanded', 'false');
+  });
 
-    // 3. Manual reopen stays open across server ID reconciliation re-renders.
-    await user.click(screen.getByRole('button', { name: /工具调用/ }));
-    expect(screen.getByText(/第 1 轮/)).toBeInTheDocument();
-    rerender(
-      <AppProvider skipInitialBootstrap>
-        <CollapseStateProvider>
-          <ContentRenderer
-            messageId="srv-1-reconciled"
-            collapsePrefix="ui-trace-1"
-            isStreaming={false}
-            stopReason="stop"
-            blocks={multiRoundBlocks}
-          />
-        </CollapseStateProvider>
-      </AppProvider>,
-    );
-    expect(screen.getByText(/第 1 轮/)).toBeInTheDocument();
-
-    // 4. Error in a tool round keeps trace open & locatable even when autoCollapseToolsOnComplete=true.
+  it('keeps failed and incomplete rounds visible but hides details until expanded', async () => {
+    const user = userEvent.setup();
     render(
       <AppProvider skipInitialBootstrap>
-        <CollapseStateProvider>
-          <ContentRenderer
-            messageId="m-err"
-            isStreaming={false}
-            stopReason="stop"
-            blocks={[
-              { type: 'toolCall', id: 'tc-e', name: 'bad', arguments: {} },
-              {
-                type: 'toolResult',
-                toolCallId: 'tc-e',
-                toolName: 'bad',
-                content: 'connection lost',
-                isError: true,
-              },
-            ]}
-          />
-        </CollapseStateProvider>
+        <ContentRenderer messageId="m-err" stopReason="aborted" blocks={[
+          { type: 'toolCall', id: 'a', name: 'broken' },
+          { type: 'toolResult', toolCallId: 'a', content: 'connection lost', isError: true },
+          { type: 'toolCall', id: 'b', name: 'interrupted' },
+        ]} />
       </AppProvider>,
     );
-    expect(screen.getByText('connection lost')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /1 个失败/ })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: /未完成/ })).toHaveAttribute('aria-expanded', 'true');
+    const detail = screen.getByText('broken').closest('summary')!;
+    expect(detail.closest('details')).not.toHaveAttribute('open');
+    await user.click(detail);
+    expect(screen.getByText('connection lost')).toBeVisible();
+    await user.click(detail);
+    expect(detail.closest('details')).not.toHaveAttribute('open');
   });
 
   it('keeps ThinkingScrollBody auto-following across large streaming deltas unless the user scrolls away', async () => {
