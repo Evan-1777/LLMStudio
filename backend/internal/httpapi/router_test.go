@@ -322,11 +322,29 @@ func TestPreferenceEndpoints(t *testing.T) {
 		{"collapseCharThreshold": 999999},
 		{"seedColorValue": -1},
 		{"enterToSend": "yes"},
+		{"fontFamily": "comic"},
+		{"fontSize": 11},
+		{"fontSize": 23},
 	}
 	for _, body := range invalid {
 		if rec := doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, body); rec.Code != http.StatusBadRequest {
 			t.Fatalf("expected 400 for %v, got status=%d body=%s", body, rec.Code, rec.Body.String())
 		}
+	}
+
+	rec = doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, map[string]any{
+		"fontFamily": "serif",
+		"fontSize":   18,
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH typography status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var typoEnv struct {
+		Preferences domain.Preferences `json:"preferences"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &typoEnv)
+	if typoEnv.Preferences.FontFamily != domain.FontFamilySerif || typoEnv.Preferences.FontSize != 18 {
+		t.Fatalf("unexpected typography patch result: %+v", typoEnv.Preferences)
 	}
 }
 

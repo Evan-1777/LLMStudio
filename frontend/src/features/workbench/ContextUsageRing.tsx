@@ -1,18 +1,30 @@
 import { useEffect, useRef, useState, type PointerEvent } from 'react';
-import { Popover } from '../../components/ui';
+import { Button, Icon, LoadingSpinner, Popover } from '../../components/ui';
 import { formatCompactTokens, type ContextUsageSnapshot } from './contextUsage';
 
-const RING_RADIUS = 7.5;
+const RING_RADIUS = 6.75;
 const RING_CIRCUMFERENCE = 2 * Math.PI * RING_RADIUS;
 
 const SOURCE_LABELS = {
-  reported: '真实用量',
+  reported: '实测',
   hybrid: '实测+估算',
-  estimated: '字符估算',
+  estimated: '估算',
 } as const;
 
-export function ContextUsageRing({ usage }: { usage: ContextUsageSnapshot }) {
-  const [openMode, setOpenMode] = useState<'hover' | 'focus' | 'touch' | null>(
+export interface ContextUsageRingProps {
+  usage: ContextUsageSnapshot;
+  onCompact?: () => Promise<void> | void;
+  canCompact?: boolean;
+  isCompacting?: boolean;
+}
+
+export function ContextUsageRing({
+  usage,
+  onCompact,
+  canCompact = false,
+  isCompacting = false,
+}: ContextUsageRingProps) {
+  const [openMode, setOpenMode] = useState<'hover' | 'focus' | 'pinned' | null>(
     null,
   );
   const lastPointerType = useRef('');
@@ -60,6 +72,22 @@ export function ContextUsageRing({ usage }: { usage: ContextUsageSnapshot }) {
       ? `上下文占用 ${usage.percent}%（${formatCompactTokens(usage.usedTokens)} / ${formatCompactTokens(usage.contextWindow!)}）`
       : `上下文已用 ${formatCompactTokens(usage.usedTokens)}（未配置上限）`;
 
+  const triggerLabel =
+    usage.percent !== null
+      ? `${usage.percent}%`
+      : usage.usedTokens > 0
+        ? formatCompactTokens(usage.usedTokens)
+        : '';
+
+  const showSecondaryStats =
+    usage.sessionTotalTokens > 0 || usage.sessionCacheReadTokens > 0;
+  const compactDisabled = !canCompact || isCompacting;
+  const compactTitle = isCompacting
+    ? '正在压缩上下文'
+    : canCompact
+      ? '压缩早先对话历史以释放上下文窗口'
+      : '至少需要一轮完整对话（≥ 2 条有效消息）才可压缩';
+
   return (
     <Popover
       side="top"
@@ -80,7 +108,10 @@ export function ContextUsageRing({ usage }: { usage: ContextUsageSnapshot }) {
           type="button"
           className="wb-ctx-ring-btn"
           data-level={level}
+          data-compacting={isCompacting ? 'true' : undefined}
           aria-label={summaryLabel}
+          aria-busy={isCompacting || undefined}
+          aria-expanded={openMode !== null}
           onPointerEnter={hoverOpen}
           onPointerLeave={leaveClose}
           onPointerDown={(event) => {
@@ -95,7 +126,7 @@ export function ContextUsageRing({ usage }: { usage: ContextUsageSnapshot }) {
               lastPointerType.current !== 'touch' &&
               event.currentTarget.matches(':focus-visible')
             ) {
-              setOpenMode('focus');
+              setOpenMode((mode) => mode ?? 'focus');
             }
           }}
           onBlur={() =>
@@ -103,58 +134,95 @@ export function ContextUsageRing({ usage }: { usage: ContextUsageSnapshot }) {
           }
           onClick={(event) => {
             event.preventDefault();
-            if (lastPointerType.current === 'touch') {
-              setOpenMode((mode) => (mode === 'touch' ? null : 'touch'));
-            } else if (event.detail === 0) {
-              setOpenMode('focus');
-            }
+            cancelClose();
+            setOpenMode((mode) => (mode === 'pinned' ? null : 'pinned'));
             lastPointerType.current = '';
           }}
         >
           <svg
-            width={20}
-            height={20}
-            viewBox="0 0 20 20"
-            className="wb-ctx-ring"
+            width={18}
+            height={18}
+            viewBox="0 0 18 18"
+            className={`wb-ctx-ring ${isCompacting ? 'wb-ctx-ring--spinning' : ''}`.trim()}
             aria-hidden="true"
           >
             <circle
-              cx={10}
-              cy={10}
+              cx={9}
+              cy={9}
               r={RING_RADIUS}
               fill="none"
-              strokeWidth={2.1}
+              strokeWidth={2}
               stroke={
                 usage.contextWindow === null
                   ? 'var(--text-tertiary)'
                   : 'var(--border-strong)'
               }
-              strokeDasharray={usage.contextWindow === null ? '2.5 2.5' : undefined}
-              opacity={usage.contextWindow === null ? 0.55 : 0.45}
+              strokeDasharray={
+                isCompacting
+                  ? '14 28'
+                  : usage.contextWindow === null
+                    ? '2.5 2.5'
+                    : undefined
+              }
+              opacity={usage.contextWindow === null && !isCompacting ? 0.55 : 0.45}
             />
-            {usage.contextWindow !== null && ratio > 0 ? (
+            {isCompacting ? (
               <circle
-                cx={10}
-                cy={10}
+                cx={9}
+                cy={9}
                 r={RING_RADIUS}
                 fill="none"
-                strokeWidth={2.1}
+                strokeWidth={2}
                 strokeLinecap="round"
+                stroke="var(--accent)"
+                strokeDasharray={`${RING_CIRCUMFERENCE * 0.32} ${RING_CIRCUMFERENCE}`}
+                transform="rotate(-90 9 9)"
+              />
+            ) : usage.contextWindow !== null && ratio > 0 ? (
+              <circle
+                cx={9}
+                cy={9}
+                r={RING_RADIUS}
+                fill="none"
+                strokeWidth={2}
+                strokeLinecap="round"
+                className="wb-ctx-ring__arc"
                 stroke={levelColor}
                 strokeDasharray={RING_CIRCUMFERENCE}
                 strokeDashoffset={dashOffset}
-                transform="rotate(-90 10 10)"
+                transform="rotate(-90 9 9)"
               />
             ) : null}
           </svg>
+          {triggerLabel ? (
+            <span className="wb-ctx-ring-label">{triggerLabel}</span>
+          ) : null}
         </button>
       }
     >
       <div className="wb-ctx-popover">
         <div className="wb-ctx-popover__head">
-          <span>上下文窗口</span>
-          <span style={{ color: level === 'unknown' ? 'var(--text-secondary)' : levelColor }}>
-            {usage.percent !== null ? `${usage.percent}%` : '未配置上限'}
+          <span className="wb-ctx-popover__title">上下文</span>
+          <span className="wb-ctx-source-badge">
+            {SOURCE_LABELS[usage.source]}
+          </span>
+        </div>
+
+        <div className="wb-ctx-popover__hero">
+          <span
+            className="wb-ctx-popover__metric"
+            style={{
+              color: level === 'unknown' ? 'var(--text-primary)' : levelColor,
+            }}
+          >
+            {usage.percent !== null
+              ? `${usage.percent}%`
+              : formatCompactTokens(usage.usedTokens)}
+          </span>
+          <span className="wb-ctx-popover__fraction">
+            {usage.contextWindow !== null
+              ? `${formatCompactTokens(usage.usedTokens)} / ${formatCompactTokens(usage.contextWindow)}`
+              : '未配置上限'}
           </span>
         </div>
 
@@ -169,27 +237,19 @@ export function ContextUsageRing({ usage }: { usage: ContextUsageSnapshot }) {
           />
         </div>
 
+        <div className="wb-ctx-divider" />
+
         <div className="wb-ctx-rows">
           <div className="wb-ctx-row">
-            <span>当前上下文（{SOURCE_LABELS[usage.source]}）</span>
+            <span>当前占用</span>
             <span>{usage.usedTokens.toLocaleString()}</span>
           </div>
-          <div className="wb-ctx-row">
-            <span>窗口上限</span>
-            <span>
-              {usage.contextWindow !== null
-                ? usage.contextWindow.toLocaleString()
-                : '未配置'}
-            </span>
-          </div>
-          <div className="wb-ctx-row">
-            <span>剩余可用</span>
-            <span>
-              {usage.remainingTokens !== null
-                ? usage.remainingTokens.toLocaleString()
-                : '—'}
-            </span>
-          </div>
+          {usage.remainingTokens !== null ? (
+            <div className="wb-ctx-row">
+              <span>剩余可用</span>
+              <span>{usage.remainingTokens.toLocaleString()}</span>
+            </div>
+          ) : null}
           {usage.draftTokens > 0 ? (
             <div className="wb-ctx-row">
               <span>草稿估算</span>
@@ -197,22 +257,64 @@ export function ContextUsageRing({ usage }: { usage: ContextUsageSnapshot }) {
             </div>
           ) : null}
           <div className="wb-ctx-row">
-            <span>消息数</span>
-            <span>{usage.messageCount}</span>
+            <span className="wb-ctx-row__label-wrap">
+              <span>有效消息</span>
+              {usage.compactedCount > 0 ? (
+                <span className="wb-ctx-compacted-tag">
+                  已折叠 {usage.compactedCount} 条
+                </span>
+              ) : null}
+            </span>
+            <span>{usage.activeMessageCount}</span>
           </div>
-          {usage.sessionTotalTokens > 0 ? (
-            <div className="wb-ctx-row">
-              <span>累计消耗</span>
-              <span>{usage.sessionTotalTokens.toLocaleString()}</span>
-            </div>
-          ) : null}
-          {usage.sessionCacheReadTokens > 0 ? (
-            <div className="wb-ctx-row">
-              <span>缓存命中</span>
-              <span>{usage.sessionCacheReadTokens.toLocaleString()}</span>
-            </div>
-          ) : null}
         </div>
+
+        {showSecondaryStats ? (
+          <>
+            <div className="wb-ctx-divider" />
+            <div className="wb-ctx-rows wb-ctx-rows--secondary">
+              {usage.sessionTotalTokens > 0 ? (
+                <div className="wb-ctx-row">
+                  <span>累计消耗</span>
+                  <span>{usage.sessionTotalTokens.toLocaleString()}</span>
+                </div>
+              ) : null}
+              {usage.sessionCacheReadTokens > 0 ? (
+                <div className="wb-ctx-row">
+                  <span>缓存命中</span>
+                  <span>{usage.sessionCacheReadTokens.toLocaleString()}</span>
+                </div>
+              ) : null}
+            </div>
+          </>
+        ) : null}
+
+        {onCompact ? (
+          <>
+            <div className="wb-ctx-divider" />
+            <Button
+              variant="secondary"
+              size="sm"
+              className="wb-ctx-compact-btn"
+              disabled={compactDisabled}
+              aria-disabled={compactDisabled || undefined}
+              title={compactTitle}
+              onClick={() => void onCompact()}
+            >
+              {isCompacting ? (
+                <>
+                  <LoadingSpinner size="sm" />
+                  <span>正在压缩…</span>
+                </>
+              ) : (
+                <>
+                  <Icon name="compress" size={14} />
+                  <span>压缩上下文</span>
+                </>
+              )}
+            </Button>
+          </>
+        ) : null}
       </div>
     </Popover>
   );

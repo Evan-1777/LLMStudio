@@ -303,6 +303,23 @@
   font-size: 12px;
 }
 
+.st-font-size-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+
+.st-font-size-value {
+  min-width: 44px;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+}
+
 .st-endpoint-preview {
   display: flex;
   align-items: baseline;

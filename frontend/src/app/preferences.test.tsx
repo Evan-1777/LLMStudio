@@ -17,6 +17,7 @@ function PreferenceProbe() {
     <div>
       <span data-testid="theme">{settings.themeMode}</span>
       <span data-testid="avatar">{settings.userAvatarDataUrl || 'none'}</span>
+      <span data-testid="typography">{`${settings.fontFamily}:${settings.fontSize}`}</span>
       <button type="button" onClick={() => void updatePreferences({ themeMode: 'dark' })}>
         主题
       </button>
@@ -25,6 +26,12 @@ function PreferenceProbe() {
         onClick={() => void updatePreferences({ userAvatarDataUrl: 'data:image/png;base64,AAAA' })}
       >
         头像
+      </button>
+      <button
+        type="button"
+        onClick={() => void updatePreferences({ fontFamily: 'kai', fontSize: 18 })}
+      >
+        排版
       </button>
     </div>
   );
@@ -98,5 +105,15 @@ describe('shared preference writes', () => {
       expect(screen.getByTestId('avatar')).toHaveTextContent('data:image/png');
     });
     expect(screen.getByTestId('theme')).toHaveTextContent('dark');
+
+    failAvatar = false;
+    await user.click(screen.getByRole('button', { name: '排版' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('typography')).toHaveTextContent('kai:18');
+    });
+    expect(document.documentElement.dataset.fontFamily).toBe('kai');
+    expect(
+      document.documentElement.style.getPropertyValue('--font-size-base'),
+    ).toBe('18px');
   });
 });

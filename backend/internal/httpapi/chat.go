@@ -74,6 +74,46 @@ func (h *ChatHandler) PrepareLocal(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, prepared)
 }
 
+func (h *ChatHandler) Compact(w http.ResponseWriter, r *http.Request) {
+	var in service.CompactConversationInput
+	if r.ContentLength != 0 {
+		if err := decodeJSONBody(r, &in); err != nil {
+			writeServiceError(w, err)
+			return
+		}
+	}
+	in.ConversationID = r.PathValue("id")
+
+	res, err := h.svc.Compact(r.Context(), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, res)
+}
+
+func (h *ChatHandler) PrepareLocalCompact(w http.ResponseWriter, r *http.Request) {
+	var in service.CompactConversationInput
+	if r.ContentLength != 0 {
+		if err := decodeJSONBody(r, &in); err != nil {
+			writeServiceError(w, err)
+			return
+		}
+	}
+	in.ConversationID = r.PathValue("id")
+
+	prepared, err := h.svc.PrepareLocalCompact(r.Context(), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	if in.CredentialEnvelope {
+		// The response carries an upstream credential; never let it be cached.
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	WriteJSON(w, http.StatusOK, prepared)
+}
+
 func (h *ChatHandler) ExecuteTools(w http.ResponseWriter, r *http.Request) {
 	var in service.ExecuteToolsInput
 	if err := decodeJSONBody(r, &in); err != nil {

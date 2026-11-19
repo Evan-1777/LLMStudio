@@ -302,7 +302,7 @@ func (s *ConversationService) CreateMessage(ctx context.Context, conversationID 
 	}
 	role := strings.TrimSpace(in.Role)
 	switch role {
-	case domain.RoleUser, domain.RoleAssistant, domain.RoleToolResult:
+	case domain.RoleUser, domain.RoleAssistant, domain.RoleToolResult, domain.RoleCompaction:
 	default:
 		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "invalid message role", nil)
 	}
@@ -312,6 +312,9 @@ func (s *ConversationService) CreateMessage(ctx context.Context, conversationID 
 	}
 	if role == domain.RoleUser && len(blocks) == 0 {
 		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "message blocks are required for user message", nil)
+	}
+	if role == domain.RoleCompaction && !hasValidCompactionBlock(blocks) {
+		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "compaction block with non-empty text is required for compaction message", nil)
 	}
 	for _, b := range blocks {
 		if strings.TrimSpace(b.Type) == "" {
@@ -384,6 +387,15 @@ func countRoleMessages(msgs []domain.Message, role string) int {
 		}
 	}
 	return n
+}
+
+func hasValidCompactionBlock(blocks []domain.ContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == domain.BlockTypeCompaction && strings.TrimSpace(b.Text) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // DeleteMessage removes a single message from a conversation and refreshes updated_at.

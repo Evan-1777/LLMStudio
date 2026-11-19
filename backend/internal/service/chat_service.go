@@ -440,7 +440,7 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 			}
 			createEndpoint, epErr := resolveEndpointForCacheCreate(
 				prep.adapter,
-				localEndpointProvider(prep, prep.credentialEnvelope),
+				localEndpointProvider(prep.provider, prep.resolveProv, prep.credentialEnvelope),
 				prep.model,
 				*plan.CreateRequest,
 				prep.compat,
@@ -482,7 +482,7 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 		return PreparedLocalRequest{}, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", encErr)
 	}
 	endpoint, epErr := prep.adapter.ResolveEndpoint(
-		localEndpointProvider(prep, prep.credentialEnvelope),
+		localEndpointProvider(prep.provider, prep.resolveProv, prep.credentialEnvelope),
 		prep.model,
 		encoded.DefaultPath,
 		encoded.Query,
@@ -512,44 +512,127 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 	}, nil
 }
 
-func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, allowMissingLocalKey bool) (preparedUpstream, error) {
-	conv, err := s.convs.Get(ctx, in.ConversationID)
+type conversationUpstreamContext struct {
+	conversation  domain.Conversation
+	provider      domain.ProviderConfig
+	resolveProv   domain.ProviderConfig
+	model         domain.ModelConfig
+	apiFormat     plugin.APIFormat
+	adapter       plugin.ProviderAdapter
+	systemPrompt  string
+	params        domain.GenerationParams
+	compat        domain.CompatConfig
+	generationURL string
+}
+
+func (s *ChatService) resolveConversationUpstreamContext(
+	ctx context.Context,
+	convID string,
+	rawProviderID string,
+	rawModelID string,
+	overrideParams domain.GenerationParams,
+	allowMissingLocalKey bool,
+) (conversationUpstreamContext, error) {
+	conv, err := s.convs.Get(ctx, convID)
 	if err != nil {
-		return preparedUpstream{}, err
+		return conversationUpstreamContext{}, err
 	}
 
-	providerID := strings.TrimSpace(in.ProviderID)
+	providerID := strings.TrimSpace(rawProviderID)
 	if providerID == "" {
 		providerID = conv.ProviderID
 	}
-	modelID := strings.TrimSpace(in.ModelID)
+	modelID := strings.TrimSpace(rawModelID)
 	if modelID == "" {
 		modelID = conv.ModelID
 	}
 	if providerID == "" || modelID == "" {
-		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, "providerId and modelId are required", nil)
+		return conversationUpstreamContext{}, domain.NewError(domain.ErrCodeInvalidArgument, "providerId and modelId are required", nil)
 	}
 
 	prov, err := s.providers.Get(ctx, providerID)
 	if err != nil {
-		return preparedUpstream{}, err
+		return conversationUpstreamContext{}, err
 	}
 	if !prov.Enabled {
-		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("provider %q is disabled", prov.Name), nil)
+		return conversationUpstreamContext{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("provider %q is disabled", prov.Name), nil)
 	}
 	model, ok := findModel(prov.Models, modelID)
 	if !ok {
-		return preparedUpstream{}, domain.NewError(domain.ErrCodeNotFound, fmt.Sprintf("model %q not found on provider %q", modelID, prov.Name), nil)
+		return conversationUpstreamContext{}, domain.NewError(domain.ErrCodeNotFound, fmt.Sprintf("model %q not found on provider %q", modelID, prov.Name), nil)
 	}
 
 	apiFormat, ok := s.formats.Get(model.APIFormat)
 	if !ok {
-		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unregistered apiFormat %q", model.APIFormat), nil)
+		return conversationUpstreamContext{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unregistered apiFormat %q", model.APIFormat), nil)
 	}
 	adapter, ok := s.adapters.Get(prov.Adapter)
 	if !ok {
-		return preparedUpstream{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unregistered provider adapter %q", prov.Adapter), nil)
+		return conversationUpstreamContext{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unregistered provider adapter %q", prov.Adapter), nil)
 	}
+
+	effectiveSystemPrompt := conv.SystemPrompt
+	effectiveParams := conv.Params
+	if s.assistants != nil {
+		assistantID := conv.AssistantID
+		if assistantID == "" {
+			assistantID = domain.DefaultAssistantID
+		}
+		if assistant, aErr := s.assistants.Get(ctx, assistantID); aErr == nil {
+			if strings.TrimSpace(effectiveSystemPrompt) == "" && strings.TrimSpace(assistant.SystemPrompt) != "" {
+				effectiveSystemPrompt = assistant.SystemPrompt
+			}
+			effectiveParams = mergeGenerationParams(assistant.Params, conv.Params)
+		}
+	}
+	effectiveParams = mergeGenerationParams(effectiveParams, overrideParams)
+
+	mergedCompat := format.MergeCompat(apiFormat.DefaultCompat(), model.Compat)
+	resolveProv := prov
+	if allowMissingLocalKey {
+		authType := strings.TrimSpace(prov.AuthType)
+		if authType == "" {
+			authType = domain.AuthTypeBearer
+		}
+		if !prov.LocalRequest && authType != domain.AuthTypeNone && strings.TrimSpace(prov.APIKey) == "" {
+			return conversationUpstreamContext{}, domain.NewError(
+				domain.ErrCodeInvalidArgument,
+				fmt.Sprintf("provider %q API key is required for authType %q", prov.Name, authType),
+				nil,
+			)
+		}
+		// Never emit server-stored API keys in pre-encoded browser-direct responses.
+		resolveProv.AuthType = domain.AuthTypeNone
+		resolveProv.APIKey = ""
+	}
+
+	var generationURL string
+	if resolved, rErr := adapter.ResolveEndpoint(resolveProv, model, apiFormat.DefaultPath(), nil, mergedCompat); rErr == nil {
+		generationURL = resolved.URL
+	}
+
+	return conversationUpstreamContext{
+		conversation:  conv,
+		provider:      prov,
+		resolveProv:   resolveProv,
+		model:         model,
+		apiFormat:     apiFormat,
+		adapter:       adapter,
+		systemPrompt:  effectiveSystemPrompt,
+		params:        effectiveParams,
+		compat:        mergedCompat,
+		generationURL: generationURL,
+	}, nil
+}
+
+func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, allowMissingLocalKey bool) (preparedUpstream, error) {
+	up, err := s.resolveConversationUpstreamContext(ctx, in.ConversationID, in.ProviderID, in.ModelID, in.Params, allowMissingLocalKey)
+	if err != nil {
+		return preparedUpstream{}, err
+	}
+	conv := up.conversation
+	prov := up.provider
+	model := up.model
 
 	isRegen := strings.TrimSpace(in.RegenerateMessageID) != ""
 	isLocalCont := in.LocalContinuation != nil
@@ -668,21 +751,8 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		})
 	}
 
-	effectiveSystemPrompt := conv.SystemPrompt
-	effectiveParams := conv.Params
-	if s.assistants != nil {
-		assistantID := conv.AssistantID
-		if assistantID == "" {
-			assistantID = domain.DefaultAssistantID
-		}
-		if assistant, aErr := s.assistants.Get(ctx, assistantID); aErr == nil {
-			if strings.TrimSpace(effectiveSystemPrompt) == "" && strings.TrimSpace(assistant.SystemPrompt) != "" {
-				effectiveSystemPrompt = assistant.SystemPrompt
-			}
-			effectiveParams = mergeGenerationParams(assistant.Params, conv.Params)
-		}
-	}
-	effectiveParams = mergeGenerationParams(effectiveParams, in.Params)
+	rawHistoryLen := len(history)
+	history = projectModelHistory(history)
 
 	// Search results belong to the current user turn, not to the reusable system
 	// prompt: appending them after the user input keeps every earlier prefix stable.
@@ -710,62 +780,38 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		return preparedUpstream{}, err
 	}
 
-	mergedCompat := format.MergeCompat(apiFormat.DefaultCompat(), model.Compat)
 	autoCreateCache := s.autoCreateCachePreference(ctx)
 	chatInput := plugin.ChatInput{
 		ConversationID:  conv.ID,
 		Provider:        prov,
 		Model:           model,
-		SystemPrompt:    effectiveSystemPrompt,
+		SystemPrompt:    up.systemPrompt,
 		Messages:        history,
-		Params:          effectiveParams,
-		Compat:          mergedCompat,
+		Params:          up.params,
+		Compat:          up.compat,
 		Tools:           tools,
 		AutoCreateCache: autoCreateCache,
+		GenerationURL:   up.generationURL,
 	}
-	cacheScope := buildPromptCacheScope(prov, model, apiFormat.ID(), mergedCompat, conv.ID)
-
-	resolveProv := prov
-	if allowMissingLocalKey {
-		authType := strings.TrimSpace(prov.AuthType)
-		if authType == "" {
-			authType = domain.AuthTypeBearer
-		}
-		if !prov.LocalRequest && authType != domain.AuthTypeNone && strings.TrimSpace(prov.APIKey) == "" {
-			return preparedUpstream{}, domain.NewError(
-				domain.ErrCodeInvalidArgument,
-				fmt.Sprintf("provider %q API key is required for authType %q", prov.Name, authType),
-				nil,
-			)
-		}
-		// Never emit server-stored API keys in pre-encoded browser-direct responses.
-		resolveProv.AuthType = domain.AuthTypeNone
-		resolveProv.APIKey = ""
-	}
-	// Resolve the generation URL once with the same adapter and compatibility
-	// override used for the real request, so format plugins can tell documented
-	// official routes from compatibility endpoints.
-	if resolved, rErr := adapter.ResolveEndpoint(resolveProv, model, apiFormat.DefaultPath(), nil, mergedCompat); rErr == nil {
-		chatInput.GenerationURL = resolved.URL
-	}
+	cacheScope := buildPromptCacheScope(prov, model, up.apiFormat.ID(), up.compat, conv.ID)
 
 	return preparedUpstream{
 		conversation:         conv,
 		provider:             prov,
-		resolveProv:          resolveProv,
+		resolveProv:          up.resolveProv,
 		model:                model,
-		apiFormat:            apiFormat,
-		adapter:              adapter,
+		apiFormat:            up.apiFormat,
+		adapter:              up.adapter,
 		history:              history,
-		systemPrompt:         effectiveSystemPrompt,
-		params:               effectiveParams,
-		compat:               mergedCompat,
+		systemPrompt:         up.systemPrompt,
+		params:               up.params,
+		compat:               up.compat,
 		tools:                tools,
 		toolBindings:         toolBindings,
 		webSearchBlock:       webSearchBlock,
 		isRegen:              isRegen,
 		userBlocks:           userBlocks,
-		historyLen:           len(history),
+		historyLen:           rawHistoryLen,
 		replaceMessageID:     replaceMessageID,
 		insertAfterMessageID: insertAfterMessageID,
 		autoCreateCache:      autoCreateCache,
@@ -778,11 +824,11 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 // localEndpointProvider selects the provider used to build a browser-direct request
 // envelope. Only an explicit credential request resolves against stored secrets;
 // otherwise the credential-free copy keeps prior behaviour.
-func localEndpointProvider(prep preparedUpstream, includeCredentials bool) domain.ProviderConfig {
+func localEndpointProvider(prov, resolveProv domain.ProviderConfig, includeCredentials bool) domain.ProviderConfig {
 	if includeCredentials {
-		return prep.provider
+		return prov
 	}
-	return prep.resolveProv
+	return resolveProv
 }
 
 // appendSearchContext projects search results onto the tail of the current turn.

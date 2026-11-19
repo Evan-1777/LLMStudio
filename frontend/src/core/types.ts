@@ -217,6 +217,19 @@ export interface WebSearchBlock {
   extra?: WebSearchExtra | unknown;
 }
 
+export interface CompactionMeta {
+  snapshotLastMessageId: string;
+  compactedCount: number;
+  beforeTokens: number;
+  afterTokens: number;
+}
+
+export interface CompactionBlock {
+  type: 'compaction';
+  text: string;
+  extra?: CompactionMeta | Record<string, unknown>;
+}
+
 export interface UnknownExtensionBlock {
   type: string;
   extra?: unknown;
@@ -230,6 +243,7 @@ export type ContentBlock =
   | ToolCallBlock
   | ToolResultBlock
   | WebSearchBlock
+  | CompactionBlock
   | UnknownExtensionBlock;
 
 export interface TokenUsage {
@@ -239,6 +253,7 @@ export interface TokenUsage {
   cacheReadInputTokens?: number;
   cacheCreationInputTokens?: number;
   totalTokens: number;
+  contextTokens?: number;
 }
 
 export type StopReason = 'stop' | 'length' | 'toolUse' | 'aborted' | 'error' | '';
@@ -246,7 +261,7 @@ export type StopReason = 'stop' | 'length' | 'toolUse' | 'aborted' | 'error' | '
 export interface Message {
   id: string;
   conversationId: string;
-  role: 'user' | 'assistant' | 'toolResult' | string;
+  role: 'user' | 'assistant' | 'toolResult' | 'compaction' | string;
   blocks: ContentBlock[];
   providerId?: string;
   modelId?: string;
@@ -555,7 +570,7 @@ export interface StreamChatInput {
 }
 
 export interface CreateMessageInput {
-  role: 'user' | 'assistant' | 'toolResult';
+  role: 'user' | 'assistant' | 'toolResult' | 'compaction';
   blocks: ContentBlock[];
   providerId?: string;
   modelId?: string;
@@ -564,6 +579,36 @@ export interface CreateMessageInput {
   errorMessage?: string;
   replaceMessageId?: string;
   afterMessageId?: string;
+}
+
+export interface PrepareLocalCompactInput {
+  providerId?: string;
+  modelId?: string;
+  credentialEnvelope?: boolean;
+}
+
+export interface CompactConversationResponse {
+  message: Message;
+  conversation: Conversation;
+  messages: Message[];
+  meta: CompactionMeta;
+}
+
+export interface PreparedLocalCompactPlan {
+  insertAfterMessageId?: string;
+  snapshotLastMessageId: string;
+  compactedCount: number;
+  keptCount: number;
+  beforeTokens: number;
+}
+
+export interface PreparedLocalCompactRequest {
+  request: PreparedLocalHTTPRequest;
+  providerId: string;
+  modelId: string;
+  apiFormat: string;
+  systemPrompt?: string;
+  plan: PreparedLocalCompactPlan;
 }
 
 export interface CreateMessageResult {
@@ -613,6 +658,7 @@ export interface ApiErrorEnvelope {
 // Server-managed application preferences. Gateway address and access token stay
 // in browser connection storage and are not part of this contract.
 export type ChatWidthMode = 'default' | 'manual';
+export type FontFamily = 'system' | 'sans' | 'serif' | 'kai' | 'mono';
 
 export interface ServerPreferences {
   composerReasoningEffort: ReasoningEffort | '';
@@ -632,6 +678,8 @@ export interface ServerPreferences {
   userAvatarDataUrl: string;
   chatWidthMode: ChatWidthMode;
   chatManualWidth: number;
+  fontFamily: FontFamily;
+  fontSize: number;
 }
 
 export interface ServerPreferencesEnvelope {
@@ -642,7 +690,12 @@ export interface ServerPreferencesEnvelope {
 /** Full preference payload used for the one-shot legacy browser import. */
 export type ServerPreferencesImport = Omit<
   ServerPreferences,
-  'composerReasoningEffort' | 'mcpMaxToolRounds' | 'chatWidthMode' | 'chatManualWidth'
+  | 'composerReasoningEffort'
+  | 'mcpMaxToolRounds'
+  | 'chatWidthMode'
+  | 'chatManualWidth'
+  | 'fontFamily'
+  | 'fontSize'
 >;
 
 export interface StorageUsage {

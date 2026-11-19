@@ -100,6 +100,8 @@ func NewRouter(deps RouterDeps) http.Handler {
 		chatHandler := NewChatHandler(deps.ChatService)
 		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/stream", chatHandler.Stream)
 		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/prepare-local", chatHandler.PrepareLocal)
+		mux.HandleFunc("POST /api/v1/conversations/{id}/compact", chatHandler.Compact)
+		mux.HandleFunc("POST /api/v1/conversations/{id}/compact/prepare-local", chatHandler.PrepareLocalCompact)
 		mux.HandleFunc("POST /api/v1/conversations/{id}/tools/execute", chatHandler.ExecuteTools)
 	}
 

@@ -6,6 +6,7 @@ import {
   SETTINGS_STORAGE_KEY,
   clearLegacyPreferences,
   defaultSettings,
+  normalizeServerPreferences,
   normalizeSettings,
   loadConnectionSettings,
   loadSettings,
@@ -60,6 +61,8 @@ describe('settings storage and migration', () => {
       mcpMaxToolRounds: 20,
       chatWidthMode: 'default',
       chatManualWidth: 780,
+      fontFamily: 'system',
+      fontSize: 14,
     });
 
     expect(defaultSettings()).toMatchObject({
@@ -160,6 +163,8 @@ describe('settings storage and migration', () => {
     expect(readLegacyPreferences()).not.toHaveProperty('mcpMaxToolRounds');
     expect(readLegacyPreferences()).not.toHaveProperty('chatWidthMode');
     expect(readLegacyPreferences()).not.toHaveProperty('chatManualWidth');
+    expect(readLegacyPreferences()).not.toHaveProperty('fontFamily');
+    expect(readLegacyPreferences()).not.toHaveProperty('fontSize');
 
     clearLegacyPreferences();
     expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).toBeNull();
@@ -180,10 +185,14 @@ describe('settings storage and migration', () => {
     expect(readThemeHint('/')).toEqual({
       themeMode: 'dark',
       seedColorValue: 0x2d6a4f,
+      fontFamily: 'system',
+      fontSize: 14,
     });
     expect(readThemeHint('https://other.example')).toEqual({
       themeMode: 'light',
       seedColorValue: 0x007aff,
+      fontFamily: 'system',
+      fontSize: 14,
     });
     expect(readThemeHint('https://unknown.example')).toBeNull();
   });
@@ -229,5 +238,22 @@ describe('settings storage and migration', () => {
     const high = normalizeSettings({ chatWidthMode: 'wide', chatManualWidth: 9999 });
     expect(high.chatWidthMode).toBe('default');
     expect(high.chatManualWidth).toBe(3840);
+  });
+
+  it('normalizes fontFamily and clamps fontSize within 12-22px', () => {
+    expect(defaultSettings().fontFamily).toBe('system');
+    expect(defaultSettings().fontSize).toBe(14);
+    expect(normalizeSettings({ fontFamily: 'invalid-font', fontSize: 5 })).toMatchObject({
+      fontFamily: 'system',
+      fontSize: 12,
+    });
+    expect(normalizeSettings({ fontFamily: 'kai', fontSize: 99 })).toMatchObject({
+      fontFamily: 'kai',
+      fontSize: 22,
+    });
+    expect(normalizeServerPreferences({ fontFamily: 'serif', fontSize: 18 })).toMatchObject({
+      fontFamily: 'serif',
+      fontSize: 18,
+    });
   });
 });

@@ -1,5 +1,5 @@
 .prose {
-  font-size: 14.5px;
+  font-size: var(--chat-font-size);
   line-height: 1.72;
   color: var(--text-primary);
   word-break: break-word;
@@ -99,7 +99,7 @@
 .prose table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: max(12px, calc(var(--font-size-base) - 1px));
 }
 
 .prose th,
@@ -227,7 +227,7 @@
 
 .trace-step > .prose {
   padding: 6px 8px;
-  font-size: 13px;
+  font-size: max(12px, calc(var(--font-size-base) - 1px));
   color: var(--text-secondary);
 }
 
@@ -235,7 +235,7 @@
   margin: 0;
   padding: 12px 14px;
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: max(11px, calc(var(--font-size-base) - 1.5px));
   line-height: 1.55;
   overflow-x: auto;
   color: var(--text-primary);
@@ -250,7 +250,7 @@
 
 .thinking-body {
   padding: 10px 12px;
-  font-size: 13px;
+  font-size: max(12px, calc(var(--font-size-base) - 1px));
   line-height: 1.55;
   color: var(--text-secondary);
   white-space: pre-wrap;

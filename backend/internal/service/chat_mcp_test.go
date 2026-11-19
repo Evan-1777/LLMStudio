@@ -215,10 +215,15 @@ func TestChatServiceMultiRoundToolsSequentialSinglePersistAndReplay(t *testing.T
 
 	var starts, ends int
 	var finalMsg *domain.Message
+	var deltaContextTokens []int
 	for _, ev := range events {
 		switch ev.Type {
 		case domain.StreamEventMessageStart:
 			starts++
+		case domain.StreamEventMessageDelta:
+			if ev.Usage != nil {
+				deltaContextTokens = append(deltaContextTokens, ev.Usage.ContextTokens)
+			}
 		case domain.StreamEventMessageEnd:
 			ends++
 			finalMsg = ev.Message
@@ -227,8 +232,11 @@ func TestChatServiceMultiRoundToolsSequentialSinglePersistAndReplay(t *testing.T
 	if starts != 1 || ends != 1 || finalMsg == nil {
 		t.Fatalf("expected 1 message_start & 1 message_end, got starts=%d ends=%d", starts, ends)
 	}
-	if finalMsg.Usage == nil || finalMsg.Usage.InputTokens != 60 || finalMsg.Usage.OutputTokens != 20 || finalMsg.Usage.TotalTokens != 80 {
-		t.Fatalf("expected cumulative summed usage across 3 rounds (60/20/80), got %+v", finalMsg.Usage)
+	if finalMsg.Usage == nil || finalMsg.Usage.InputTokens != 60 || finalMsg.Usage.OutputTokens != 20 || finalMsg.Usage.TotalTokens != 80 || finalMsg.Usage.ContextTokens != 38 {
+		t.Fatalf("expected cumulative summed usage (60/20/80) with last-round contextTokens=38, got %+v", finalMsg.Usage)
+	}
+	if len(deltaContextTokens) != 3 || deltaContextTokens[0] != 15 || deltaContextTokens[1] != 27 || deltaContextTokens[2] != 38 {
+		t.Fatalf("expected per-round message_delta contextTokens [15 27 38], got %v", deltaContextTokens)
 	}
 
 	// DB must contain exactly 1 user + 1 assistant message, replayable on next user turn.

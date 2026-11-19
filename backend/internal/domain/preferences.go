@@ -27,6 +27,18 @@ const (
 	DefaultChatManualWidth = 780
 )
 
+// Typography presets and bounds for user preferences.
+const (
+	FontFamilySystem = "system"
+	FontFamilySans   = "sans"
+	FontFamilySerif  = "serif"
+	FontFamilyKai    = "kai"
+	FontFamilyMono   = "mono"
+	MinFontSize      = 12
+	MaxFontSize      = 22
+	DefaultFontSize  = 14
+)
+
 // DefaultAppleBlue is the default accent color (#007AFF).
 const DefaultAppleBlue = 0x007aff
 
@@ -61,6 +73,8 @@ type Preferences struct {
 	MCPMaxToolRounds             int    `json:"mcpMaxToolRounds"`
 	ChatWidthMode                string `json:"chatWidthMode"`
 	ChatManualWidth              int    `json:"chatManualWidth"`
+	FontFamily                   string `json:"fontFamily"`
+	FontSize                     int    `json:"fontSize"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -81,6 +95,8 @@ func DefaultPreferences() Preferences {
 		MCPMaxToolRounds:             DefaultMCPMaxToolRounds,
 		ChatWidthMode:                ChatWidthDefault,
 		ChatManualWidth:              DefaultChatManualWidth,
+		FontFamily:                   FontFamilySystem,
+		FontSize:                     DefaultFontSize,
 	}
 }
 
@@ -105,6 +121,8 @@ type PreferencesPatch struct {
 	MCPMaxToolRounds             *int    `json:"mcpMaxToolRounds"`
 	ChatWidthMode                *string `json:"chatWidthMode"`
 	ChatManualWidth              *int    `json:"chatManualWidth"`
+	FontFamily                   *string `json:"fontFamily"`
+	FontSize                     *int    `json:"fontSize"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -161,6 +179,12 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	if p.ChatManualWidth != nil {
 		out.ChatManualWidth = *p.ChatManualWidth
 	}
+	if p.FontFamily != nil {
+		out.FontFamily = *p.FontFamily
+	}
+	if p.FontSize != nil {
+		out.FontSize = *p.FontSize
+	}
 	return out
 }
 
@@ -179,6 +203,13 @@ func (p Preferences) Normalize() Preferences {
 	p.ChatWidthMode = strings.ToLower(strings.TrimSpace(p.ChatWidthMode))
 	if p.ChatWidthMode == "" {
 		p.ChatWidthMode = defaults.ChatWidthMode
+	}
+	p.FontFamily = strings.ToLower(strings.TrimSpace(p.FontFamily))
+	if p.FontFamily == "" {
+		p.FontFamily = defaults.FontFamily
+	}
+	if p.FontSize == 0 {
+		p.FontSize = defaults.FontSize
 	}
 	return p
 }
@@ -219,6 +250,14 @@ func (p Preferences) Validate() error {
 	}
 	if p.ChatManualWidth < MinChatManualWidth || p.ChatManualWidth > MaxChatManualWidth {
 		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("chatManualWidth must be between %d and %d", MinChatManualWidth, MaxChatManualWidth), nil)
+	}
+	switch p.FontFamily {
+	case FontFamilySystem, FontFamilySans, FontFamilySerif, FontFamilyKai, FontFamilyMono:
+	default:
+		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("unsupported fontFamily %q", p.FontFamily), nil)
+	}
+	if p.FontSize < MinFontSize || p.FontSize > MaxFontSize {
+		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("fontSize must be between %d and %d", MinFontSize, MaxFontSize), nil)
 	}
 	return ValidateAvatarDataURL(p.UserAvatarDataURL)
 }

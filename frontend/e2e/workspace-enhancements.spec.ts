@@ -112,7 +112,7 @@ test.describe('Workspace Enhancements', () => {
     const popover = page.getByRole('dialog', { name: '上下文占用明细' });
     await expect(popover).toBeVisible();
     await expect(popover).toContainText('1,500');
-    await expect(popover).toContainText('128,000');
+    await expect(popover).toContainText('128K');
 
     // Delayed upstream (600ms) -> 0ms instant waiting placeholder & stop button, plus retry in-place swap.
     upstream.firstByteDelayMs = 600;

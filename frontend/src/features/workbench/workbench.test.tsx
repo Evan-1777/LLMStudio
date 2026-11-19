@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { AppProvider } from '../../app/AppProvider';
@@ -1392,8 +1392,10 @@ describe('Workbench flows and attachments', () => {
     await waitFor(() => expect(deletedIds).toEqual(['temp-1']));
   });
 
-  it('toggles manual chat width preference from AppearancePage', async () => {
+  it('toggles manual chat width and typography preferences from AppearancePage', async () => {
     let widthMode: 'default' | 'manual' = 'default';
+    let fontFamily = 'system';
+    let fontSize = 14;
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = typeof input === 'string' ? input : input.toString();
       const method = init?.method ?? 'GET';
@@ -1403,17 +1405,23 @@ describe('Workbench flows and attachments', () => {
       if (url.endsWith('/api/v1/settings') && method === 'GET') {
         return new Response(
           JSON.stringify({
-            preferences: { ...defaultAppPreferences(), chatWidthMode: widthMode },
+            preferences: { ...defaultAppPreferences(), chatWidthMode: widthMode, fontFamily, fontSize },
             initialized: true,
           }),
         );
       }
       if (url.endsWith('/api/v1/settings') && method === 'PATCH') {
-        const patch = JSON.parse(String(init?.body ?? '{}')) as { chatWidthMode?: 'default' | 'manual' };
+        const patch = JSON.parse(String(init?.body ?? '{}')) as {
+          chatWidthMode?: 'default' | 'manual';
+          fontFamily?: string;
+          fontSize?: number;
+        };
         if (patch.chatWidthMode) widthMode = patch.chatWidthMode;
+        if (patch.fontFamily) fontFamily = patch.fontFamily;
+        if (typeof patch.fontSize === 'number') fontSize = patch.fontSize;
         return new Response(
           JSON.stringify({
-            preferences: { ...defaultAppPreferences(), chatWidthMode: widthMode },
+            preferences: { ...defaultAppPreferences(), chatWidthMode: widthMode, fontFamily, fontSize },
             initialized: true,
           }),
         );
@@ -1440,5 +1448,198 @@ describe('Workbench flows and attachments', () => {
     await user.click(toggle);
     await waitFor(() => expect(widthMode).toBe('manual'));
     expect(toggle).toBeChecked();
+
+    await user.click(screen.getByRole('radio', { name: '衬线' }));
+    await waitFor(() => expect(fontFamily).toBe('serif'));
+    expect(document.documentElement.dataset.fontFamily).toBe('serif');
+
+    await user.click(screen.getByRole('button', { name: '增大字号' }));
+    await waitFor(() => expect(fontSize).toBe(15));
+    expect(
+      document.documentElement.style.getPropertyValue('--font-size-base'),
+    ).toBe('15px');
+  });
+
+  it('triggers context compaction from ContextUsageRing, expands checkpoint card, and deletes checkpoint', async () => {
+    localStorage.clear();
+    const conv = {
+      id: 'c1',
+      assistantId: 'default',
+      title: '压缩测试话题',
+      providerId: 'openai',
+      modelId: 'gpt-4.1',
+      systemPrompt: '',
+      params: {},
+      syncEnabled: false,
+      syncState: 'local_only' as const,
+      syncVersion: 0,
+      createdAt: '2026-11-17T08:00:00Z',
+      updatedAt: '2026-11-17T08:00:00Z',
+    };
+    const initialMsgs = [
+      {
+        id: 'm1',
+        conversationId: 'c1',
+        role: 'user',
+        blocks: [{ type: 'text', text: '旧问题' }],
+        createdAt: '2026-11-17T08:00:01Z',
+      },
+      {
+        id: 'm2',
+        conversationId: 'c1',
+        role: 'assistant',
+        blocks: [{ type: 'text', text: '旧回答' }],
+        usage: { inputTokens: 800, outputTokens: 200, totalTokens: 1000, contextTokens: 1000 },
+        createdAt: '2026-11-17T08:00:02Z',
+      },
+      {
+        id: 'm3',
+        conversationId: 'c1',
+        role: 'user',
+        blocks: [{ type: 'text', text: '保留问题' }],
+        createdAt: '2026-11-17T08:00:03Z',
+      },
+      {
+        id: 'm4',
+        conversationId: 'c1',
+        role: 'assistant',
+        blocks: [{ type: 'text', text: '保留回答' }],
+        usage: { inputTokens: 10000, outputTokens: 2000, totalTokens: 12000, contextTokens: 12000 },
+        createdAt: '2026-11-17T08:00:04Z',
+      },
+    ];
+    let messages = [...initialMsgs];
+    let failFirstCompact = true;
+    let resolveCompact!: () => void;
+
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.0', authRequired: false }));
+      }
+      if (url.endsWith('/api/v1/settings')) {
+        return new Response(JSON.stringify({ preferences: defaultAppPreferences(), initialized: true }));
+      }
+      if (url.endsWith('/api/v1/formats')) return new Response(JSON.stringify({ formats: [], adapters: [] }));
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(
+          JSON.stringify({
+            providers: [
+              {
+                id: 'openai',
+                name: 'OpenAI',
+                adapter: 'generic-http',
+                baseURL: 'https://api.openai.com/v1',
+                authType: 'bearer',
+                apiKeyMasked: 'sk-1...89',
+                apiKeySet: true,
+                enabled: true,
+                models: [
+                  { id: 'gpt-4.1', name: 'GPT-4.1', apiFormat: 'openai-responses', contextWindow: 128000 },
+                ],
+              },
+            ],
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return new Response(JSON.stringify({ assistants: [{ id: 'default', name: '默认助手', params: {}, isDefault: true }] }));
+      }
+      if (url.endsWith('/api/v1/conversations')) {
+        return new Response(JSON.stringify({ conversations: [conv] }));
+      }
+      if (url.endsWith('/api/v1/conversation-groups')) return new Response(JSON.stringify({ groups: [] }));
+      if (url.endsWith('/api/v1/plugins/search')) return new Response(JSON.stringify({ engines: [] }));
+      if (url.endsWith('/api/v1/mcp/servers')) return new Response(JSON.stringify({ servers: [] }));
+      if (url.endsWith('/api/v1/conversations/c1') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: conv, messages }));
+      }
+      if (url.endsWith('/api/v1/conversations/c1/compact') && method === 'POST') {
+        if (failFirstCompact) {
+          failFirstCompact = false;
+          return new Response(JSON.stringify({ code: 'UPSTREAM_ERROR', message: '上游暂时不可用' }), { status: 502 });
+        }
+        await new Promise<void>((resolve) => {
+          resolveCompact = resolve;
+        });
+        const checkpoint = {
+          id: 'cmp-1',
+          conversationId: 'c1',
+          role: 'compaction',
+          blocks: [
+            {
+              type: 'compaction',
+              text: '## 核心目标与约束\n保留旧约束',
+              extra: {
+                snapshotLastMessageId: 'm4',
+                compactedCount: 2,
+                beforeTokens: 12000,
+                afterTokens: 400,
+              },
+            },
+          ],
+          createdAt: '2026-11-17T08:00:05Z',
+        };
+        messages = [initialMsgs[0], initialMsgs[1], checkpoint, initialMsgs[2], initialMsgs[3]];
+        return new Response(
+          JSON.stringify({
+            message: checkpoint,
+            conversation: conv,
+            messages,
+            meta: checkpoint.blocks[0].extra,
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/c1/messages/cmp-1') && method === 'DELETE') {
+        messages = [...initialMsgs];
+        return new Response(null, { status: 204 });
+      }
+      return new Response('{}');
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter initialEntries={['/chat/c1']}>
+          <Routes>
+            <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('保留回答')).toBeInTheDocument());
+
+    const ringBtn = screen.getByRole('button', { name: /上下文占用 9%/ });
+    expect(ringBtn).toHaveTextContent('9%');
+    await user.click(ringBtn);
+
+    const compactBtn = await screen.findByRole('button', { name: '压缩上下文' });
+    await user.click(compactBtn);
+    await waitFor(() => expect(screen.getByText('上游暂时不可用')).toBeInTheDocument());
+
+    // Retry succeeds and exposes busy state while compacting.
+    await user.click(screen.getByRole('button', { name: '压缩上下文' }));
+    await waitFor(() => expect(screen.getByText('正在压缩…')).toBeInTheDocument());
+    resolveCompact();
+
+    const card = await screen.findByLabelText('压缩检查点');
+    expect(within(card).getByText('已折叠 2 条')).toBeInTheDocument();
+    expect(within(card).getByText('12K → 400')).toBeInTheDocument();
+
+    // Expand summary card.
+    const togglePill = screen.getByRole('button', { name: /上下文已压缩/ });
+    expect(togglePill).toHaveAttribute('aria-expanded', 'false');
+    await user.click(togglePill);
+    expect(togglePill).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('保留旧约束')).toBeInTheDocument();
+
+    // Delete checkpoint via ConfirmDialog.
+    await user.click(screen.getByRole('button', { name: '删除压缩检查点' }));
+    expect(screen.getByText('删除后将恢复此前历史消息进入上下文。')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '删除' }));
+
+    await waitFor(() => expect(screen.queryByLabelText('压缩检查点')).not.toBeInTheDocument());
   });
 });

@@ -10,8 +10,12 @@ import {
   Switch,
 } from '../../components/ui';
 import {
+  FONT_SIZE_DEFAULT,
+  FONT_SIZE_MAX,
+  FONT_SIZE_MIN,
   PRESET_ACCENT_COLORS,
   type ChatDisplayMode,
+  type FontFamily,
   type ThemeMode,
 } from '../../core/settings';
 
@@ -186,6 +190,84 @@ export function AppearancePage() {
                     </button>
                   );
                 })}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section>
+          <h3 className="st-subhead">排版</h3>
+          <div className="st-group">
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">字体</span>
+              <SegmentedControl<FontFamily>
+                ariaLabel="字体"
+                value={settings.fontFamily}
+                options={[
+                  { value: 'system', label: '系统' },
+                  { value: 'sans', label: '无衬线' },
+                  { value: 'serif', label: '衬线' },
+                  { value: 'kai', label: '楷体' },
+                  { value: 'mono', label: '等宽' },
+                ]}
+                onChange={(fontFamily) => void updatePreferences({ fontFamily })}
+              />
+            </div>
+
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">字体大小</span>
+              <div className="st-font-size-controls">
+                <IconButton
+                  size="sm"
+                  icon="minus"
+                  label="减小字号"
+                  disabled={settings.fontSize <= FONT_SIZE_MIN}
+                  onClick={() =>
+                    void updatePreferences({
+                      fontSize: Math.max(FONT_SIZE_MIN, settings.fontSize - 1),
+                    })
+                  }
+                />
+                <input
+                  type="range"
+                  className="st-range"
+                  aria-label="字体大小"
+                  min={FONT_SIZE_MIN}
+                  max={FONT_SIZE_MAX}
+                  step={1}
+                  value={settings.fontSize}
+                  onChange={(e) => {
+                    const n = Number(e.target.value);
+                    if (Number.isInteger(n)) {
+                      void updatePreferences({ fontSize: n });
+                    }
+                  }}
+                />
+                <IconButton
+                  size="sm"
+                  icon="plus"
+                  label="增大字号"
+                  disabled={settings.fontSize >= FONT_SIZE_MAX}
+                  onClick={() =>
+                    void updatePreferences({
+                      fontSize: Math.min(FONT_SIZE_MAX, settings.fontSize + 1),
+                    })
+                  }
+                />
+                <span className="st-font-size-value">
+                  {settings.fontSize} px
+                </span>
+                {settings.fontSize !== FONT_SIZE_DEFAULT ? (
+                  <button
+                    type="button"
+                    className="ui-btn ui-btn--ghost ui-btn--sm"
+                    onClick={() =>
+                      void updatePreferences({ fontSize: FONT_SIZE_DEFAULT })
+                    }
+                  >
+                    重置
+                  </button>
+                ) : null}
               </div>
             </div>
           </div>

@@ -2,6 +2,8 @@ import type { ButtonHTMLAttributes, ReactNode, Ref } from 'react';
 
 export type IconName =
   | 'plus'
+  | 'minus'
+  | 'compress'
   | 'sidebar'
   | 'history'
   | 'sliders'
@@ -64,6 +66,15 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
     <>
       <path d="M12 5v14" />
       <path d="M5 12h14" />
+    </>
+  ),
+  minus: <path d="M5 12h14" />,
+  compress: (
+    <>
+      <path d="M4 14h6v6" />
+      <path d="M20 10h-6V4" />
+      <path d="M14 10l7-7" />
+      <path d="M3 21l7-7" />
     </>
   ),
   sidebar: (

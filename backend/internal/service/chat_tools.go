@@ -271,12 +271,32 @@ func filterBlocksForModelHistory(blocks []domain.ContentBlock) []domain.ContentB
 	return out
 }
 
+func roundContextTokens(u *domain.Usage) int {
+	if u == nil {
+		return 0
+	}
+	if u.ContextTokens > 0 {
+		return u.ContextTokens
+	}
+	if ctx := u.InputTokens + u.OutputTokens; ctx > 0 {
+		return ctx
+	}
+	if u.TotalTokens > 0 {
+		return u.TotalTokens
+	}
+	return 0
+}
+
 func addUsage(acc, round *domain.Usage) *domain.Usage {
 	if round == nil {
 		return acc
 	}
+	roundCtx := roundContextTokens(round)
 	if acc == nil {
 		cp := *round
+		if roundCtx > 0 && cp.ContextTokens == 0 {
+			cp.ContextTokens = roundCtx
+		}
 		return &cp
 	}
 	acc.InputTokens += round.InputTokens
@@ -285,6 +305,9 @@ func addUsage(acc, round *domain.Usage) *domain.Usage {
 	acc.CacheReadInputTokens += round.CacheReadInputTokens
 	acc.CacheCreationInputTokens += round.CacheCreationInputTokens
 	acc.TotalTokens += round.TotalTokens
+	if roundCtx > 0 {
+		acc.ContextTokens = roundCtx
+	}
 	return acc
 }
 

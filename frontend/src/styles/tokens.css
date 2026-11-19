@@ -2,6 +2,8 @@
   color-scheme: light;
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Noto Sans SC", sans-serif;
   --font-mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --font-size-base: 14px;
+  --chat-font-size: calc(var(--font-size-base) + 0.5px);
 
   /* Apple HIG Layer 0 - 3 Surfaces (Light) */
   --bg-base: #ececf1;
@@ -84,6 +86,22 @@
   --z-popover: 50;
   --z-modal: 60;
   --z-toast: 70;
+}
+
+:root[data-font-family='sans'] {
+  --font-sans: "Inter", "SF Pro Text", "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Noto Sans CJK SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+}
+
+:root[data-font-family='serif'] {
+  --font-sans: "New York", "Iowan Old Style", Georgia, "Songti SC", "STSong", "Noto Serif CJK SC", "Noto Serif SC", "SimSun", serif;
+}
+
+:root[data-font-family='kai'] {
+  --font-sans: "LXGW WenKai", "LXGW WenKai Screen", "Kaiti SC", "STKaiti", "KaiTi", "BiauKai", serif;
+}
+
+:root[data-font-family='mono'] {
+  --font-sans: "SF Mono", "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, "PingFang SC", "Noto Sans SC", monospace;
 }
 
 :root[data-theme='dark'] {

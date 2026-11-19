@@ -13,7 +13,7 @@ const preferencesSelect = "SELECT theme_mode, seed_color_value, enter_to_send, v
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
 	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, mcp_max_tool_rounds, " +
-	"chat_width_mode, chat_manual_width, imported " +
+	"chat_width_mode, chat_manual_width, font_family, font_size, imported " +
 	"FROM user_preferences WHERE id = 1"
 
 const preferencesUpsert = "INSERT INTO user_preferences (" +
@@ -21,8 +21,8 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
 	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, mcp_max_tool_rounds, " +
-	"chat_width_mode, chat_manual_width, imported, updated_at" +
-	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
+	"chat_width_mode, chat_manual_width, font_family, font_size, imported, updated_at" +
+	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
 	"ON CONFLICT(id) DO UPDATE SET " +
 	"theme_mode = excluded.theme_mode, " +
 	"seed_color_value = excluded.seed_color_value, " +
@@ -41,6 +41,8 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"mcp_max_tool_rounds = excluded.mcp_max_tool_rounds, " +
 	"chat_width_mode = excluded.chat_width_mode, " +
 	"chat_manual_width = excluded.chat_manual_width, " +
+	"font_family = excluded.font_family, " +
+	"font_size = excluded.font_size, " +
 	"imported = 1, " +
 	"updated_at = excluded.updated_at"
 
@@ -123,6 +125,8 @@ func (s *PreferenceStore) Update(
 		next.MCPMaxToolRounds,
 		next.ChatWidthMode,
 		next.ChatManualWidth,
+		next.FontFamily,
+		next.FontSize,
 		formatTime(time.Now().UTC()),
 	); err != nil {
 		return domain.Preferences{}, false, fmt.Errorf("write preferences: %w", err)
@@ -168,6 +172,8 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 		&prefs.MCPMaxToolRounds,
 		&prefs.ChatWidthMode,
 		&prefs.ChatManualWidth,
+		&prefs.FontFamily,
+		&prefs.FontSize,
 		&initialized,
 	)
 	if err != nil {

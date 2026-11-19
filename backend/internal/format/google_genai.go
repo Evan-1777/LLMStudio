@@ -356,6 +356,20 @@ func buildGeminiTools(tools []plugin.ChatTool) []map[string]any {
 
 func buildGeminiContents(messages []domain.Message) []map[string]any {
 	contents := make([]map[string]any, 0, len(messages))
+	appendContent := func(role string, parts []map[string]any) {
+		if len(parts) == 0 {
+			return
+		}
+		if n := len(contents); n > 0 && contents[n-1]["role"] == role {
+			existing, _ := contents[n-1]["parts"].([]map[string]any)
+			contents[n-1]["parts"] = append(existing, parts...)
+			return
+		}
+		contents = append(contents, map[string]any{
+			"role":  role,
+			"parts": parts,
+		})
+	}
 	for _, msg := range messages {
 		switch msg.Role {
 		case domain.RoleUser:
@@ -372,31 +386,20 @@ func buildGeminiContents(messages []domain.Message) []map[string]any {
 					parts = append(parts, encodeGeminiFunctionResponse(b))
 				}
 			}
-			if len(parts) > 0 {
-				contents = append(contents, map[string]any{
-					"role":  "user",
-					"parts": parts,
-				})
-			}
+			appendContent("user", parts)
 
 		case domain.RoleAssistant:
 			var modelParts []map[string]any
 			var toolParts []map[string]any
 			flushModel := func() {
 				if len(modelParts) > 0 {
-					contents = append(contents, map[string]any{
-						"role":  "model",
-						"parts": modelParts,
-					})
+					appendContent("model", modelParts)
 					modelParts = nil
 				}
 			}
 			flushToolResults := func() {
 				if len(toolParts) > 0 {
-					contents = append(contents, map[string]any{
-						"role":  "user",
-						"parts": toolParts,
-					})
+					appendContent("user", toolParts)
 					toolParts = nil
 				}
 			}
@@ -448,12 +451,7 @@ func buildGeminiContents(messages []domain.Message) []map[string]any {
 					parts = append(parts, encodeGeminiFunctionResponse(b))
 				}
 			}
-			if len(parts) > 0 {
-				contents = append(contents, map[string]any{
-					"role":  "user",
-					"parts": parts,
-				})
-			}
+			appendContent("user", parts)
 		}
 	}
 	return contents

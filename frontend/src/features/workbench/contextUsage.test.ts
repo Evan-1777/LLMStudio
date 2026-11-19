@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import type { Message } from '../../core/types';
-import { computeContextUsage, formatCompactTokens } from './contextUsage';
+import {
+  computeContextUsage,
+  estimateCompactionAfterTokens,
+  estimateTextTokens,
+  formatCompactTokens,
+} from './contextUsage';
 
 function msg(
   id: string,
@@ -106,5 +111,208 @@ describe('contextUsage', () => {
     expect(overflow.ratio).toBe(1);
     expect(overflow.percent).toBe(120);
     expect(overflow.remainingTokens).toBe(0);
+  });
+
+  it('prefers contextTokens, skips legacy multi-round tool messages, and counts structuredContent', () => {
+    expect(estimateTextTokens('hello 世界')).toBe(4);
+
+    const multiRoundCurrent: Message = {
+      id: 'a-multi',
+      conversationId: 'c1',
+      role: 'assistant',
+      blocks: [
+        { type: 'toolCall', id: 'tc1', name: 'search', arguments: { q: 'hi' } },
+        {
+          type: 'toolResult',
+          toolCallId: 'tc1',
+          toolName: 'search',
+          content: 'summary',
+          extra: { structuredContent: { hits: 10, body: 'long structured content payload' } },
+        },
+        { type: 'text', text: 'done' },
+      ],
+      usage: {
+        inputTokens: 48000,
+        outputTokens: 1500,
+        totalTokens: 49500,
+        contextTokens: 22500,
+      },
+      createdAt: '2026-11-19T10:01:00Z',
+    };
+
+    const reportedSnap = computeContextUsage({
+      messages: [msg('u1', 'user', 'find'), multiRoundCurrent],
+      draft: '',
+      attachments: [],
+      contextWindow: 128000,
+    });
+    expect(reportedSnap.source).toBe('reported');
+    expect(reportedSnap.usedTokens).toBe(22500);
+    expect(reportedSnap.sessionTotalTokens).toBe(49500);
+
+    // Legacy multi-round message (has toolResult, no contextTokens) is skipped as anchor.
+    const legacyToolMsg: Message = {
+      ...multiRoundCurrent,
+      id: 'a-legacy',
+      usage: {
+        inputTokens: 48000,
+        outputTokens: 1500,
+        totalTokens: 49500,
+      },
+    };
+    const anchorA1 = msg('a1', 'assistant', 'first reply', {
+      inputTokens: 1000,
+      outputTokens: 200,
+      totalTokens: 1200,
+    });
+    const hybridLegacy = computeContextUsage({
+      messages: [msg('u1', 'user', 'q1'), anchorA1, msg('u2', 'user', 'q2'), legacyToolMsg],
+      draft: '',
+      attachments: [],
+    });
+    expect(hybridLegacy.source).toBe('hybrid');
+    expect(hybridLegacy.usedTokens).toBeLessThan(2000);
+
+    const estimatedLegacyWithStruct = computeContextUsage({
+      messages: [msg('u2', 'user', 'q2'), legacyToolMsg],
+      draft: '',
+      attachments: [],
+    });
+    const legacyWithoutStruct: Message = {
+      ...legacyToolMsg,
+      blocks: [
+        { type: 'toolCall', id: 'tc1', name: 'search', arguments: { q: 'hi' } },
+        { type: 'toolResult', toolCallId: 'tc1', toolName: 'search', content: 'summary' },
+        { type: 'text', text: 'done' },
+      ],
+    };
+    const estimatedLegacyPlain = computeContextUsage({
+      messages: [msg('u2', 'user', 'q2'), legacyWithoutStruct],
+      draft: '',
+      attachments: [],
+    });
+    expect(estimatedLegacyWithStruct.source).toBe('estimated');
+    expect(estimatedLegacyWithStruct.usedTokens).toBeGreaterThan(
+      estimatedLegacyPlain.usedTokens,
+    );
+  });
+
+  it('slices compaction history, ignores retained snapshot usage, counts checkpoint usage, and restores on delete', () => {
+    const u1 = msg('u1', 'user', 'old user turn');
+    const a1 = msg('a1', 'assistant', 'old assistant turn', {
+      inputTokens: 4000,
+      outputTokens: 1000,
+      totalTokens: 5000,
+      contextTokens: 5000,
+    });
+    const u2 = msg('u2', 'user', 'retained question');
+    const a2 = msg('a2', 'assistant', 'retained answer', {
+      inputTokens: 10000,
+      outputTokens: 2000,
+      totalTokens: 12000,
+      contextTokens: 12000,
+    });
+    const summaryText = '## 核心目标与约束\n保留约束';
+    const expectedAfter = estimateCompactionAfterTokens('sys', summaryText, [u2, a2]);
+    const checkpoint: Message = {
+      id: 'c1',
+      conversationId: 'c1',
+      role: 'compaction',
+      blocks: [
+        {
+          type: 'compaction',
+          text: summaryText,
+          extra: {
+            snapshotLastMessageId: 'a2',
+            compactedCount: 2,
+            beforeTokens: 12000,
+            afterTokens: expectedAfter,
+          },
+        },
+      ],
+      usage: {
+        inputTokens: 500,
+        outputTokens: 80,
+        cacheReadInputTokens: 200,
+        totalTokens: 580,
+      },
+      createdAt: '2026-11-19T10:02:00Z',
+    };
+
+    const compactedSnap = computeContextUsage({
+      messages: [u1, a1, checkpoint, u2, a2],
+      systemPrompt: 'sys',
+      draft: '',
+      attachments: [],
+      contextWindow: 128000,
+    });
+    expect(compactedSnap.source).toBe('estimated');
+    expect(compactedSnap.usedTokens).toBe(expectedAfter);
+    expect(compactedSnap.compactedCount).toBe(2);
+    expect(compactedSnap.activeMessageCount).toBe(2);
+    expect(compactedSnap.canCompact).toBe(true);
+    expect(compactedSnap.sessionTotalTokens).toBe(5000 + 12000 + 580);
+    expect(compactedSnap.sessionCacheReadTokens).toBe(200);
+
+    // Extra metadata must not affect estimateTextTokens on compaction block.
+    const bloatedExtraCheckpoint: Message = {
+      ...checkpoint,
+      blocks: [
+        {
+          type: 'compaction',
+          text: summaryText,
+          extra: {
+            snapshotLastMessageId: 'a2',
+            compactedCount: 2,
+            beforeTokens: 12000,
+            afterTokens: expectedAfter,
+            hugeNoise: 'x'.repeat(2000),
+          },
+        },
+      ],
+    };
+    expect(
+      computeContextUsage({
+        messages: [u1, a1, bloatedExtraCheckpoint, u2, a2],
+        systemPrompt: 'sys',
+        draft: '',
+        attachments: [],
+      }).usedTokens,
+    ).toBe(expectedAfter);
+
+    // New reply after compaction switches back to reported.
+    const afterReply = computeContextUsage({
+      messages: [
+        u1,
+        a1,
+        checkpoint,
+        u2,
+        a2,
+        msg('u3', 'user', 'next'),
+        msg('a3', 'assistant', 'ok', {
+          inputTokens: 2000,
+          outputTokens: 400,
+          totalTokens: 2400,
+          contextTokens: 2400,
+        }),
+      ],
+      systemPrompt: 'sys',
+      draft: '',
+      attachments: [],
+    });
+    expect(afterReply.source).toBe('reported');
+    expect(afterReply.usedTokens).toBe(2400);
+
+    // Deleting checkpoint restores original pre-compaction context.
+    const restored = computeContextUsage({
+      messages: [u1, a1, u2, a2],
+      systemPrompt: 'sys',
+      draft: '',
+      attachments: [],
+    });
+    expect(restored.source).toBe('reported');
+    expect(restored.usedTokens).toBe(12000);
+    expect(restored.compactedCount).toBe(0);
+    expect(restored.activeMessageCount).toBe(4);
   });
 });

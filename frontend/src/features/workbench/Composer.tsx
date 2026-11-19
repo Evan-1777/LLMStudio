@@ -61,6 +61,9 @@ export function Composer({
   onChangeReasoningEffort,
   onStop,
   onSend,
+  onCompact,
+  canCompact = false,
+  isCompacting = false,
 }: {
   selectedProviderId: string;
   selectedModelId: string;
@@ -82,6 +85,9 @@ export function Composer({
     onPrepareRollback: () => void;
     onAccepted: () => void;
   }) => Promise<boolean>;
+  onCompact?: () => Promise<void> | void;
+  canCompact?: boolean;
+  isCompacting?: boolean;
 }) {
   const location = useLocation();
   const { settings, resources, toast } = useApp();
@@ -503,7 +509,14 @@ export function Composer({
           />
 
           <div className="wb-composer__right">
-            <ContextUsageRing usage={contextUsage} />
+            <ContextUsageRing
+              usage={contextUsage}
+              onCompact={onCompact}
+              canCompact={Boolean(
+                canCompact && !isBusy && !isCompacting && contextUsage.canCompact,
+              )}
+              isCompacting={isCompacting}
+            />
             {isBusy ? (
               <button
                 type="button"

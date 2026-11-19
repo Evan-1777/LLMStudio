@@ -138,6 +138,33 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if updated.ChatWidthMode != domain.ChatWidthManual || updated.ChatManualWidth != 1120 {
 		t.Fatalf("unexpected persisted width prefs: %+v", updated)
 	}
+
+	// Typography defaults, partial update and validation.
+	if stored.FontFamily != domain.FontFamilySystem || stored.FontSize != domain.DefaultFontSize {
+		t.Fatalf("unexpected typography defaults: family=%q size=%d", stored.FontFamily, stored.FontSize)
+	}
+	badFont := "comic"
+	if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{FontFamily: &badFont}, false, validatePrefs); err == nil {
+		t.Fatal("expected invalid fontFamily to fail validation")
+	}
+	for _, badSize := range []int{11, 23} {
+		sz := badSize
+		if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{FontSize: &sz}, false, validatePrefs); err == nil {
+			t.Fatalf("expected out-of-range fontSize %d to fail validation", badSize)
+		}
+	}
+	kai := " kai "
+	fontSize := 18
+	typoUpdated, _, err := prefs.Update(ctx, domain.PreferencesPatch{
+		FontFamily: &kai,
+		FontSize:   &fontSize,
+	}, false, validatePrefs)
+	if err != nil {
+		t.Fatalf("update typography prefs: %v", err)
+	}
+	if typoUpdated.FontFamily != domain.FontFamilyKai || typoUpdated.FontSize != 18 {
+		t.Fatalf("unexpected persisted typography prefs: %+v", typoUpdated)
+	}
 }
 
 func TestMigration005BackfillsManagedAPIKeys(t *testing.T) {

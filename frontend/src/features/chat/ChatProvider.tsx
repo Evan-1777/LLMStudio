@@ -6,6 +6,7 @@ import {
   useMemo,
   useReducer,
   useRef,
+  useState,
   type ReactNode,
 } from 'react';
 import { useApp } from '../../app/AppProvider';
@@ -13,6 +14,7 @@ import { GatewayError } from '../../core/gateway';
 import { decodeUpstreamSseStream } from '../../core/localStreamDecoders';
 import { decodeSseByteStream, parseStreamEventFrame } from '../../core/sse';
 import type {
+  CompactionMeta,
   ContentBlock,
   Conversation,
   ConversationDetail,
@@ -36,6 +38,7 @@ import {
   type ChatState,
   type StreamingBlockBuffer,
 } from './chatReducer';
+import { estimateCompactionAfterTokens } from '../workbench/contextUsage';
 
 export interface SendMessageOptions {
   conversationId?: string;
@@ -62,15 +65,27 @@ export interface RegenerateOptions {
   searchEngineId?: string;
 }
 
+export interface CompactConversationResult {
+  ok: boolean;
+  beforeTokens?: number;
+  afterTokens?: number;
+  error?: string;
+}
+
 export interface ChatContextValue {
   state: ChatState;
   isBusy: boolean;
+  isCompacting: boolean;
   updateConversationMeta: (conversation: Conversation) => void;
   clearSession: () => void;
   loadConversation: (conversationId: string) => Promise<ConversationDetail | null>;
   reloadCurrentConversation: () => Promise<void>;
   sendMessage: (opts: SendMessageOptions) => Promise<boolean>;
   regenerateMessage: (opts: RegenerateOptions) => Promise<boolean>;
+  compactConversation: (opts: {
+    providerId: string;
+    modelId: string;
+  }) => Promise<CompactConversationResult>;
   updateMessage: (messageId: string, blocks: ContentBlock[]) => Promise<boolean>;
   deleteMessage: (messageId: string) => Promise<boolean>;
   branchFromMessage: (messageId: string) => Promise<ConversationDetail | null>;
@@ -155,6 +170,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [state, dispatch] = useReducer(chatReducer, initialChatState);
   const stateRef = useRef(state);
   stateRef.current = state;
+  const [isCompacting, setIsCompacting] = useState(false);
 
   const epochRef = useRef(0);
   const prevConnectionEpochRef = useRef(connectionEpoch);
@@ -805,12 +821,25 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         });
       };
 
+      const roundContextTokens = (u: TokenUsage): number => {
+        if (u.contextTokens !== undefined && u.contextTokens > 0) {
+          return u.contextTokens;
+        }
+        const sum = u.inputTokens + u.outputTokens;
+        return sum > 0 ? sum : Math.max(0, u.totalTokens);
+      };
+
       const sumTokenUsage = (
         acc: TokenUsage | undefined,
         round: TokenUsage | undefined,
       ): TokenUsage | undefined => {
         if (!round) return acc;
-        if (!acc) return { ...round };
+        const roundCtx = roundContextTokens(round);
+        if (!acc) {
+          return roundCtx > 0 && !round.contextTokens
+            ? { ...round, contextTokens: roundCtx }
+            : { ...round };
+        }
         const thinkingTokens =
           (acc.thinkingTokens ?? 0) + (round.thinkingTokens ?? 0);
         const cacheReadInputTokens =
@@ -818,6 +847,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         const cacheCreationInputTokens =
           (acc.cacheCreationInputTokens ?? 0) +
           (round.cacheCreationInputTokens ?? 0);
+        const nextCtx = roundCtx > 0 ? roundCtx : (acc.contextTokens ?? 0);
         return {
           inputTokens: acc.inputTokens + round.inputTokens,
           outputTokens: acc.outputTokens + round.outputTokens,
@@ -825,6 +855,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           ...(cacheReadInputTokens > 0 ? { cacheReadInputTokens } : {}),
           ...(cacheCreationInputTokens > 0 ? { cacheCreationInputTokens } : {}),
           totalTokens: acc.totalTokens + round.totalTokens,
+          ...(nextCtx > 0 ? { contextTokens: nextCtx } : {}),
         };
       };
 
@@ -1452,6 +1483,255 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [gateway, toast, upsertLocalConversation],
   );
 
+  const compactConversation = useCallback(
+    async (opts: {
+      providerId: string;
+      modelId: string;
+    }): Promise<CompactConversationResult> => {
+      const conv = stateRef.current.conversation;
+      const runState = stateRef.current.runState;
+      if (
+        !conv ||
+        sendingRef.current ||
+        runState === 'loading' ||
+        runState === 'streaming'
+      ) {
+        return { ok: false, error: '当前状态不可压缩对话' };
+      }
+
+      const provider = resources.providers.find(
+        (p) => p.id === opts.providerId,
+      );
+      const epoch = epochRef.current;
+      const ctrl = new AbortController();
+      sendingRef.current = true;
+      manualAbortRef.current = false;
+      activeAbortRef.current = ctrl;
+      setIsCompacting(true);
+
+      try {
+        if (!provider?.localRequest) {
+          const res = await gateway.compactConversation(
+            conv.id,
+            {
+              providerId: opts.providerId,
+              modelId: opts.modelId,
+            },
+            ctrl.signal,
+          );
+          if (epoch !== epochRef.current || ctrl.signal.aborted) {
+            return { ok: false, error: '压缩已取消' };
+          }
+          dispatch({
+            type: 'LOAD_SUCCESS',
+            conversation: res.conversation,
+            messages: res.messages,
+          });
+          upsertLocalConversation(res.conversation);
+          return {
+            ok: true,
+            beforeTokens: res.meta.beforeTokens,
+            afterTokens: res.meta.afterTokens,
+          };
+        }
+
+        const prepared = await gateway.prepareLocalCompact(
+          conv.id,
+          {
+            providerId: opts.providerId,
+            modelId: opts.modelId,
+            credentialEnvelope: true,
+          },
+          ctrl.signal,
+        );
+        if (epoch !== epochRef.current || ctrl.signal.aborted) {
+          return { ok: false, error: '压缩已取消' };
+        }
+
+        const upstreamRes = await sendLocalHttpFetch(
+          prepared.request,
+          provider,
+          opts.providerId,
+          ctrl.signal,
+        );
+        if (!upstreamRes.ok) {
+          const snippet = await upstreamRes.text().catch(() => '');
+          throw new GatewayError(
+            `HTTP_${upstreamRes.status}`,
+            snippet.trim()
+              ? `上游返回 HTTP ${upstreamRes.status}: ${snippet.trim().slice(0, 300)}`
+              : `上游返回 HTTP ${upstreamRes.status}`,
+            upstreamRes.status,
+          );
+        }
+        if (!upstreamRes.body) {
+          throw new GatewayError('STREAM_EMPTY', '上游未返回事件流');
+        }
+
+        const accBlocks: Record<number, StreamingBlockBuffer> = {};
+        const accOrder: number[] = [];
+        let accUsage: TokenUsage | undefined;
+        let streamErrorMsg = '';
+
+        await decodeUpstreamSseStream(
+          prepared.apiFormat,
+          upstreamRes.body,
+          {
+            conversationId: conv.id,
+            providerId: prepared.providerId,
+            modelId: prepared.modelId,
+          },
+          (ev) => {
+            if (epoch !== epochRef.current || ctrl.signal.aborted) return;
+            if (ev.type === 'block_start' && ev.index !== undefined) {
+              if (!accBlocks[ev.index]) {
+                accOrder.push(ev.index);
+                accBlocks[ev.index] = {
+                  blockType: ev.blockType || ev.block?.type || 'text',
+                  id: '',
+                  name: '',
+                  text: '',
+                  signature: '',
+                  finalized: ev.block,
+                };
+              }
+            } else if (ev.type === 'block_delta' && ev.index !== undefined) {
+              let buf = accBlocks[ev.index];
+              if (!buf) {
+                accOrder.push(ev.index);
+                buf = {
+                  blockType: ev.blockType || 'text',
+                  id: '',
+                  name: '',
+                  text: '',
+                  signature: '',
+                };
+                accBlocks[ev.index] = buf;
+              }
+              buf.finalized = undefined;
+              if (ev.deltaType !== 'signature_delta') {
+                buf.text += ev.delta ?? '';
+              }
+            } else if (
+              ev.type === 'block_end' &&
+              ev.index !== undefined &&
+              ev.block
+            ) {
+              if (!accBlocks[ev.index]) {
+                accOrder.push(ev.index);
+                accBlocks[ev.index] = {
+                  blockType: ev.block.type,
+                  id: '',
+                  name: '',
+                  text: '',
+                  signature: '',
+                  finalized: ev.block,
+                };
+              } else {
+                accBlocks[ev.index].finalized = ev.block;
+              }
+            } else if (ev.type === 'message_delta' && ev.usage) {
+              accUsage = ev.usage;
+            } else if (ev.type === 'error' && ev.error?.message) {
+              streamErrorMsg = ev.error.message;
+            }
+          },
+        );
+
+        if (epoch !== epochRef.current || ctrl.signal.aborted) {
+          return { ok: false, error: '压缩已取消' };
+        }
+        if (streamErrorMsg) {
+          throw new GatewayError('UPSTREAM_ERROR', streamErrorMsg);
+        }
+
+        const summary = accOrder
+          .map((idx) => bufferToBlock(accBlocks[idx]))
+          .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+          .map((b) => b.text)
+          .join('\n')
+          .trim();
+        if (!summary) {
+          throw new GatewayError('UPSTREAM_ERROR', '压缩摘要返回为空');
+        }
+
+        const curMessages = stateRef.current.messages;
+        let keptMessages: Message[] = [];
+        if (prepared.plan.insertAfterMessageId) {
+          const afterIdx = curMessages.findIndex(
+            (m) => m.id === prepared.plan.insertAfterMessageId,
+          );
+          if (afterIdx >= 0) {
+            keptMessages = curMessages.slice(afterIdx + 1);
+          } else if (prepared.plan.keptCount > 0) {
+            keptMessages = curMessages.slice(-prepared.plan.keptCount);
+          }
+        }
+        const afterTokens = estimateCompactionAfterTokens(
+          prepared.systemPrompt,
+          summary,
+          keptMessages,
+        );
+        const meta: CompactionMeta = {
+          snapshotLastMessageId: prepared.plan.snapshotLastMessageId,
+          compactedCount: prepared.plan.compactedCount,
+          beforeTokens: prepared.plan.beforeTokens,
+          afterTokens,
+        };
+
+        await gateway.createMessage(
+          conv.id,
+          {
+            role: 'compaction',
+            blocks: [{ type: 'compaction', text: summary, extra: meta }],
+            providerId: prepared.providerId,
+            modelId: prepared.modelId,
+            ...(accUsage ? { usage: accUsage } : {}),
+            stopReason: 'stop',
+            ...(prepared.plan.insertAfterMessageId
+              ? { afterMessageId: prepared.plan.insertAfterMessageId }
+              : {}),
+          },
+          ctrl.signal,
+        );
+        if (epoch !== epochRef.current || ctrl.signal.aborted) {
+          return { ok: false, error: '压缩已取消' };
+        }
+
+        const detail = await gateway.getConversationDetail(
+          conv.id,
+          ctrl.signal,
+        );
+        if (epoch !== epochRef.current) {
+          return { ok: false, error: '压缩已取消' };
+        }
+        dispatch({
+          type: 'LOAD_SUCCESS',
+          conversation: detail.conversation,
+          messages: detail.messages,
+        });
+        upsertLocalConversation(detail.conversation);
+        return {
+          ok: true,
+          beforeTokens: prepared.plan.beforeTokens,
+          afterTokens,
+        };
+      } catch (err) {
+        if (isAbortError(err) || epoch !== epochRef.current) {
+          return { ok: false, error: '压缩已取消' };
+        }
+        return { ok: false, error: formatError(err).message };
+      } finally {
+        sendingRef.current = false;
+        setIsCompacting(false);
+        if (activeAbortRef.current === ctrl) {
+          activeAbortRef.current = null;
+        }
+      }
+    },
+    [gateway, resources.providers, sendLocalHttpFetch, upsertLocalConversation],
+  );
+
   const applyBranchedDetail = useCallback(
     (detail: ConversationDetail) => {
       cancelActiveStream(true);
@@ -1469,12 +1749,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     () => ({
       state,
       isBusy,
+      isCompacting,
       updateConversationMeta,
       clearSession,
       loadConversation,
       reloadCurrentConversation,
       sendMessage,
       regenerateMessage,
+      compactConversation,
       updateMessage,
       deleteMessage,
       branchFromMessage,
@@ -1484,12 +1766,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [
       state,
       isBusy,
+      isCompacting,
       updateConversationMeta,
       clearSession,
       loadConversation,
       reloadCurrentConversation,
       sendMessage,
       regenerateMessage,
+      compactConversation,
       updateMessage,
       deleteMessage,
       branchFromMessage,

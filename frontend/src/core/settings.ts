@@ -1,4 +1,4 @@
-import { isReasoningEffort, type ChatWidthMode, type ReasoningEffort, type ServerPreferencesImport } from './types';
+import { isReasoningEffort, type ChatWidthMode, type FontFamily, type ReasoningEffort, type ServerPreferencesImport } from './types';
 
 // Legacy single-blob key: pre-migration browser state, removed once the gateway
 // confirms the import (or already holds server-owned preferences).
@@ -19,9 +19,29 @@ export function canonicalGateway(raw: string): string {
   return trimmed === '' ? '/' : trimmed;
 }
 
+export const FONT_FAMILIES: readonly FontFamily[] = [
+  'system',
+  'sans',
+  'serif',
+  'kai',
+  'mono',
+];
+export const FONT_SIZE_MIN = 12;
+export const FONT_SIZE_MAX = 22;
+export const FONT_SIZE_DEFAULT = 14;
+
+export function normalizeFontFamily(raw: unknown): FontFamily {
+  return typeof raw === 'string' &&
+    (FONT_FAMILIES as readonly string[]).includes(raw)
+    ? (raw as FontFamily)
+    : 'system';
+}
+
 export interface ThemeHint {
   themeMode: ThemeMode;
   seedColorValue: number;
+  fontFamily?: FontFamily;
+  fontSize?: number;
 }
 
 function safeStorage(explicit?: Storage | null): Storage | null {
@@ -59,7 +79,14 @@ export function readThemeHint(
       Number.isFinite(obj.seedColorValue)
         ? Math.trunc(obj.seedColorValue) >>> 0
         : DEFAULT_APPLE_BLUE;
-    return { themeMode, seedColorValue };
+    const fontFamily = normalizeFontFamily(obj.fontFamily);
+    const fontSize = clampInt(
+      obj.fontSize,
+      FONT_SIZE_MIN,
+      FONT_SIZE_MAX,
+      FONT_SIZE_DEFAULT,
+    );
+    return { themeMode, seedColorValue, fontFamily, fontSize };
   } catch {
     return null;
   }
@@ -82,7 +109,7 @@ export function writeThemeHint(
 
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type ChatDisplayMode = 'bubble' | 'feed';
-export type { ChatWidthMode };
+export type { ChatWidthMode, FontFamily };
 
 export const CHAT_WIDTH_MIN = 560;
 export const CHAT_WIDTH_MAX = 3840;
@@ -127,6 +154,8 @@ export interface AppSettings {
   mcpMaxToolRounds: number;
   chatWidthMode: ChatWidthMode;
   chatManualWidth: number;
+  fontFamily: FontFamily;
+  fontSize: number;
 }
 
 export interface SettingsLoadResult {
@@ -161,6 +190,8 @@ export const APP_PREFERENCE_KEYS = [
   'mcpMaxToolRounds',
   'chatWidthMode',
   'chatManualWidth',
+  'fontFamily',
+  'fontSize',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -186,6 +217,8 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     mcpMaxToolRounds: settings.mcpMaxToolRounds,
     chatWidthMode: settings.chatWidthMode,
     chatManualWidth: settings.chatManualWidth,
+    fontFamily: settings.fontFamily,
+    fontSize: settings.fontSize,
   };
 }
 
@@ -215,6 +248,8 @@ export function defaultSettings(): AppSettings {
     mcpMaxToolRounds: 20,
     chatWidthMode: 'default',
     chatManualWidth: CHAT_WIDTH_DEFAULT,
+    fontFamily: 'system',
+    fontSize: FONT_SIZE_DEFAULT,
   };
 }
 
@@ -319,6 +354,13 @@ export function normalizeSettings(raw: unknown): AppSettings {
       CHAT_WIDTH_MIN,
       CHAT_WIDTH_MAX,
       defaults.chatManualWidth,
+    ),
+    fontFamily: normalizeFontFamily(obj.fontFamily),
+    fontSize: clampInt(
+      obj.fontSize,
+      FONT_SIZE_MIN,
+      FONT_SIZE_MAX,
+      defaults.fontSize,
     ),
   };
 }
@@ -513,6 +555,8 @@ export function readLegacyPreferences(
         mcpMaxToolRounds: _m,
         chatWidthMode: _w,
         chatManualWidth: _mw,
+        fontFamily: _ff,
+        fontSize: _fs,
         ...legacy
       } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
       return legacy;
@@ -524,6 +568,8 @@ export function readLegacyPreferences(
         mcpMaxToolRounds: _m,
         chatWidthMode: _w,
         chatManualWidth: _mw,
+        fontFamily: _ff,
+        fontSize: _fs,
         ...legacy
       } = pickAppPreferences(
         normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),

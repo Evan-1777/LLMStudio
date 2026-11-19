@@ -301,3 +301,42 @@ func TestAnthropicAndGoogleSixEffortLevelsWithoutReasoningFlag(t *testing.T) {
 		t.Fatalf("gemini thinkingLevel mismatch: %+v", tcLvl)
 	}
 }
+
+func TestGoogleGenAIMergesConsecutiveUserMessages(t *testing.T) {
+	gem := NewGoogleGenAIFormat()
+	req, err := gem.EncodeRequest(context.Background(), plugin.ChatInput{
+		Model: domain.ModelConfig{ID: "gemini-2.5"},
+		Messages: []domain.Message{
+			{
+				Role:   domain.RoleUser,
+				Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "Checkpoint background"}},
+			},
+			{
+				Role:   domain.RoleUser,
+				Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "Follow-up prompt"}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EncodeRequest: %v", err)
+	}
+	var body struct {
+		Contents []struct {
+			Role  string `json:"role"`
+			Parts []struct {
+				Text string `json:"text"`
+			} `json:"parts"`
+		} `json:"contents"`
+	}
+	if err := json.Unmarshal(req.Body, &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if len(body.Contents) != 1 {
+		t.Fatalf("expected consecutive user messages to merge into 1 content entry, got %d: %+v", len(body.Contents), body.Contents)
+	}
+	if body.Contents[0].Role != "user" || len(body.Contents[0].Parts) != 2 ||
+		body.Contents[0].Parts[0].Text != "Checkpoint background" ||
+		body.Contents[0].Parts[1].Text != "Follow-up prompt" {
+		t.Fatalf("unexpected merged user parts: %+v", body.Contents[0])
+	}
+}

@@ -15,6 +15,7 @@ const (
 	BlockTypeToolCall   = "toolCall"
 	BlockTypeToolResult = "toolResult"
 	BlockTypeWebSearch  = "webSearch"
+	BlockTypeCompaction = "compaction"
 )
 
 // Reasoning effort levels.
@@ -42,6 +43,7 @@ const (
 	RoleUser       = "user"
 	RoleAssistant  = "assistant"
 	RoleToolResult = "toolResult"
+	RoleCompaction = "compaction"
 )
 
 // Stop reasons.
@@ -267,6 +269,7 @@ type Usage struct {
 	CacheReadInputTokens     int `json:"cacheReadInputTokens,omitempty"`
 	CacheCreationInputTokens int `json:"cacheCreationInputTokens,omitempty"`
 	TotalTokens              int `json:"totalTokens"`
+	ContextTokens            int `json:"contextTokens,omitempty"`
 }
 
 // Message represents a persisted turn in a conversation.

@@ -353,6 +353,8 @@ describe('AppProvider, ConnectionGate, and Routing', () => {
     expect(readThemeHint('/')).toEqual({
       themeMode: 'dark',
       seedColorValue: DEFAULT_APPLE_BLUE,
+      fontFamily: 'system',
+      fontSize: 14,
     });
   });
 

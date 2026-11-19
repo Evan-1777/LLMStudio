@@ -4,15 +4,23 @@ import { useApp } from '../../app/AppProvider';
 import {
   Avatar,
   Button,
+  ConfirmDialog,
   ErrorBanner,
   Icon,
   IconButton,
   LoadingSpinner,
   Textarea,
 } from '../../components/ui';
-import type { Assistant, ContentBlock, Message, ProviderConfig } from '../../core/types';
+import type {
+  Assistant,
+  CompactionBlock,
+  ContentBlock,
+  Message,
+  ProviderConfig,
+} from '../../core/types';
 import { CollapseStateProvider } from '../../rendering/CollapsibleBlock';
 import { ContentRenderer } from '../../rendering/ContentRenderer';
+import { formatCompactTokens, parseCompactionMeta } from './contextUsage';
 import { MessageActions, extractMessageCopyText } from '../chat/MessageActions';
 import {
   insertMessageAt,
@@ -80,6 +88,85 @@ function formatFeedTimestamp(iso?: string): string {
   return `${mm}/${dd} ${hh}:${min}`;
 }
 
+function CompactionCheckpointCard({
+  message,
+  collapsePrefix,
+  disabled,
+  onRequestDelete,
+}: {
+  message: Message;
+  collapsePrefix: string;
+  disabled: boolean;
+  onRequestDelete: (message: Message) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const meta = parseCompactionMeta(message);
+  const block = message.blocks.find(
+    (b): b is CompactionBlock => b.type === 'compaction',
+  );
+  const summary = block?.text ?? '';
+
+  return (
+    <section
+      className="wb-compaction"
+      aria-label="压缩检查点"
+      data-expanded={expanded ? 'true' : 'false'}
+    >
+      <div className="wb-compaction__row">
+        <span className="wb-compaction__line" aria-hidden="true" />
+        <div className="wb-compaction__pill">
+          <button
+            type="button"
+            className="wb-compaction__toggle"
+            aria-expanded={expanded}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <Icon name="compress" size={13} />
+            <span className="wb-compaction__title">上下文已压缩</span>
+            {typeof meta?.compactedCount === 'number' && meta.compactedCount > 0 ? (
+              <span className="wb-compaction__meta">
+                已折叠 {meta.compactedCount} 条
+              </span>
+            ) : null}
+            {typeof meta?.beforeTokens === 'number' &&
+            typeof meta?.afterTokens === 'number' &&
+            meta.beforeTokens > 0 ? (
+              <span className="wb-compaction__tokens">
+                {formatCompactTokens(meta.beforeTokens)} →{' '}
+                {formatCompactTokens(meta.afterTokens)}
+              </span>
+            ) : null}
+            <Icon
+              name={expanded ? 'chevronUp' : 'chevronDown'}
+              size={13}
+              className="wb-compaction__chevron"
+            />
+          </button>
+          <IconButton
+            size="sm"
+            icon="trash"
+            tone="danger"
+            label="删除压缩检查点"
+            disabled={disabled}
+            onClick={() => onRequestDelete(message)}
+          />
+        </div>
+        <span className="wb-compaction__line" aria-hidden="true" />
+      </div>
+
+      {expanded && summary ? (
+        <div className="wb-compaction__body">
+          <ContentRenderer
+            messageId={message.id}
+            collapsePrefix={`${collapsePrefix}:compaction`}
+            blocks={[{ type: 'text', text: summary }]}
+          />
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
 export function ChatCanvas({
   state,
   assistant,
@@ -116,6 +203,9 @@ export function ChatCanvas({
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingText, setEditingText] = useState('');
   const [savingEdit, setSavingEdit] = useState(false);
+  const [deletingCompactionMsg, setDeletingCompactionMsg] =
+    useState<Message | null>(null);
+  const [deletingCompactionBusy, setDeletingCompactionBusy] = useState(false);
   const isBusy = savingEdit || state.runState === 'loading' || state.runState === 'streaming';
 
   const visibleMessages = useMemo(() => {
@@ -338,6 +428,17 @@ export function ChatCanvas({
           <CollapseStateProvider>
             {visibleMessages.map((msg) => {
               const uiKey = state.uiKeyByMsgId[msg.id] ?? msg.id;
+              if (msg.role === 'compaction') {
+                return (
+                  <CompactionCheckpointCard
+                    key={uiKey}
+                    message={msg}
+                    collapsePrefix={uiKey}
+                    disabled={isBusy}
+                    onRequestDelete={(target) => setDeletingCompactionMsg(target)}
+                  />
+                );
+              }
               const isStreamingThis =
                 Boolean(state.streaming) &&
                 msg.id === state.streaming?.messageId;
@@ -571,6 +672,32 @@ export function ChatCanvas({
           <Icon name="arrowDown" size={16} />
         </button>
       ) : null}
+
+      <ConfirmDialog
+        open={Boolean(deletingCompactionMsg)}
+        onOpenChange={(open) => {
+          if (!open && !deletingCompactionBusy) {
+            setDeletingCompactionMsg(null);
+          }
+        }}
+        title="删除压缩检查点"
+        message="删除后将恢复此前历史消息进入上下文。"
+        confirmLabel="删除"
+        danger
+        busy={deletingCompactionBusy}
+        onConfirm={async () => {
+          if (!deletingCompactionMsg || deletingCompactionBusy) return;
+          setDeletingCompactionBusy(true);
+          try {
+            const ok = await onDeleteMessage(deletingCompactionMsg);
+            if (ok) {
+              setDeletingCompactionMsg(null);
+            }
+          } finally {
+            setDeletingCompactionBusy(false);
+          }
+        }}
+      />
     </div>
   );
 }

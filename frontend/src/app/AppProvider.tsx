@@ -300,7 +300,14 @@ export function AppProvider({
     root.dataset.theme = resolvedTheme;
     const accent = resolveAccentColors(settings.seedColorValue)[resolvedTheme];
     root.style.setProperty('--accent', accent);
-  }, [resolvedTheme, settings.seedColorValue]);
+    root.dataset.fontFamily = settings.fontFamily;
+    root.style.setProperty('--font-size-base', `${settings.fontSize}px`);
+  }, [
+    resolvedTheme,
+    settings.fontFamily,
+    settings.fontSize,
+    settings.seedColorValue,
+  ]);
 
   const toast = useCallback(
     (message: string, tone: 'default' | 'error' = 'default') => {
@@ -359,6 +366,8 @@ export function AppProvider({
     writeThemeHint(settingsRef.current.gatewayBaseUrl, {
       themeMode: next.themeMode,
       seedColorValue: next.seedColorValue,
+      fontFamily: next.fontFamily,
+      fontSize: next.fontSize,
     });
   }, []);
 
@@ -381,6 +390,8 @@ export function AppProvider({
         mcpMaxToolRounds: _m,
         chatWidthMode: _w,
         chatManualWidth: _mw,
+        fontFamily: _ff,
+        fontSize: _fs,
         ...fallback
       } = pickAppPreferences(settingsRef.current);
       const seed = legacy ?? fallback;
@@ -437,6 +448,8 @@ export function AppProvider({
         writeThemeHint(settingsRef.current.gatewayBaseUrl, {
           themeMode: settingsRef.current.themeMode,
           seedColorValue: settingsRef.current.seedColorValue,
+          fontFamily: settingsRef.current.fontFamily,
+          fontSize: settingsRef.current.fontSize,
         });
         setSettingsNotice(null);
         return { ok: true };

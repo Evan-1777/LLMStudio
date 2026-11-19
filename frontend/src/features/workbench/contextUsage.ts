@@ -1,4 +1,9 @@
-import type { ContentBlock, Message } from '../../core/types';
+import type {
+  CompactionBlock,
+  CompactionMeta,
+  ContentBlock,
+  Message,
+} from '../../core/types';
 import {
   insertMessageAt,
   materializeStreamingMessage,
@@ -26,6 +31,9 @@ export interface ContextUsageSnapshot {
   remainingTokens: number | null;
   draftTokens: number;
   messageCount: number;
+  activeMessageCount: number;
+  compactedCount: number;
+  canCompact: boolean;
   sessionTotalTokens: number;
   sessionCacheReadTokens: number;
   source: ContextUsageSource;
@@ -49,6 +57,8 @@ function estimateBlockTokens(block: ContentBlock): number {
   switch (block.type) {
     case 'text':
       return estimateTextTokens(String(block.text ?? ''));
+    case 'compaction':
+      return estimateTextTokens(String(block.text ?? ''));
     case 'thinking':
       return estimateTextTokens(String(block.thinking ?? ''));
     case 'toolCall': {
@@ -60,15 +70,36 @@ function estimateBlockTokens(block: ContentBlock): number {
             : JSON.stringify(block.arguments);
       return estimateTextTokens(`${String(block.name ?? '')} ${args}`);
     }
-    case 'toolResult':
+    case 'toolResult': {
+      let contentStr = String(block.content ?? '');
+      if (
+        block.extra &&
+        typeof block.extra === 'object' &&
+        !Array.isArray(block.extra)
+      ) {
+        const sc = (block.extra as { structuredContent?: unknown })
+          .structuredContent;
+        if (sc !== undefined && sc !== null) {
+          const scText =
+            typeof sc === 'string' ? sc.trim() : JSON.stringify(sc);
+          if (scText && scText !== 'null' && !contentStr.includes(scText)) {
+            contentStr = contentStr ? `${contentStr}\n${scText}` : scText;
+          }
+        }
+      }
       return estimateTextTokens(
-        `${String(block.toolName ?? '')} ${String(block.content ?? '')}`,
+        `${String(block.toolName ?? '')} ${contentStr}`,
       );
+    }
     case 'image':
       return 1024;
     default:
       return estimateTextTokens(JSON.stringify(block));
   }
+}
+
+function hasToolResultBlocks(msg: Message): boolean {
+  return msg.blocks.some((b) => b.type === 'toolResult');
 }
 
 function estimateMessageTokens(msg: Message): number {
@@ -77,6 +108,39 @@ function estimateMessageTokens(msg: Message): number {
     tokens += estimateBlockTokens(block);
   }
   return tokens;
+}
+
+export function estimateCompactionAfterTokens(
+  systemPrompt: string | undefined,
+  summary: string,
+  keptMessages: readonly Message[],
+): number {
+  let total = systemPrompt?.trim()
+    ? estimateTextTokens(systemPrompt) + 4
+    : 0;
+  total += 4 + estimateTextTokens(summary);
+  for (const msg of keptMessages) {
+    total += estimateMessageTokens(msg);
+  }
+  return total;
+}
+
+export function parseCompactionMeta(
+  msg: Message | undefined,
+): Partial<CompactionMeta> | null {
+  if (!msg) return null;
+  const block = msg.blocks.find(
+    (b): b is CompactionBlock => b.type === 'compaction',
+  );
+  if (
+    !block ||
+    !block.extra ||
+    typeof block.extra !== 'object' ||
+    Array.isArray(block.extra)
+  ) {
+    return null;
+  }
+  return block.extra as Partial<CompactionMeta>;
 }
 
 function estimateAttachmentsTokens(
@@ -128,17 +192,60 @@ export function computeContextUsage({
 
   let sessionTotalTokens = 0;
   let sessionCacheReadTokens = 0;
-  let anchorIdx = -1;
+  let compactIdx = -1;
 
   for (let i = 0; i < visible.length; i++) {
     const msg = visible[i];
-    if (msg.role !== 'assistant' || !msg.usage) continue;
+    if (msg.role === 'compaction') {
+      compactIdx = i;
+    }
+    if ((msg.role !== 'assistant' && msg.role !== 'compaction') || !msg.usage) {
+      continue;
+    }
     const u = msg.usage;
     const reportedTotal =
       u.totalTokens > 0 ? u.totalTokens : u.inputTokens + u.outputTokens;
     sessionTotalTokens += reportedTotal;
     sessionCacheReadTokens += u.cacheReadInputTokens ?? 0;
-    if (u.inputTokens > 0 || u.outputTokens > 0 || u.totalTokens > 0) {
+  }
+
+  const activeVisible = compactIdx >= 0 ? visible.slice(compactIdx) : visible;
+  const checkpointMeta =
+    compactIdx >= 0 ? parseCompactionMeta(visible[compactIdx]) : null;
+  const compactedCount =
+    compactIdx >= 0
+      ? typeof checkpointMeta?.compactedCount === 'number'
+        ? checkpointMeta.compactedCount
+        : visible.slice(0, compactIdx).filter((m) => m.role !== 'compaction').length
+      : 0;
+  const activeMessageCount = activeVisible.filter(
+    (m) => m.role !== 'compaction',
+  ).length;
+  const canCompact = activeMessageCount >= 2;
+
+  let snapshotCutoffIdx = -1;
+  if (compactIdx >= 0) {
+    snapshotCutoffIdx = 0;
+    const snapId = checkpointMeta?.snapshotLastMessageId;
+    if (typeof snapId === 'string' && snapId) {
+      const idx = activeVisible.findIndex((m) => m.id === snapId);
+      if (idx >= 0) {
+        snapshotCutoffIdx = Math.max(snapshotCutoffIdx, idx);
+      }
+    }
+  }
+
+  let anchorIdx = -1;
+  for (let i = snapshotCutoffIdx + 1; i < activeVisible.length; i++) {
+    const msg = activeVisible[i];
+    if (msg.role !== 'assistant' || !msg.usage) continue;
+    const u = msg.usage;
+    if (u.contextTokens !== undefined && u.contextTokens > 0) {
+      anchorIdx = i;
+    } else if (
+      !hasToolResultBlocks(msg) &&
+      (u.inputTokens > 0 || u.outputTokens > 0 || u.totalTokens > 0)
+    ) {
       anchorIdx = i;
     }
   }
@@ -146,18 +253,20 @@ export function computeContextUsage({
   let usedTokens: number;
   let source: ContextUsageSource;
   if (anchorIdx >= 0) {
-    const u = visible[anchorIdx].usage!;
+    const u = activeVisible[anchorIdx].usage!;
     const anchorTokens =
-      u.inputTokens + u.outputTokens > 0
-        ? u.inputTokens + u.outputTokens
-        : u.totalTokens;
+      u.contextTokens !== undefined && u.contextTokens > 0
+        ? u.contextTokens
+        : u.inputTokens + u.outputTokens > 0
+          ? u.inputTokens + u.outputTokens
+          : u.totalTokens;
     let trailingTokens = 0;
-    for (let i = anchorIdx + 1; i < visible.length; i++) {
-      trailingTokens += estimateMessageTokens(visible[i]);
+    for (let i = anchorIdx + 1; i < activeVisible.length; i++) {
+      trailingTokens += estimateMessageTokens(activeVisible[i]);
     }
     usedTokens = anchorTokens + trailingTokens + draftTokens;
     source =
-      anchorIdx === visible.length - 1 && draftTokens === 0
+      anchorIdx === activeVisible.length - 1 && draftTokens === 0
         ? 'reported'
         : 'hybrid';
   } else {
@@ -165,7 +274,7 @@ export function computeContextUsage({
       ? estimateTextTokens(systemPrompt) + 4
       : 0;
     let historyTokens = 0;
-    for (const msg of visible) {
+    for (const msg of activeVisible) {
       historyTokens += estimateMessageTokens(msg);
     }
     usedTokens = sysTokens + historyTokens + draftTokens;
@@ -197,6 +306,9 @@ export function computeContextUsage({
     remainingTokens,
     draftTokens,
     messageCount: visible.length,
+    activeMessageCount,
+    compactedCount,
+    canCompact,
     sessionTotalTokens,
     sessionCacheReadTokens,
     source,

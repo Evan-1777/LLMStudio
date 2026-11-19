@@ -64,6 +64,18 @@
                 (seed & 0xffffff).toString(16).padStart(6, '0');
             root.style.setProperty('--accent', accent);
           }
+          var fonts = { system: 1, sans: 1, serif: 1, kai: 1, mono: 1 };
+          if (typeof hint.fontFamily === 'string' && fonts[hint.fontFamily]) {
+            root.dataset.fontFamily = hint.fontFamily;
+          }
+          if (
+            typeof hint.fontSize === 'number' &&
+            Number.isInteger(hint.fontSize) &&
+            hint.fontSize >= 12 &&
+            hint.fontSize <= 22
+          ) {
+            root.style.setProperty('--font-size-base', hint.fontSize + 'px');
+          }
         } catch (error) {
           /* first paint falls back to the default theme */
         }

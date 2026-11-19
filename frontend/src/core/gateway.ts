@@ -3,6 +3,7 @@ import {
   type Assistant,
   type AssistantUpsertPayload,
   type BatchConversationsInput,
+  type CompactConversationResponse,
   type ContentBlock,
   type Conversation,
   type ConversationDetail,
@@ -24,6 +25,8 @@ import {
   type Message,
   type ModelConfig,
   type PatchConversationInput,
+  type PrepareLocalCompactInput,
+  type PreparedLocalCompactRequest,
   type PreparedLocalRequest,
   type ProviderAdapterInfo,
   type ProviderConfig,
@@ -832,6 +835,30 @@ export class GatewayClient {
       'POST',
       `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/prepare-local`,
       { body: buildStreamChatPayload(input), signal },
+    );
+  }
+
+  compactConversation(
+    conversationId: string,
+    body: { providerId?: string; modelId?: string },
+    signal?: AbortSignal,
+  ): Promise<CompactConversationResponse> {
+    return this.requestJson<CompactConversationResponse>(
+      'POST',
+      `/api/v1/conversations/${encodeURIComponent(conversationId)}/compact`,
+      { body, signal },
+    );
+  }
+
+  prepareLocalCompact(
+    conversationId: string,
+    input: PrepareLocalCompactInput,
+    signal?: AbortSignal,
+  ): Promise<PreparedLocalCompactRequest> {
+    return this.requestJson<PreparedLocalCompactRequest>(
+      'POST',
+      `/api/v1/conversations/${encodeURIComponent(conversationId)}/compact/prepare-local`,
+      { body: input, signal },
     );
   }
 

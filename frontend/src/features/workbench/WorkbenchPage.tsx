@@ -97,12 +97,14 @@ function WorkbenchInner() {
   const {
     state: chatState,
     isBusy,
+    isCompacting,
     updateConversationMeta,
     clearSession,
     loadConversation,
     reloadCurrentConversation,
     sendMessage,
     regenerateMessage,
+    compactConversation,
     updateMessage,
     deleteMessage,
     branchFromMessage,
@@ -627,6 +629,27 @@ function WorkbenchInner() {
 
   const handleDeleteMessage = (message: Message) => deleteMessage(message.id);
 
+  const handleCompact = useCallback(async () => {
+    if (!currentConversation?.id || !selectedProviderId || !selectedModelId) {
+      return;
+    }
+    const res = await compactConversation({
+      providerId: selectedProviderId,
+      modelId: selectedModelId,
+    });
+    if (res.ok) {
+      toast('上下文已压缩');
+    } else if (res.error) {
+      toast(res.error, 'error');
+    }
+  }, [
+    compactConversation,
+    currentConversation?.id,
+    selectedModelId,
+    selectedProviderId,
+    toast,
+  ]);
+
   const handleUpdateMessage = (messageId: string, blocks: ContentBlock[]) =>
     updateMessage(messageId, blocks);
 
@@ -972,7 +995,7 @@ function WorkbenchInner() {
             selectedModelId={selectedModelId}
             reasoningEffort={reasoningEffort}
             savingEffort={savingEffort}
-            isBusy={isBusy}
+            isBusy={isBusy || isCompacting}
             messages={chatState.messages}
             streaming={chatState.streaming}
             systemPrompt={currentConversation?.systemPrompt || activeAssistant.systemPrompt || ''}
@@ -980,6 +1003,15 @@ function WorkbenchInner() {
             onChangeReasoningEffort={(effort) => void saveReasoningEffort(effort)}
             onStop={stopStreaming}
             onSend={handleSend}
+            onCompact={handleCompact}
+            canCompact={Boolean(
+              currentConversation?.id &&
+                selectedProviderId &&
+                selectedModelId &&
+                !isBusy &&
+                !isCompacting,
+            )}
+            isCompacting={isCompacting}
           />
         </div>
       </main>
