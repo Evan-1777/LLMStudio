@@ -592,3 +592,120 @@ func TestMessageUsageCacheStatsAndLegacyJSONCompatibility(t *testing.T) {
 		t.Fatalf("expected persisted cache usage, got err=%v msg=%+v", err, reloaded)
 	}
 }
+
+func TestMigration011EphemeralConversationsLifecycleAndCleanup(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "ephemeral.db")
+
+	db, err := OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	// Verify 011 migration upgrade idempotency on an existing database.
+	if _, err := db.ExecContext(ctx, `
+		DELETE FROM schema_migrations WHERE version = '011_workspace_enhancements.sql';
+		ALTER TABLE conversations DROP COLUMN ephemeral;
+		ALTER TABLE user_preferences DROP COLUMN chat_width_mode;
+		ALTER TABLE user_preferences DROP COLUMN chat_manual_width;
+	`); err != nil {
+		t.Fatalf("reset 011 migration: %v", err)
+	}
+	if err := RunMigrations(ctx, db); err != nil {
+		t.Fatalf("re-run 011 migration: %v", err)
+	}
+
+	convs := NewConversationStore(db)
+	msgs := NewMessageStore(db)
+
+	regular, err := convs.Create(ctx, domain.Conversation{
+		AssistantID: domain.DefaultAssistantID,
+		Title:       "Regular Topic",
+	})
+	if err != nil {
+		t.Fatalf("create regular conv: %v", err)
+	}
+	pinned, err := convs.Create(ctx, domain.Conversation{
+		AssistantID: domain.DefaultAssistantID,
+		Title:       "Pinned Topic",
+		Pinned:      true,
+	})
+	if err != nil {
+		t.Fatalf("create pinned conv: %v", err)
+	}
+	ephemeral, err := convs.Create(ctx, domain.Conversation{
+		AssistantID: domain.DefaultAssistantID,
+		Title:       "Temp Chat",
+		Ephemeral:   true,
+	})
+	if err != nil {
+		t.Fatalf("create ephemeral conv: %v", err)
+	}
+	if !ephemeral.Ephemeral {
+		t.Fatalf("expected ephemeral=true, got %+v", ephemeral)
+	}
+
+	// List & ListByAssistant exclude ephemeral conversations.
+	all, err := convs.List(ctx)
+	if err != nil {
+		t.Fatalf("list conversations: %v", err)
+	}
+	byAssistant, err := convs.ListByAssistant(ctx, domain.DefaultAssistantID)
+	if err != nil {
+		t.Fatalf("list by assistant: %v", err)
+	}
+	for _, list := range [][]domain.Conversation{all, byAssistant} {
+		if len(list) != 2 {
+			t.Fatalf("expected 2 non-ephemeral conversations, got %d: %+v", len(list), list)
+		}
+		for _, c := range list {
+			if c.ID == ephemeral.ID {
+				t.Fatalf("ephemeral conversation leaked into list: %+v", c)
+			}
+		}
+	}
+
+	// Get and message persistence still work for ephemeral conversations.
+	fetched, err := convs.Get(ctx, ephemeral.ID)
+	if err != nil || !fetched.Ephemeral {
+		t.Fatalf("get ephemeral conv: err=%v conv=%+v", err, fetched)
+	}
+	if _, err := msgs.Create(ctx, domain.Message{
+		ConversationID: ephemeral.ID,
+		Role:           domain.RoleUser,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "ping"}},
+	}); err != nil {
+		t.Fatalf("create ephemeral message: %v", err)
+	}
+
+	// CleanupUngrouped removes regular ungrouped topic without deleting active ephemeral conversation.
+	deletedUngrouped, err := convs.CleanupUngrouped(ctx)
+	if err != nil {
+		t.Fatalf("cleanup ungrouped: %v", err)
+	}
+	if len(deletedUngrouped) != 1 || deletedUngrouped[0].ID != regular.ID {
+		t.Fatalf("expected only regular ungrouped deleted, got %+v", deletedUngrouped)
+	}
+	if _, err := convs.Get(ctx, ephemeral.ID); err != nil {
+		t.Fatalf("ephemeral conversation should survive CleanupUngrouped: %v", err)
+	}
+
+	// CleanupEphemeral deletes all ephemeral conversations and cascades messages, preserving pinned regular ones.
+	removed, err := convs.CleanupEphemeral(ctx)
+	if err != nil {
+		t.Fatalf("cleanup ephemeral: %v", err)
+	}
+	if removed != 1 {
+		t.Fatalf("expected 1 removed ephemeral conversation, got %d", removed)
+	}
+	if _, err := convs.Get(ctx, ephemeral.ID); err == nil {
+		t.Fatal("expected ephemeral conversation to be deleted")
+	}
+	if remainingMsgs, err := msgs.ListByConversation(ctx, ephemeral.ID); err != nil || len(remainingMsgs) != 0 {
+		t.Fatalf("expected ephemeral messages cascaded, err=%v count=%d", err, len(remainingMsgs))
+	}
+	if _, err := convs.Get(ctx, pinned.ID); err != nil {
+		t.Fatalf("expected pinned regular conversation preserved: %v", err)
+	}
+}

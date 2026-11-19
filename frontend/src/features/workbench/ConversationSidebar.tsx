@@ -74,6 +74,9 @@ export function ConversationSidebar({
   onConversationPatched,
   onConversationsDeleted,
   onSaveDraftSessionParams,
+  lastSyncedAt = null,
+  syncingServer = false,
+  onSyncServer,
 }: {
   assistantId: string;
   conversations: Conversation[];
@@ -96,6 +99,9 @@ export function ConversationSidebar({
     remaining: Conversation[],
   ) => void;
   onSaveDraftSessionParams: (next: DraftSessionParams) => void;
+  lastSyncedAt?: string | null;
+  syncingServer?: boolean;
+  onSyncServer?: () => void;
 }) {
   const {
     gateway,
@@ -107,7 +113,7 @@ export function ConversationSidebar({
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
-  const [collapsedGroupIds, setCollapsedGroupIds] = useState<Set<string>>(
+  const [expandedGroupIds, setExpandedGroupIds] = useState<Set<string>>(
     () => new Set(),
   );
   const [mutating, setMutating] = useState(false);
@@ -155,6 +161,10 @@ export function ConversationSidebar({
     setSearchQuery('');
     onManageModeChange(false);
   }, [assistantId, connectionEpoch, onManageModeChange]);
+
+  useEffect(() => {
+    setExpandedGroupIds(new Set());
+  }, [connectionEpoch]);
 
   useEffect(() => {
     if (!manageMode) {
@@ -245,7 +255,7 @@ export function ConversationSidebar({
   const toggleSelectAllFiltered = () => toggleSelection(visibleFilteredIds, allFilteredSelected);
 
   const toggleGroupCollapse = (groupId: string) => {
-    setCollapsedGroupIds((prev) => {
+    setExpandedGroupIds((prev) => {
       const next = new Set(prev);
       if (next.has(groupId)) next.delete(groupId);
       else next.add(groupId);
@@ -775,7 +785,7 @@ export function ConversationSidebar({
                   const isCollapsed =
                     section.group !== null &&
                     !isSearching &&
-                    collapsedGroupIds.has(section.group.id);
+                    !expandedGroupIds.has(section.group.id);
                   const isBucketDropTarget =
                     draggingId !== null &&
                     dropTarget?.bucketKey === section.key;
@@ -1083,6 +1093,30 @@ export function ConversationSidebar({
                 })
               )}
               </div>
+            </div>
+            <div className="wb-history__foot">
+              <button
+                type="button"
+                className="wb-sync-bar"
+                aria-label="刷新服务端数据"
+                title="从服务端刷新最新数据"
+                aria-busy={syncingServer || undefined}
+                disabled={Boolean(syncingServer || isBusy)}
+                onClick={() => onSyncServer?.()}
+              >
+                <Icon
+                  name="refresh"
+                  size={13}
+                  className={syncingServer ? 'wb-spin' : undefined}
+                />
+                <span>
+                  {syncingServer
+                    ? '同步中…'
+                    : lastSyncedAt
+                      ? `${formatShortTime(lastSyncedAt)} 已同步`
+                      : '同步服务端'}
+                </span>
+              </button>
             </div>
           </>
         )}

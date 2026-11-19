@@ -111,6 +111,33 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if stored.ThemeMode != domain.ThemeModeLight {
 		t.Fatalf("legacy import replayed: %+v", stored)
 	}
+
+	// Chat width defaults, partial update and range validation.
+	if stored.ChatWidthMode != domain.ChatWidthDefault || stored.ChatManualWidth != domain.DefaultChatManualWidth {
+		t.Fatalf("unexpected chat width defaults: mode=%q width=%d", stored.ChatWidthMode, stored.ChatManualWidth)
+	}
+	badWidthMode := "wide"
+	if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{ChatWidthMode: &badWidthMode}, false, validatePrefs); err == nil {
+		t.Fatal("expected invalid chatWidthMode to fail validation")
+	}
+	for _, badWidth := range []int{300, 5000} {
+		w := badWidth
+		if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{ChatManualWidth: &w}, false, validatePrefs); err == nil {
+			t.Fatalf("expected out-of-range chatManualWidth %d to fail", badWidth)
+		}
+	}
+	manualMode := " MANUAL "
+	manualWidth := 1120
+	updated, _, err := prefs.Update(ctx, domain.PreferencesPatch{
+		ChatWidthMode:   &manualMode,
+		ChatManualWidth: &manualWidth,
+	}, false, validatePrefs)
+	if err != nil {
+		t.Fatalf("update chat width prefs: %v", err)
+	}
+	if updated.ChatWidthMode != domain.ChatWidthManual || updated.ChatManualWidth != 1120 {
+		t.Fatalf("unexpected persisted width prefs: %+v", updated)
+	}
 }
 
 func TestMigration005BackfillsManagedAPIKeys(t *testing.T) {

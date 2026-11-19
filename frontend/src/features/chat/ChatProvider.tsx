@@ -38,8 +38,9 @@ import {
 } from './chatReducer';
 
 export interface SendMessageOptions {
-  conversationId: string;
+  conversationId?: string;
   conversation?: Conversation;
+  ensureConversation?: (signal: AbortSignal) => Promise<Conversation | null>;
   blocks: ContentBlock[];
   text?: string;
   providerId: string;
@@ -47,6 +48,8 @@ export interface SendMessageOptions {
   params?: GenerationParams;
   webSearch?: boolean;
   searchEngineId?: string;
+  onOptimisticStart?: () => void;
+  onPrepareRollback?: () => void;
   onStreamAccepted?: () => void;
 }
 
@@ -300,14 +303,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       optimisticUserId?: string;
       regenerateTargetId?: string;
       expectedCountOnAbort: number;
+      epoch: number;
+      ctrl: AbortController;
+      placeholderAssistantId: string;
+      onPrepareRollback?: () => void;
       onStreamAccepted?: () => void;
     }): Promise<boolean> => {
-      if (sendingRef.current) return false;
-      sendingRef.current = true;
-      const epoch = ++epochRef.current;
-      const ctrl = new AbortController();
-      activeAbortRef.current = ctrl;
-      manualAbortRef.current = false;
+      const { epoch, ctrl } = opts;
 
       let response: Response;
       try {
@@ -329,6 +331,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
               code: 'ABORTED',
               message: '已取消请求',
             });
+            opts.onPrepareRollback?.();
           } else {
             dispatch({ type: 'ABORT_LOCAL' });
           }
@@ -343,6 +346,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             code: e.code,
             message: e.message,
           });
+          opts.onPrepareRollback?.();
         } else {
           dispatch({
             type: 'REGEN_PREPARE_FAILED',
@@ -599,14 +603,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       optimisticUserId?: string;
       regenerateTargetId?: string;
       expectedCountOnAbort: number;
+      epoch: number;
+      ctrl: AbortController;
+      placeholderAssistantId: string;
+      onPrepareRollback?: () => void;
       onStreamAccepted?: () => void;
     }): Promise<boolean> => {
-      if (sendingRef.current) return false;
-      sendingRef.current = true;
-      const epoch = ++epochRef.current;
-      const ctrl = new AbortController();
-      activeAbortRef.current = ctrl;
-      manualAbortRef.current = false;
+      const { epoch, ctrl } = opts;
 
       const provider = resources.providers.find(
         (p) => p.id === opts.input.providerId,
@@ -642,6 +645,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
               code: 'ABORTED',
               message: '已取消请求',
             });
+            opts.onPrepareRollback?.();
           } else {
             dispatch({ type: 'ABORT_LOCAL' });
           }
@@ -656,6 +660,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             code: e.code,
             message: e.message,
           });
+          opts.onPrepareRollback?.();
         } else {
           dispatch({
             type: 'REGEN_PREPARE_FAILED',
@@ -712,6 +717,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             code: e.code,
             message: e.message,
           });
+          opts.onPrepareRollback?.();
           return false;
         }
       } else {
@@ -724,7 +730,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      const localAssistantId = `local-assistant-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const localAssistantId = opts.placeholderAssistantId;
       const accOrder: number[] = [];
       const accBlocks: Record<number, StreamingBlockBuffer> = {};
       let accUsage: TokenUsage | undefined;
@@ -1182,7 +1188,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       if (sendingRef.current || (opts.blocks.length === 0 && !opts.text?.trim())) {
         return false;
       }
+      sendingRef.current = true;
+      const epoch = ++epochRef.current;
+      const ctrl = new AbortController();
+      activeAbortRef.current = ctrl;
+      manualAbortRef.current = false;
+
       const optimisticId = `local-user-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const placeholderAssistantId = `local-assistant-${Date.now()}-${Math.random().toString(16).slice(2)}`;
       const expectedAfterAbort = stateRef.current.messages.length + 2;
 
       if (opts.conversation) {
@@ -1196,19 +1209,87 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         type: 'SEND_PREPARE_START',
         optimisticUser: {
           id: optimisticId,
-          conversationId: opts.conversationId,
+          conversationId: opts.conversationId ?? '',
           role: 'user',
           blocks: opts.blocks,
           createdAt: new Date().toISOString(),
         },
+        providerId: opts.providerId,
+        modelId: opts.modelId,
+        placeholderAssistantId,
       });
+      opts.onOptimisticStart?.();
+
+      let targetConvId = opts.conversationId ?? '';
+      if (!targetConvId) {
+        if (!opts.ensureConversation) {
+          sendingRef.current = false;
+          if (activeAbortRef.current === ctrl) activeAbortRef.current = null;
+          dispatch({
+            type: 'SEND_PREPARE_FAILED',
+            optimisticUserId: optimisticId,
+            code: 'INVALID_ARGUMENT',
+            message: '缺少会话标识',
+          });
+          opts.onPrepareRollback?.();
+          return false;
+        }
+        try {
+          const created = await opts.ensureConversation(ctrl.signal);
+          if (epoch !== epochRef.current) {
+            sendingRef.current = false;
+            if (activeAbortRef.current === ctrl) activeAbortRef.current = null;
+            return false;
+          }
+          if (!created || manualAbortRef.current || ctrl.signal.aborted) {
+            sendingRef.current = false;
+            if (activeAbortRef.current === ctrl) activeAbortRef.current = null;
+            dispatch({
+              type: 'SEND_PREPARE_FAILED',
+              optimisticUserId: optimisticId,
+              code: 'ABORTED',
+              message: '已取消请求',
+            });
+            opts.onPrepareRollback?.();
+            return false;
+          }
+          targetConvId = created.id;
+          dispatch({
+            type: 'UPDATE_CONVERSATION_META',
+            conversation: created,
+          });
+        } catch (err) {
+          sendingRef.current = false;
+          if (activeAbortRef.current === ctrl) activeAbortRef.current = null;
+          if (epoch !== epochRef.current) return false;
+
+          if (isAbortError(err) && manualAbortRef.current) {
+            dispatch({
+              type: 'SEND_PREPARE_FAILED',
+              optimisticUserId: optimisticId,
+              code: 'ABORTED',
+              message: '已取消请求',
+            });
+          } else {
+            const e = formatError(err);
+            dispatch({
+              type: 'SEND_PREPARE_FAILED',
+              optimisticUserId: optimisticId,
+              code: e.code,
+              message: e.message,
+            });
+          }
+          opts.onPrepareRollback?.();
+          return false;
+        }
+      }
 
       const isLocal = Boolean(
         resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
       );
       const streamRunner = isLocal ? executeLocalStream : executeStream;
       return streamRunner({
-        conversationId: opts.conversationId,
+        conversationId: targetConvId,
         input: {
           blocks: opts.blocks,
           text: opts.text,
@@ -1220,6 +1301,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         },
         optimisticUserId: optimisticId,
         expectedCountOnAbort: expectedAfterAbort,
+        epoch,
+        ctrl,
+        placeholderAssistantId,
+        onPrepareRollback: opts.onPrepareRollback,
         onStreamAccepted: opts.onStreamAccepted,
       });
     },
@@ -1246,8 +1331,20 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         ? stateRef.current.messages.length
         : stateRef.current.messages.length + 1;
 
+      sendingRef.current = true;
+      const epoch = ++epochRef.current;
+      const ctrl = new AbortController();
+      activeAbortRef.current = ctrl;
+      manualAbortRef.current = false;
+      const placeholderAssistantId = `local-assistant-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-      dispatch({ type: 'REGEN_PREPARE_START' });
+      dispatch({
+        type: 'REGEN_PREPARE_START',
+        targetMessageId: opts.targetMessageId,
+        providerId: opts.providerId,
+        modelId: opts.modelId,
+        placeholderAssistantId,
+      });
 
       const isLocal = Boolean(
         resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
@@ -1265,6 +1362,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         },
         regenerateTargetId: opts.targetMessageId,
         expectedCountOnAbort,
+        epoch,
+        ctrl,
+        placeholderAssistantId,
       });
     },
     [executeLocalStream, executeStream, resources.providers, toast],

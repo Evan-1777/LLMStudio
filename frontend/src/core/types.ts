@@ -275,6 +275,7 @@ export interface Conversation {
   groupId?: string | null;
   pinned?: boolean;
   sortOrder?: number;
+  ephemeral?: boolean;
   syncEnabled: boolean;
   syncState: string;
   syncVersion: number;
@@ -341,6 +342,7 @@ export interface CreateConversationInput {
   modelId?: string;
   systemPrompt?: string;
   params?: GenerationParams;
+  ephemeral?: boolean;
 }
 
 export interface PatchConversationInput {
@@ -610,6 +612,8 @@ export interface ApiErrorEnvelope {
 
 // Server-managed application preferences. Gateway address and access token stay
 // in browser connection storage and are not part of this contract.
+export type ChatWidthMode = 'default' | 'manual';
+
 export interface ServerPreferences {
   composerReasoningEffort: ReasoningEffort | '';
   mcpMaxToolRounds: number;
@@ -626,6 +630,8 @@ export interface ServerPreferences {
   collapseLineThreshold: number;
   collapseCharThreshold: number;
   userAvatarDataUrl: string;
+  chatWidthMode: ChatWidthMode;
+  chatManualWidth: number;
 }
 
 export interface ServerPreferencesEnvelope {
@@ -634,7 +640,10 @@ export interface ServerPreferencesEnvelope {
 }
 
 /** Full preference payload used for the one-shot legacy browser import. */
-export type ServerPreferencesImport = Omit<ServerPreferences, 'composerReasoningEffort' | 'mcpMaxToolRounds'>;
+export type ServerPreferencesImport = Omit<
+  ServerPreferences,
+  'composerReasoningEffort' | 'mcpMaxToolRounds' | 'chatWidthMode' | 'chatManualWidth'
+>;
 
 export interface StorageUsage {
   mainBytes: number;

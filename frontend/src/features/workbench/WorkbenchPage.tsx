@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import {
   useNavigate,
   useParams,
@@ -6,6 +15,7 @@ import {
 } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import { Icon, IconButton } from '../../components/ui';
+import { CHAT_WIDTH_MAX, CHAT_WIDTH_MIN } from '../../core/settings';
 import { isReasoningEffort, type Assistant, type ContentBlock, type Message, type ReasoningEffort } from '../../core/types';
 import { ChatProvider, useChat } from '../chat/ChatProvider';
 import { AssistantEditor } from './AssistantEditor';
@@ -78,6 +88,9 @@ function WorkbenchInner() {
     upsertLocalConversation,
     settings,
     updatePreferences,
+    syncFromServer,
+    lastSyncedAt,
+    syncingServer,
     toast,
   } = useApp();
 
@@ -102,6 +115,7 @@ function WorkbenchInner() {
   const [rightDrawerOpen, setRightDrawerOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [sidebarManageMode, setSidebarManageMode] = useState(false);
+  const [isTemporaryMode, setIsTemporaryMode] = useState(false);
 
   const [selectedAssistantId, setSelectedAssistantId] = useState('default');
   const [draftModel, setDraftModel] = useState<{
@@ -118,11 +132,68 @@ function WorkbenchInner() {
 
   const leftToggleRef = useRef<HTMLButtonElement | null>(null);
   const rightToggleRef = useRef<HTMLButtonElement | null>(null);
+  const chatStageRef = useRef<HTMLDivElement | null>(null);
+  const [stageWidth, setStageWidth] = useState(0);
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
+  const [resizingWidth, setResizingWidth] = useState(false);
+  const dragSessionRef = useRef<{
+    pointerId: number;
+    side: 'left' | 'right';
+    startX: number;
+    startWidth: number;
+    containerWidth: number;
+    currentWidth: number;
+  } | null>(null);
   const skipNextLoadIdRef = useRef<string | null>(null);
-  const activeConvIdRef = useRef<string | undefined>(conversationId);
-  activeConvIdRef.current = conversationId;
+  const temporaryConvIdRef = useRef<string | null>(null);
   const activeConnEpochRef = useRef<number>(connectionEpoch);
   activeConnEpochRef.current = connectionEpoch;
+  const prevConnEpochRef = useRef<number>(connectionEpoch);
+
+  const discardTemporarySession = useCallback(
+    (options?: { keepalive?: boolean }) => {
+      const tempId = temporaryConvIdRef.current;
+      if (!tempId) return;
+      temporaryConvIdRef.current = null;
+      if (options?.keepalive) {
+        gateway.deleteConversationKeepalive(tempId);
+      } else {
+        void gateway.deleteConversation(tempId).catch(() => {});
+      }
+    },
+    [gateway],
+  );
+  const discardRef = useRef(discardTemporarySession);
+  discardRef.current = discardTemporarySession;
+
+  useEffect(() => {
+    const onPageHide = () => {
+      discardRef.current({ keepalive: true });
+    };
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      window.removeEventListener('pagehide', onPageHide);
+      discardRef.current();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (prevConnEpochRef.current === connectionEpoch) return;
+    prevConnEpochRef.current = connectionEpoch;
+    discardRef.current();
+    setIsTemporaryMode(false);
+  }, [connectionEpoch]);
+
+  useEffect(() => {
+    const el = chatStageRef.current;
+    if (!el) return;
+    const measure = () => setStageWidth(el.clientWidth);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const obs = new ResizeObserver(measure);
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
   const [savingModelKey, setSavingModelKey] = useState<string | null>(null);
   const modelSaveLockRef = useRef<string | null>(null);
   const [effortSaveEpoch, setEffortSaveEpoch] = useState<number | null>(null);
@@ -161,6 +232,8 @@ function WorkbenchInner() {
       setDraftSessionParams({ systemPrompt: '', params: {} });
       return;
     }
+    discardRef.current();
+    setIsTemporaryMode(false);
     if (connectionState !== 'connected') {
       return;
     }
@@ -208,14 +281,24 @@ function WorkbenchInner() {
   );
 
   const currentConversation = useMemo(() => {
-    if (!conversationId) return null;
-    if (chatState.conversation?.id === conversationId) {
+    if (conversationId) {
+      if (chatState.conversation?.id === conversationId) {
+        return chatState.conversation;
+      }
+      return (
+        resources.conversations.find((c) => c.id === conversationId) ?? null
+      );
+    }
+    if (isTemporaryMode && chatState.conversation?.ephemeral) {
       return chatState.conversation;
     }
-    return (
-      resources.conversations.find((c) => c.id === conversationId) ?? null
-    );
-  }, [chatState.conversation, conversationId, resources.conversations]);
+    return null;
+  }, [chatState.conversation, conversationId, isTemporaryMode, resources.conversations]);
+
+  const activeConvIdRef = useRef<string | undefined>(
+    currentConversation?.id ?? conversationId,
+  );
+  activeConvIdRef.current = currentConversation?.id ?? conversationId;
 
   const previousEffort = currentConversation?.params?.reasoningEffort;
   const reasoningEffort = settings.composerReasoningEffort || (isReasoningEffort(previousEffort) ? previousEffort : 'none');
@@ -291,12 +374,44 @@ function WorkbenchInner() {
 
   const handleStartNewTopic = useCallback(() => {
     stopStreaming();
+    discardTemporarySession();
+    setIsTemporaryMode(false);
     clearSession();
     setDraftSessionParams({ systemPrompt: '', params: {} });
     setInspectorOpen(false);
     closeDrawers();
     navigate(`/chat?assistant=${encodeURIComponent(activeAssistant.id)}`);
-  }, [activeAssistant.id, clearSession, closeDrawers, navigate, stopStreaming]);
+  }, [
+    activeAssistant.id,
+    clearSession,
+    closeDrawers,
+    discardTemporarySession,
+    navigate,
+    stopStreaming,
+  ]);
+
+  const handleToggleTemporaryMode = useCallback(() => {
+    stopStreaming();
+    discardTemporarySession();
+    clearSession();
+    setDraftSessionParams({ systemPrompt: '', params: {} });
+    if (isTemporaryMode) {
+      setIsTemporaryMode(false);
+      return;
+    }
+    setIsTemporaryMode(true);
+    if (conversationId) {
+      navigate(`/chat?assistant=${encodeURIComponent(activeAssistant.id)}`);
+    }
+  }, [
+    activeAssistant.id,
+    clearSession,
+    conversationId,
+    discardTemporarySession,
+    isTemporaryMode,
+    navigate,
+    stopStreaming,
+  ]);
 
   useEffect(() => {
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
@@ -351,6 +466,8 @@ function WorkbenchInner() {
   const handleSelectAssistant = (assistantId: string) => {
     if (assistantId !== activeAssistant.id) {
       stopStreaming();
+      discardTemporarySession();
+      setIsTemporaryMode(false);
       setSelectedAssistantId(assistantId);
       setInspectorOpen(false);
       setDraftSessionParams({ systemPrompt: '', params: {} });
@@ -370,8 +487,10 @@ function WorkbenchInner() {
   };
 
   const handleSelectConversation = (id: string) => {
-    if (id !== conversationId) {
+    if (id !== conversationId || isTemporaryMode) {
       stopStreaming();
+      discardTemporarySession();
+      setIsTemporaryMode(false);
       navigate(`/chat/${encodeURIComponent(id)}`);
     }
     if (window.innerWidth < 1200) {
@@ -430,6 +549,8 @@ function WorkbenchInner() {
     text: string;
     webSearch: boolean;
     searchEngineId?: string;
+    onOptimisticStart: () => void;
+    onPrepareRollback: () => void;
     onAccepted: () => void;
   }): Promise<boolean> => {
     if (effortSaveLock.current === connectionEpoch) return false;
@@ -438,34 +559,51 @@ function WorkbenchInner() {
       return false;
     }
 
-    let targetConvId = currentConversation?.id ?? conversationId ?? '';
-    let createdConv = undefined;
-    if (!targetConvId) {
-      try {
-        const created = await gateway.createConversation({
-          assistantId: activeAssistant.id,
-          providerId: selectedProviderId,
-          modelId: selectedModelId,
-          systemPrompt: draftSessionParams.systemPrompt,
-          params: {
-            ...draftSessionParams.params,
-            reasoningEffort,
-          },
-        });
-        upsertLocalConversation(created);
-        targetConvId = created.id;
-        createdConv = created;
-        skipNextLoadIdRef.current = created.id;
-        navigate(`/chat/${encodeURIComponent(created.id)}`, { replace: true });
-      } catch {
-        toast('创建话题失败，草稿已保留', 'error');
-        return false;
-      }
-    }
-
+    const existingConvId =
+      currentConversation?.id ??
+      (isTemporaryMode ? temporaryConvIdRef.current ?? '' : conversationId ?? '');
+    const tempModeAtSend = isTemporaryMode;
     return sendMessage({
-      conversationId: targetConvId,
-      conversation: createdConv,
+      conversationId: existingConvId || undefined,
+      ensureConversation: existingConvId
+        ? undefined
+        : async (signal) => {
+            if (tempModeAtSend && temporaryConvIdRef.current) {
+              const created = await gateway.getConversationDetail(
+                temporaryConvIdRef.current,
+                signal,
+              );
+              return created.conversation;
+            }
+            const created = await gateway.createConversation(
+              {
+                assistantId: activeAssistant.id,
+                providerId: selectedProviderId,
+                modelId: selectedModelId,
+                systemPrompt: draftSessionParams.systemPrompt,
+                params: {
+                  ...draftSessionParams.params,
+                  reasoningEffort,
+                },
+                ...(tempModeAtSend ? { ephemeral: true } : {}),
+              },
+              signal,
+            );
+            if (signal.aborted) {
+              if (tempModeAtSend) {
+                void gateway.deleteConversation(created.id).catch(() => {});
+              }
+              return null;
+            }
+            if (tempModeAtSend) {
+              temporaryConvIdRef.current = created.id;
+              return created;
+            }
+            upsertLocalConversation(created);
+            skipNextLoadIdRef.current = created.id;
+            navigate(`/chat/${encodeURIComponent(created.id)}`, { replace: true });
+            return created;
+          },
       blocks: opts.blocks,
       text: opts.text,
       providerId: selectedProviderId,
@@ -473,6 +611,8 @@ function WorkbenchInner() {
       params: { reasoningEffort },
       webSearch: opts.webSearch,
       searchEngineId: opts.searchEngineId,
+      onOptimisticStart: opts.onOptimisticStart,
+      onPrepareRollback: opts.onPrepareRollback,
       onStreamAccepted: opts.onAccepted,
     });
   };
@@ -534,6 +674,46 @@ function WorkbenchInner() {
     }
   };
 
+  const handleSyncServer = useCallback(async () => {
+    if (isBusy || syncingServer) return;
+    const startEpoch = activeConnEpochRef.current;
+    const openPersistentConvId = !isTemporaryMode ? conversationId : undefined;
+    const res = await syncFromServer();
+    if (activeConnEpochRef.current !== startEpoch) return;
+    if (!res.ok) {
+      toast(res.error || '同步失败', 'error');
+      return;
+    }
+    if (openPersistentConvId) {
+      const stillExists = res.conversations?.some(
+        (c) => c.id === openPersistentConvId,
+      );
+      if (!stillExists) {
+        stopStreaming();
+        clearSession();
+        setDraftSessionParams({ systemPrompt: '', params: {} });
+        navigate(`/chat?assistant=${encodeURIComponent(activeAssistant.id)}`, {
+          replace: true,
+        });
+        toast('当前话题已在其他端删除');
+        return;
+      }
+      await reloadCurrentConversation();
+    }
+  }, [
+    activeAssistant.id,
+    clearSession,
+    conversationId,
+    isBusy,
+    isTemporaryMode,
+    navigate,
+    reloadCurrentConversation,
+    stopStreaming,
+    syncFromServer,
+    syncingServer,
+    toast,
+  ]);
+
   const shellClasses = [
     'wb-shell',
     !leftOpenDesktop ? 'wb-shell--no-left' : '',
@@ -541,6 +721,122 @@ function WorkbenchInner() {
   ]
     .filter(Boolean)
     .join(' ');
+
+  const manualWidthActive = settings.chatWidthMode === 'manual';
+  const resolvedManualWidth = useMemo(() => {
+    if (!manualWidthActive) return null;
+    const desired = dragWidth ?? settings.chatManualWidth;
+    if (stageWidth <= 0) {
+      const clamped = Math.max(CHAT_WIDTH_MIN, Math.min(CHAT_WIDTH_MAX, desired));
+      return { cssMaxWidth: `${Math.round(clamped)}px`, railHalfPx: Math.round(clamped) / 2, effectivePx: clamped };
+    }
+    const minAllowed = Math.min(CHAT_WIDTH_MIN, stageWidth);
+    const maxAllowed = Math.min(CHAT_WIDTH_MAX, stageWidth);
+    const clamped = Math.max(minAllowed, Math.min(maxAllowed, desired));
+    if (stageWidth - clamped <= 8 && stageWidth <= CHAT_WIDTH_MAX) {
+      return { cssMaxWidth: '100%', railHalfPx: stageWidth / 2, effectivePx: stageWidth };
+    }
+    return { cssMaxWidth: `${Math.round(clamped)}px`, railHalfPx: Math.round(clamped) / 2, effectivePx: clamped };
+  }, [dragWidth, manualWidthActive, settings.chatManualWidth, stageWidth]);
+
+  const chatStageStyle = useMemo((): CSSProperties | undefined => {
+    if (!resolvedManualWidth) return undefined;
+    return {
+      '--chat-max-width': resolvedManualWidth.cssMaxWidth,
+      '--chat-rail-half': `${resolvedManualWidth.railHalfPx}px`,
+    } as CSSProperties;
+  }, [resolvedManualWidth]);
+
+  const clampManualDragWidth = useCallback(
+    (rawWidth: number, containerWidth: number): number => {
+      const effMax = containerWidth > 0 ? Math.min(CHAT_WIDTH_MAX, containerWidth) : CHAT_WIDTH_MAX;
+      const effMin = Math.min(CHAT_WIDTH_MIN, effMax);
+      const clamped = Math.max(effMin, Math.min(effMax, rawWidth));
+      if (containerWidth > 0 && containerWidth <= CHAT_WIDTH_MAX && containerWidth - clamped <= 8) {
+        return containerWidth;
+      }
+      return Math.round(clamped);
+    },
+    [],
+  );
+
+  const handleWidthEdgePointerDown = (
+    side: 'left' | 'right',
+    e: ReactPointerEvent<HTMLDivElement>,
+  ) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    const containerWidth = chatStageRef.current?.clientWidth || stageWidth || settings.chatManualWidth;
+    const startWidth = resolvedManualWidth?.effectivePx ?? settings.chatManualWidth;
+    dragSessionRef.current = {
+      pointerId: e.pointerId,
+      side,
+      startX: e.clientX,
+      startWidth,
+      containerWidth,
+      currentWidth: startWidth,
+    };
+    setResizingWidth(true);
+    setDragWidth(startWidth);
+  };
+
+  const handleWidthEdgePointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const session = dragSessionRef.current;
+    if (!session || session.pointerId !== e.pointerId) return;
+    const dx = e.clientX - session.startX;
+    const rawNext =
+      session.side === 'right'
+        ? session.startWidth + 2 * dx
+        : session.startWidth - 2 * dx;
+    const next = clampManualDragWidth(rawNext, session.containerWidth);
+    session.currentWidth = next;
+    setDragWidth(next);
+  };
+
+  const finishWidthDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const session = dragSessionRef.current;
+    if (!session || session.pointerId !== e.pointerId) return;
+    dragSessionRef.current = null;
+    if (e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setResizingWidth(false);
+    setDragWidth(null);
+    const committed = Math.max(
+      CHAT_WIDTH_MIN,
+      Math.min(CHAT_WIDTH_MAX, Math.round(session.currentWidth)),
+    );
+    if (committed !== settings.chatManualWidth) {
+      void updatePreferences({ chatManualWidth: committed });
+    }
+  };
+
+  const handleWidthEdgeKeyDown = (
+    side: 'left' | 'right',
+    e: ReactKeyboardEvent<HTMLDivElement>,
+  ) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const containerWidth = chatStageRef.current?.clientWidth || stageWidth || settings.chatManualWidth;
+    const base = resolvedManualWidth?.effectivePx ?? settings.chatManualWidth;
+    const delta =
+      side === 'right'
+        ? e.key === 'ArrowRight'
+          ? 24
+          : -24
+        : e.key === 'ArrowLeft'
+          ? 24
+          : -24;
+    const next = clampManualDragWidth(base + delta, containerWidth);
+    const committed = Math.max(
+      CHAT_WIDTH_MIN,
+      Math.min(CHAT_WIDTH_MAX, Math.round(next)),
+    );
+    if (committed !== settings.chatManualWidth) {
+      void updatePreferences({ chatManualWidth: committed });
+    }
+  };
 
   return (
     <div ref={shellRef} className={shellClasses}>
@@ -601,6 +897,12 @@ function WorkbenchInner() {
           <div className="wb-toolbar__spacer" />
 
           <IconButton
+            icon="temporaryChat"
+            label={isTemporaryMode ? '退出临时会话' : '临时会话'}
+            active={isTemporaryMode}
+            onClick={handleToggleTemporaryMode}
+          />
+          <IconButton
             icon="sliders"
             label="话题参数"
             active={inspectorOpen}
@@ -615,36 +917,78 @@ function WorkbenchInner() {
           />
         </header>
 
-        <ChatCanvas
-          state={chatState}
-          assistant={activeAssistant}
-          providers={resources.providers}
-          hasConversationId={Boolean(conversationId)}
-          onUpdateMessage={handleUpdateMessage}
-          onRetryMessage={handleRetryMessage}
-          onDeleteMessage={handleDeleteMessage}
-          onBranchMessage={handleBranchMessage}
-          onReloadConversation={reloadCurrentConversation}
-          onResetToNewTopic={handleStartNewTopic}
-        />
+        <div
+          ref={chatStageRef}
+          className="wb-chat-stage"
+          data-width-mode={settings.chatWidthMode}
+          data-resizing={resizingWidth ? 'true' : undefined}
+          style={chatStageStyle}
+        >
+          {manualWidthActive ? (
+            <>
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="拖动调整对话区域宽度"
+                tabIndex={0}
+                className="wb-width-edge wb-width-edge--left"
+                onPointerDown={(e) => handleWidthEdgePointerDown('left', e)}
+                onPointerMove={handleWidthEdgePointerMove}
+                onPointerUp={finishWidthDrag}
+                onPointerCancel={finishWidthDrag}
+                onKeyDown={(e) => handleWidthEdgeKeyDown('left', e)}
+              />
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="拖动调整对话区域宽度"
+                tabIndex={0}
+                className="wb-width-edge wb-width-edge--right"
+                onPointerDown={(e) => handleWidthEdgePointerDown('right', e)}
+                onPointerMove={handleWidthEdgePointerMove}
+                onPointerUp={finishWidthDrag}
+                onPointerCancel={finishWidthDrag}
+                onKeyDown={(e) => handleWidthEdgeKeyDown('right', e)}
+              />
+            </>
+          ) : null}
 
-        <Composer
-          selectedProviderId={selectedProviderId}
-          selectedModelId={selectedModelId}
-          reasoningEffort={reasoningEffort}
-          savingEffort={savingEffort}
-          isBusy={isBusy}
-          onChangeReasoningEffort={(effort) => void saveReasoningEffort(effort)}
-          onStop={stopStreaming}
-          onSend={handleSend}
-        />
+          <ChatCanvas
+            state={chatState}
+            assistant={activeAssistant}
+            providers={resources.providers}
+            hasConversationId={Boolean(conversationId)}
+            isTemporary={isTemporaryMode}
+            onUpdateMessage={handleUpdateMessage}
+            onRetryMessage={handleRetryMessage}
+            onDeleteMessage={handleDeleteMessage}
+            onBranchMessage={handleBranchMessage}
+            onReloadConversation={reloadCurrentConversation}
+            onResetToNewTopic={handleStartNewTopic}
+          />
+
+          <Composer
+            selectedProviderId={selectedProviderId}
+            selectedModelId={selectedModelId}
+            reasoningEffort={reasoningEffort}
+            savingEffort={savingEffort}
+            isBusy={isBusy}
+            messages={chatState.messages}
+            streaming={chatState.streaming}
+            systemPrompt={currentConversation?.systemPrompt || activeAssistant.systemPrompt || ''}
+            contextWindow={targetModel?.model.contextWindow}
+            onChangeReasoningEffort={(effort) => void saveReasoningEffort(effort)}
+            onStop={stopStreaming}
+            onSend={handleSend}
+          />
+        </div>
       </main>
 
       <ConversationSidebar
         assistantId={activeAssistant.id}
         conversations={scopedConversations}
         groups={scopedGroups}
-        activeConversationId={conversationId ?? null}
+        activeConversationId={currentConversation?.id ?? conversationId ?? null}
         activeConversation={currentConversation}
         draftSessionParams={draftSessionParams}
         inspectorOpen={inspectorOpen}
@@ -684,6 +1028,9 @@ function WorkbenchInner() {
           }
         }}
         onSaveDraftSessionParams={setDraftSessionParams}
+        lastSyncedAt={lastSyncedAt}
+        syncingServer={syncingServer}
+        onSyncServer={() => void handleSyncServer()}
       />
 
       <button

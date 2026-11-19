@@ -118,8 +118,10 @@ test.describe('Topic Organization, Manual Order, Touch Drag, and Batch Operation
     await page.getByRole('menuitem', { name: '置顶' }).click();
 
     // Order should now be: Pinned [Topic B], Work [Topic C Renamed], Ungrouped [Topic A].
+    await page.getByRole('button', { name: /^Work/ }).click();
     await expect.poll(getTitles).toEqual(['Topic B', 'Topic C Renamed', 'Topic A']);
     await page.reload({ waitUntil: 'networkidle' });
+    await page.getByRole('button', { name: /^Work/ }).click();
     await expect.poll(getTitles).toEqual(['Topic B', 'Topic C Renamed', 'Topic A']);
 
     // 3. Desktop mouse drag: drag Topic A into Research group, then drag back to ungrouped, and verify!
@@ -145,6 +147,7 @@ test.describe('Topic Organization, Manual Order, Touch Drag, and Batch Operation
       .not.toBeNull();
 
     // Move Topic A back to ungrouped via menu and verify groupId becomes null.
+    await page.getByRole('button', { name: /^Research/ }).click();
     await page.getByRole('button', { name: '更多操作 Topic A' }).click();
     await page.getByRole('menuitem', { name: '移至分组' }).click();
     await page.getByRole('radio', { name: '未分组' }).check();
@@ -314,9 +317,13 @@ test('drags group headers only onto ordinary headers and preserves membership ac
   const names = page.locator('.wb-topic-group__name');
   const titles = page.locator('.wb-topic-row__title');
   const expectedTitles = ['Pinned topic', 'Album review', 'Album notes', 'Ungrouped topic'];
+  await expect(head(a).getByRole('button', { name: /^Albums/ })).toHaveAttribute('aria-expanded', 'false');
+  await expect(head(b).getByRole('button', { name: /^Books/ })).toHaveAttribute('aria-expanded', 'false');
+  await expect(head(c).getByRole('button', { name: /^Cinema/ })).toHaveAttribute('aria-expanded', 'false');
+  await head(a).getByRole('button', { name: /^Albums/ }).click();
   await expect(titles).toHaveText(expectedTitles);
   await head(b).getByRole('button', { name: /^Books/ }).click();
-  await expect(head(b).getByRole('button', { name: /^Books/ })).toHaveAttribute('aria-expanded', 'false');
+  await expect(head(b).getByRole('button', { name: /^Books/ })).toHaveAttribute('aria-expanded', 'true');
   const requests: unknown[] = [];
   page.on('request', req => {
     if (req.url().endsWith('/conversation-groups/reorder')) requests.push(req.postDataJSON());
@@ -338,7 +345,7 @@ test('drags group headers only onto ordinary headers and preserves membership ac
     await page.mouse.up();
   }
   expect(requests).toEqual([]);
-  await expect(head(c).getByRole('button', { name: /^Cinema/ })).toHaveAttribute('aria-expanded', 'true');
+  await expect(head(c).getByRole('button', { name: /^Cinema/ })).toHaveAttribute('aria-expanded', 'false');
   await page.route('**/api/v1/conversation-groups/reorder', route => route.fulfill({ status: 500, json: { message: '分组排序未保存' } }), { times: 1 });
   await move(c, head(b));
   await page.mouse.up();
@@ -357,6 +364,7 @@ test('drags group headers only onto ordinary headers and preserves membership ac
   expect(requests.at(-1)).toEqual({ assistantId: 'default', id: a, beforeId: null });
   await page.reload();
   await expect(names).toHaveText(['Cinema', 'Books', 'Albums']);
+  await head(a).getByRole('button', { name: /^Albums/ }).click();
   await expect(titles).toHaveText(expectedTitles);
   await expect(page.locator('.wb-drag-handle')).toHaveCount(0);
 
@@ -390,10 +398,11 @@ test('drags group headers only onto ordinary headers and preserves membership ac
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchCancel', touchPoints: [] });
     await expect(dst).not.toHaveAttribute('data-group-drop', 'before');
     expect(touchRequests).toEqual([]);
-    await expect(hdr).toHaveAttribute('aria-expanded', 'true');
+    await expect(hdr).toHaveAttribute('aria-expanded', 'false');
     await longPressMove();
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
     await expect(mobile.locator('.wb-topic-group__name')).toHaveText(['Albums', 'Cinema', 'Books']);
+    await hdr.click();
     await expect(mobile.locator('.wb-topic-row__title')).toHaveText(expectedTitles);
   } finally {
     await ctx.close();

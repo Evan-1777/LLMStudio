@@ -37,6 +37,9 @@ func main() {
 	providerStore := store.NewProviderStore(db)
 	assistantStore := store.NewAssistantStore(db)
 	convStore := store.NewConversationStore(db)
+	if _, err := convStore.CleanupEphemeral(ctx); err != nil {
+		log.Printf("cleanup ephemeral conversations: %v", err)
+	}
 	msgStore := store.NewMessageStore(db)
 	searchStore := store.NewSearchConfigStore(db)
 	mcpStore := store.NewMCPServerStore(db)

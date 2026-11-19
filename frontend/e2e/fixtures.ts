@@ -52,6 +52,7 @@ export interface MockUpstreamControl {
   lastAuthHeaders: string[];
   lastChatBodies: Array<Record<string, unknown>>;
   abortedCount: number;
+  firstByteDelayMs: number;
   reset: () => void;
 }
 
@@ -116,11 +117,13 @@ async function startMockUpstream(): Promise<{
     lastAuthHeaders: [],
     lastChatBodies: [],
     abortedCount: 0,
+    firstByteDelayMs: 0,
     reset() {
       this.models = DEFAULT_UPSTREAM_MODELS.map((m) => ({ ...m }));
       this.lastAuthHeaders = [];
       this.lastChatBodies = [];
       this.abortedCount = 0;
+      this.firstByteDelayMs = 0;
     },
   };
 
@@ -188,6 +191,28 @@ async function startMockUpstream(): Promise<{
           }),
         );
         return;
+      }
+
+      if (control.firstByteDelayMs > 0) {
+        const abortedEarly = await new Promise<boolean>((resolve) => {
+          let settled = false;
+          const finish = (aborted: boolean) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            req.off('close', onEarlyClose);
+            res.off('close', onEarlyClose);
+            resolve(aborted);
+          };
+          const onEarlyClose = () => {
+            control.abortedCount += 1;
+            finish(true);
+          };
+          const timer = setTimeout(() => finish(false), control.firstByteDelayMs);
+          req.on('close', onEarlyClose);
+          res.on('close', onEarlyClose);
+        });
+        if (abortedEarly || res.writableEnded) return;
       }
 
       res.writeHead(200, {

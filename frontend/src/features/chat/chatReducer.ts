@@ -43,6 +43,7 @@ export interface ChatState {
   errorMessage: string | null;
   needsReloadAfterAbort: boolean;
   pendingInsertIndex: number | null;
+  pendingRollback: { message: Message; index: number } | null;
   streaming: StreamingDraft | null;
   uiKeyByMsgId: Record<string, string>;
 }
@@ -55,6 +56,7 @@ export const initialChatState: ChatState = {
   errorMessage: null,
   needsReloadAfterAbort: false,
   pendingInsertIndex: null,
+  pendingRollback: null,
   streaming: null,
   uiKeyByMsgId: {},
 };
@@ -163,9 +165,21 @@ export type ChatAction =
   | { type: 'LOAD_SUCCESS'; conversation: Conversation; messages: Message[] }
   | { type: 'LOAD_ERROR'; code: string; message: string }
   | { type: 'UPDATE_CONVERSATION_META'; conversation: Conversation }
-  | { type: 'SEND_PREPARE_START'; optimisticUser: Message }
+  | {
+      type: 'SEND_PREPARE_START';
+      optimisticUser: Message;
+      providerId: string;
+      modelId: string;
+      placeholderAssistantId: string;
+    }
   | { type: 'SEND_PREPARE_FAILED'; optimisticUserId: string; code: string; message: string }
-  | { type: 'REGEN_PREPARE_START' }
+  | {
+      type: 'REGEN_PREPARE_START';
+      targetMessageId: string;
+      providerId: string;
+      modelId: string;
+      placeholderAssistantId: string;
+    }
   | { type: 'REGEN_PREPARE_CONFIRMED'; targetMessageId: string }
   | { type: 'REGEN_PREPARE_FAILED'; code: string; message: string }
   | { type: 'STREAM_EVENT'; event: StreamEvent; fallbackProviderId: string; fallbackModelId: string }
@@ -198,6 +212,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorMessage: null,
         needsReloadAfterAbort: false,
         pendingInsertIndex: null,
+        pendingRollback: null,
         streaming: null,
         uiKeyByMsgId: sameConversation ? state.uiKeyByMsgId : {},
       };
@@ -214,6 +229,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorMessage: rest.errorMessage,
         needsReloadAfterAbort: false,
         pendingInsertIndex: null,
+        pendingRollback: null,
         streaming: null,
         uiKeyByMsgId: {},
       };
@@ -226,6 +242,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorCode: action.code,
         errorMessage: action.message,
         pendingInsertIndex: null,
+        pendingRollback: null,
         streaming: null,
       };
 
@@ -236,12 +253,19 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         messages: [...state.messages, action.optimisticUser],
-        runState: 'loading',
+        runState: 'streaming',
         errorCode: null,
         errorMessage: null,
         needsReloadAfterAbort: false,
         pendingInsertIndex: null,
-        streaming: null,
+        pendingRollback: null,
+        streaming: {
+          messageId: action.placeholderAssistantId,
+          providerId: action.providerId,
+          modelId: action.modelId,
+          blockOrder: [],
+          blocksByIndex: {},
+        },
       };
 
     case 'SEND_PREPARE_FAILED': {
@@ -255,67 +279,90 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorCode: action.code,
         errorMessage: action.message,
         pendingInsertIndex: null,
+        pendingRollback: null,
         streaming: null,
       };
     }
 
-    case 'REGEN_PREPARE_START':
-      return {
-        ...state,
-        runState: 'loading',
-        errorCode: null,
-        errorMessage: null,
-        needsReloadAfterAbort: false,
-        pendingInsertIndex: null,
-        streaming: null,
-      };
-
-    case 'REGEN_PREPARE_CONFIRMED': {
+    case 'REGEN_PREPARE_START': {
       const idx = state.messages.findIndex(
         (m) => m.id === action.targetMessageId,
       );
       if (idx < 0) return state;
+
       const target = state.messages[idx];
+      let nextMessages = state.messages;
+      let insertIndex = idx;
+      let rollback: { message: Message; index: number } | null = null;
+      let nextKeys = state.uiKeyByMsgId;
+
       if (target.role === 'user') {
+        insertIndex = idx + 1;
         const nextMsg = state.messages[idx + 1];
         if (nextMsg && nextMsg.role === 'assistant') {
-          const nextKeys = { ...state.uiKeyByMsgId };
-          delete nextKeys[nextMsg.id];
-          return {
-            ...state,
-            messages: [
-              ...state.messages.slice(0, idx + 1),
-              ...state.messages.slice(idx + 2),
-            ],
-            pendingInsertIndex: idx + 1,
-            uiKeyByMsgId: nextKeys,
-          };
+          rollback = { message: nextMsg, index: idx + 1 };
+          nextMessages = [
+            ...state.messages.slice(0, idx + 1),
+            ...state.messages.slice(idx + 2),
+          ];
+          if (nextMsg.id in nextKeys) {
+            nextKeys = { ...nextKeys };
+            delete nextKeys[nextMsg.id];
+          }
         }
-        return {
-          ...state,
-          pendingInsertIndex: idx + 1,
-        };
-      }
-      const nextKeys = { ...state.uiKeyByMsgId };
-      delete nextKeys[target.id];
-      return {
-        ...state,
-        messages: [
+      } else {
+        rollback = { message: target, index: idx };
+        nextMessages = [
           ...state.messages.slice(0, idx),
           ...state.messages.slice(idx + 1),
-        ],
-        pendingInsertIndex: idx,
+        ];
+        if (target.id in nextKeys) {
+          nextKeys = { ...nextKeys };
+          delete nextKeys[target.id];
+        }
+      }
+
+      return {
+        ...state,
+        messages: nextMessages,
+        runState: 'streaming',
+        errorCode: null,
+        errorMessage: null,
+        needsReloadAfterAbort: false,
+        pendingInsertIndex: insertIndex,
+        pendingRollback: rollback,
+        streaming: {
+          messageId: action.placeholderAssistantId,
+          providerId: action.providerId,
+          modelId: action.modelId,
+          insertIndex,
+          blockOrder: [],
+          blocksByIndex: {},
+        },
         uiKeyByMsgId: nextKeys,
       };
     }
 
+    case 'REGEN_PREPARE_CONFIRMED':
+      return state.pendingRollback === null
+        ? state
+        : { ...state, pendingRollback: null };
+
     case 'REGEN_PREPARE_FAILED':
       return {
         ...state,
+        messages: state.pendingRollback
+          ? insertMessageAt(
+              state.messages,
+              state.pendingRollback.message,
+              state.pendingRollback.index,
+            )
+          : state.messages,
         runState: 'error',
         errorCode: action.code,
         errorMessage: action.message,
         pendingInsertIndex: null,
+        pendingRollback: null,
         streaming: null,
       };
 
@@ -337,15 +384,23 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
       if (ev.type === 'message_start') {
         const draft = ensureDraft();
+        const nextId = ev.messageId || draft.messageId;
+        let nextKeys = state.uiKeyByMsgId;
+        if (state.streaming && nextId !== draft.messageId) {
+          const uiKey =
+            state.uiKeyByMsgId[draft.messageId] ?? draft.messageId;
+          nextKeys = { ...state.uiKeyByMsgId, [nextId]: uiKey };
+        }
         return {
           ...state,
           runState: 'streaming',
           streaming: {
             ...draft,
-            messageId: ev.messageId || draft.messageId,
+            messageId: nextId,
             providerId: ev.providerId || draft.providerId,
             modelId: ev.modelId || draft.modelId,
           },
+          uiKeyByMsgId: nextKeys,
         };
       }
 
@@ -535,19 +590,39 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     }
 
     case 'ABORT_LOCAL': {
+      if (state.pendingRollback) {
+        const restored = insertMessageAt(
+          state.messages,
+          state.pendingRollback.message,
+          state.pendingRollback.index,
+        );
+        const rest = deriveRestState(restored);
+        return {
+          ...state,
+          messages: restored,
+          pendingInsertIndex: null,
+          pendingRollback: null,
+          streaming: null,
+          runState: rest.runState,
+          errorCode: rest.errorCode,
+          errorMessage: rest.errorMessage,
+        };
+      }
       const convId = state.conversation?.id ?? '';
       const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
-      const partial = state.streaming
-        ? materializeStreamingMessage(convId, state.streaming, {
-            stopReason: 'aborted',
-          })
-        : null;
+      const partial =
+        state.streaming && state.streaming.blockOrder.length > 0
+          ? materializeStreamingMessage(convId, state.streaming, {
+              stopReason: 'aborted',
+            })
+          : null;
       return {
         ...state,
         messages: partial
           ? insertMessageAt(state.messages, partial, slotIndex)
           : state.messages,
         pendingInsertIndex: null,
+        pendingRollback: null,
         streaming: null,
         runState: 'aborted',
         errorCode: null,
@@ -626,6 +701,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         errorMessage: rest.errorMessage,
         needsReloadAfterAbort: action.markReloadNeeded ?? false,
         pendingInsertIndex: null,
+        pendingRollback: null,
         streaming: null,
         uiKeyByMsgId: nextKeys,
       };

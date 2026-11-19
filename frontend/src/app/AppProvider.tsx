@@ -99,12 +99,20 @@ export interface AppContextValue {
   }>;
   retryConnection: () => void;
   resources: AppResources;
-  refreshProviders: () => Promise<void>;
+  refreshProviders: () => Promise<boolean>;
   reorderProviders: (id: string, beforeId: string | null) => Promise<void>;
-  refreshAssistants: () => Promise<void>;
-  refreshConversations: () => Promise<void>;
-  refreshPlugins: () => Promise<void>;
+  refreshAssistants: () => Promise<boolean>;
+  refreshConversations: () => Promise<Conversation[] | null>;
+  refreshPlugins: () => Promise<boolean>;
+  refreshPreferences: () => Promise<boolean>;
   refreshAll: () => Promise<void>;
+  syncFromServer: () => Promise<{
+    ok: boolean;
+    conversations?: Conversation[];
+    error?: string;
+  }>;
+  lastSyncedAt: string | null;
+  syncingServer: boolean;
   upsertLocalConversation: (conv: Conversation) => void;
   removeLocalConversation: (id: string) => void;
   cleanupUngroupedConversations: () => Promise<DeletedConversation[] | null>;
@@ -243,6 +251,10 @@ export function AppProvider({
   const [gatewayHealth, setGatewayHealth] = useState<HealthResponse | null>(
     null,
   );
+  const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
+  const [syncingServer, setSyncingServer] = useState(false);
+  const syncInFlightRef = useRef(false);
+  const lastRefreshErrorRef = useRef<string | null>(null);
   const [resources, setResources] = useState<AppResources>(emptyResources);
 
   const [toastState, setToastState] = useState<{
@@ -340,6 +352,16 @@ export function AppProvider({
     [],
   );
 
+  const applyConfirmedPreferences = useCallback((next: AppPreferences) => {
+    settingsRef.current = { ...settingsRef.current, ...next };
+    serverPreferencesRef.current = next;
+    setSettings(settingsRef.current);
+    writeThemeHint(settingsRef.current.gatewayBaseUrl, {
+      themeMode: next.themeMode,
+      seedColorValue: next.seedColorValue,
+    });
+  }, []);
+
   // The gateway owns preference values once its row is initialized. Until then
   // the browser snapshot is the only source, so it seeds the server on first write
   // while still rendering correctly.
@@ -354,7 +376,13 @@ export function AppProvider({
       // A gateway switch while the request was in flight must not apply stale values.
       if (connectionGateway !== settingsRef.current.gatewayBaseUrl) return;
 
-      const { composerReasoningEffort: _, mcpMaxToolRounds: __, ...fallback } = pickAppPreferences(settingsRef.current);
+      const {
+        composerReasoningEffort: _c,
+        mcpMaxToolRounds: _m,
+        chatWidthMode: _w,
+        chatManualWidth: _mw,
+        ...fallback
+      } = pickAppPreferences(settingsRef.current);
       const seed = legacy ?? fallback;
       let resolved = envelope;
       if (!envelope.initialized) {
@@ -370,18 +398,12 @@ export function AppProvider({
       const next = resolved.initialized
         ? normalizeServerPreferences(resolved.preferences)
         : normalizeServerPreferences(seed);
-      settingsRef.current = { ...settingsRef.current, ...next };
-      serverPreferencesRef.current = next;
-      setSettings(settingsRef.current);
-      writeThemeHint(settingsRef.current.gatewayBaseUrl, {
-        themeMode: next.themeMode,
-        seedColorValue: next.seedColorValue,
-      });
+      applyConfirmedPreferences(next);
       if (resolved.initialized) {
         clearLegacyPreferences();
       }
     },
-    [gateway],
+    [applyConfirmedPreferences, gateway],
   );
 
   const applyPreferenceFields = useCallback((values: Partial<AppPreferences>) => {
@@ -458,7 +480,7 @@ export function AppProvider({
 
   const providerOrderRevision = useRef(0);
   const providerReorderEpoch = useRef<number | null>(null);
-  const refreshProviders = useCallback(async () => {
+  const refreshProviders = useCallback(async (): Promise<boolean> => {
     const { epoch, signal, cleanup } = trackSignal();
     const orderRevision = providerOrderRevision.current;
     setResources((prev) => ({
@@ -471,7 +493,7 @@ export function AppProvider({
         gateway.listFormatsAndAdapters(signal),
         gateway.listProviders(signal),
       ]);
-      if (epoch !== epochRef.current) return;
+      if (epoch !== epochRef.current) return false;
       setResources((prev) => ({
         ...prev,
         formats: meta.formats,
@@ -479,22 +501,26 @@ export function AppProvider({
         providers: orderRevision === providerOrderRevision.current ? providers : prev.providers,
         loading: { ...prev.loading, providers: false },
       }));
+      return true;
     } catch (err) {
-      if (epoch !== epochRef.current) return;
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (err instanceof Error && err.name === 'AbortError') return;
+      if (epoch !== epochRef.current) return false;
+      if (err instanceof DOMException && err.name === 'AbortError') return false;
+      if (err instanceof Error && err.name === 'AbortError') return false;
       handleAuthFailureIf401(err, epoch);
+      const message = errorMessageOf(err);
+      lastRefreshErrorRef.current = message;
       setResources((prev) => ({
         ...prev,
         loading: { ...prev.loading, providers: false },
-        error: { ...prev.error, providers: errorMessageOf(err) },
+        error: { ...prev.error, providers: message },
       }));
+      return false;
     } finally {
       cleanup();
     }
   }, [gateway, handleAuthFailureIf401, trackSignal]);
 
-  const refreshAssistants = useCallback(async () => {
+  const refreshAssistants = useCallback(async (): Promise<boolean> => {
     const { epoch, signal, cleanup } = trackSignal();
     setResources((prev) => ({
       ...prev,
@@ -503,29 +529,33 @@ export function AppProvider({
     }));
     try {
       const assistants = await gateway.listAssistants(signal);
-      if (epoch !== epochRef.current) return;
+      if (epoch !== epochRef.current) return false;
       setResources((prev) => ({
         ...prev,
         assistants,
         loading: { ...prev.loading, assistants: false },
       }));
+      return true;
     } catch (err) {
-      if (epoch !== epochRef.current) return;
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (err instanceof Error && err.name === 'AbortError') return;
+      if (epoch !== epochRef.current) return false;
+      if (err instanceof DOMException && err.name === 'AbortError') return false;
+      if (err instanceof Error && err.name === 'AbortError') return false;
       handleAuthFailureIf401(err, epoch);
+      const message = errorMessageOf(err);
+      lastRefreshErrorRef.current = message;
       setResources((prev) => ({
         ...prev,
         loading: { ...prev.loading, assistants: false },
-        error: { ...prev.error, assistants: errorMessageOf(err) },
+        error: { ...prev.error, assistants: message },
       }));
+      return false;
     } finally {
       cleanup();
     }
   }, [gateway, handleAuthFailureIf401, trackSignal]);
 
   const conversationCleanupRevision = useRef(0);
-  const refreshConversations = useCallback(async () => {
+  const refreshConversations = useCallback(async (): Promise<Conversation[] | null> => {
     const { epoch, signal, cleanup } = trackSignal();
     const cleanupRevision = conversationCleanupRevision.current;
     setResources((prev) => ({
@@ -538,29 +568,35 @@ export function AppProvider({
         gateway.listConversations(signal),
         gateway.listConversationGroups(undefined, signal),
       ]);
-      if (epoch !== epochRef.current) return;
+      if (epoch !== epochRef.current) return null;
+      const nextConversations =
+        cleanupRevision === conversationCleanupRevision.current ? conversations : null;
       setResources((prev) => ({
         ...prev,
-        conversations: cleanupRevision === conversationCleanupRevision.current ? conversations : prev.conversations,
+        conversations: nextConversations ?? prev.conversations,
         conversationGroups,
         loading: { ...prev.loading, conversations: false },
       }));
+      return conversations;
     } catch (err) {
-      if (epoch !== epochRef.current) return;
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (err instanceof Error && err.name === 'AbortError') return;
+      if (epoch !== epochRef.current) return null;
+      if (err instanceof DOMException && err.name === 'AbortError') return null;
+      if (err instanceof Error && err.name === 'AbortError') return null;
       handleAuthFailureIf401(err, epoch);
+      const message = errorMessageOf(err);
+      lastRefreshErrorRef.current = message;
       setResources((prev) => ({
         ...prev,
         loading: { ...prev.loading, conversations: false },
-        error: { ...prev.error, conversations: errorMessageOf(err) },
+        error: { ...prev.error, conversations: message },
       }));
+      return null;
     } finally {
       cleanup();
     }
   }, [gateway, handleAuthFailureIf401, trackSignal]);
 
-  const refreshPlugins = useCallback(async () => {
+  const refreshPlugins = useCallback(async (): Promise<boolean> => {
     const { epoch, signal, cleanup } = trackSignal();
     setResources((prev) => ({
       ...prev,
@@ -572,27 +608,54 @@ export function AppProvider({
         gateway.listSearchEngines(signal),
         gateway.listMcpServers(signal),
       ]);
-      if (epoch !== epochRef.current) return;
+      if (epoch !== epochRef.current) return false;
       setResources((prev) => ({
         ...prev,
         searchEngines,
         mcpServers,
         loading: { ...prev.loading, plugins: false },
       }));
+      return true;
     } catch (err) {
-      if (epoch !== epochRef.current) return;
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (err instanceof Error && err.name === 'AbortError') return;
+      if (epoch !== epochRef.current) return false;
+      if (err instanceof DOMException && err.name === 'AbortError') return false;
+      if (err instanceof Error && err.name === 'AbortError') return false;
       handleAuthFailureIf401(err, epoch);
+      const message = errorMessageOf(err);
+      lastRefreshErrorRef.current = message;
       setResources((prev) => ({
         ...prev,
         loading: { ...prev.loading, plugins: false },
-        error: { ...prev.error, plugins: errorMessageOf(err) },
+        error: { ...prev.error, plugins: message },
       }));
+      return false;
     } finally {
       cleanup();
     }
   }, [gateway, handleAuthFailureIf401, trackSignal]);
+
+  const refreshPreferences = useCallback(async (): Promise<boolean> => {
+    const connectionGateway = settingsRef.current.gatewayBaseUrl;
+    const { epoch, signal, cleanup } = trackSignal();
+    try {
+      const envelope = await gateway.getPreferences(signal);
+      if (epoch !== epochRef.current) return false;
+      if (connectionGateway !== settingsRef.current.gatewayBaseUrl) return false;
+      if (envelope.initialized) {
+        applyConfirmedPreferences(normalizeServerPreferences(envelope.preferences));
+      }
+      return true;
+    } catch (err) {
+      if (epoch !== epochRef.current) return false;
+      if (err instanceof DOMException && err.name === 'AbortError') return false;
+      if (err instanceof Error && err.name === 'AbortError') return false;
+      handleAuthFailureIf401(err, epoch);
+      lastRefreshErrorRef.current = errorMessageOf(err);
+      return false;
+    } finally {
+      cleanup();
+    }
+  }, [applyConfirmedPreferences, gateway, handleAuthFailureIf401, trackSignal]);
 
   const refreshAll = useCallback(async () => {
     await Promise.all([
@@ -605,6 +668,49 @@ export function AppProvider({
     refreshAssistants,
     refreshConversations,
     refreshPlugins,
+    refreshProviders,
+  ]);
+
+  const syncFromServer = useCallback(async (): Promise<{
+    ok: boolean;
+    conversations?: Conversation[];
+    error?: string;
+  }> => {
+    if (syncInFlightRef.current) {
+      return { ok: false, error: '正在同步中' };
+    }
+    syncInFlightRef.current = true;
+    setSyncingServer(true);
+    lastRefreshErrorRef.current = null;
+    const startEpoch = epochRef.current;
+    try {
+      const [provOk, asstOk, convs, pluginsOk, prefsOk] = await Promise.all([
+        refreshProviders(),
+        refreshAssistants(),
+        refreshConversations(),
+        refreshPlugins(),
+        refreshPreferences(),
+      ]);
+      if (startEpoch !== epochRef.current) {
+        return { ok: false, error: '连接已切换' };
+      }
+      if (!provOk || !asstOk || convs === null || !pluginsOk || !prefsOk) {
+        return {
+          ok: false,
+          error: lastRefreshErrorRef.current || '同步服务端数据失败',
+        };
+      }
+      setLastSyncedAt(new Date().toISOString());
+      return { ok: true, conversations: convs };
+    } finally {
+      syncInFlightRef.current = false;
+      setSyncingServer(false);
+    }
+  }, [
+    refreshAssistants,
+    refreshConversations,
+    refreshPlugins,
+    refreshPreferences,
     refreshProviders,
   ]);
 
@@ -625,6 +731,7 @@ export function AppProvider({
       setResources(emptyResources());
       setConnectionState('checking');
       setConnectionError(null);
+      setLastSyncedAt(null);
 
       const { signal, cleanup } = trackSignal();
       try {
@@ -644,12 +751,21 @@ export function AppProvider({
         if (nextEpoch !== epochRef.current) return;
 
         setConnectionState('connected');
-        await Promise.all([
+        const [provOk, asstOk, convs, pluginsOk] = await Promise.all([
           refreshProviders(),
           refreshAssistants(),
           refreshConversations(),
           refreshPlugins(),
         ]);
+        if (
+          nextEpoch === epochRef.current &&
+          provOk &&
+          asstOk &&
+          convs !== null &&
+          pluginsOk
+        ) {
+          setLastSyncedAt(new Date().toISOString());
+        }
       } catch (err) {
         if (nextEpoch !== epochRef.current) return;
         if (err instanceof DOMException && err.name === 'AbortError') return;
@@ -740,6 +856,7 @@ export function AppProvider({
   }, [bootstrapConnection, settings.accessToken, settings.gatewayBaseUrl]);
 
   const upsertLocalConversation = useCallback((conv: Conversation) => {
+    if (conv.ephemeral) return;
     setResources((prev) => {
       const idx = prev.conversations.findIndex((c) => c.id === conv.id);
       const next =
@@ -949,7 +1066,11 @@ export function AppProvider({
       refreshAssistants,
       refreshConversations,
       refreshPlugins,
+      refreshPreferences,
       refreshAll,
+      syncFromServer,
+      lastSyncedAt,
+      syncingServer,
       upsertLocalConversation,
       removeLocalConversation,
       cleanupUngroupedConversations,
@@ -985,7 +1106,11 @@ export function AppProvider({
       refreshAssistants,
       refreshConversations,
       refreshPlugins,
+      refreshPreferences,
       refreshAll,
+      syncFromServer,
+      lastSyncedAt,
+      syncingServer,
       upsertLocalConversation,
       removeLocalConversation,
       cleanupUngroupedConversations,

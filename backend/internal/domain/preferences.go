@@ -18,6 +18,15 @@ const (
 	ChatDisplayFeed   = "feed"
 )
 
+// Chat width modes and bounds for user preferences.
+const (
+	ChatWidthDefault       = "default"
+	ChatWidthManual        = "manual"
+	MinChatManualWidth     = 560
+	MaxChatManualWidth     = 3840
+	DefaultChatManualWidth = 780
+)
+
 // DefaultAppleBlue is the default accent color (#007AFF).
 const DefaultAppleBlue = 0x007aff
 
@@ -50,6 +59,8 @@ type Preferences struct {
 	UserAvatarDataURL            string `json:"userAvatarDataUrl"`
 	ComposerReasoningEffort      string `json:"composerReasoningEffort"`
 	MCPMaxToolRounds             int    `json:"mcpMaxToolRounds"`
+	ChatWidthMode                string `json:"chatWidthMode"`
+	ChatManualWidth              int    `json:"chatManualWidth"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -68,6 +79,8 @@ func DefaultPreferences() Preferences {
 		CollapseLineThreshold:        24,
 		CollapseCharThreshold:        1200,
 		MCPMaxToolRounds:             DefaultMCPMaxToolRounds,
+		ChatWidthMode:                ChatWidthDefault,
+		ChatManualWidth:              DefaultChatManualWidth,
 	}
 }
 
@@ -90,6 +103,8 @@ type PreferencesPatch struct {
 	UserAvatarDataURL            *string `json:"userAvatarDataUrl"`
 	ComposerReasoningEffort      *string `json:"composerReasoningEffort"`
 	MCPMaxToolRounds             *int    `json:"mcpMaxToolRounds"`
+	ChatWidthMode                *string `json:"chatWidthMode"`
+	ChatManualWidth              *int    `json:"chatManualWidth"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -140,6 +155,12 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	if p.MCPMaxToolRounds != nil {
 		out.MCPMaxToolRounds = *p.MCPMaxToolRounds
 	}
+	if p.ChatWidthMode != nil {
+		out.ChatWidthMode = *p.ChatWidthMode
+	}
+	if p.ChatManualWidth != nil {
+		out.ChatManualWidth = *p.ChatManualWidth
+	}
 	return out
 }
 
@@ -155,6 +176,10 @@ func (p Preferences) Normalize() Preferences {
 		p.ChatDisplayMode = defaults.ChatDisplayMode
 	}
 	p.ComposerReasoningEffort = strings.ToLower(strings.TrimSpace(p.ComposerReasoningEffort))
+	p.ChatWidthMode = strings.ToLower(strings.TrimSpace(p.ChatWidthMode))
+	if p.ChatWidthMode == "" {
+		p.ChatWidthMode = defaults.ChatWidthMode
+	}
 	return p
 }
 
@@ -186,6 +211,14 @@ func (p Preferences) Validate() error {
 	}
 	if p.MCPMaxToolRounds < MinMCPMaxToolRounds || p.MCPMaxToolRounds > MaxMCPMaxToolRounds {
 		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("mcpMaxToolRounds must be between %d and %d", MinMCPMaxToolRounds, MaxMCPMaxToolRounds), nil)
+	}
+	switch p.ChatWidthMode {
+	case ChatWidthDefault, ChatWidthManual:
+	default:
+		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("unsupported chatWidthMode %q", p.ChatWidthMode), nil)
+	}
+	if p.ChatManualWidth < MinChatManualWidth || p.ChatManualWidth > MaxChatManualWidth {
+		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("chatManualWidth must be between %d and %d", MinChatManualWidth, MaxChatManualWidth), nil)
 	}
 	return ValidateAvatarDataURL(p.UserAvatarDataURL)
 }

@@ -21,9 +21,13 @@ import {
 import {
   REASONING_EFFORT_LEVELS,
   type ContentBlock,
+  type Message,
   type ReasoningEffort,
 } from '../../core/types';
+import type { StreamingDraft } from '../chat/chatReducer';
 import { AttachmentChips } from './AttachmentChips';
+import { ContextUsageRing } from './ContextUsageRing';
+import { computeContextUsage } from './contextUsage';
 import {
   FILE_INPUT_ACCEPT,
   attachmentToContentBlock,
@@ -50,6 +54,10 @@ export function Composer({
   reasoningEffort,
   savingEffort,
   isBusy,
+  messages = [],
+  streaming = null,
+  systemPrompt = '',
+  contextWindow,
   onChangeReasoningEffort,
   onStop,
   onSend,
@@ -59,6 +67,10 @@ export function Composer({
   reasoningEffort: ReasoningEffort;
   savingEffort: boolean;
   isBusy: boolean;
+  messages?: readonly Message[];
+  streaming?: StreamingDraft | null;
+  systemPrompt?: string;
+  contextWindow?: number;
   onChangeReasoningEffort: (effort: ReasoningEffort) => void;
   onStop: () => void;
   onSend: (opts: {
@@ -66,6 +78,8 @@ export function Composer({
     text: string;
     webSearch: boolean;
     searchEngineId?: string;
+    onOptimisticStart: () => void;
+    onPrepareRollback: () => void;
     onAccepted: () => void;
   }) => Promise<boolean>;
 }) {
@@ -84,11 +98,19 @@ export function Composer({
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const attachmentsRef = useRef<PendingAttachment[]>([]);
   attachmentsRef.current = attachments;
+  const pendingSnapshotRef = useRef<PendingAttachment[] | null>(null);
+  const draftVersionRef = useRef(0);
 
   useEffect(() => {
     return () => {
       for (const att of attachmentsRef.current) {
         revokeAttachmentResources(att);
+      }
+      if (pendingSnapshotRef.current) {
+        for (const att of pendingSnapshotRef.current) {
+          revokeAttachmentResources(att);
+        }
+        pendingSnapshotRef.current = null;
       }
     };
   }, []);
@@ -106,6 +128,19 @@ export function Composer({
       enabledEngines[0]
     );
   }, [enabledEngines, selectedEngineId]);
+
+  const contextUsage = useMemo(
+    () =>
+      computeContextUsage({
+        messages,
+        streaming,
+        systemPrompt,
+        draft,
+        attachments,
+        contextWindow,
+      }),
+    [attachments, contextWindow, draft, messages, streaming, systemPrompt],
+  );
 
   const readyAttachments = attachments.filter((a) => a.status === 'ready');
   const hasReading = attachments.some((a) => a.status === 'reading');
@@ -141,6 +176,7 @@ export function Composer({
       );
     }
     if (added.length === 0) return;
+    draftVersionRef.current += 1;
     setAttachments((prev) => [...prev, ...added]);
     setBodyError(null);
   };
@@ -166,6 +202,7 @@ export function Composer({
   const handleRemoveAttachment = (id: string) => {
     const target = attachmentsRef.current.find((a) => a.id === id);
     if (target) revokeAttachmentResources(target);
+    draftVersionRef.current += 1;
     setAttachments((prev) => prev.filter((a) => a.id !== id));
     setBodyError(null);
   };
@@ -201,6 +238,10 @@ export function Composer({
       return;
     }
 
+    const submitVersion = draftVersionRef.current;
+    const snapshotDraft = draft;
+    const snapshotAttachments = attachments;
+
     setSubmitting(true);
     try {
       await onSend({
@@ -208,15 +249,31 @@ export function Composer({
         text: trimmed,
         webSearch: Boolean(webSearch && activeEngine),
         searchEngineId: activeEngine?.engineId,
-        onAccepted: () => {
-          for (const att of attachmentsRef.current) {
-            revokeAttachmentResources(att);
-          }
+        onOptimisticStart: () => {
+          pendingSnapshotRef.current = snapshotAttachments;
           setDraft('');
           setAttachments([]);
           setBodyError(null);
           if (textareaRef.current) {
             textareaRef.current.style.height = '40px';
+          }
+        },
+        onPrepareRollback: () => {
+          pendingSnapshotRef.current = null;
+          if (draftVersionRef.current === submitVersion) {
+            setDraft(snapshotDraft);
+            setAttachments(snapshotAttachments);
+            window.requestAnimationFrame(() => adjustHeight());
+          } else {
+            for (const att of snapshotAttachments) {
+              revokeAttachmentResources(att);
+            }
+          }
+        },
+        onAccepted: () => {
+          pendingSnapshotRef.current = null;
+          for (const att of snapshotAttachments) {
+            revokeAttachmentResources(att);
           }
         },
       });
@@ -284,6 +341,7 @@ export function Composer({
           rows={1}
           value={draft}
           onChange={(e) => {
+            draftVersionRef.current += 1;
             setDraft(e.target.value);
             adjustHeight();
           }}
@@ -444,27 +502,30 @@ export function Composer({
             onChange={handleFileChange}
           />
 
-          {isBusy ? (
-            <button
-              type="button"
-              className="wb-send-btn wb-send-btn--stop"
-              aria-label="停止生成"
-              title="停止生成"
-              onClick={onStop}
-            >
-              <Icon name="stop" size={14} />
-            </button>
-          ) : (
-            <button
-              type="submit"
-              className="wb-send-btn"
-              aria-label="发送消息"
-              title="发送消息"
-              disabled={!canSend}
-            >
-              <Icon name="arrowUp" size={16} />
-            </button>
-          )}
+          <div className="wb-composer__right">
+            <ContextUsageRing usage={contextUsage} />
+            {isBusy ? (
+              <button
+                type="button"
+                className="wb-send-btn wb-send-btn--stop"
+                aria-label="停止生成"
+                title="停止生成"
+                onClick={onStop}
+              >
+                <Icon name="stop" size={14} />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                className="wb-send-btn"
+                aria-label="发送消息"
+                title="发送消息"
+                disabled={!canSend}
+              >
+                <Icon name="arrowUp" size={16} />
+              </button>
+            )}
+          </div>
         </div>
       </form>
     </div>

@@ -1,4 +1,4 @@
-import { isReasoningEffort, type ReasoningEffort, type ServerPreferencesImport } from './types';
+import { isReasoningEffort, type ChatWidthMode, type ReasoningEffort, type ServerPreferencesImport } from './types';
 
 // Legacy single-blob key: pre-migration browser state, removed once the gateway
 // confirms the import (or already holds server-owned preferences).
@@ -82,6 +82,11 @@ export function writeThemeHint(
 
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type ChatDisplayMode = 'bubble' | 'feed';
+export type { ChatWidthMode };
+
+export const CHAT_WIDTH_MIN = 560;
+export const CHAT_WIDTH_MAX = 3840;
+export const CHAT_WIDTH_DEFAULT = 780;
 
 export const DEFAULT_APPLE_BLUE = 0x007aff;
 
@@ -120,6 +125,8 @@ export interface AppSettings {
   userAvatarDataUrl: string;
   composerReasoningEffort: ReasoningEffort | '';
   mcpMaxToolRounds: number;
+  chatWidthMode: ChatWidthMode;
+  chatManualWidth: number;
 }
 
 export interface SettingsLoadResult {
@@ -152,6 +159,8 @@ export const APP_PREFERENCE_KEYS = [
   'userAvatarDataUrl',
   'composerReasoningEffort',
   'mcpMaxToolRounds',
+  'chatWidthMode',
+  'chatManualWidth',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -175,6 +184,8 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     userAvatarDataUrl: settings.userAvatarDataUrl,
     composerReasoningEffort: settings.composerReasoningEffort,
     mcpMaxToolRounds: settings.mcpMaxToolRounds,
+    chatWidthMode: settings.chatWidthMode,
+    chatManualWidth: settings.chatManualWidth,
   };
 }
 
@@ -202,6 +213,8 @@ export function defaultSettings(): AppSettings {
     userAvatarDataUrl: '',
     composerReasoningEffort: '',
     mcpMaxToolRounds: 20,
+    chatWidthMode: 'default',
+    chatManualWidth: CHAT_WIDTH_DEFAULT,
   };
 }
 
@@ -243,6 +256,9 @@ export function normalizeSettings(raw: unknown): AppSettings {
     obj.chatDisplayMode === 'feed' || obj.chatDisplayMode === 'bubble'
       ? obj.chatDisplayMode
       : defaults.chatDisplayMode;
+
+  const chatWidthMode: ChatWidthMode =
+    obj.chatWidthMode === 'manual' ? 'manual' : 'default';
 
   return {
     gatewayBaseUrl: rawUrl || defaults.gatewayBaseUrl,
@@ -297,6 +313,13 @@ export function normalizeSettings(raw: unknown): AppSettings {
       typeof obj.userAvatarDataUrl === 'string'
         ? obj.userAvatarDataUrl
         : defaults.userAvatarDataUrl,
+    chatWidthMode,
+    chatManualWidth: clampInt(
+      obj.chatManualWidth,
+      CHAT_WIDTH_MIN,
+      CHAT_WIDTH_MAX,
+      defaults.chatManualWidth,
+    ),
   };
 }
 
@@ -485,12 +508,24 @@ export function readLegacyPreferences(
   try {
     const raw = storage.getItem(SETTINGS_STORAGE_KEY);
     if (raw) {
-      const { composerReasoningEffort: _, mcpMaxToolRounds: __, ...legacy } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
+      const {
+        composerReasoningEffort: _c,
+        mcpMaxToolRounds: _m,
+        chatWidthMode: _w,
+        chatManualWidth: _mw,
+        ...legacy
+      } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
       return legacy;
     }
     const flutterRaw = storage.getItem(LEGACY_FLUTTER_SETTINGS_KEY);
     if (flutterRaw) {
-      const { composerReasoningEffort: _, mcpMaxToolRounds: __, ...legacy } = pickAppPreferences(
+      const {
+        composerReasoningEffort: _c,
+        mcpMaxToolRounds: _m,
+        chatWidthMode: _w,
+        chatManualWidth: _mw,
+        ...legacy
+      } = pickAppPreferences(
         normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),
       );
       return legacy;

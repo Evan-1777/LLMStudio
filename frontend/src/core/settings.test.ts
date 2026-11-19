@@ -58,6 +58,8 @@ describe('settings storage and migration', () => {
       userAvatarDataUrl: '',
       composerReasoningEffort: '',
       mcpMaxToolRounds: 20,
+      chatWidthMode: 'default',
+      chatManualWidth: 780,
     });
 
     expect(defaultSettings()).toMatchObject({
@@ -156,6 +158,8 @@ describe('settings storage and migration', () => {
 
     expect(readLegacyPreferences()).not.toHaveProperty('composerReasoningEffort');
     expect(readLegacyPreferences()).not.toHaveProperty('mcpMaxToolRounds');
+    expect(readLegacyPreferences()).not.toHaveProperty('chatWidthMode');
+    expect(readLegacyPreferences()).not.toHaveProperty('chatManualWidth');
 
     clearLegacyPreferences();
     expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).toBeNull();
@@ -212,5 +216,18 @@ describe('settings storage and migration', () => {
     const failSave = saveSettings(defaultSettings(), throwingWriteStorage);
     expect(failSave.persisted).toBe(false);
     expect(failSave.notice).toBeTruthy();
+  });
+
+  it('normalizes chatWidthMode and clamps chatManualWidth within bounds', () => {
+    expect(defaultSettings().chatWidthMode).toBe('default');
+    expect(defaultSettings().chatManualWidth).toBe(780);
+
+    const low = normalizeSettings({ chatWidthMode: 'manual', chatManualWidth: 200 });
+    expect(low.chatWidthMode).toBe('manual');
+    expect(low.chatManualWidth).toBe(560);
+
+    const high = normalizeSettings({ chatWidthMode: 'wide', chatManualWidth: 9999 });
+    expect(high.chatWidthMode).toBe('default');
+    expect(high.chatManualWidth).toBe(3840);
   });
 });

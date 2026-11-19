@@ -668,6 +668,18 @@ export class GatewayClient {
     );
   }
 
+  deleteConversationKeepalive(id: string): void {
+    const url = resolveGatewayUrl(
+      this.baseUrl,
+      `/api/v1/conversations/${encodeURIComponent(id)}`,
+    );
+    void this.fetchImpl(url, {
+      method: 'DELETE',
+      headers: this.buildHeaders(false, true),
+      keepalive: true,
+    }).catch(() => {});
+  }
+
   cleanupUngroupedConversations(signal?: AbortSignal): Promise<DeletedConversation[]> {
     return this.requestJson<{ deleted: DeletedConversation[] }>(
       'POST', '/api/v1/conversations/cleanup-ungrouped', { signal },

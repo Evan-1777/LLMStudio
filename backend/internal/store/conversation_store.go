@@ -24,7 +24,7 @@ func NewConversationStore(db *sql.DB) *ConversationStore {
 const conversationSelectCols = `
 	c.id, c.assistant_id, c.title, c.provider_id, c.model_id, c.system_prompt, c.params_json,
 	c.sync_enabled, c.sync_state, c.sync_version, c.last_synced_at, c.created_at, c.updated_at,
-	c.group_id, c.pinned, c.sort_order
+	c.group_id, c.pinned, c.sort_order, c.ephemeral
 `
 
 const conversationOrderByClause = `
@@ -44,6 +44,7 @@ func (s *ConversationStore) List(ctx context.Context) ([]domain.Conversation, er
 		SELECT `+conversationSelectCols+`
 		FROM conversations c
 		LEFT JOIN conversation_groups g ON c.group_id = g.id
+		WHERE c.ephemeral = 0
 	`+conversationOrderByClause)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations: %w", err)
@@ -70,7 +71,7 @@ func (s *ConversationStore) ListByAssistant(ctx context.Context, assistantID str
 		SELECT `+conversationSelectCols+`
 		FROM conversations c
 		LEFT JOIN conversation_groups g ON c.group_id = g.id
-		WHERE c.assistant_id = ?
+		WHERE c.assistant_id = ? AND c.ephemeral = 0
 	`+conversationOrderByClause, assistantID)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations by assistant %s: %w", assistantID, err)
@@ -169,11 +170,11 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 		INSERT INTO conversations (
 			id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
 			sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at,
-			group_id, pinned, sort_order
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			group_id, pinned, sort_order, ephemeral
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, c.ID, c.AssistantID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes),
 		boolToInt(c.SyncEnabled), c.SyncState, c.SyncVersion, lastSynced, formatTime(c.CreatedAt), formatTime(c.UpdatedAt),
-		groupID, boolToInt(c.Pinned), c.SortOrder)
+		groupID, boolToInt(c.Pinned), c.SortOrder, boolToInt(c.Ephemeral))
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("create conversation: %w", err)
 	}
@@ -241,27 +242,42 @@ func (s *ConversationStore) Delete(ctx context.Context, id string) error {
 	return nil
 }
 
+// CleanupEphemeral removes all ephemeral conversations; SQLite ON DELETE CASCADE removes child messages.
+func (s *ConversationStore) CleanupEphemeral(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM conversations WHERE ephemeral = 1`)
+	if err != nil {
+		return 0, fmt.Errorf("cleanup ephemeral conversations: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("rows affected cleanup ephemeral conversations: %w", err)
+	}
+	return affected, nil
+}
+
 func scanConversation(row rowScanner) (domain.Conversation, error) {
 	var (
-		c           domain.Conversation
-		paramsJSON  string
-		syncEnabled int
-		lastSynced  sql.NullString
-		createdRaw  string
-		updatedRaw  string
-		groupID     sql.NullString
-		pinnedInt   int
+		c            domain.Conversation
+		paramsJSON   string
+		syncEnabled  int
+		lastSynced   sql.NullString
+		createdRaw   string
+		updatedRaw   string
+		groupID      sql.NullString
+		pinnedInt    int
+		ephemeralInt int
 	)
 	if err := row.Scan(
 		&c.ID, &c.AssistantID, &c.Title, &c.ProviderID, &c.ModelID, &c.SystemPrompt, &paramsJSON,
 		&syncEnabled, &c.SyncState, &c.SyncVersion, &lastSynced, &createdRaw, &updatedRaw,
-		&groupID, &pinnedInt, &c.SortOrder,
+		&groupID, &pinnedInt, &c.SortOrder, &ephemeralInt,
 	); err != nil {
 		return domain.Conversation{}, err
 	}
 	domain.NewConversationDefaults(&c)
 	c.SyncEnabled = syncEnabled != 0
 	c.Pinned = pinnedInt != 0
+	c.Ephemeral = ephemeralInt != 0
 	if groupID.Valid && groupID.String != "" {
 		gid := groupID.String
 		c.GroupID = &gid

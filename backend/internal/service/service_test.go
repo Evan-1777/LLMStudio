@@ -544,3 +544,45 @@ func TestConversationGroupsBatchAndReorder(t *testing.T) {
 	}
 	_ = g2Res
 }
+
+func TestPreferenceImportLegacyIgnoresMissingWidthAndEphemeralCreate(t *testing.T) {
+	ctx := context.Background()
+	_, _, convSvc, _, chatSvc, msgStore := setupServiceTestEnv(t)
+
+	// Legacy payload without chatWidthMode/chatManualWidth (0 value) still imports cleanly.
+	legacy := domain.DefaultPreferences()
+	legacy.ThemeMode = domain.ThemeModeDark
+	legacy.ChatWidthMode = ""
+	legacy.ChatManualWidth = 0
+	imported, initialized, err := chatSvc.preferences.ImportLegacy(ctx, legacy)
+	if err != nil || !initialized {
+		t.Fatalf("import legacy without width fields: err=%v initialized=%v", err, initialized)
+	}
+	if imported.ChatWidthMode != domain.ChatWidthDefault || imported.ChatManualWidth != domain.DefaultChatManualWidth {
+		t.Fatalf("expected default width preserved on legacy import, got %+v", imported)
+	}
+
+	// Ephemeral conversation stays hidden from list while branch creates a persistent copy.
+	tempConv, err := convSvc.Create(ctx, CreateConversationInput{
+		Title:     "Ephemeral",
+		Ephemeral: true,
+	})
+	if err != nil || !tempConv.Ephemeral {
+		t.Fatalf("create ephemeral: err=%v conv=%+v", err, tempConv)
+	}
+	m, err := msgStore.Create(ctx, domain.Message{
+		ConversationID: tempConv.ID,
+		Role:           domain.RoleUser,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("add msg to ephemeral: %v", err)
+	}
+	branched, err := convSvc.BranchFromMessage(ctx, tempConv.ID, m.ID)
+	if err != nil {
+		t.Fatalf("branch from ephemeral: %v", err)
+	}
+	if branched.Conversation.Ephemeral {
+		t.Fatalf("expected branched conversation to be non-ephemeral: %+v", branched.Conversation)
+	}
+}

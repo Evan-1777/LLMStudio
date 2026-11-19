@@ -58,6 +58,7 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
         await right.click();
       }
       await expect(history).toBeVisible();
+      await page.getByRole('button', { name: /^工作记录/ }).click();
       await expect(page.getByRole('button', { name: new RegExp('^' + titles[1]) })).toBeVisible();
       if (width < 768) {
         await page.getByRole('button', { name: '管理话题' }).click();

@@ -56,7 +56,8 @@ export type IconName =
   | 'checkSquare'
   | 'download'
   | 'undo'
-  | 'token';
+  | 'token'
+  | 'temporaryChat';
 
 const ICON_BODIES: Record<IconName, ReactNode> = {
   plus: (
@@ -398,6 +399,12 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
     </>
   ),
   token: <path d="M5 6h14M12 6v13" />,
+  temporaryChat: (
+    <path
+      d="M21 12a8.5 8.5 0 0 1-12.5 7.5L4 21l1.4-4.2A8.5 8.5 0 1 1 21 12Z"
+      strokeDasharray="3 2.5"
+    />
+  ),
   checkSquare: (
     <>
       <rect x="3" y="3" width="18" height="18" rx="3" />

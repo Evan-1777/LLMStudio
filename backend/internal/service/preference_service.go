@@ -29,7 +29,7 @@ func (s *PreferenceService) Update(ctx context.Context, patch domain.Preferences
 }
 
 // ImportLegacy seeds preferences from legacy browser storage exactly once.
-// The legacy payload cannot set the avatar, composer reasoning or MCP round limit.
+// The legacy payload cannot set the avatar, composer reasoning, MCP round limit, or chat width settings.
 func (s *PreferenceService) ImportLegacy(ctx context.Context, input domain.Preferences) (domain.Preferences, bool, error) {
 	input.UserAvatarDataURL = ""
 	return s.store.Update(ctx, fullPatch(input.Normalize()), true, validatePreferences)

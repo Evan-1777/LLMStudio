@@ -42,6 +42,7 @@ test('cleans ungrouped topics across assistants and repairs only a deleted retur
   await page.goto(`${appUrl}/chat/${keeper}`);
   await expect(page.getByRole('button', { name: /^Pinned notes/ })).toHaveAttribute('aria-current', 'true');
   await expect(page.getByRole('button', { name: /^Reference/ })).toBeVisible();
+  await page.getByRole('button', { name: /^Reference/ }).click();
   await expect(page.getByRole('button', { name: /^Filed notes/ })).toBeVisible();
   await expect(page.getByRole('button', { name: /^Discard another draft/ })).toHaveCount(0);
   await openStorage();

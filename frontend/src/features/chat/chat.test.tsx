@@ -43,6 +43,9 @@ describe('chatReducer and ChatProvider', () => {
         blocks: [{ type: 'text', text: 'hi' }],
         createdAt: '2026-11-17T00:00:00Z',
       },
+      providerId: 'openai',
+      modelId: 'gpt-4.1',
+      placeholderAssistantId: 'local-a1',
     });
 
     s = chatReducer(s, {
@@ -421,7 +424,13 @@ describe('chatReducer and ChatProvider', () => {
       conversation: makeConv('c1'),
       messages: msgs,
     });
-    s = chatReducer(s, { type: 'REGEN_PREPARE_START' });
+    s = chatReducer(s, {
+      type: 'REGEN_PREPARE_START',
+      targetMessageId: 'u1',
+      providerId: 'p1',
+      modelId: 'm1',
+      placeholderAssistantId: 'local-a1-new',
+    });
     s = chatReducer(s, { type: 'REGEN_PREPARE_CONFIRMED', targetMessageId: 'u1' });
     expect(s.messages.map((m) => m.id)).toEqual(['u1', 'u2', 'a2']);
     expect(s.pendingInsertIndex).toBe(1);
@@ -1626,5 +1635,77 @@ describe('chatReducer and ChatProvider', () => {
     fireEvent.pointerDown(screen.getByText('Cached reply'), { pointerType: 'touch' });
     fireEvent.click(screen.getByText('Cached reply'));
     expect(trigger).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('mounts 0ms waiting placeholders, preserves uiKey on message_start, and restores pendingRollback on failed or aborted regen', () => {
+    const msgs: Message[] = [
+      { id: 'u1', conversationId: 'c1', role: 'user', blocks: [{ type: 'text', text: 'Q1' }], createdAt: '2026-11-19T10:00:00Z' },
+      { id: 'a1', conversationId: 'c1', role: 'assistant', blocks: [{ type: 'text', text: 'Old A1' }], stopReason: 'stop', createdAt: '2026-11-19T10:01:00Z' },
+    ];
+
+    let s = chatReducer(initialChatState, {
+      type: 'LOAD_SUCCESS',
+      conversation: makeConv('c1'),
+      messages: msgs,
+    });
+
+    // SEND_PREPARE_START immediately mounts waiting placeholder and STREAM_EVENT message_start preserves uiKey.
+    s = chatReducer(s, {
+      type: 'SEND_PREPARE_START',
+      optimisticUser: {
+        id: 'local-u2',
+        conversationId: 'c1',
+        role: 'user',
+        blocks: [{ type: 'text', text: 'Q2' }],
+        createdAt: '2026-11-19T10:02:00Z',
+      },
+      providerId: 'openai',
+      modelId: 'gpt-4.1',
+      placeholderAssistantId: 'local-a2',
+    });
+    expect(s.runState).toBe('streaming');
+    expect(s.streaming?.messageId).toBe('local-a2');
+
+    s = chatReducer(s, {
+      type: 'STREAM_EVENT',
+      fallbackProviderId: 'openai',
+      fallbackModelId: 'gpt-4.1',
+      event: { type: 'message_start', messageId: 'server-a2' },
+    });
+    expect(s.uiKeyByMsgId['server-a2']).toBe('local-a2');
+
+    // Regen prepare failure restores pendingRollback in original slot.
+    let r = chatReducer(initialChatState, {
+      type: 'LOAD_SUCCESS',
+      conversation: makeConv('c1'),
+      messages: msgs,
+    });
+    r = chatReducer(r, {
+      type: 'REGEN_PREPARE_START',
+      targetMessageId: 'a1',
+      providerId: 'openai',
+      modelId: 'gpt-4.1',
+      placeholderAssistantId: 'local-regen',
+    });
+    expect(r.runState).toBe('streaming');
+    expect(r.messages.map((m) => m.id)).toEqual(['u1']);
+    expect(r.pendingRollback).toMatchObject({ index: 1, message: { id: 'a1' } });
+    expect(r.streaming?.messageId).toBe('local-regen');
+
+    const failed = chatReducer(r, {
+      type: 'REGEN_PREPARE_FAILED',
+      code: 'UPSTREAM_ERROR',
+      message: 'failed',
+    });
+    expect(failed.runState).toBe('error');
+    expect(failed.pendingRollback).toBeNull();
+    expect(failed.messages.map((m) => m.id)).toEqual(['u1', 'a1']);
+
+    // Pre-confirm ABORT_LOCAL restores pendingRollback back to idle without leaving empty placeholder.
+    const aborted = chatReducer(r, { type: 'ABORT_LOCAL' });
+    expect(aborted.runState).toBe('idle');
+    expect(aborted.pendingRollback).toBeNull();
+    expect(aborted.streaming).toBeNull();
+    expect(aborted.messages.map((m) => m.id)).toEqual(['u1', 'a1']);
   });
 });

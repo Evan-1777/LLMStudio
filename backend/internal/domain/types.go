@@ -388,6 +388,7 @@ type Conversation struct {
 	GroupID      *string          `json:"groupId"`
 	Pinned       bool             `json:"pinned"`
 	SortOrder    int              `json:"sortOrder"`
+	Ephemeral    bool             `json:"ephemeral,omitempty"`
 	SyncEnabled  bool             `json:"syncEnabled"`
 	SyncState    string           `json:"syncState"`
 	SyncVersion  int64            `json:"syncVersion"`

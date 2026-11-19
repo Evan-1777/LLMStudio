@@ -236,6 +236,19 @@ export function AppearancePage() {
             </div>
 
             <div className="st-row--inline">
+              <span className="st-row__label--plain">手动调整对话宽度</span>
+              <Switch
+                checked={settings.chatWidthMode === 'manual'}
+                label="手动调整对话宽度"
+                onCheckedChange={(checked) =>
+                  void updatePreferences({
+                    chatWidthMode: checked ? 'manual' : 'default',
+                  })
+                }
+              />
+            </div>
+
+            <div className="st-row--inline">
               <span className="st-row__label--plain">可视化功能渲染</span>
               <Switch
                 checked={settings.visualHtmlRender}

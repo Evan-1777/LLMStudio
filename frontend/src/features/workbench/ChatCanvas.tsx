@@ -85,6 +85,7 @@ export function ChatCanvas({
   assistant,
   providers = [],
   hasConversationId,
+  isTemporary = false,
   onUpdateMessage,
   onRetryMessage,
   onDeleteMessage,
@@ -96,6 +97,7 @@ export function ChatCanvas({
   assistant: Assistant;
   providers?: readonly ProviderConfig[];
   hasConversationId: boolean;
+  isTemporary?: boolean;
   onUpdateMessage: (messageId: string, blocks: ContentBlock[]) => Promise<boolean>;
   onRetryMessage: (message: Message) => Promise<boolean>;
   onDeleteMessage: (message: Message) => Promise<boolean>;
@@ -117,15 +119,15 @@ export function ChatCanvas({
   const isBusy = savingEdit || state.runState === 'loading' || state.runState === 'streaming';
 
   const visibleMessages = useMemo(() => {
-    if (!state.streaming || !state.conversation) {
+    if (!state.streaming) {
       return state.messages;
     }
     return insertMessageAt(
       state.messages,
-      materializeStreamingMessage(state.conversation.id, state.streaming),
+      materializeStreamingMessage(state.conversation?.id ?? '', state.streaming),
       state.streaming.insertIndex,
     );
-  }, [state.conversation, state.messages, state.streaming]);
+  }, [state.conversation?.id, state.messages, state.streaming]);
 
   const streamingBlockCompleted = useMemo(() => {
     if (!state.streaming) return undefined;
@@ -292,7 +294,7 @@ export function ChatCanvas({
       onScroll={handleScroll}
     >
       <div className="wb-chat-inner" data-display-mode={displayMode}>
-        {state.runState === 'loading' && visibleMessages.length > 0 ? (
+        {state.runState === 'loading' && !state.streaming && visibleMessages.length > 0 ? (
           <div className="wb-refresh-status">
             <LoadingSpinner size="sm" label="正在刷新" />
           </div>
@@ -327,6 +329,9 @@ export function ChatCanvas({
                 className="ui-avatar--lg"
               />
               <h2 className="wb-empty-focus__title">{assistant.name}</h2>
+              {isTemporary ? (
+                <span className="wb-temp-badge">临时会话</span>
+              ) : null}
             </div>
           )
         ) : (
@@ -370,7 +375,7 @@ export function ChatCanvas({
                       {isEditingThis ? (
                         renderInlineEditor(msg)
                       ) : isStreamingThis && msg.blocks.length === 0 ? (
-                        <LoadingSpinner />
+                        <LoadingSpinner size="sm" label="等待响应" />
                       ) : (
                         <ContentRenderer
                           messageId={msg.id}
@@ -476,7 +481,7 @@ export function ChatCanvas({
                   {isEditingThis ? (
                     renderInlineEditor(msg)
                   ) : isStreamingThis && msg.blocks.length === 0 ? (
-                    <LoadingSpinner />
+                    <LoadingSpinner size="sm" label="等待响应" />
                   ) : (
                     <ContentRenderer
                       messageId={msg.id}

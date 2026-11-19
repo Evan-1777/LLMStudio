@@ -287,7 +287,7 @@ func (s *ConversationStore) listByAssistantTx(ctx context.Context, tx *sql.Tx, a
 		SELECT `+conversationSelectCols+`
 		FROM conversations c
 		LEFT JOIN conversation_groups g ON c.group_id = g.id
-		WHERE c.assistant_id = ?
+		WHERE c.assistant_id = ? AND c.ephemeral = 0
 	`+conversationOrderByClause, assistantID)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations in tx: %w", err)
@@ -364,7 +364,7 @@ func (s *ConversationStore) CleanupUngrouped(ctx context.Context) ([]domain.Dele
 	}
 	defer tx.Rollback()
 	rows, err := tx.QueryContext(ctx, `DELETE FROM conversations
-   WHERE group_id IS NULL AND pinned = 0 RETURNING id, assistant_id`)
+   WHERE group_id IS NULL AND pinned = 0 AND ephemeral = 0 RETURNING id, assistant_id`)
 	if err != nil {
 		return nil, fmt.Errorf("cleanup ungrouped conversations: %w", err)
 	}

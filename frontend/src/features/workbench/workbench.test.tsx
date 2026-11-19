@@ -16,6 +16,7 @@ import {
   revokeAttachmentResources,
 } from './attachments';
 import { WorkbenchPage } from './WorkbenchPage';
+import { AppearancePage } from '../settings/AppearancePage';
 import * as imageCompression from './imageCompression';
 
 function makeWorkbenchFetch(enterToSend?: boolean) {
@@ -1109,12 +1110,17 @@ describe('Workbench flows and attachments', () => {
     const pinned = screen.getByRole('checkbox', { name: '选择分区 置顶' });
     const empty = screen.getByRole('checkbox', { name: '选择分区 Empty' });
     const workTitle = screen.getByRole('button', { name: /^Work/ });
+    const otherTitle = screen.getByRole('button', { name: /^Other/ });
+    expect(workTitle).toHaveAttribute('aria-expanded', 'false');
+    expect(otherTitle).toHaveAttribute('aria-expanded', 'false');
     expect(empty).toBeDisabled();
     await user.click(work); // Clear only this group's two selected topics.
+    await user.click(otherTitle);
     await user.click(screen.getByRole('checkbox', { name: '选择 Beta Note' }));
     expect(other).toBeChecked();
     expect(work).not.toBeChecked();
     expect(work).not.toBePartiallyChecked();
+    await user.click(workTitle);
     await user.click(screen.getByRole('checkbox', { name: '选择 Alpha Plan' }));
     expect(work).toBePartiallyChecked();
     work.focus();
@@ -1154,5 +1160,285 @@ describe('Workbench flows and attachments', () => {
     fireEvent.keyDown(window, { key: 'Escape' });
     await waitFor(() => expect(screen.queryByRole('region', { name: '批量管理' })).not.toBeInTheDocument());
     expect(screen.getByRole('button', { name: '管理话题' })).toBeVisible();
+  });
+
+  it('supports temporary session lifecycle, footer server sync, and manual chat width toggle', async () => {
+    let remoteSynced = false;
+    let currentWidthMode: 'default' | 'manual' = 'default';
+    const deletedIds: string[] = [];
+    const createdPayloads: Array<Record<string, unknown>> = [];
+
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const bodyStr = typeof init?.body === 'string' ? init.body : undefined;
+
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.0', authRequired: false }));
+      }
+      if (url.endsWith('/api/v1/settings') && method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            preferences: { ...defaultAppPreferences(), chatWidthMode: currentWidthMode },
+            initialized: true,
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/settings') && method === 'PATCH') {
+        const patch = JSON.parse(bodyStr ?? '{}') as { chatWidthMode?: 'default' | 'manual' };
+        if (patch.chatWidthMode) currentWidthMode = patch.chatWidthMode;
+        return new Response(
+          JSON.stringify({
+            preferences: { ...defaultAppPreferences(), chatWidthMode: currentWidthMode },
+            initialized: true,
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [] }));
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(
+          JSON.stringify({
+            providers: [
+              {
+                id: 'openai',
+                name: 'OpenAI',
+                adapter: 'generic-http',
+                baseURL: 'https://api.openai.com/v1',
+                authType: 'bearer',
+                apiKeyMasked: 'sk-1...2',
+                apiKeySet: true,
+                models: [{ id: 'gpt-4.1', name: 'GPT-4.1', apiFormat: 'openai-responses', contextWindow: 10000 }],
+                enabled: true,
+                builtIn: true,
+              },
+            ],
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return new Response(
+          JSON.stringify({
+            assistants: [{ id: 'default', name: '默认助手', params: {}, isDefault: true }],
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/conversations') && method === 'GET') {
+        const list = [
+          {
+            id: 'c1',
+            assistantId: 'default',
+            title: '原有话题',
+            providerId: 'openai',
+            modelId: 'gpt-4.1',
+            params: {},
+            syncEnabled: false,
+            syncState: 'local_only',
+            syncVersion: 0,
+            createdAt: '2026-11-19T08:00:00Z',
+            updatedAt: '2026-11-19T08:00:00Z',
+          },
+          ...(remoteSynced
+            ? [
+                {
+                  id: 'c-remote',
+                  assistantId: 'default',
+                  title: '他端新增话题',
+                  providerId: 'openai',
+                  modelId: 'gpt-4.1',
+                  params: {},
+                  syncEnabled: false,
+                  syncState: 'local_only',
+                  syncVersion: 0,
+                  createdAt: '2026-11-19T09:00:00Z',
+                  updatedAt: '2026-11-19T09:00:00Z',
+                },
+              ]
+            : []),
+        ];
+        return new Response(JSON.stringify({ conversations: list }));
+      }
+      if (url.endsWith('/api/v1/conversation-groups')) {
+        return new Response(JSON.stringify({ groups: [] }));
+      }
+      if (url.endsWith('/api/v1/conversations') && method === 'POST') {
+        const parsed = JSON.parse(bodyStr ?? '{}') as Record<string, unknown>;
+        createdPayloads.push(parsed);
+        return new Response(
+          JSON.stringify({
+            conversation: {
+              id: 'temp-1',
+              assistantId: 'default',
+              title: 'Temp',
+              providerId: 'openai',
+              modelId: 'gpt-4.1',
+              params: {},
+              ephemeral: Boolean(parsed.ephemeral),
+              syncEnabled: false,
+              syncState: 'local_only',
+              syncVersion: 0,
+              createdAt: '2026-11-19T10:00:00Z',
+              updatedAt: '2026-11-19T10:00:00Z',
+            },
+          }),
+          { status: 201 },
+        );
+      }
+      if (url.endsWith('/messages/stream') && method === 'POST') {
+        const sse = new TextEncoder().encode(
+          'data: {"type":"message_start","messageId":"m-temp-a1"}\n\n' +
+            'data: {"type":"block_start","index":0,"blockType":"text"}\n\n' +
+            'data: {"type":"block_delta","index":0,"blockType":"text","deltaType":"text_delta","delta":"临时回复"}\n\n' +
+            'data: {"type":"message_end","messageId":"m-temp-a1","message":{"id":"m-temp-a1","conversationId":"temp-1","role":"assistant","blocks":[{"type":"text","text":"临时回复"}],"stopReason":"stop","createdAt":"2026-11-19T10:00:01Z"}}\n\n',
+        );
+        return new Response(sse, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+      if (url.endsWith('/api/v1/conversations/temp-1') && method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            conversation: {
+              id: 'temp-1',
+              assistantId: 'default',
+              title: 'Temp',
+              providerId: 'openai',
+              modelId: 'gpt-4.1',
+              params: {},
+              ephemeral: true,
+              syncEnabled: false,
+              syncState: 'local_only',
+              syncVersion: 0,
+              createdAt: '2026-11-19T10:00:00Z',
+              updatedAt: '2026-11-19T10:00:00Z',
+            },
+            messages: [
+              { id: 'm-temp-u1', conversationId: 'temp-1', role: 'user', blocks: [{ type: 'text', text: 'temp hello' }], createdAt: '2026-11-19T10:00:00Z' },
+              { id: 'm-temp-a1', conversationId: 'temp-1', role: 'assistant', blocks: [{ type: 'text', text: '临时回复' }], stopReason: 'stop', createdAt: '2026-11-19T10:00:01Z' },
+            ],
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/temp-1') && method === 'DELETE') {
+        deletedIds.push('temp-1');
+        return new Response(null, { status: 204 });
+      }
+      if (url.endsWith('/api/v1/conversations/c1') && method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            conversation: {
+              id: 'c1',
+              assistantId: 'default',
+              title: '原有话题',
+              providerId: 'openai',
+              modelId: 'gpt-4.1',
+              params: {},
+              syncEnabled: false,
+              syncState: 'local_only',
+              syncVersion: 0,
+              createdAt: '2026-11-19T08:00:00Z',
+              updatedAt: '2026-11-19T08:00:00Z',
+            },
+            messages: [],
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/plugins/search')) {
+        return new Response(JSON.stringify({ engines: [] }));
+      }
+      if (url.endsWith('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ servers: [] }));
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter initialEntries={['/chat']}>
+          <Routes>
+            <Route path="/chat" element={<WorkbenchPage />} />
+            <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+            <Route path="/settings/appearance" element={<AppearancePage />} />
+          </Routes>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('原有话题')).toBeInTheDocument());
+
+    // Enter temporary mode -> badge renders -> send creates ephemeral conversation hidden from sidebar.
+    await user.click(screen.getByRole('button', { name: '临时会话' }));
+    expect(screen.getByText('临时会话')).toBeInTheDocument();
+    await user.type(screen.getByLabelText('消息输入框'), 'temp hello');
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+
+    await waitFor(() => expect(screen.getByText('临时回复')).toBeInTheDocument());
+    expect(createdPayloads.some((p) => p.ephemeral === true)).toBe(true);
+    expect(screen.queryByText('Temp')).not.toBeInTheDocument();
+
+    // Footer sync bar fetches updated remote conversations while keeping ephemeral session intact.
+    remoteSynced = true;
+    await user.click(screen.getByRole('button', { name: '切换话题栏' }));
+    await user.click(screen.getByRole('button', { name: '刷新服务端数据' }));
+    await waitFor(() => expect(screen.getByText('他端新增话题')).toBeInTheDocument());
+    expect(screen.getByText('临时回复')).toBeInTheDocument();
+    expect(deletedIds).toEqual([]);
+
+    // Exit temporary mode -> deletes ephemeral server session.
+    await user.click(screen.getByRole('button', { name: '退出临时会话' }));
+    await waitFor(() => expect(deletedIds).toEqual(['temp-1']));
+  });
+
+  it('toggles manual chat width preference from AppearancePage', async () => {
+    let widthMode: 'default' | 'manual' = 'default';
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.0', authRequired: false }));
+      }
+      if (url.endsWith('/api/v1/settings') && method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            preferences: { ...defaultAppPreferences(), chatWidthMode: widthMode },
+            initialized: true,
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/settings') && method === 'PATCH') {
+        const patch = JSON.parse(String(init?.body ?? '{}')) as { chatWidthMode?: 'default' | 'manual' };
+        if (patch.chatWidthMode) widthMode = patch.chatWidthMode;
+        return new Response(
+          JSON.stringify({
+            preferences: { ...defaultAppPreferences(), chatWidthMode: widthMode },
+            initialized: true,
+          }),
+        );
+      }
+      if (url.endsWith('/api/v1/formats')) return new Response(JSON.stringify({ formats: [], adapters: [] }));
+      if (url.endsWith('/api/v1/providers')) return new Response(JSON.stringify({ providers: [] }));
+      if (url.endsWith('/api/v1/assistants')) return new Response(JSON.stringify({ assistants: [] }));
+      if (url.endsWith('/api/v1/conversations')) return new Response(JSON.stringify({ conversations: [] }));
+      if (url.endsWith('/api/v1/conversation-groups')) return new Response(JSON.stringify({ groups: [] }));
+      if (url.endsWith('/api/v1/plugins/search')) return new Response(JSON.stringify({ engines: [] }));
+      if (url.endsWith('/api/v1/mcp/servers')) return new Response(JSON.stringify({ servers: [] }));
+      return new Response('{}');
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <AppearancePage />
+      </AppProvider>,
+    );
+
+    const toggle = await screen.findByRole('switch', { name: '手动调整对话宽度' });
+    expect(toggle).not.toBeChecked();
+    await user.click(toggle);
+    await waitFor(() => expect(widthMode).toBe('manual'));
+    expect(toggle).toBeChecked();
   });
 });

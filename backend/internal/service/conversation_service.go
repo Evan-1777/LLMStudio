@@ -37,6 +37,7 @@ type CreateConversationInput struct {
 	ModelID      string                  `json:"modelId"`
 	SystemPrompt string                  `json:"systemPrompt"`
 	Params       domain.GenerationParams `json:"params"`
+	Ephemeral    bool                    `json:"ephemeral,omitempty"`
 }
 
 // PatchParamsInput supports clearing individual generation parameters when explicitly set to null or empty.
@@ -127,6 +128,7 @@ func (s *ConversationService) Create(ctx context.Context, in CreateConversationI
 		ModelID:      modelID,
 		SystemPrompt: in.SystemPrompt,
 		Params:       in.Params,
+		Ephemeral:    in.Ephemeral,
 	})
 }
 
