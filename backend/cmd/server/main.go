@@ -42,10 +42,6 @@ func main() {
 	mcpStore := store.NewMCPServerStore(db)
 	prefStore := store.NewPreferenceStore(db)
 
-	if err := provider.SeedBuiltInProviders(ctx, providerStore); err != nil {
-		log.Fatalf("seed built-in providers failed: %v", err)
-	}
-
 	formats := plugin.NewFormatRegistry()
 	formats.MustRegister(format.NewOpenAICompletionsFormat())
 	formats.MustRegister(format.NewOpenAIResponsesFormat())

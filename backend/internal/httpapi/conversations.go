@@ -163,6 +163,20 @@ func (h *ConversationHandler) CreateGroup(w http.ResponseWriter, r *http.Request
 	WriteJSON(w, http.StatusCreated, res)
 }
 
+func (h *ConversationHandler) ReorderGroups(w http.ResponseWriter, r *http.Request) {
+	var in service.ReorderGroupsInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	snap, err := h.svc.ReorderGroups(r.Context(), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, snap)
+}
+
 func (h *ConversationHandler) RenameGroup(w http.ResponseWriter, r *http.Request) {
 	var in service.RenameGroupInput
 	if err := decodeJSONBody(r, &in); err != nil {
@@ -184,6 +198,15 @@ func (h *ConversationHandler) DeleteGroup(w http.ResponseWriter, r *http.Request
 		return
 	}
 	WriteJSON(w, http.StatusOK, res)
+}
+
+func (h *ConversationHandler) CleanupUngrouped(w http.ResponseWriter, r *http.Request) {
+	deleted, err := h.svc.CleanupUngrouped(r.Context())
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
 }
 
 func (h *ConversationHandler) Batch(w http.ResponseWriter, r *http.Request) {

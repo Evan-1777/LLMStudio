@@ -34,7 +34,7 @@ func TestSQLiteMigrationsAndStores(t *testing.T) {
 	convs := NewConversationStore(db)
 	msgs := NewMessageStore(db)
 
-	// Provider CRUD + EnsureBuiltIn non-overwrite.
+	// Provider CRUD.
 	p, err := providers.Create(ctx, domain.ProviderConfig{
 		ID:       "openai",
 		Name:     "OpenAI",
@@ -60,22 +60,12 @@ func TestSQLiteMigrationsAndStores(t *testing.T) {
 		t.Fatalf("unexpected provider models: %+v", p.Models)
 	}
 
-	if err := providers.EnsureBuiltIn(ctx, domain.ProviderConfig{
-		ID:       "openai",
-		Name:     "Overwritten Name",
-		Adapter:  "generic-http",
-		BaseURL:  "https://wrong.example.com",
-		AuthType: domain.AuthTypeNone,
-		BuiltIn:  true,
-	}); err != nil {
-		t.Fatalf("EnsureBuiltIn failed: %v", err)
-	}
 	fetchedP, err := providers.Get(ctx, "openai")
 	if err != nil {
 		t.Fatalf("get provider failed: %v", err)
 	}
 	if fetchedP.BaseURL != "https://api.openai.com/v1" || fetchedP.APIKey != "sk-user-key" {
-		t.Fatalf("EnsureBuiltIn overwrote existing provider: %+v", fetchedP)
+		t.Fatalf("provider address or key did not round trip: %+v", fetchedP)
 	}
 
 	fetchedP.Name = "OpenAI Updated"

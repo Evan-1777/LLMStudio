@@ -27,6 +27,23 @@ func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *ProviderHandler) Reorder(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ID       string  `json:"id"`
+		BeforeID *string `json:"beforeId"`
+	}
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	providers, err := h.svc.Reorder(r.Context(), in.ID, in.BeforeID)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{"providers": providers})
+}
+
 func (h *ProviderHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var in service.ProviderInput
 	if err := decodeJSONBody(r, &in); err != nil {

@@ -1,8 +1,9 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { AppProvider } from '../../app/AppProvider';
+import type { ReactNode } from 'react';
+import { AppProvider, useApp } from '../../app/AppProvider';
 import { defaultSettings } from '../../core/settings';
 import { SettingsLayout } from './SettingsLayout';
 
@@ -17,10 +18,11 @@ function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status });
 }
 
-function setups(fetchMock: ReturnType<typeof vi.fn>) {
+function setups(fetchMock: ReturnType<typeof vi.fn>, probe?: ReactNode) {
   const user = userEvent.setup();
   render(
     <AppProvider fetchImpl={fetchMock as unknown as typeof fetch}>
+      {probe}
       <MemoryRouter initialEntries={['/settings/storage']}>
         <Routes>
           <Route path="/settings/:section" element={<SettingsLayout />} />
@@ -189,5 +191,93 @@ describe('StoragePage', () => {
       expect(screen.getByText('未释放空间')).toBeInTheDocument(),
     );
     expect(attempts).toBe(2);
+  });
+
+  it('requires confirmation on every cleanup, retains success if stats fail, and prevents stale refresh from restoring topics', async () => {
+    let commands = 0;
+    let compactCalls = 0;
+    let stats = 0;
+    let failNextStats = false;
+    let reads = 0;
+    let settleCleanup: (value: Response) => void = () => {};
+    let settleRefresh: (value: Response) => void = () => {};
+    const initial = { conversations: [{ id: 'deleted', assistantId: 'default' }, { id: 'kept', assistantId: 'default' }] };
+    const footprint = { mainBytes: 8192, walBytes: 1024, totalBytes: 9216, compactable: true };
+    const fetchMock = baseFetch((url, init) => {
+      if (url.endsWith('/api/v1/storage/compact')) {
+        compactCalls++;
+        return jsonResponse({ freedBytes: 0, usage: footprint });
+      }
+      if (url.endsWith('/api/v1/storage')) {
+        stats++;
+        if (failNextStats) {
+          failNextStats = false;
+          return jsonResponse({ message: '无法读取磁盘占用' }, 500);
+        }
+        return jsonResponse(footprint);
+      }
+      if (url.endsWith('/api/v1/conversations/cleanup-ungrouped')) {
+        expect(init?.method).toBe('POST');
+        commands++;
+        if (commands === 1) return jsonResponse({ message: '清理失败' }, 500);
+        if (commands === 2) return new Promise<Response>((resolve) => { settleCleanup = resolve; });
+        return jsonResponse({ deleted: [] });
+      }
+      if (url.endsWith('/api/v1/conversations')) {
+        reads++;
+        if (reads === 2) return new Promise<Response>((resolve) => { settleRefresh = resolve; });
+        return jsonResponse(initial);
+      }
+      return null;
+    });
+    function Probe() {
+      const { resources, refreshConversations } = useApp();
+      return <>
+        <button onClick={() => void refreshConversations()}>刷新话题</button>
+        <span data-testid="ids">{resources.conversations.map(({ id }) => id).join(',')}</span>
+      </>;
+    }
+    const user = setups(fetchMock, <Probe />);
+    await waitFor(() => expect(screen.getByTestId('ids')).toHaveTextContent('deleted,kept'));
+    const open = () => user.click(screen.getByRole('button', { name: '删除未分组话题' }));
+    const dialog = () => within(screen.getByRole('dialog', { name: '删除未分组话题' }));
+    const confirm = () => user.click(dialog().getByRole('button', { name: '删除' }));
+    await open();
+    expect(dialog().getByText(/所有助手.*保留置顶和已分组话题/)).toBeInTheDocument();
+    await user.click(dialog().getByRole('button', { name: '取消' }));
+    expect(commands).toBe(0);
+    await open();
+    await confirm();
+    expect(await screen.findByText('清理失败')).toBeInTheDocument();
+    expect(screen.queryByText(/已删除|没有未分组话题/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '刷新话题' }));
+    await waitFor(() => expect(reads).toBe(2));
+    await user.click(screen.getByRole('button', { name: '重试' }));
+    expect(commands).toBe(1);
+    await confirm();
+    await waitFor(() => expect(commands).toBe(2));
+    const button = dialog().getByRole('button', { name: '删除' });
+    expect(button).toBeDisabled();
+    await user.click(button);
+    expect(commands).toBe(2);
+    expect(compactCalls).toBe(0);
+    failNextStats = true;
+    await act(async () => settleCleanup(jsonResponse({ deleted: [{ id: 'deleted', assistantId: 'default' }] })));
+    expect(await screen.findByText('已删除 1 个话题')).toBeInTheDocument();
+    expect(await screen.findByText('无法读取磁盘占用')).toBeInTheDocument();
+    await act(async () => settleRefresh(jsonResponse(initial)));
+    expect(screen.getByTestId('ids')).toHaveTextContent(/^kept$/);
+    const statsBeforeRetry = stats;
+    await user.click(screen.getByRole('button', { name: '重试' }));
+    expect(commands).toBe(2);
+    await waitFor(() => expect(stats).toBe(statsBeforeRetry + 1));
+    expect(screen.getByText('已删除 1 个话题')).toBeInTheDocument();
+    await open();
+    await confirm();
+    expect(await screen.findByText('没有未分组话题')).toBeInTheDocument();
+    expect(compactCalls).toBe(0);
+    await user.click(screen.getByRole('button', { name: '压缩数据库' }));
+    expect(compactCalls).toBe(1);
   });
 });

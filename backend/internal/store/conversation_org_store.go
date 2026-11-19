@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"llmstudio/backend/internal/domain"
@@ -41,6 +42,12 @@ func scanConversationGroup(row rowScanner) (domain.ConversationGroup, error) {
 
 // ListGroups returns conversation groups filtered by assistantID when non-empty.
 func (s *ConversationStore) ListGroups(ctx context.Context, assistantID string) ([]domain.ConversationGroup, error) {
+	return listGroups(ctx, s.db, assistantID)
+}
+
+func listGroups(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, assistantID string) ([]domain.ConversationGroup, error) {
 	query := `
 		SELECT id, assistant_id, name, sort_order, created_at
 		FROM conversation_groups
@@ -52,7 +59,7 @@ func (s *ConversationStore) ListGroups(ctx context.Context, assistantID string) 
 	}
 	query += ` ORDER BY sort_order ASC, created_at ASC, id ASC`
 
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list conversation groups: %w", err)
 	}
@@ -70,6 +77,50 @@ func (s *ConversationStore) ListGroups(ctx context.Context, assistantID string) 
 		return nil, fmt.Errorf("iterate conversation groups: %w", err)
 	}
 	return groups, nil
+}
+
+// ReorderGroups changes only the positions of groups that belong to assistantID.
+func (s *ConversationStore) ReorderGroups(ctx context.Context, assistantID, id string, beforeID *string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	groups, err := listGroups(ctx, tx, assistantID)
+	if err != nil {
+		return err
+	}
+	index := func(id string) int {
+		return slices.IndexFunc(groups, func(g domain.ConversationGroup) bool { return g.ID == id })
+	}
+	from := index(id)
+	if from < 0 {
+		return domain.NewError(domain.ErrCodeNotFound, "group not found for assistant", nil)
+	}
+	to := len(groups)
+	if beforeID != nil {
+		to = index(*beforeID)
+		if to < 0 {
+			return domain.NewError(domain.ErrCodeNotFound, "anchor group not found for assistant", nil)
+		}
+	}
+	if from < to {
+		to--
+	}
+	if from == to {
+		return nil
+	}
+	moved := groups[from]
+	groups = slices.Insert(slices.Delete(groups, from, from+1), to, moved)
+	for i, group := range groups {
+		if group.SortOrder == i+1 {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE conversation_groups SET sort_order = ? WHERE assistant_id = ? AND id = ?", i+1, assistantID, group.ID); err != nil {
+			return fmt.Errorf("reorder groups: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // GetGroup fetches a conversation group by ID.
@@ -303,6 +354,39 @@ func (s *ConversationStore) BatchDelete(ctx context.Context, assistantID string,
 		}
 	}
 	return tx.Commit()
+}
+
+// CleanupUngrouped deletes the ungrouped and unpinned topics across all assistants.
+func (s *ConversationStore) CleanupUngrouped(ctx context.Context) ([]domain.DeletedConversation, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `DELETE FROM conversations
+   WHERE group_id IS NULL AND pinned = 0 RETURNING id, assistant_id`)
+	if err != nil {
+		return nil, fmt.Errorf("cleanup ungrouped conversations: %w", err)
+	}
+	defer rows.Close()
+	deleted := make([]domain.DeletedConversation, 0)
+	for rows.Next() {
+		var item domain.DeletedConversation
+		if err := rows.Scan(&item.ID, &item.AssistantID); err != nil {
+			return nil, err
+		}
+		deleted = append(deleted, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return deleted, nil
 }
 
 // BatchMove atomically moves conversations to targetGroupID (nil for ungrouped) within assistantID.

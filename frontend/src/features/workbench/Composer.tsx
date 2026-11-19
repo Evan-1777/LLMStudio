@@ -123,7 +123,7 @@ export function Composer({
     const el = textareaRef.current;
     if (!el) return;
     el.style.height = 'auto';
-    el.style.height = `${Math.min(180, Math.max(40, el.scrollHeight))}px`;
+    el.style.height = `${el.scrollHeight}px`;
   };
 
   const addFiles = (files: Iterable<File>) => {

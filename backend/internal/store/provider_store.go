@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,12 +23,18 @@ func NewProviderStore(db *sql.DB) *ProviderStore {
 	return &ProviderStore{db: db}
 }
 
-// List returns all configured providers ordered with built-ins first, then creation time.
+// List returns all configured providers in user order.
 func (s *ProviderStore) List(ctx context.Context) ([]domain.ProviderConfig, error) {
-	rows, err := s.db.QueryContext(ctx, `
+	return listProviders(ctx, s.db)
+}
+
+func listProviders(ctx context.Context, q interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}) ([]domain.ProviderConfig, error) {
+	rows, err := q.QueryContext(ctx, `
 		SELECT id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at
 		FROM providers
-		ORDER BY built_in DESC, created_at ASC, name ASC
+		ORDER BY sort_order ASC, id ASC
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("list providers: %w", err)
@@ -44,6 +51,50 @@ func (s *ProviderStore) List(ctx context.Context) ([]domain.ProviderConfig, erro
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate providers: %w", err)
+	}
+	return providers, nil
+}
+
+// Reorder moves a provider before the anchor, or to the end, without editing its config.
+func (s *ProviderStore) Reorder(ctx context.Context, id string, beforeID *string) ([]domain.ProviderConfig, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	providers, err := listProviders(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	index := func(id string) int {
+		return slices.IndexFunc(providers, func(p domain.ProviderConfig) bool { return p.ID == id })
+	}
+	from := index(id)
+	if from < 0 {
+		return nil, domain.NewError(domain.ErrCodeNotFound, "provider not found", nil)
+	}
+	to := len(providers)
+	if beforeID != nil {
+		to = index(*beforeID)
+		if to < 0 {
+			return nil, domain.NewError(domain.ErrCodeNotFound, "anchor provider not found", nil)
+		}
+	}
+	if from < to {
+		to--
+	}
+	if from == to {
+		return providers, nil
+	}
+	moved := providers[from]
+	providers = slices.Insert(slices.Delete(providers, from, from+1), to, moved)
+	for i, provider := range providers {
+		if _, err := tx.ExecContext(ctx, "UPDATE providers SET sort_order = ? WHERE id = ?", i+1, provider.ID); err != nil {
+			return nil, fmt.Errorf("reorder providers: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
 	}
 	return providers, nil
 }
@@ -83,8 +134,8 @@ func (s *ProviderStore) Create(ctx context.Context, p domain.ProviderConfig) (do
 	}
 
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at, api_key_managed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at, api_key_managed, sort_order)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM providers))
 	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), boolToInt(p.LocalRequest), formatTime(p.CreatedAt), formatTime(p.UpdatedAt), boolToInt(p.APIKeyManaged() || strings.TrimSpace(p.APIKey) != ""))
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -93,30 +144,6 @@ func (s *ProviderStore) Create(ctx context.Context, p domain.ProviderConfig) (do
 		return domain.ProviderConfig{}, fmt.Errorf("create provider: %w", err)
 	}
 	return s.Get(ctx, p.ID)
-}
-
-// EnsureBuiltIn inserts a built-in provider preset only when its ID does not yet exist.
-func (s *ProviderStore) EnsureBuiltIn(ctx context.Context, p domain.ProviderConfig) error {
-	now := time.Now().UTC()
-	if p.CreatedAt.IsZero() {
-		p.CreatedAt = now
-	}
-	if p.UpdatedAt.IsZero() {
-		p.UpdatedAt = p.CreatedAt
-	}
-	headersJSON, modelsJSON, err := encodeProviderJSON(p.Headers, p.Models)
-	if err != nil {
-		return err
-	}
-
-	_, err = s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO providers (id, name, adapter, base_url, auth_type, api_key, headers_json, models_json, enabled, built_in, local_request, created_at, updated_at, api_key_managed)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, p.ID, p.Name, p.Adapter, p.BaseURL, p.AuthType, p.APIKey, headersJSON, modelsJSON, boolToInt(p.Enabled), boolToInt(p.BuiltIn), boolToInt(p.LocalRequest), formatTime(p.CreatedAt), formatTime(p.UpdatedAt), boolToInt(p.APIKeyManaged() || strings.TrimSpace(p.APIKey) != ""))
-	if err != nil {
-		return fmt.Errorf("ensure built-in provider %s: %w", p.ID, err)
-	}
-	return nil
 }
 
 // Update overwrites an existing provider record.

@@ -431,7 +431,6 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
         <div style={{ minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <h2 className="st-section-title">{provider.name}</h2>
-            {provider.builtIn ? <span className="st-badge">内置</span> : null}
             {provider.localRequest ? (
               <span className="st-badge st-badge--accent">本地</span>
             ) : null}
@@ -481,7 +480,7 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
               <Input
                 id="provider-base-url"
                 type="url"
-                placeholder="https://api.openai.com/v1"
+                placeholder="https://api.example.com/v1"
                 value={baseURL}
                 onChange={(e) => setBaseURL(e.target.value)}
                 required

@@ -69,16 +69,19 @@ export function Dropdown({
 
 export function DropdownItem({
   active = false,
+  disabled = false,
   onSelect,
   children,
 }: {
   active?: boolean;
+  disabled?: boolean;
   onSelect: () => void;
   children: ReactNode;
 }) {
   return (
     <DropdownMenu.Item
       className={`ui-menu-item ${active ? 'ui-menu-item--active' : ''}`.trim()}
+      disabled={disabled}
       onSelect={onSelect}
     >
       {children}

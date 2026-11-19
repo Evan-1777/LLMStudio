@@ -184,6 +184,22 @@ export function ChatCanvas({
     };
   }, []);
 
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    let height = el.clientHeight;
+    const observer = new ResizeObserver(() => {
+      if (el.clientHeight === height) return;
+      height = el.clientHeight;
+      if (stickToBottomRef.current) {
+        el.scrollTop = el.scrollHeight;
+        programmaticTopRef.current = el.scrollTop;
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+
   const scrollToBottom = () => {
     const el = scrollRef.current;
     if (!el) return;

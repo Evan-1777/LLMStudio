@@ -184,6 +184,62 @@ func TestProviderAPIKeyImportEndpoint(t *testing.T) {
 	}
 }
 
+func TestProviderReorderEndpoint(t *testing.T) {
+	const tok = "test-token"
+	const path = "/api/v1/providers"
+	const secret = "example-test-credential"
+	router := setupTestRouter(t, tok, false)
+	for _, id := range []string{"a", "b", "c"} {
+		rec := doJSONReq(t, router, http.MethodPost, path, tok, map[string]any{
+			"id": id, "name": id, "adapter": "generic-http", "baseURL": "https://example.com", "authType": "bearer", "apiKey": secret,
+		})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s: %s", id, rec.Body.String())
+		}
+	}
+	timestamps := map[string]time.Time{}
+	check := func(rec *httptest.ResponseRecorder, want string) {
+		t.Helper()
+		if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), secret) || strings.Contains(rec.Body.String(), "\"apiKey\"") {
+			t.Fatalf("response %d: %s", rec.Code, rec.Body.String())
+		}
+		var body struct{ Providers []domain.ProviderConfig }
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		got := ""
+		for _, p := range body.Providers {
+			got += p.ID
+			if ts, ok := timestamps[p.ID]; ok && ts != p.UpdatedAt {
+				t.Fatalf("reorder changed timestamp for %s", p.ID)
+			}
+			timestamps[p.ID] = p.UpdatedAt
+		}
+		if got != want {
+			t.Fatalf("order %s, want %s", got, want)
+		}
+	}
+	check(doJSONReq(t, router, http.MethodGet, path, tok, nil), "abc")
+	for _, tc := range []struct {
+		id     string
+		before any
+		want   string
+	}{{"c", "a", "cab"}, {"b", "a", "cba"}, {"c", nil, "bac"}, {"a", "c", "bac"}} {
+		check(doJSONReq(t, router, http.MethodPost, path+"/reorder", tok, map[string]any{"id": tc.id, "beforeId": tc.before}), tc.want)
+	}
+	for _, tc := range []struct {
+		token, id string
+		before    any
+		status    int
+	}{{"", "b", nil, 401}, {tok, "x", nil, 404}, {tok, "b", "x", 404}, {tok, "", nil, 400}} {
+		rec := doJSONReq(t, router, http.MethodPost, path+"/reorder", tc.token, map[string]any{"id": tc.id, "beforeId": tc.before})
+		if rec.Code != tc.status {
+			t.Fatalf("status %d, want %d: %s", rec.Code, tc.status, rec.Body.String())
+		}
+	}
+	check(doJSONReq(t, router, http.MethodGet, path, tok, nil), "bac")
+}
+
 func TestPreferenceEndpoints(t *testing.T) {
 	const tok = "test-token"
 	router := setupTestRouter(t, tok, false)

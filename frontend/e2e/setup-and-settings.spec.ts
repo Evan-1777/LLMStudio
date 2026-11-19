@@ -53,11 +53,18 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await expect(asstBtn).toBeVisible();
 
     // 3. Provider creation, probe, model discovery cancel-vs-import, and secret preservation.
+    const providers = await page.request.get(`${appUrl}/api/v1/providers`, {
+      headers: { Authorization: `Bearer ${E2E_TOKEN}` },
+    });
+    expect(providers.ok()).toBe(true);
+    expect(await providers.json()).toEqual({ providers: [] });
     await page.getByRole('link', { name: '设置' }).click();
     await expect(page.getByRole('heading', { level: 1, name: '模型服务' })).toBeVisible();
 
     await page.getByRole('button', { name: '添加供应商' }).click();
     const addProvDialog = page.getByRole('dialog');
+    await expect(addProvDialog.getByLabel('名称')).toHaveValue('');
+    await expect(addProvDialog.getByLabel('API 地址')).toHaveValue('');
     await addProvDialog.getByLabel('名称').fill('Mock Provider');
     await addProvDialog.getByLabel('API 地址').fill(upstream.url);
     await addProvDialog.getByLabel('API Key').fill('sk-e2e-upstream-secret');
@@ -130,7 +137,7 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
 
     await page.getByRole('button', { name: '模型服务' }).click();
-    await page.getByRole('button', { name: /Mock Provider Renamed/ }).click();
+    await page.getByRole('button', { name: /^Mock Provider Renamed/ }).click();
     await expect(page.getByRole('heading', { name: 'Mock Provider Renamed' })).toBeVisible();
     await expect(page.getByText('Mock Chat')).toBeVisible();
 
@@ -261,7 +268,7 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
 
     await connectWithToken(page, appUrl);
     await page.getByRole('link', { name: '设置' }).click();
-    await page.getByRole('button', { name: /E2E Mock Provider/ }).click();
+    await page.getByRole('button', { name: /^E2E Mock Provider/ }).click();
     await expect(page.getByRole('heading', { name: 'E2E Mock Provider' })).toBeVisible();
 
     await page.getByRole('button', { name: '获取模型' }).first().click();

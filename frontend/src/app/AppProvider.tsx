@@ -30,6 +30,7 @@ import type {
   Assistant,
   Conversation,
   ConversationGroup,
+  DeletedConversation,
   FormatInfo,
   HealthResponse,
   MCPServerConfig,
@@ -99,15 +100,18 @@ export interface AppContextValue {
   retryConnection: () => void;
   resources: AppResources;
   refreshProviders: () => Promise<void>;
+  reorderProviders: (id: string, beforeId: string | null) => Promise<void>;
   refreshAssistants: () => Promise<void>;
   refreshConversations: () => Promise<void>;
   refreshPlugins: () => Promise<void>;
   refreshAll: () => Promise<void>;
   upsertLocalConversation: (conv: Conversation) => void;
   removeLocalConversation: (id: string) => void;
+  cleanupUngroupedConversations: () => Promise<DeletedConversation[] | null>;
   applyConversationOrganizationSnapshot: (
     assistantId: string,
     snapshot: { conversations: Conversation[]; groups: ConversationGroup[] },
+    expectedEpoch?: number,
   ) => void;
   upsertLocalAssistant: (assistant: Assistant) => void;
   removeLocalAssistant: (id: string) => void;
@@ -452,8 +456,11 @@ export function AppProvider({
     return false;
   }, []);
 
+  const providerOrderRevision = useRef(0);
+  const providerReorderEpoch = useRef<number | null>(null);
   const refreshProviders = useCallback(async () => {
     const { epoch, signal, cleanup } = trackSignal();
+    const orderRevision = providerOrderRevision.current;
     setResources((prev) => ({
       ...prev,
       loading: { ...prev.loading, providers: true },
@@ -469,7 +476,7 @@ export function AppProvider({
         ...prev,
         formats: meta.formats,
         adapters: meta.adapters,
-        providers,
+        providers: orderRevision === providerOrderRevision.current ? providers : prev.providers,
         loading: { ...prev.loading, providers: false },
       }));
     } catch (err) {
@@ -517,8 +524,10 @@ export function AppProvider({
     }
   }, [gateway, handleAuthFailureIf401, trackSignal]);
 
+  const conversationCleanupRevision = useRef(0);
   const refreshConversations = useCallback(async () => {
     const { epoch, signal, cleanup } = trackSignal();
+    const cleanupRevision = conversationCleanupRevision.current;
     setResources((prev) => ({
       ...prev,
       loading: { ...prev.loading, conversations: true },
@@ -532,7 +541,7 @@ export function AppProvider({
       if (epoch !== epochRef.current) return;
       setResources((prev) => ({
         ...prev,
-        conversations,
+        conversations: cleanupRevision === conversationCleanupRevision.current ? conversations : prev.conversations,
         conversationGroups,
         loading: { ...prev.loading, conversations: false },
       }));
@@ -751,11 +760,36 @@ export function AppProvider({
     }));
   }, []);
 
+  const cleanupUngroupedConversations = useCallback(async () => {
+    const { epoch, signal, cleanup } = trackSignal();
+    try {
+      const deleted = await gateway.cleanupUngroupedConversations(signal);
+      if (epoch !== epochRef.current) return null;
+      if (deleted.length > 0) {
+        conversationCleanupRevision.current++;
+        const ids = new Set(deleted.map((item) => item.id));
+        setResources((prev) => ({
+          ...prev,
+          conversations: prev.conversations.filter((c) => !ids.has(c.id)),
+        }));
+      }
+      return deleted;
+    } catch (err) {
+      if (epoch !== epochRef.current) return null;
+      handleAuthFailureIf401(err, epoch);
+      throw err;
+    } finally {
+      cleanup();
+    }
+  }, [gateway, handleAuthFailureIf401, trackSignal]);
+
   const applyConversationOrganizationSnapshot = useCallback(
     (
       assistantId: string,
       snapshot: { conversations: Conversation[]; groups: ConversationGroup[] },
+      expectedEpoch?: number,
     ) => {
+      if (expectedEpoch !== undefined && expectedEpoch !== epochRef.current) return;
       setResources((prev) => {
         const otherConvs = prev.conversations.filter(
           (c) => (c.assistantId || 'default') !== assistantId,
@@ -798,6 +832,32 @@ export function AppProvider({
       assistants: prev.assistants.filter((a) => a.id !== id),
     }));
   }, []);
+
+  const reorderProviders = useCallback(async (id: string, beforeId: string | null) => {
+    if (providerReorderEpoch.current === epochRef.current) return;
+    const { epoch, signal, cleanup } = trackSignal();
+    providerReorderEpoch.current = epoch;
+    try {
+      const ordered = await gateway.reorderProviders(id, beforeId, signal);
+      if (epoch !== epochRef.current) return;
+      providerOrderRevision.current++;
+      const positions = new Map(ordered.map((p, index) => [p.id, index]));
+      setResources((prev) => ({
+        ...prev,
+        // Apply only order; a simultaneous save or delete owns the current records.
+        providers: [...prev.providers].sort((a, b) =>
+          (positions.get(a.id) ?? Infinity) - (positions.get(b.id) ?? Infinity),
+        ),
+      }));
+    } catch (err) {
+      if (epoch === epochRef.current && !handleAuthFailureIf401(err, epoch)) {
+        toast(err instanceof Error ? err.message : '供应商排序失败', 'error');
+      }
+    } finally {
+      cleanup();
+      if (providerReorderEpoch.current === epoch) providerReorderEpoch.current = null;
+    }
+  }, [gateway, handleAuthFailureIf401, toast, trackSignal]);
 
   const upsertLocalProvider = useCallback((provider: ProviderConfig) => {
     setResources((prev) => {
@@ -885,12 +945,14 @@ export function AppProvider({
       retryConnection,
       resources,
       refreshProviders,
+      reorderProviders,
       refreshAssistants,
       refreshConversations,
       refreshPlugins,
       refreshAll,
       upsertLocalConversation,
       removeLocalConversation,
+      cleanupUngroupedConversations,
       applyConversationOrganizationSnapshot,
       upsertLocalAssistant,
       removeLocalAssistant,
@@ -919,12 +981,14 @@ export function AppProvider({
       retryConnection,
       resources,
       refreshProviders,
+      reorderProviders,
       refreshAssistants,
       refreshConversations,
       refreshPlugins,
       refreshAll,
       upsertLocalConversation,
       removeLocalConversation,
+      cleanupUngroupedConversations,
       applyConversationOrganizationSnapshot,
       upsertLocalAssistant,
       removeLocalAssistant,

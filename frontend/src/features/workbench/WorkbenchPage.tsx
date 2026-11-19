@@ -21,7 +21,51 @@ import {
 import type { DraftSessionParams } from './SessionInspector';
 import './workbench.css';
 
+function useComposerViewport() {
+  const shellRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const shell = shellRef.current;
+    const viewport = window.visualViewport;
+    if (!shell || !viewport) return;
+    const handheld = window.matchMedia('(pointer: coarse)');
+    let frame = 0;
+    const clear = () => {
+      shell.style.removeProperty('--wb-visible-height');
+      shell.style.removeProperty('--wb-visible-top');
+    };
+    const update = () => {
+      frame = 0;
+      const focused = shell.querySelector('.wb-draft') === document.activeElement;
+      if (!handheld.matches || !focused || viewport.scale !== 1 || viewport.height >= window.innerHeight - 1) {
+        clear();
+        return;
+      }
+      shell.style.setProperty('--wb-visible-height', viewport.height + 'px');
+      shell.style.setProperty('--wb-visible-top', viewport.offsetTop + 'px');
+    };
+    const schedule = () => {
+      if (!frame) frame = window.requestAnimationFrame(update);
+    };
+    const listeners = new AbortController();
+    const options = { signal: listeners.signal };
+    shell.addEventListener('focusin', schedule, options);
+    shell.addEventListener('focusout', schedule, options);
+    viewport.addEventListener('resize', schedule, options);
+    viewport.addEventListener('scroll', schedule, options);
+    window.addEventListener('resize', schedule, options);
+    handheld.addEventListener('change', schedule, options);
+    schedule();
+    return () => {
+      listeners.abort();
+      window.cancelAnimationFrame(frame);
+      clear();
+    };
+  }, []);
+  return shellRef;
+}
+
 function WorkbenchInner() {
+  const shellRef = useComposerViewport();
   const { conversationId } = useParams<{ conversationId?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -499,7 +543,7 @@ function WorkbenchInner() {
     .join(' ');
 
   return (
-    <div className={shellClasses}>
+    <div ref={shellRef} className={shellClasses}>
       <AssistantSidebar
         assistants={assistants}
         activeAssistantId={activeAssistant.id}

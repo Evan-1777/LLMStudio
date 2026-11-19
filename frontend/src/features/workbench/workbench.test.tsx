@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { AppProvider } from '../../app/AppProvider';
+import { defaultAppPreferences } from '../../core/settings';
 import { MAX_ATTACHMENT_BYTES, MAX_GATEWAY_BODY_BYTES } from '../../core/types';
 import {
   attachmentToContentBlock,
@@ -17,7 +18,7 @@ import {
 import { WorkbenchPage } from './WorkbenchPage';
 import * as imageCompression from './imageCompression';
 
-function makeWorkbenchFetch() {
+function makeWorkbenchFetch(enterToSend?: boolean) {
   const conversations = [
     {
       id: 'c1',
@@ -62,6 +63,9 @@ function makeWorkbenchFetch() {
         JSON.stringify({ status: 'ok', version: '0.1.0', authRequired: false }),
         { status: 200 },
       );
+    }
+    if (enterToSend !== undefined && url.endsWith('/api/v1/settings') && method === 'GET') {
+      return new Response(JSON.stringify({ preferences: { ...defaultAppPreferences(), enterToSend }, initialized: true }));
     }
     if (url.endsWith('/api/v1/formats')) {
       return new Response(JSON.stringify({ formats: [], adapters: [] }), {
@@ -592,25 +596,10 @@ describe('Workbench flows and attachments', () => {
     });
   });
 
-  it('respects enterToSend=false requiring Ctrl/Cmd+Enter', async () => {
-    localStorage.setItem(
-      'llmstudio.settings.v2',
-      JSON.stringify({
-        gatewayBaseUrl: '/',
-        accessToken: '',
-        themeMode: 'light',
-        seedColorValue: 0xff007aff,
-        enterToSend: false,
-        defaultHtmlPreview: true,
-        autoCollapseEnabled: true,
-        collapseLineThreshold: 24,
-        collapseCharThreshold: 1200,
-      }),
-    );
-
-    const { fetchMock, requests } = makeWorkbenchFetch();
+  it.each([true, false])('handles Enter and IME with gateway enterToSend=%s', async (enterToSend) => {
+    localStorage.clear();
+    const { fetchMock, requests } = makeWorkbenchFetch(enterToSend);
     const user = userEvent.setup();
-
     render(
       <AppProvider fetchImpl={fetchMock}>
         <MemoryRouter initialEntries={['/chat']}>
@@ -621,24 +610,21 @@ describe('Workbench flows and attachments', () => {
         </MemoryRouter>
       </AppProvider>,
     );
-
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-4.1');
-    });
-
+    await waitFor(() => expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('GPT-4.1'));
     const box = screen.getByLabelText('消息输入框');
-    await user.type(box, 'Line 1');
-    fireEvent.keyDown(box, { key: 'Enter' });
-    expect(
-      requests.filter((r) => r.method === 'POST' && r.url.endsWith('/conversations')),
-    ).toHaveLength(0);
+    const submitted = () => requests.filter((r) => r.method === 'POST' && r.url.endsWith('/conversations'));
+    await user.type(box, '待发送草稿');
+    expect(fireEvent.keyDown(box, { key: 'Enter', isComposing: true })).toBe(true);
+    expect(fireEvent.keyDown(box, { key: 'Enter', keyCode: 229 })).toBe(true);
+    expect(fireEvent.keyDown(box, { key: 'Enter', shiftKey: true })).toBe(true);
+    expect(submitted()).toHaveLength(0);
 
-    fireEvent.keyDown(box, { key: 'Enter', ctrlKey: true });
-    await waitFor(() => {
-      expect(
-        requests.filter((r) => r.method === 'POST' && r.url.endsWith('/conversations')),
-      ).toHaveLength(1);
-    });
+    if (!enterToSend) {
+      expect(fireEvent.keyDown(box, { key: 'Enter' })).toBe(true);
+      expect(submitted()).toHaveLength(0);
+    }
+    fireEvent.keyDown(box, { key: 'Enter', ctrlKey: !enterToSend });
+    await waitFor(() => expect(submitted()).toHaveLength(1));
   });
 
   it('keeps focus in composer during streaming, prioritizes Escape over stop, and creates new topic on Ctrl+N', async () => {
@@ -993,7 +979,7 @@ describe('Workbench flows and attachments', () => {
         modelId: 'gpt-4.1',
         systemPrompt: '',
         params: {},
-        groupId: null,
+        groupId: 'g-other',
         pinned: false,
         sortOrder: 3,
         syncEnabled: false,
@@ -1003,7 +989,11 @@ describe('Workbench flows and attachments', () => {
         updatedAt: '2026-11-17T06:00:00Z',
       },
     ];
-    let orgGroups: OrgGroup[] = [];
+    orgConvs.push({ ...orgConvs[0], id: 't4', title: 'Pinned note', pinned: true, groupId: 'g-work' });
+    let orgGroups: OrgGroup[] = [
+      { id: 'g-other', assistantId: 'default', name: 'Other', sortOrder: 2, createdAt: '2026-11-17T07:00:00Z' },
+      { id: 'g-empty', assistantId: 'default', name: 'Empty', sortOrder: 3, createdAt: '2026-11-17T08:00:00Z' },
+    ];
     const batchCalls: Array<Record<string, unknown>> = [];
     let failNextBatch = false;
 
@@ -1028,7 +1018,7 @@ describe('Workbench flows and attachments', () => {
           sortOrder: 1,
           createdAt: '2026-11-17T09:00:00Z',
         };
-        orgGroups = [grp];
+        orgGroups = [grp, ...orgGroups];
         return new Response(
           JSON.stringify({ group: grp, assistantId: 'default', conversations: orgConvs, groups: orgGroups }),
           { status: 201 },
@@ -1112,16 +1102,50 @@ describe('Workbench flows and attachments', () => {
       expect(batchCalls.some((c) => c.operation === 'move' && c.groupId === 'g-work')).toBe(true);
     });
 
-    // Clear search, select only t2 & t3, fail delete keeps selection & current topic t1 & draft!
-    await user.clear(screen.getByLabelText('搜索话题'));
-    await user.click(screen.getByRole('checkbox', { name: '选择 Alpha Plan' })); // uncheck t1
-    await user.click(screen.getByRole('checkbox', { name: '选择 Beta Note' })); // check t3 (now t2 + t3)
+    const search = screen.getByLabelText('搜索话题');
+    await user.clear(search);
+    const work = screen.getByRole('checkbox', { name: '选择分区 Work' });
+    const other = screen.getByRole('checkbox', { name: '选择分区 Other' });
+    const pinned = screen.getByRole('checkbox', { name: '选择分区 置顶' });
+    const empty = screen.getByRole('checkbox', { name: '选择分区 Empty' });
+    const workTitle = screen.getByRole('button', { name: /^Work/ });
+    expect(empty).toBeDisabled();
+    await user.click(work); // Clear only this group's two selected topics.
+    await user.click(screen.getByRole('checkbox', { name: '选择 Beta Note' }));
+    expect(other).toBeChecked();
+    expect(work).not.toBeChecked();
+    expect(work).not.toBePartiallyChecked();
+    await user.click(screen.getByRole('checkbox', { name: '选择 Alpha Plan' }));
+    expect(work).toBePartiallyChecked();
+    work.focus();
+    await user.keyboard(' ');
+    expect(work).toBeChecked();
+    expect(pinned).not.toBeChecked(); // A pinned member does not belong to the visible Work bucket.
+    await user.click(work);
+    expect(work).not.toBeChecked();
+    expect(other).toBeChecked();
+    await user.click(workTitle);
+    expect(workTitle).toHaveAttribute('aria-expanded', 'false');
+    await user.click(work);
+    expect(screen.getByText('已选 3 项')).toBeInTheDocument();
+    expect(workTitle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('checkbox', { name: '选择 Alpha Plan' })).not.toBeInTheDocument();
+
+    // Selecting a filtered partition affects only matching items; hidden selections survive.
+    await user.type(search, 'Alpha Plan');
+    const matches = screen.getByRole('checkbox', { name: '选择分区 Work的搜索结果' });
+    expect(matches).toBeChecked();
+    await user.click(matches);
+    await user.clear(search);
+    expect(work).toBePartiallyChecked();
+    expect(other).toBeChecked();
     expect(screen.getByText('已选 2 项')).toBeInTheDocument();
 
     failNextBatch = true;
     await user.click(screen.getByRole('button', { name: '删除 (2)' }));
     await user.click(screen.getByRole('button', { name: '删除' }));
     await waitFor(() => expect(screen.getByText('批次拒绝')).toBeInTheDocument());
+    expect(batchCalls.at(-1)).toMatchObject({ operation: 'delete', ids: ['t2', 't3'] });
     await user.click(screen.getByRole('button', { name: '取消' }));
     expect(screen.getByText('已选 2 项')).toBeInTheDocument();
     expect(draftBox).toHaveValue('保留当前草稿');

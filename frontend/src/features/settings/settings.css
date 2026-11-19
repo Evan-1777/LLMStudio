@@ -385,11 +385,33 @@
   gap: 3px;
 }
 
+.st-provider-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  border-radius: var(--radius-md);
+}
+
+.st-provider-row[data-provider-drop]::after {
+  position: absolute;
+  content: '';
+  pointer-events: none;
+  inset-inline: 2px;
+  height: 2px;
+  background: var(--accent);
+  border-radius: 1px;
+}
+
+.st-provider-row[data-provider-drop='before']::after { top: 0; }
+.st-provider-row[data-provider-drop='after']::after { bottom: 0; }
+.st-provider-row--active { background: var(--accent-soft); }
+
 .st-provider-item {
   display: flex;
   align-items: center;
   gap: 9px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   padding: 8px 9px;
   border-radius: var(--radius-md);
   text-align: left;
@@ -791,9 +813,22 @@
     padding-bottom: 2px;
   }
 
+  .st-provider-row { flex: none; }
+
+  .st-provider-row[data-provider-drop]::after {
+    inset-inline: auto;
+    top: 2px;
+    bottom: 2px;
+    width: 2px;
+    height: auto;
+  }
+
+  .st-provider-row[data-provider-drop='before']::after { left: 0; top: 2px; }
+  .st-provider-row[data-provider-drop='after']::after { right: 0; bottom: 2px; }
+
+  .st-provider-row > .ui-icon-btn { min-width: 44px; min-height: 44px; }
+
   .st-provider-item {
-    flex: none;
-    width: auto;
     min-width: 144px;
     white-space: nowrap;
   }

@@ -1,11 +1,9 @@
 import {
-  useCallback,
   useEffect,
   useMemo,
   useRef,
   useState,
   type FormEvent,
-  type PointerEvent as ReactPointerEvent,
 } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
@@ -20,6 +18,7 @@ import {
   Input,
   Modal,
 } from '../../components/ui';
+import { useRowDrag } from '../../components/ui/useRowDrag';
 import { GatewayError } from '../../core/gateway';
 import type { Conversation, ConversationGroup } from '../../core/types';
 import {
@@ -39,6 +38,9 @@ interface DropTarget {
   groupId: string | null;
   beforeId: string | null;
 }
+
+type GroupDrop = { groupId: string; beforeId: string | null; edge: 'before' | 'after' };
+type OrganizationDrop = { kind: 'topic'; target: DropTarget } | { kind: 'group'; target: GroupDrop };
 
 interface BucketSection {
   key: string;
@@ -143,27 +145,14 @@ export function ConversationSidebar({
   );
   const [movingBusy, setMovingBusy] = useState(false);
 
-  // Pointer drag state
-  const [draggingId, setDraggingId] = useState<string | null>(null);
-  const [dropTarget, setDropTarget] = useState<DropTarget | null>(null);
-  const listContainerRef = useRef<HTMLDivElement | null>(null);
-  const dragSessionRef = useRef<{
-    conv: Conversation;
-    pointerId: number;
-    startX: number;
-    startY: number;
-    active: boolean;
-  } | null>(null);
-  const dropTargetRef = useRef<DropTarget | null>(null);
-  dropTargetRef.current = dropTarget;
+  const listContainerRef = useRef<HTMLDivElement>(null);
+  const currentEpoch = useRef(connectionEpoch);
+  currentEpoch.current = connectionEpoch;
 
   // Clear local selection & search on assistant or gateway switch.
   useEffect(() => {
     setSelectedIds(new Set());
     setSearchQuery('');
-    setDraggingId(null);
-    setDropTarget(null);
-    dragSessionRef.current = null;
     onManageModeChange(false);
   }, [assistantId, connectionEpoch, onManageModeChange]);
 
@@ -201,61 +190,6 @@ export function ConversationSidebar({
       c.title.toLowerCase().includes(trimmedSearch),
     );
   }, [conversations, trimmedSearch]);
-
-  const sections = useMemo<BucketSection[]>(() => {
-    const pinnedItems: Conversation[] = [];
-    const byGroup = new Map<string, Conversation[]>();
-    for (const g of sortedGroups) {
-      byGroup.set(g.id, []);
-    }
-    const ungroupedItems: Conversation[] = [];
-
-    for (const conv of filtered) {
-      if (conv.pinned) {
-        pinnedItems.push(conv);
-      } else if (conv.groupId && byGroup.has(conv.groupId)) {
-        byGroup.get(conv.groupId)!.push(conv);
-      } else {
-        ungroupedItems.push(conv);
-      }
-    }
-
-    const out: BucketSection[] = [];
-    if (pinnedItems.length > 0 || draggingId !== null) {
-      out.push({
-        key: 'pinned',
-        label: '置顶',
-        pinned: true,
-        group: null,
-        items: pinnedItems,
-      });
-    }
-    for (const g of sortedGroups) {
-      const items = byGroup.get(g.id) ?? [];
-      if (isSearching && items.length === 0) continue;
-      out.push({
-        key: `group:${g.id}`,
-        label: g.name,
-        pinned: false,
-        group: g,
-        items,
-      });
-    }
-    if (
-      ungroupedItems.length > 0 ||
-      draggingId !== null ||
-      (!isSearching && sortedGroups.length > 0)
-    ) {
-      out.push({
-        key: 'ungrouped',
-        label: sortedGroups.length > 0 || pinnedItems.length > 0 ? '未分组' : '全部话题',
-        pinned: false,
-        group: null,
-        items: ungroupedItems,
-      });
-    }
-    return out;
-  }, [draggingId, filtered, isSearching, sortedGroups]);
 
   const bucketItemsMap = useMemo(() => {
     const map = new Map<string, Conversation[]>();
@@ -297,17 +231,18 @@ export function ConversationSidebar({
     });
   };
 
-  const toggleSelectAllFiltered = () => {
+  const toggleSelection = (ids: readonly string[], allSelected: boolean) => {
     setSelectedIds((prev) => {
       const next = new Set(prev);
-      if (allFilteredSelected) {
-        for (const id of visibleFilteredIds) next.delete(id);
-      } else {
-        for (const id of visibleFilteredIds) next.add(id);
+      for (const id of ids) {
+        if (allSelected) next.delete(id);
+        else next.add(id);
       }
       return next;
     });
   };
+
+  const toggleSelectAllFiltered = () => toggleSelection(visibleFilteredIds, allFilteredSelected);
 
   const toggleGroupCollapse = (groupId: string) => {
     setCollapsedGroupIds((prev) => {
@@ -477,96 +412,47 @@ export function ConversationSidebar({
     }
   };
 
-  const executeReorder = useCallback(
-    async (conv: Conversation, target: DropTarget) => {
-      const prevSnapshot = {
-        conversations,
-        groups: sortedGroups,
-      };
-      const sourceBucketKey = bucketKeyForTarget(
-        Boolean(conv.pinned),
-        conv.groupId && groupById.has(conv.groupId) ? conv.groupId : null,
-      );
-      const targetItems = bucketItemsMap.get(target.bucketKey) ?? [];
-      const currentIdx =
-        sourceBucketKey === target.bucketKey
-          ? targetItems.findIndex((c) => c.id === conv.id)
-          : -1;
-      const currentNextId =
-        currentIdx >= 0 ? (targetItems[currentIdx + 1]?.id ?? null) : undefined;
-      if (
-        sourceBucketKey === target.bucketKey &&
-        target.beforeId === currentNextId
-      ) {
-        return;
-      }
+  const canReorder = !isSearching && !manageMode && !mutating && !inspectorOpen &&
+    !renamingConv && !groupModalMode && !moveTargetIds && !deletingConvs && !deletingGroup;
 
-      // Optimistic preview in memory; rolled back cleanly if server fails.
-      const remainingInBucket = targetItems.filter((c) => c.id !== conv.id);
-      const insertAt =
-        target.beforeId === null
-          ? remainingInBucket.length
-          : remainingInBucket.findIndex((c) => c.id === target.beforeId);
-      const safeInsert = insertAt >= 0 ? insertAt : remainingInBucket.length;
-      const updatedConv: Conversation = {
-        ...conv,
-        pinned: target.pinned,
-        groupId: target.pinned ? conv.groupId : target.groupId,
-      };
-      const reorderedBucket = [
-        ...remainingInBucket.slice(0, safeInsert),
-        updatedConv,
-        ...remainingInBucket.slice(safeInsert),
-      ].map((c, idx) => ({ ...c, sortOrder: idx + 1 }));
-      const reorderedMap = new Map(reorderedBucket.map((c) => [c.id, c]));
-      const previewConvs = conversations.map((c) =>
-        reorderedMap.get(c.id) ?? c,
-      );
-      applyConversationOrganizationSnapshot(assistantId, {
-        conversations: previewConvs,
-        groups: sortedGroups,
-      });
-
-      setMutating(true);
-      try {
-        const snap = await gateway.reorderConversations(
-          target.pinned
-            ? {
-                assistantId,
-                ids: [conv.id],
-                pinned: true,
-                beforeId: target.beforeId,
-              }
-            : {
-                assistantId,
-                ids: [conv.id],
-                pinned: false,
-                groupId: target.groupId,
-                beforeId: target.beforeId,
-              },
-        );
-        applyConversationOrganizationSnapshot(assistantId, {
-          conversations: snap.conversations,
-          groups: snap.groups,
-        });
-      } catch (err) {
-        applyConversationOrganizationSnapshot(assistantId, prevSnapshot);
+  const runReorder = async (request: () => Promise<{ conversations: Conversation[]; groups: ConversationGroup[] }>) => {
+    if (!canReorder) return;
+    setMutating(true);
+    try {
+      const snap = await request();
+      applyConversationOrganizationSnapshot(assistantId, snap, connectionEpoch);
+    } catch (err) {
+      if (connectionEpoch === currentEpoch.current) {
         toast(err instanceof GatewayError ? err.message : '排序保存失败', 'error');
-      } finally {
-        setMutating(false);
       }
-    },
-    [
-      applyConversationOrganizationSnapshot,
+    } finally {
+      setMutating(false);
+    }
+  };
+
+  const executeReorder = (conv: Conversation, target: DropTarget) => {
+    const sourceBucket = bucketKeyForTarget(
+      Boolean(conv.pinned),
+      conv.groupId && groupById.has(conv.groupId) ? conv.groupId : null,
+    );
+    if (sourceBucket === target.bucketKey) {
+      const items = bucketItemsMap.get(sourceBucket) ?? [];
+      const i = items.findIndex((c) => c.id === conv.id);
+      if (i < 0 || (items[i + 1]?.id ?? null) === target.beforeId) return;
+    }
+    return runReorder(() => gateway.reorderConversations({
       assistantId,
-      bucketItemsMap,
-      conversations,
-      gateway,
-      groupById,
-      sortedGroups,
-      toast,
-    ],
-  );
+      ids: [conv.id],
+      ...(target.pinned ? { pinned: true } : { pinned: false, groupId: target.groupId }),
+      beforeId: target.beforeId,
+    }));
+  };
+
+  const moveGroup = (id: string, beforeId: string | null) => {
+    const i = sortedGroups.findIndex((g) => g.id === id);
+    if (i < 0 || (sortedGroups[i + 1]?.id ?? null) === beforeId) return;
+    return runReorder(() => gateway.reorderConversationGroup({ assistantId, id, beforeId }));
+  };
 
   const handleStepMove = (conv: Conversation, direction: 'up' | 'down') => {
     const isPinned = Boolean(conv.pinned);
@@ -594,129 +480,140 @@ export function ConversationSidebar({
     });
   };
 
-  const computeDropTarget = useCallback(
-    (clientY: number, draggingConvId: string): DropTarget | null => {
-      const container = listContainerRef.current;
-      if (!container) return null;
+  const computeDropTarget = (container: HTMLElement, clientY: number, draggingConvId: string): DropTarget | null => {
 
-      const sectionEls = Array.from(
-        container.querySelectorAll<HTMLElement>('[data-drop-bucket]'),
-      );
-      if (sectionEls.length === 0) return null;
+    const sectionEls = Array.from(
+      container.querySelectorAll<HTMLElement>('[data-drop-bucket]'),
+    );
+    if (sectionEls.length === 0) return null;
 
-      let chosenSection = sectionEls[sectionEls.length - 1];
-      let bestDist = Infinity;
-      for (const sec of sectionEls) {
-        const r = sec.getBoundingClientRect();
-        if (clientY >= r.top && clientY <= r.bottom) {
-          chosenSection = sec;
-          break;
-        }
-        const dist =
-          clientY < r.top ? r.top - clientY : clientY - r.bottom;
-        if (dist < bestDist) {
-          bestDist = dist;
-          chosenSection = sec;
-        }
+    let chosenSection = sectionEls[sectionEls.length - 1];
+    let bestDist = Infinity;
+    for (const sec of sectionEls) {
+      const r = sec.getBoundingClientRect();
+      if (clientY >= r.top && clientY <= r.bottom) {
+        chosenSection = sec;
+        break;
       }
-
-      const bucketKey = chosenSection.dataset.dropBucket || 'ungrouped';
-      const pinned = chosenSection.dataset.dropPinned === 'true';
-      const rawGroup = chosenSection.dataset.dropGroupId ?? '';
-      const groupId = pinned ? null : rawGroup || null;
-
-      const rowEls = Array.from(
-        chosenSection.querySelectorAll<HTMLElement>('[data-topic-id]'),
-      ).filter((el) => el.dataset.topicId !== draggingConvId);
-
-      let beforeId: string | null = null;
-      for (const rowEl of rowEls) {
-        const r = rowEl.getBoundingClientRect();
-        const midY = r.top + r.height / 2;
-        if (clientY < midY) {
-          beforeId = rowEl.dataset.topicId ?? null;
-          break;
-        }
+      const dist =
+        clientY < r.top ? r.top - clientY : clientY - r.bottom;
+      if (dist < bestDist) {
+        bestDist = dist;
+        chosenSection = sec;
       }
-      return { bucketKey, pinned, groupId, beforeId };
-    },
-    [],
-  );
-
-  useEffect(() => {
-    const onPointerMove = (e: PointerEvent) => {
-      const session = dragSessionRef.current;
-      if (!session || e.pointerId !== session.pointerId) return;
-      if (!session.active) {
-        const dist = Math.hypot(
-          e.clientX - session.startX,
-          e.clientY - session.startY,
-        );
-        if (dist < 6) return;
-        session.active = true;
-        setDraggingId(session.conv.id);
-      }
-      e.preventDefault();
-      const target = computeDropTarget(e.clientY, session.conv.id);
-      setDropTarget(target);
-    };
-
-    const finishDrag = (e: PointerEvent, commit: boolean) => {
-      const session = dragSessionRef.current;
-      if (!session || e.pointerId !== session.pointerId) return;
-      const wasActive = session.active;
-      const target = dropTargetRef.current;
-      dragSessionRef.current = null;
-      setDraggingId(null);
-      setDropTarget(null);
-      if (commit && wasActive && target) {
-        void executeReorder(session.conv, target);
-      }
-    };
-
-    const onPointerUp = (e: PointerEvent) => finishDrag(e, true);
-    const onPointerCancel = (e: PointerEvent) => finishDrag(e, false);
-    const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (e.key === 'Escape' && dragSessionRef.current?.active) {
-        e.preventDefault();
-        dragSessionRef.current = null;
-        setDraggingId(null);
-        setDropTarget(null);
-      }
-    };
-
-    window.addEventListener('pointermove', onPointerMove, { passive: false });
-    window.addEventListener('pointerup', onPointerUp);
-    window.addEventListener('pointercancel', onPointerCancel);
-    window.addEventListener('keydown', onKeyDown);
-    return () => {
-      window.removeEventListener('pointermove', onPointerMove);
-      window.removeEventListener('pointerup', onPointerUp);
-      window.removeEventListener('pointercancel', onPointerCancel);
-      window.removeEventListener('keydown', onKeyDown);
-    };
-  }, [computeDropTarget, executeReorder]);
-
-  const handleDragPointerDown = (
-    e: ReactPointerEvent<HTMLButtonElement>,
-    conv: Conversation,
-  ) => {
-    if (isSearching || manageMode || mutating) return;
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    e.stopPropagation();
-    try {
-      e.currentTarget.setPointerCapture(e.pointerId);
-    } catch {
-      // Ignore environments without pointer capture support.
     }
-    dragSessionRef.current = {
-      conv,
-      pointerId: e.pointerId,
-      startX: e.clientX,
-      startY: e.clientY,
-      active: false,
-    };
+
+    const bucketKey = chosenSection.dataset.dropBucket || 'ungrouped';
+    const pinned = chosenSection.dataset.dropPinned === 'true';
+    const rawGroup = chosenSection.dataset.dropGroupId ?? '';
+    const groupId = pinned ? null : rawGroup || null;
+
+    const rowEls = Array.from(
+      chosenSection.querySelectorAll<HTMLElement>('[data-topic-id]'),
+    ).filter((el) => el.dataset.topicId !== draggingConvId);
+
+    let beforeId: string | null = null;
+    for (const rowEl of rowEls) {
+      const r = rowEl.getBoundingClientRect();
+      const midY = r.top + r.height / 2;
+      if (clientY < midY) {
+        beforeId = rowEl.dataset.topicId ?? null;
+        break;
+      }
+    }
+    return { bucketKey, pinned, groupId, beforeId };
   };
+
+  const { drag, bind } = useRowDrag<OrganizationDrop>(canReorder, (source, { clientX, clientY }) => {
+    const container = listContainerRef.current;
+    if (!container) return null;
+    const bounds = container.getBoundingClientRect();
+    if (clientX < bounds.left || clientX >= bounds.right || clientY < bounds.top || clientY >= bounds.bottom) return null;
+    if (source.startsWith('topic:')) {
+      const target = computeDropTarget(container, clientY, source.slice(6));
+      return target ? { kind: 'topic', target } : null;
+    }
+
+    const id = source.slice(6);
+    const head = document.elementFromPoint(clientX, clientY)?.closest<HTMLElement>('[data-group-head]');
+    const groupId = head?.dataset.groupHead;
+    if (!head || !groupId || id === groupId || !container.contains(head)) return null;
+    const rect = head.getBoundingClientRect();
+    const edge = clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+    const candidates = sortedGroups.filter((g) => g.id !== id);
+    const i = candidates.findIndex((g) => g.id === groupId);
+    if (i < 0) return null;
+    const beforeId = candidates[i + (edge === 'after' ? 1 : 0)]?.id ?? null;
+    if ((sortedGroups[sortedGroups.findIndex((g) => g.id === id) + 1]?.id ?? null) === beforeId) return null;
+    return { kind: 'group', target: { groupId, beforeId, edge } };
+  }, (source, drop) => {
+    const id = source.slice(6);
+    if (drop.kind === 'group') {
+      void moveGroup(id, drop.target.beforeId);
+    } else {
+      const conv = conversations.find((c) => c.id === id);
+      if (conv) void executeReorder(conv, drop.target);
+    }
+  }, `${connectionEpoch}:${assistantId}`);
+
+  const draggingId = drag?.id.startsWith('topic:') ? drag.id.slice(6) : null;
+  const dropTarget = drag?.target?.kind === 'topic' ? drag.target.target : null;
+  const groupDrop = drag?.target?.kind === 'group' ? drag.target.target : null;
+
+  const sections = useMemo<BucketSection[]>(() => {
+    const pinnedItems: Conversation[] = [];
+    const byGroup = new Map<string, Conversation[]>();
+    for (const g of sortedGroups) {
+      byGroup.set(g.id, []);
+    }
+    const ungroupedItems: Conversation[] = [];
+
+    for (const conv of filtered) {
+      if (conv.pinned) {
+        pinnedItems.push(conv);
+      } else if (conv.groupId && byGroup.has(conv.groupId)) {
+        byGroup.get(conv.groupId)!.push(conv);
+      } else {
+        ungroupedItems.push(conv);
+      }
+    }
+
+    const out: BucketSection[] = [];
+    if (pinnedItems.length > 0 || draggingId !== null) {
+      out.push({
+        key: 'pinned',
+        label: '置顶',
+        pinned: true,
+        group: null,
+        items: pinnedItems,
+      });
+    }
+    for (const g of sortedGroups) {
+      const items = byGroup.get(g.id) ?? [];
+      if (isSearching && items.length === 0) continue;
+      out.push({
+        key: `group:${g.id}`,
+        label: g.name,
+        pinned: false,
+        group: g,
+        items,
+      });
+    }
+    if (
+      ungroupedItems.length > 0 ||
+      draggingId !== null ||
+      (!isSearching && sortedGroups.length > 0)
+    ) {
+      out.push({
+        key: 'ungrouped',
+        label: sortedGroups.length > 0 || pinnedItems.length > 0 ? '未分组' : '全部话题',
+        pinned: false,
+        group: null,
+        items: ungroupedItems,
+      });
+    }
+    return out;
+  }, [draggingId, filtered, isSearching, sortedGroups]);
 
   return (
     <>
@@ -862,6 +759,12 @@ export function ConversationSidebar({
                 <div className="wb-topic-empty">无匹配话题</div>
               ) : (
                 sections.map((section) => {
+                  const group = section.group;
+                  const sectionSelectedCount = manageMode
+                    ? section.items.filter(({ id }) => selectedIds.has(id)).length
+                    : 0;
+                  const sectionChecked = section.items.length > 0 && sectionSelectedCount === section.items.length;
+                  const groupIndex = group ? sortedGroups.findIndex((g) => g.id === group.id) : -1;
                   const isCollapsed =
                     section.group !== null &&
                     !isSearching &&
@@ -882,10 +785,30 @@ export function ConversationSidebar({
                       data-drop-pinned={section.pinned ? 'true' : 'false'}
                       data-drop-group-id={section.group?.id ?? ''}
                     >
-                      <div className="wb-topic-section__head">
+                      <div
+                        className="wb-topic-section__head"
+                        data-group-head={group?.id}
+                        data-group-drop={groupDrop && groupDrop.groupId === group?.id ? groupDrop.edge : undefined}
+                      >
+                        {manageMode ? (
+                          <label className="wb-topic-check wb-topic-check--section">
+                            <input
+                              type="checkbox"
+                              aria-label={`选择分区 ${section.label}${isSearching ? '的搜索结果' : ''}`}
+                              checked={sectionChecked}
+                              disabled={section.items.length === 0 || mutating}
+                              ref={(input) => {
+                                if (input) input.indeterminate = sectionSelectedCount > 0 && !sectionChecked;
+                              }}
+                              onChange={() => toggleSelection(section.items.map(({ id }) => id), sectionChecked)}
+                            />
+                          </label>
+                        ) : null}
                         {section.group ? (
                           <button
+                            {...bind(`group:${section.group.id}`)}
                             type="button"
+                            draggable={false}
                             className="wb-topic-group__toggle"
                             aria-expanded={!isCollapsed}
                             onClick={() =>
@@ -917,9 +840,20 @@ export function ConversationSidebar({
                                 size="sm"
                                 icon="ellipsis"
                                 label={`分组操作 ${section.group.name}`}
+                                disabled={mutating}
                               />
                             }
                           >
+                            {canReorder && sortedGroups.length > 1 ? (
+                              <>
+                                <DropdownItem disabled={groupIndex === 0} onSelect={() => void moveGroup(group!.id, sortedGroups[groupIndex - 1]?.id ?? null)}>
+                                  <Icon name="arrowUp" size={14} /><span>上移</span>
+                                </DropdownItem>
+                                <DropdownItem disabled={groupIndex === sortedGroups.length - 1} onSelect={() => void moveGroup(group!.id, sortedGroups[groupIndex + 2]?.id ?? null)}>
+                                  <Icon name="arrowDown" size={14} /><span>下移</span>
+                                </DropdownItem>
+                              </>
+                            ) : null}
                             <DropdownItem
                               onSelect={() => {
                                 setGroupNameInput(section.group!.name);
@@ -945,13 +879,15 @@ export function ConversationSidebar({
 
                       {!isCollapsed ? (
                         section.items.length === 0 ? (
-                          <div
-                            className={`wb-topic-section__empty ${
-                              isTailDropTarget ? 'wb-topic-row--drop-tail' : ''
-                            }`.trim()}
-                          >
-                            {draggingId ? '拖放至此' : '空分组'}
-                          </div>
+                          group || draggingId !== null ? (
+                            <div
+                              className={`wb-topic-section__empty ${
+                                isTailDropTarget ? 'wb-topic-row--drop-tail' : ''
+                              }`.trim()}
+                            >
+                              {group ? '空分组' : null}
+                            </div>
+                          ) : null
                         ) : (
                           <div
                             className={
@@ -1016,23 +952,12 @@ export function ConversationSidebar({
                                         onChange={() => toggleSelect(conv.id)}
                                       />
                                     </label>
-                                  ) : !isSearching ? (
-                                    <button
-                                      type="button"
-                                      className="wb-drag-handle"
-                                      aria-label={`拖动排序 ${conv.title}`}
-                                      title="拖动排序"
-                                      disabled={mutating}
-                                      onPointerDown={(e) =>
-                                        handleDragPointerDown(e, conv)
-                                      }
-                                    >
-                                      <Icon name="grip" size={13} />
-                                    </button>
                                   ) : null}
 
                                   <button
+                                    {...bind(`topic:${conv.id}`)}
                                     type="button"
+                                    draggable={false}
                                     className="wb-topic-row__btn"
                                     title={conv.title}
                                     aria-current={

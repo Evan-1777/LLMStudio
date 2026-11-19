@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
   Button,
+  Dropdown,
+  DropdownItem,
   EmptyState,
   ErrorBanner,
   Field,
@@ -13,6 +15,7 @@ import {
   Select,
   Switch,
 } from '../../components/ui';
+import { useRowDrag } from '../../components/ui/useRowDrag';
 import type { AuthType } from '../../core/types';
 import { ProviderEditor } from './ProviderEditor';
 import { errorMessageOf, validateHttpUrl } from './jsonValidation';
@@ -140,7 +143,6 @@ function CreateProviderModal({
         <Field label="名称" htmlFor="new-provider-name" error={nameError}>
           <Input
             id="new-provider-name"
-            placeholder="OpenAI"
             value={name}
             onChange={(e) => setName(e.target.value)}
             required
@@ -151,7 +153,7 @@ function CreateProviderModal({
           <Input
             id="new-provider-url"
             type="url"
-            placeholder="https://api.openai.com/v1"
+            placeholder="https://api.example.com/v1"
             value={baseURL}
             onChange={(e) => setBaseURL(e.target.value)}
             required
@@ -220,7 +222,7 @@ function CreateProviderModal({
 }
 
 export function ProvidersPage() {
-  const { resources, refreshProviders, confirmLeaveIfDirty } = useApp();
+  const { resources, refreshProviders, reorderProviders, confirmLeaveIfDirty } = useApp();
   const { providers } = resources;
 
   const [search, setSearch] = useState('');
@@ -228,6 +230,8 @@ export function ProvidersPage() {
     providers[0]?.id ?? null,
   );
   const [createOpen, setCreateOpen] = useState(false);
+  const [reordering, setReordering] = useState(false);
+  const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (providers.length === 0) {
@@ -252,6 +256,37 @@ export function ProvidersPage() {
 
   const selectedProvider =
     providers.find((p) => p.id === selectedId) ?? providers[0] ?? null;
+
+  const canReorder = !search.trim() && !createOpen && !reordering && providers.length > 1;
+  const moveProvider = async (id: string, beforeId: string | null) => {
+    if (!canReorder) return;
+    const index = providers.findIndex((p) => p.id === id);
+    if (index === -1 || (providers[index + 1]?.id ?? null) === beforeId) return;
+    setReordering(true);
+    try {
+      await reorderProviders(id, beforeId);
+    } finally {
+      setReordering(false);
+    }
+  };
+
+  const { drag, bind } = useRowDrag(canReorder, (id, { clientX, clientY }) => {
+    const list = listRef.current;
+    if (!list) return null;
+    const bounds = list.getBoundingClientRect();
+    if (clientX < bounds.left || clientX >= bounds.right || clientY < bounds.top || clientY >= bounds.bottom) return null;
+    const horizontal = getComputedStyle(list).flexDirection === 'row';
+    const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-provider-id]'))
+      .filter((row) => row.dataset.providerId !== id);
+    const next = rows.find((row) => {
+      const rect = row.getBoundingClientRect();
+      return horizontal ? clientX < rect.left + rect.width / 2 : clientY < rect.top + rect.height / 2;
+    });
+    const beforeId = next?.dataset.providerId ?? null;
+    const from = providers.findIndex((p) => p.id === id);
+    if (from === -1 || (providers[from + 1]?.id ?? null) === beforeId) return null;
+    return { beforeId, markerId: (next ?? rows.at(-1))?.dataset.providerId };
+  }, (id, target) => void moveProvider(id, target.beforeId));
 
   const handleSelectProvider = async (nextId: string) => {
     if (nextId === selectedProvider?.id) return;
@@ -323,36 +358,56 @@ export function ProvidersPage() {
           />
         </div>
 
-        <div className="st-provider-scroll">
-          {filtered.map((p) => {
+        <div ref={listRef} className="st-provider-scroll">
+          {filtered.map((p, index) => {
             const active = p.id === selectedProvider?.id;
             const initial = p.name.trim().charAt(0).toUpperCase() || '?';
+            const marker = drag?.target?.markerId === p.id
+              ? (drag.target.beforeId ? 'before' : 'after')
+              : undefined;
             return (
-              <button
+              <div
                 key={p.id}
-                type="button"
-                className={`st-provider-item ${
-                  active ? 'st-provider-item--active' : ''
-                }`.trim()}
-                aria-current={active ? 'true' : undefined}
-                onClick={() => void handleSelectProvider(p.id)}
+                className={`st-provider-row${active ? ' st-provider-row--active' : ''}`}
+                data-provider-id={p.id}
+                data-provider-drop={marker}
               >
-                <span className="st-provider-badge" aria-hidden="true">
-                  {initial}
-                </span>
-                <span className="st-provider-meta">
-                  <span className="st-provider-name">{p.name}</span>
-                  <span className="st-provider-sub">
-                    {p.models.length} 个模型
+                <button
+                  {...bind(p.id)}
+                  type="button"
+                  className={`st-provider-item${active ? ' st-provider-item--active' : ''}`}
+                  aria-current={active ? 'true' : undefined}
+                  draggable={false}
+                  onClick={() => void handleSelectProvider(p.id)}
+                >
+                  <span className="st-provider-badge" aria-hidden="true">
+                    {initial}
                   </span>
-                </span>
-                {p.localRequest ? (
-                  <span className="st-badge st-badge--accent">本地</span>
-                ) : null}
-                {!p.enabled ? (
-                  <span className="st-badge st-badge--muted">停用</span>
-                ) : null}
-              </button>
+                  <span className="st-provider-meta">
+                    <span className="st-provider-name">{p.name}</span>
+                    <span className="st-provider-sub">{p.models.length} 个模型</span>
+                  </span>
+                  {p.localRequest ? <span className="st-badge st-badge--accent">本地</span> : null}
+                  {!p.enabled ? <span className="st-badge st-badge--muted">停用</span> : null}
+                </button>
+                <Dropdown
+                  align="end"
+                  trigger={<IconButton icon="ellipsis" label={`调整 ${p.name} 的顺序`} disabled={!canReorder} />}
+                >
+                  <DropdownItem
+                    disabled={index === 0}
+                    onSelect={() => void moveProvider(p.id, providers[index - 1]?.id ?? null)}
+                  >
+                    上移
+                  </DropdownItem>
+                  <DropdownItem
+                    disabled={index === providers.length - 1}
+                    onSelect={() => void moveProvider(p.id, providers[index + 2]?.id ?? null)}
+                  >
+                    下移
+                  </DropdownItem>
+                </Dropdown>
+              </div>
             );
           })}
         </div>

@@ -396,6 +396,12 @@ type Conversation struct {
 	UpdatedAt    time.Time        `json:"updatedAt"`
 }
 
+// DeletedConversation identifies a removed topic and its assistant.
+type DeletedConversation struct {
+	ID          string `json:"id"`
+	AssistantID string `json:"assistantId"`
+}
+
 // NewConversationDefaults ensures reserved sync metadata and assistant defaults are populated.
 func NewConversationDefaults(c *Conversation) {
 	if c.AssistantID == "" {

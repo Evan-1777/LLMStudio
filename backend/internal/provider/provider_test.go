@@ -1,12 +1,10 @@
 package provider
 
 import (
-	"context"
 	"net/url"
 	"testing"
 
 	"llmstudio/backend/internal/domain"
-	"llmstudio/backend/internal/store"
 )
 
 func TestGenericHTTPAdapterAuthModes(t *testing.T) {
@@ -125,39 +123,4 @@ func TestGenericHTTPAdapterAuthModes(t *testing.T) {
 			t.Fatalf("unexpected auth header: %v", ep.Headers)
 		}
 	})
-}
-
-func TestSeedBuiltInProvidersNonDestructive(t *testing.T) {
-	ctx := context.Background()
-	db, err := store.OpenSQLite(ctx, ":memory:")
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
-	}
-	defer db.Close()
-
-	providers := store.NewProviderStore(db)
-	if err := SeedBuiltInProviders(ctx, providers); err != nil {
-		t.Fatalf("first SeedBuiltInProviders failed: %v", err)
-	}
-
-	openai, err := providers.Get(ctx, "openai")
-	if err != nil {
-		t.Fatalf("get seeded openai: %v", err)
-	}
-	openai.BaseURL = "https://proxy.myvps.example/v1"
-	openai.APIKey = "sk-custom-user"
-	if _, err := providers.Update(ctx, openai); err != nil {
-		t.Fatalf("update openai: %v", err)
-	}
-
-	if err := SeedBuiltInProviders(ctx, providers); err != nil {
-		t.Fatalf("second SeedBuiltInProviders failed: %v", err)
-	}
-	after, err := providers.Get(ctx, "openai")
-	if err != nil {
-		t.Fatalf("get openai after reseed: %v", err)
-	}
-	if after.BaseURL != "https://proxy.myvps.example/v1" || after.APIKey != "sk-custom-user" {
-		t.Fatalf("SeedBuiltInProviders overwrote user configuration: %+v", after)
-	}
 }

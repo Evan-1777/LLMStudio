@@ -256,7 +256,7 @@ test.describe('Prompt caching, persisted cacheMode, and localRequest MCP E2E', (
       await expect(cacheSwitch).toBeChecked();
 
       await page.getByRole('button', { name: '模型服务' }).click();
-      await page.getByRole('button', { name: /OpenAI Cache E2E/ }).click();
+      await page.getByRole('button', { name: /^OpenAI Cache E2E/ }).click();
       await page.getByRole('button', { name: '编辑 GPT 5.6' }).click();
       const dialog = page.getByRole('dialog');
       await dialog.getByText('协议兼容覆盖').click();

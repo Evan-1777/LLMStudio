@@ -450,8 +450,13 @@ a {
 }
 
 .ui-menu-item[data-highlighted],
-.ui-menu-item:hover {
+.ui-menu-item:hover:not([data-disabled]) {
   background: var(--bg-hover);
+}
+
+.ui-menu-item[data-disabled] {
+  color: var(--text-tertiary);
+  cursor: default;
 }
 
 .ui-menu-item--active {

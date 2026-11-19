@@ -123,7 +123,7 @@ test.describe('Topic Organization, Manual Order, Touch Drag, and Batch Operation
     await expect.poll(getTitles).toEqual(['Topic B', 'Topic C Renamed', 'Topic A']);
 
     // 3. Desktop mouse drag: drag Topic A into Research group, then drag back to ungrouped, and verify!
-    const dragA = page.getByRole('button', { name: '拖动排序 Topic A' });
+    const dragA = page.locator(`[data-topic-id="${idA}"] .wb-topic-row__btn`);
     const researchSection = page.locator('[data-drop-bucket^="group:"]').nth(1);
     await dragA.scrollIntoViewIfNeeded();
     const boxA = (await dragA.boundingBox())!;
@@ -179,7 +179,7 @@ test.describe('Topic Organization, Manual Order, Touch Drag, and Batch Operation
       await touchPage.getByRole('button', { name: '切换话题栏' }).click();
       await expect(touchPage.getByText('Topic C Renamed')).toBeVisible();
 
-      const handleB = touchPage.getByRole('button', { name: '拖动排序 Topic B' });
+      const handleB = touchPage.locator(`[data-topic-id="${idB}"] .wb-topic-row__btn`);
       const rowC = touchPage.locator(`[data-topic-id="${idC}"]`);
       // Wait for drawer slide transition to finish before sampling CDP touch coordinates.
       await expect
@@ -201,6 +201,7 @@ test.describe('Topic Organization, Manual Order, Touch Drag, and Batch Operation
         type: 'touchStart',
         touchPoints: [{ x: startX, y: startY, id: 1 }],
       });
+      await touchPage.waitForTimeout(370); // Wait for long-press activation before moving.
       for (let step = 1; step <= 6; step++) {
         await cdp.send('Input.dispatchTouchEvent', {
           type: 'touchMove',
@@ -291,4 +292,110 @@ test.describe('Topic Organization, Manual Order, Touch Drag, and Batch Operation
     await expect(page.locator('[data-topic-id]')).toHaveCount(0);
     await expect(page.getByRole('button', { name: '全选' })).toBeDisabled();
   });
+});
+
+
+test('drags group headers only onto ordinary headers and preserves membership across reload', async ({ appUrl, page, browser }) => {
+  const post = <T,>(path: string, body: unknown) => apiJson<T>(appUrl, path, { method: 'POST', body: JSON.stringify(body) });
+  const group = async (name: string) => (await post<{ group: { id: string } }>('/api/v1/conversation-groups', { assistantId: 'default', name })).group.id;
+  const a = await group('Albums');
+  const b = await group('Books');
+  const c = await group('Cinema');
+  const topic = async (title: string) => (await post<{ conversation: { id: string } }>('/api/v1/conversations', { title })).conversation.id;
+  const m1 = await topic('Album notes');
+  const m2 = await topic('Album review');
+  const pin = await topic('Pinned topic');
+  await topic('Ungrouped topic');
+  await post('/api/v1/conversations/batch', { assistantId: 'default', ids: [m2, m1], operation: 'move', groupId: a });
+  await post('/api/v1/conversations/batch', { assistantId: 'default', ids: [pin], operation: 'pin', pinned: true });
+
+  await connectWithToken(page, appUrl);
+  const head = (id: string) => page.locator(`[data-group-head="${id}"]`);
+  const names = page.locator('.wb-topic-group__name');
+  const titles = page.locator('.wb-topic-row__title');
+  const expectedTitles = ['Pinned topic', 'Album review', 'Album notes', 'Ungrouped topic'];
+  await expect(titles).toHaveText(expectedTitles);
+  await head(b).getByRole('button', { name: /^Books/ }).click();
+  await expect(head(b).getByRole('button', { name: /^Books/ })).toHaveAttribute('aria-expanded', 'false');
+  const requests: unknown[] = [];
+  page.on('request', req => {
+    if (req.url().endsWith('/conversation-groups/reorder')) requests.push(req.postDataJSON());
+  });
+  const move = async (id: string, dest: ReturnType<typeof head>, after = false) => {
+    const source = (await head(id).locator('.wb-topic-group__toggle').boundingBox())!;
+    const target = (await dest.boundingBox())!;
+    await page.mouse.move(source.x + 28, source.y + source.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(target.x + 28, target.y + target.height * (after ? 0.78 : 0.23), { steps: 6 });
+  };
+  await move(c, head(b));
+  await expect(head(b)).toHaveAttribute('data-group-drop', 'before');
+  await page.keyboard.press('Escape');
+  await page.mouse.up();
+  for (const bucket of ['pinned', 'ungrouped']) {
+    await move(c, page.locator(`[data-drop-bucket="${bucket}"] .wb-topic-section__head`));
+    await expect(page.locator('[data-group-drop]')).toHaveCount(0);
+    await page.mouse.up();
+  }
+  expect(requests).toEqual([]);
+  await expect(head(c).getByRole('button', { name: /^Cinema/ })).toHaveAttribute('aria-expanded', 'true');
+  await page.route('**/api/v1/conversation-groups/reorder', route => route.fulfill({ status: 500, json: { message: '分组排序未保存' } }), { times: 1 });
+  await move(c, head(b));
+  await page.mouse.up();
+  await expect(page.getByText('分组排序未保存')).toBeVisible();
+  await expect(names).toHaveText(['Albums', 'Books', 'Cinema']);
+  requests.length = 0;
+  await move(c, head(b));
+  await expect(head(b)).toHaveAttribute('data-group-drop', 'before');
+  await page.mouse.up();
+  await expect(names).toHaveText(['Albums', 'Cinema', 'Books']);
+  expect(requests).toEqual([{ assistantId: 'default', id: c, beforeId: b }]);
+  await move(a, head(b), true);
+  await expect(head(b)).toHaveAttribute('data-group-drop', 'after');
+  await page.mouse.up();
+  await expect(names).toHaveText(['Cinema', 'Books', 'Albums']);
+  expect(requests.at(-1)).toEqual({ assistantId: 'default', id: a, beforeId: null });
+  await page.reload();
+  await expect(names).toHaveText(['Cinema', 'Books', 'Albums']);
+  await expect(titles).toHaveText(expectedTitles);
+  await expect(page.locator('.wb-drag-handle')).toHaveCount(0);
+
+  const ctx = await browser.newContext({ viewport: { width: 375, height: 800 }, hasTouch: true, reducedMotion: 'reduce' });
+  try {
+    const mobile = await ctx.newPage();
+    await connectWithToken(mobile, appUrl);
+    await mobile.getByRole('button', { name: '切换话题栏' }).click();
+    const hdr = mobile.locator(`[data-group-head="${a}"] .wb-topic-group__toggle`);
+    const dst = mobile.locator(`[data-group-head="${c}"]`);
+    await expect(hdr).toBeVisible();
+    const source = (await hdr.boundingBox())!;
+    const target = (await dst.boundingBox())!;
+    const cdp = await ctx.newCDPSession(mobile);
+    const x = Math.round(source.x + 25);
+    const y = Math.round(source.y + source.height / 2);
+    const end = Math.round(target.y + target.height / 4);
+    const longPressMove = async () => {
+      await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y, id: 1 }] });
+      await mobile.waitForTimeout(370);
+      for (let i = 1; i <= 6; i++) {
+        await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y: Math.round(y + (end - y) * i / 6), id: 1 }] });
+      }
+      await expect(dst).toHaveAttribute('data-group-drop', 'before');
+    };
+    const touchRequests: string[] = [];
+    mobile.on('request', req => {
+      if (req.url().endsWith('/conversation-groups/reorder')) touchRequests.push(req.url());
+    });
+    await longPressMove();
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchCancel', touchPoints: [] });
+    await expect(dst).not.toHaveAttribute('data-group-drop', 'before');
+    expect(touchRequests).toEqual([]);
+    await expect(hdr).toHaveAttribute('aria-expanded', 'true');
+    await longPressMove();
+    await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    await expect(mobile.locator('.wb-topic-group__name')).toHaveText(['Albums', 'Cinema', 'Books']);
+    await expect(mobile.locator('.wb-topic-row__title')).toHaveText(expectedTitles);
+  } finally {
+    await ctx.close();
+  }
 });

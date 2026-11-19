@@ -11,6 +11,7 @@ import {
   type CreateConversationInput,
   type CreateMessageInput,
   type CreateMessageResult,
+  type DeletedConversation,
   type DiscoveredModel,
   type FormatInfo,
   type GroupDeleteResult,
@@ -505,6 +506,12 @@ export class GatewayClient {
     ).then((res) => res.providers ?? []);
   }
 
+  reorderProviders(id: string, beforeId: string | null, signal?: AbortSignal): Promise<ProviderConfig[]> {
+    return this.requestJson<{ providers: ProviderConfig[] }>('POST', '/api/v1/providers/reorder', {
+      body: { id, beforeId }, signal,
+    }).then((res) => res.providers);
+  }
+
   createProvider(
     payload: ProviderUpsertPayload,
     signal?: AbortSignal,
@@ -661,6 +668,12 @@ export class GatewayClient {
     );
   }
 
+  cleanupUngroupedConversations(signal?: AbortSignal): Promise<DeletedConversation[]> {
+    return this.requestJson<{ deleted: DeletedConversation[] }>(
+      'POST', '/api/v1/conversations/cleanup-ungrouped', { signal },
+    ).then((res) => res.deleted);
+  }
+
   listConversationGroups(
     assistantId?: string,
     signal?: AbortSignal,
@@ -683,6 +696,15 @@ export class GatewayClient {
       'POST',
       '/api/v1/conversation-groups',
       { body: input, signal },
+    );
+  }
+
+  reorderConversationGroup(
+    input: { assistantId: string; id: string; beforeId: string | null },
+    signal?: AbortSignal,
+  ): Promise<ConversationOrganizationSnapshot> {
+    return this.requestJson<ConversationOrganizationSnapshot>(
+      'POST', '/api/v1/conversation-groups/reorder', { body: input, signal },
     );
   }
 

@@ -82,6 +82,14 @@ func (s *ProviderService) List(ctx context.Context) ([]domain.ProviderConfig, er
 	return s.store.List(ctx)
 }
 
+// Reorder persists provider order without changing provider configuration.
+func (s *ProviderService) Reorder(ctx context.Context, id string, beforeID *string) ([]domain.ProviderConfig, error) {
+	if strings.TrimSpace(id) == "" || (beforeID != nil && strings.TrimSpace(*beforeID) == "") {
+		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "provider id and anchor must not be empty", nil)
+	}
+	return s.store.Reorder(ctx, id, beforeID)
+}
+
 // Get returns a single provider by ID.
 func (s *ProviderService) Get(ctx context.Context, id string) (domain.ProviderConfig, error) {
 	return s.store.Get(ctx, id)

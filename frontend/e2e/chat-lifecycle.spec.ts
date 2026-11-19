@@ -298,3 +298,55 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeEnabled();
   });
 });
+
+
+test('persists Enter behavior on the gateway and preserves multiline and IME input', async ({ appUrl, upstream, page }) => {
+  await seedMockProviderViaApi(appUrl, upstream.url);
+  await connectWithToken(page, appUrl);
+  const composer = page.getByLabel('消息输入框');
+  const sent: string[] = [];
+  page.on('request', req => {
+    if (req.method() === 'POST' && /\/api\/v1\/conversations\/[^/]+\/messages\/stream$/.test(req.url())) sent.push(req.url());
+  });
+  await composer.fill('First draft');
+  await composer.press('Shift+Enter');
+  await expect(composer).toHaveValue('First draft\n');
+  await composer.dispatchEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true });
+  await expect(composer).toHaveValue('First draft\n');
+  expect(sent).toEqual([]);
+  await composer.press('Enter');
+  await expect(page.getByText(/Reply #1 to: First draft/)).toBeVisible();
+  expect(upstream.lastChatBodies).toHaveLength(1);
+
+  await page.getByRole('link', { name: '设置' }).click();
+  await page.getByRole('button', { name: '外观与显示' }).click();
+  const enter = page.getByRole('switch', { name: 'Enter 发送' });
+  await expect(enter).toBeChecked();
+  const saved = page.waitForResponse(res => res.url().endsWith('/api/v1/settings') && res.request().method() === 'PATCH' && res.ok());
+  await enter.click();
+  await saved;
+  await page.reload();
+  await expect(enter).not.toBeChecked();
+  await page.route('**/api/v1/settings', route => route.request().method() === 'PATCH'
+    ? route.fulfill({ status: 500, json: { code: 'INTERNAL_ERROR', message: '故障回归' } })
+    : route.continue());
+  await enter.click();
+  await expect(page.getByText('设置保存失败：故障回归')).toBeVisible();
+  await expect(enter).not.toBeChecked();
+  await page.unroute('**/api/v1/settings');
+  await page.getByRole('button', { name: '返回工作台' }).click();
+
+  await composer.fill('Second draft');
+  await composer.press('Enter');
+  await expect(composer).toHaveValue('Second draft\n');
+  expect(upstream.lastChatBodies).toHaveLength(1);
+  await composer.press('Control+Enter');
+  await expect(page.getByText(/Reply #2 to: Second draft/)).toBeVisible();
+  await composer.fill('Third draft');
+  await composer.press('Meta+Enter');
+  await expect(page.getByText(/Reply #3 to: Third draft/)).toBeVisible();
+  await composer.fill('Fourth draft');
+  await page.getByRole('button', { name: '发送消息' }).click();
+  await expect(page.getByText(/Reply #4 to: Fourth draft/)).toBeVisible();
+  expect(upstream.lastChatBodies).toHaveLength(4);
+});

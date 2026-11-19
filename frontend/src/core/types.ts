@@ -283,6 +283,8 @@ export interface Conversation {
   updatedAt: string;
 }
 
+export type DeletedConversation = Pick<Conversation, 'id' | 'assistantId'>;
+
 export interface ConversationOrganizationSnapshot {
   assistantId: string;
   conversations: Conversation[];

@@ -327,13 +327,13 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
 
     // Unsaved draft confirms before switching provider; cancel preserves draft.
     await user.type(screen.getByLabelText('名称'), ' Edited');
-    await user.click(screen.getByRole('button', { name: /DeepSeek/ }));
+    await user.click(screen.getByRole('button', { name: /^DeepSeek/ }));
     expect(screen.getByText('放弃未保存的更改？')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '取消' }));
     expect(screen.getByLabelText('名称')).toHaveValue('OpenAI Edited');
 
     // Confirming switches to DeepSeek.
-    await user.click(screen.getByRole('button', { name: /DeepSeek/ }));
+    await user.click(screen.getByRole('button', { name: /^DeepSeek/ }));
     await user.click(screen.getByRole('button', { name: '放弃' }));
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: 'DeepSeek' })).toBeInTheDocument();

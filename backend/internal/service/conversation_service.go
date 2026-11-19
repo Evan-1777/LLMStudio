@@ -473,6 +473,13 @@ type CreateGroupInput struct {
 	Name        string `json:"name"`
 }
 
+// ReorderGroupsInput describes relative placement within one assistant.
+type ReorderGroupsInput struct {
+	AssistantID string  `json:"assistantId"`
+	ID          string  `json:"id"`
+	BeforeID    *string `json:"beforeId"`
+}
+
 // RenameGroupInput describes payload fields for renaming a conversation group.
 type RenameGroupInput struct {
 	Name string `json:"name"`
@@ -576,6 +583,22 @@ func (s *ConversationService) CreateGroup(ctx context.Context, in CreateGroupInp
 	}, nil
 }
 
+// ReorderGroups moves a group and returns the assistant's canonical organization.
+func (s *ConversationService) ReorderGroups(ctx context.Context, in ReorderGroupsInput) (OrganizationSnapshot, error) {
+	aid, err := s.requireAssistantExists(ctx, in.AssistantID)
+	if err != nil {
+		return OrganizationSnapshot{}, err
+	}
+	id := strings.TrimSpace(in.ID)
+	if id == "" || (in.BeforeID != nil && strings.TrimSpace(*in.BeforeID) == "") {
+		return OrganizationSnapshot{}, domain.NewError(domain.ErrCodeInvalidArgument, "group id and anchor must not be empty", nil)
+	}
+	if err := s.convs.ReorderGroups(ctx, aid, id, in.BeforeID); err != nil {
+		return OrganizationSnapshot{}, err
+	}
+	return s.snapshot(ctx, aid, nil)
+}
+
 // RenameGroup validates and updates a conversation group's name.
 func (s *ConversationService) RenameGroup(ctx context.Context, id string, in RenameGroupInput) (GroupMutationResult, error) {
 	name := strings.TrimSpace(in.Name)
@@ -615,6 +638,11 @@ func (s *ConversationService) DeleteGroup(ctx context.Context, id string) (Group
 		Conversations:  snap.Conversations,
 		Groups:         snap.Groups,
 	}, nil
+}
+
+// CleanupUngrouped removes only the current ungrouped, unpinned bucket.
+func (s *ConversationService) CleanupUngrouped(ctx context.Context) ([]domain.DeletedConversation, error) {
+	return s.convs.CleanupUngrouped(ctx)
 }
 
 // BatchConversations executes an atomic batch delete, move, or pin operation for an assistant.
