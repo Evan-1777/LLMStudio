@@ -406,9 +406,44 @@ func (s *ChatService) executeCachePlan(
 		return shared, plugin.CachePlan{ReuseState: shared, InlineCache: plan.InlineCache}, nil
 	}
 
+	flightPlanKey := plan.PlanKey
+	plan, shouldCreate, err := s.recheckCachePlanAfterClaim(ctx, chatInput, planner, scope, plan)
+	if err != nil {
+		return nil, plugin.CachePlan{}, err
+	}
+	if !shouldCreate {
+		return plan.ReuseState, plan, nil
+	}
+
 	state, createErr := s.runCacheCreate(ctx, chatInput, planner, adapter, scope, plan)
-	s.cacheStore.FinishCreate(scope, plan.PlanKey, state)
+	s.cacheStore.FinishCreate(scope, flightPlanKey, state)
 	return state, plan, createErr
+}
+
+// recheckCachePlanAfterClaim re-evaluates PlanCache against the store while
+// holding plan.PlanKey's leadership, releasing the flight early if another
+// request populated a reusable or negative cache state before ClaimCreate.
+func (s *ChatService) recheckCachePlanAfterClaim(
+	ctx context.Context,
+	chatInput plugin.ChatInput,
+	planner plugin.PromptCachePlanner,
+	scope plugin.PromptCacheScope,
+	plan plugin.CachePlan,
+) (plugin.CachePlan, bool, error) {
+	latest := s.cacheStore.Get(scope)
+	if latest == nil {
+		return plan, true, nil
+	}
+	latestPlan, err := planner.PlanCache(ctx, chatInput, latest)
+	if err != nil {
+		s.cacheStore.FinishCreate(scope, plan.PlanKey, nil)
+		return plugin.CachePlan{}, false, err
+	}
+	if latestPlan.CreateRequest == nil {
+		s.cacheStore.FinishCreate(scope, plan.PlanKey, latestPlan.ReuseState)
+		return latestPlan, false, nil
+	}
+	return latestPlan, true, nil
 }
 
 // runCacheCreate executes one planned cache creation request and records its result.

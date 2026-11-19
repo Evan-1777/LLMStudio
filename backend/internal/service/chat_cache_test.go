@@ -24,6 +24,7 @@ type fakePlannerFormat struct {
 	id         string
 	planCount  atomic.Int32
 	createPath string
+	onPlan     func(input plugin.ChatInput, current *plugin.PromptCacheState)
 }
 
 func (f *fakePlannerFormat) ID() string          { return f.id }
@@ -35,6 +36,9 @@ func (f *fakePlannerFormat) DefaultCompat() domain.CompatConfig {
 
 func (f *fakePlannerFormat) PlanCache(_ context.Context, input plugin.ChatInput, current *plugin.PromptCacheState) (plugin.CachePlan, error) {
 	f.planCount.Add(1)
+	if f.onPlan != nil {
+		f.onPlan(input, current)
+	}
 	compat := format.MergeCompat(f.DefaultCompat(), input.Compat)
 	if !input.AutoCreateCache || compat.CacheMode == domain.CacheModeDisabled || compat.CacheMode == domain.CacheModeImplicit {
 		return plugin.CachePlan{}, nil
@@ -1377,4 +1381,237 @@ func TestGeminiCacheConcurrentCandidateCreatesOnce(t *testing.T) {
 			t.Fatalf("request #%d must reuse the shared resource: %+v", i, body)
 		}
 	}
+}
+
+func TestCachePlanRechecksStoreAfterClaimLeader(t *testing.T) {
+	lastMessageText := func(in plugin.ChatInput) string {
+		if len(in.Messages) == 0 || len(in.Messages[len(in.Messages)-1].Blocks) == 0 {
+			return ""
+		}
+		return in.Messages[len(in.Messages)-1].Blocks[0].Text
+	}
+
+	t.Run("Prepare", func(t *testing.T) {
+		ctx := context.Background()
+		db, err := store.OpenSQLite(ctx, ":memory:")
+		if err != nil {
+			t.Fatalf("open sqlite: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+
+		provStore := store.NewProviderStore(db)
+		convStore := store.NewConversationStore(db)
+		msgStore := store.NewMessageStore(db)
+		staleEntered := make(chan struct{})
+		releaseStale := make(chan struct{})
+
+		formats := plugin.NewFormatRegistry()
+		formats.MustRegister(&fakePlannerFormat{
+			id:         "fake-recheck",
+			createPath: "/v1/cache",
+			onPlan: func(input plugin.ChatInput, current *plugin.PromptCacheState) {
+				if current == nil && lastMessageText(input) == "delayed" {
+					close(staleEntered)
+					<-releaseStale
+				}
+			},
+		})
+		adapters := plugin.NewProviderRegistry()
+		adapters.MustRegister(provider.NewGenericHTTPAdapter())
+
+		var (
+			creates    atomic.Int32
+			mu         sync.Mutex
+			mainBodies []map[string]any
+		)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/cache":
+				n := creates.Add(1)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"name":       fmt.Sprintf("caches/recheck-%d", n),
+					"expireTime": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano),
+				})
+			case "/v1/generate":
+				raw, _ := io.ReadAll(r.Body)
+				var body map[string]any
+				_ = json.Unmarshal(raw, &body)
+				mu.Lock()
+				mainBodies = append(mainBodies, body)
+				mu.Unlock()
+				_, _ = fmt.Fprint(w, "ok")
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer srv.Close()
+
+		provSvc := NewProviderService(provStore, formats, adapters)
+		chatSvc := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
+			WithPreferences(NewPreferenceService(store.NewPreferenceStore(db)))
+		setAutoCache(t, chatSvc, true)
+
+		prov, err := provSvc.Create(ctx, ProviderInput{
+			ID: "p-recheck", Name: "Recheck", Adapter: "generic-http",
+			BaseURL: srv.URL, AuthType: domain.AuthTypeBearer, APIKey: "sk-1",
+			Models: []domain.ModelConfig{{ID: "m1", Name: "M1", APIFormat: "fake-recheck"}},
+		})
+		if err != nil {
+			t.Fatalf("create provider: %v", err)
+		}
+		conv, err := convStore.Create(ctx, domain.Conversation{
+			ProviderID: prov.ID, ModelID: "m1", SystemPrompt: "Sys", AssistantID: domain.DefaultAssistantID,
+		})
+		if err != nil {
+			t.Fatalf("create conversation: %v", err)
+		}
+
+		delayedDone := make(chan error, 1)
+		go func() {
+			prep, pErr := chatSvc.Prepare(ctx, StreamChatInput{ConversationID: conv.ID, Text: "delayed"})
+			if pErr != nil {
+				delayedDone <- pErr
+				return
+			}
+			delayedDone <- prep.Stream(ctx, func(domain.StreamEvent) error { return nil })
+		}()
+
+		select {
+		case <-staleEntered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("delayed caller never entered PlanCache")
+		}
+
+		firstPrep, err := chatSvc.Prepare(ctx, StreamChatInput{ConversationID: conv.ID, Text: "first"})
+		if err != nil {
+			close(releaseStale)
+			t.Fatalf("first Prepare: %v", err)
+		}
+		if err := firstPrep.Stream(ctx, func(domain.StreamEvent) error { return nil }); err != nil {
+			close(releaseStale)
+			t.Fatalf("first Stream: %v", err)
+		}
+
+		close(releaseStale)
+		if err := <-delayedDone; err != nil {
+			t.Fatalf("delayed Prepare/Stream: %v", err)
+		}
+		if got := creates.Load(); got != 1 {
+			t.Fatalf("expected 1 cache creation across staggered claim, got %d", got)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(mainBodies) != 2 {
+			t.Fatalf("expected 2 main requests, got %d", len(mainBodies))
+		}
+		for i, body := range mainBodies {
+			if body["cachedContent"] != "caches/recheck-1" {
+				t.Fatalf("request #%d must reuse caches/recheck-1, got %+v", i, body)
+			}
+		}
+	})
+
+	t.Run("PrepareLocal", func(t *testing.T) {
+		ctx := context.Background()
+		db, err := store.OpenSQLite(ctx, ":memory:")
+		if err != nil {
+			t.Fatalf("open sqlite: %v", err)
+		}
+		defer func() { _ = db.Close() }()
+
+		provStore := store.NewProviderStore(db)
+		convStore := store.NewConversationStore(db)
+		msgStore := store.NewMessageStore(db)
+		staleEntered := make(chan struct{})
+		releaseStale := make(chan struct{})
+
+		formats := plugin.NewFormatRegistry()
+		formats.MustRegister(&fakePlannerFormat{
+			id:         "fake-recheck-local",
+			createPath: "/v1/cache",
+			onPlan: func(input plugin.ChatInput, current *plugin.PromptCacheState) {
+				if current == nil && lastMessageText(input) == "delayed" {
+					close(staleEntered)
+					<-releaseStale
+				}
+			},
+		})
+		adapters := plugin.NewProviderRegistry()
+		adapters.MustRegister(provider.NewGenericHTTPAdapter())
+
+		provSvc := NewProviderService(provStore, formats, adapters)
+		chatSvc := NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
+			WithPreferences(NewPreferenceService(store.NewPreferenceStore(db)))
+		setAutoCache(t, chatSvc, true)
+
+		prov, err := provSvc.Create(ctx, ProviderInput{
+			ID: "p-recheck-local", Name: "RecheckLocal", Adapter: "generic-http",
+			BaseURL: "https://api.example", AuthType: domain.AuthTypeBearer, LocalRequest: domain.BoolPtr(true),
+			Models: []domain.ModelConfig{{ID: "m1", Name: "M1", APIFormat: "fake-recheck-local"}},
+		})
+		if err != nil {
+			t.Fatalf("create provider: %v", err)
+		}
+		conv, err := convStore.Create(ctx, domain.Conversation{
+			ProviderID: prov.ID, ModelID: "m1", SystemPrompt: "Sys", AssistantID: domain.DefaultAssistantID,
+		})
+		if err != nil {
+			t.Fatalf("create conversation: %v", err)
+		}
+
+		type localResult struct {
+			req PreparedLocalRequest
+			err error
+		}
+		delayedDone := make(chan localResult, 1)
+		go func() {
+			req, pErr := chatSvc.PrepareLocal(ctx, StreamChatInput{ConversationID: conv.ID, Text: "delayed"})
+			delayedDone <- localResult{req: req, err: pErr}
+		}()
+
+		select {
+		case <-staleEntered:
+		case <-time.After(3 * time.Second):
+			t.Fatal("delayed local caller never entered PlanCache")
+		}
+
+		firstReq, err := chatSvc.PrepareLocal(ctx, StreamChatInput{ConversationID: conv.ID, Text: "first"})
+		if err != nil || firstReq.CacheStep == nil {
+			close(releaseStale)
+			t.Fatalf("first PrepareLocal expected CacheStep, req=%+v err=%v", firstReq, err)
+		}
+		resolvedReq, err := chatSvc.PrepareLocal(ctx, StreamChatInput{
+			ConversationID: conv.ID,
+			Text:           "first",
+			CacheResolution: &LocalCacheResolutionInput{
+				PlanKey: firstReq.CacheStep.PlanKey,
+				Status:  http.StatusOK,
+				Result: LocalCacheResultData{
+					Name:       "caches/local-recheck-1",
+					ExpireTime: time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339Nano),
+				},
+			},
+		})
+		if err != nil || resolvedReq.CacheState == nil || resolvedReq.CacheState.ResourceName != "caches/local-recheck-1" {
+			close(releaseStale)
+			t.Fatalf("resolve PrepareLocal failed: req=%+v err=%v", resolvedReq, err)
+		}
+
+		close(releaseStale)
+		delayed := <-delayedDone
+		if delayed.err != nil {
+			t.Fatalf("delayed PrepareLocal: %v", delayed.err)
+		}
+		if delayed.req.CacheStep != nil {
+			t.Fatalf("delayed PrepareLocal must not issue duplicate CacheStep, got %+v", delayed.req.CacheStep)
+		}
+		if delayed.req.CacheState == nil || delayed.req.CacheState.ResourceName != "caches/local-recheck-1" {
+			t.Fatalf("delayed PrepareLocal must reuse caches/local-recheck-1, got %+v", delayed.req.CacheState)
+		}
+		var body map[string]any
+		_ = json.Unmarshal(delayed.req.Body, &body)
+		if body["cachedContent"] != "caches/local-recheck-1" {
+			t.Fatalf("delayed PrepareLocal body must carry cachedContent, got %+v", body)
+		}
+	})
 }

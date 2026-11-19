@@ -396,15 +396,17 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 					PlanKey:    plan.PlanKey,
 				})
 				if resErr != nil {
+					s.cacheStore.FinishCreate(prep.cacheScope, plan.PlanKey, nil)
 					return PreparedLocalRequest{}, resErr
 				}
 				if res.HardError != nil {
+					s.cacheStore.FinishCreate(prep.cacheScope, plan.PlanKey, nil)
 					return PreparedLocalRequest{}, res.HardError
 				}
-				s.cacheStore.FinishCreate(prep.cacheScope, plan.PlanKey, res.State)
 				if res.State != nil {
 					s.cacheStore.Set(prep.cacheScope, *res.State)
 				}
+				s.cacheStore.FinishCreate(prep.cacheScope, plan.PlanKey, res.State)
 				outCacheState = res.State
 				chatInput.PromptCache = res.State
 			} else if plan.CreateRequest == nil && plan.ReuseState != nil {
@@ -418,6 +420,24 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 				// request proceeds without the cache resource.
 				break
 			}
+			flightPlanKey := plan.PlanKey
+			if in.CacheState == nil {
+				var shouldCreate bool
+				plan, shouldCreate, planErr = s.recheckCachePlanAfterClaim(ctx, chatInput, planner, prep.cacheScope, plan)
+				if planErr != nil {
+					return PreparedLocalRequest{}, planErr
+				}
+				if !shouldCreate {
+					outCacheState = plan.ReuseState
+					chatInput.PromptCache = plan.ReuseState
+					break
+				}
+				if plan.PlanKey != "" {
+					fullPlanKey = buildLocalPlanKey(prep.cacheScope, prep.systemPrompt, prep.tools, plan.PlanKey)
+				} else {
+					fullPlanKey = ""
+				}
+			}
 			createEndpoint, epErr := resolveEndpointForCacheCreate(
 				prep.adapter,
 				localEndpointProvider(prep, prep.credentialEnvelope),
@@ -426,6 +446,7 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 				prep.compat,
 			)
 			if epErr != nil {
+				s.cacheStore.FinishCreate(prep.cacheScope, flightPlanKey, nil)
 				return PreparedLocalRequest{}, epErr
 			}
 			createBody := json.RawMessage(plan.CreateRequest.Body)
