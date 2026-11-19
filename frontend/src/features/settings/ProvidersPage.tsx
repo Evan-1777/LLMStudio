@@ -346,15 +346,23 @@ export function ProvidersPage() {
   return (
     <div className="st-provider-layout">
       <aside className="st-provider-list" aria-label="供应商列表">
-        <div className="st-search-wrap">
-          <Icon name="search" size={14} className="st-search-icon" />
-          <Input
-            compact
-            className="st-search-input"
-            aria-label="搜索供应商"
-            placeholder="搜索供应商"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <div className="st-search-wrap" style={{ flex: 1 }}>
+            <Icon name="search" size={14} className="st-search-icon" />
+            <Input
+              compact
+              className="st-search-input"
+              aria-label="搜索供应商"
+              placeholder="搜索供应商"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+          </div>
+          <IconButton
+            size="sm"
+            icon="plus"
+            label="添加供应商"
+            onClick={() => void handleOpenCreate()}
           />
         </div>
 
@@ -411,15 +419,6 @@ export function ProvidersPage() {
             );
           })}
         </div>
-
-        <Button
-          variant="secondary"
-          onClick={() => void handleOpenCreate()}
-          style={{ width: '100%' }}
-        >
-          <Icon name="plus" size={15} />
-          <span>添加供应商</span>
-        </Button>
       </aside>
 
       <section className="st-provider-detail" aria-label="供应商详情">

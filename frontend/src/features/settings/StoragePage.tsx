@@ -98,8 +98,12 @@ export function StoragePage() {
     <div className="st-scroll">
       <div className="st-container">
         <div className="st-section-head">
-          <h2 className="st-section-title">存储</h2>
-          <p className="st-subtitle">本地数据库的磁盘占用与空间回收。</p>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <h2 className="st-section-title">存储</h2>
+            {usage && !usage.compactable ? (
+              <span className="st-badge st-badge--muted">内存数据库</span>
+            ) : null}
+          </div>
         </div>
 
         <div className="st-group">
@@ -153,10 +157,6 @@ export function StoragePage() {
             <span className="st-status-text st-status-text--ok" role="status">{status}</span>
           ) : null}
         </div>
-
-        {usage && !usage.compactable ? (
-          <p className="st-subtitle">内存数据库不占用文件空间，无需压缩。</p>
-        ) : null}
 
         {error ? (
           <ErrorBanner

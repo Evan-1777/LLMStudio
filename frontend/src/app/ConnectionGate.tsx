@@ -98,9 +98,12 @@ export function ConnectionGate({ children }: { children: ReactNode }) {
           <ErrorBanner
             message={settingsNotice}
             action={
-              <Button size="sm" variant="ghost" onClick={dismissSettingsNotice}>
-                关闭
-              </Button>
+              <IconButton
+                icon="close"
+                size="sm"
+                label="关闭"
+                onClick={dismissSettingsNotice}
+              />
             }
           />
         ) : null}

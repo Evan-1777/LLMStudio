@@ -567,33 +567,36 @@ function WorkbenchInner() {
             ref={leftToggleRef}
             icon="sidebar"
             label="切换助手栏"
+            active={leftDrawerOpen}
             onClick={handleToggleLeft}
           />
 
-          <button
-            type="button"
-            className="wb-assistant-pill"
-            onClick={() => {
-              setEditingAssistant(activeAssistant);
-              setAssistantModalOpen(true);
-            }}
-            title={`编辑 ${activeAssistant.name}`}
-          >
-            <span className="wb-assistant-pill__name">
-              {activeAssistant.name}
-            </span>
-          </button>
+          <div className="wb-crumb">
+            <button
+              type="button"
+              className="wb-assistant-pill"
+              onClick={() => {
+                setEditingAssistant(activeAssistant);
+                setAssistantModalOpen(true);
+              }}
+              title={`编辑 ${activeAssistant.name}`}
+            >
+              <span className="wb-assistant-pill__name">
+                {activeAssistant.name}
+              </span>
+            </button>
 
-          <Icon name="chevronRight" size={14} className="wb-crumb-sep" />
+            <Icon name="chevronRight" size={14} className="wb-crumb-sep" />
 
-          <ModelPicker
-            providers={resources.providers}
-            selectedProviderId={selectedProviderId}
-            selectedModelId={selectedModelId}
-            disabled={isBusy}
-            busy={isSavingModel}
-            onSelect={(pId, mId) => void handleSelectModel(pId, mId)}
-          />
+            <ModelPicker
+              providers={resources.providers}
+              selectedProviderId={selectedProviderId}
+              selectedModelId={selectedModelId}
+              disabled={isBusy}
+              busy={isSavingModel}
+              onSelect={(pId, mId) => void handleSelectModel(pId, mId)}
+            />
+          </div>
 
           <div className="wb-toolbar__spacer" />
 
@@ -607,6 +610,7 @@ function WorkbenchInner() {
             ref={rightToggleRef}
             icon="history"
             label="切换话题栏"
+            active={rightDrawerOpen && !inspectorOpen}
             onClick={handleToggleRight}
           />
         </header>

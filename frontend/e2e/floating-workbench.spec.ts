@@ -88,11 +88,12 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
             const c = channel / 255;
             return sum + [0.2126, 0.7152, 0.0722][index] * (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
           }, 0);
-          return Math.min(...Array.from(document.querySelectorAll('.wb-eyebrow, .wb-nav-row--active .wb-nav-row__btn, .wb-topic-group__toggle, .wb-topic-row__time, .wb-topic-row__title')).filter(el => el.checkVisibility({ visibilityProperty: true })).map(el => {
-            const panel = el.closest('.wb-rail, .wb-history')!;
-            const row = el.closest('.wb-topic-row, .wb-nav-row');
+          return Math.min(...Array.from(document.querySelectorAll('.wb-eyebrow, .wb-nav-row--active .wb-nav-row__btn, .wb-topic-group__toggle, .wb-topic-row__time, .wb-topic-row__title, .wb-assistant-pill, .wb-model-btn, .wb-asst-name, .wb-asst-tag, .wb-user-bubble, .prose')).filter(el => el.checkVisibility({ visibilityProperty: true })).map(el => {
+            const panel = el.closest('.wb-rail, .wb-history, .wb-main')!;
+            const layer = el.closest('.wb-topic-row, .wb-nav-row, .wb-toolbar, .wb-user-bubble');
             const colors = [root.getPropertyValue('--bg-base'), getComputedStyle(panel).backgroundColor];
-            if (row) colors.push(getComputedStyle(row).backgroundColor);
+            if (layer) colors.push(getComputedStyle(layer).backgroundColor);
+            if (el.matches('.wb-asst-tag')) colors.push(getComputedStyle(el).backgroundColor);
             const background = luminance(pixel(...colors));
             const foreground = luminance(pixel(getComputedStyle(el).color));
             return (Math.max(background, foreground) + 0.05) / (Math.min(background, foreground) + 0.05);
@@ -100,6 +101,10 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
         });
         expect(minContrast).toBeGreaterThanOrEqual(4.5);
         if (width < 768) {
+          const mainBox = (await page.locator('.wb-main').boundingBox())!;
+          await expect(page.locator('.wb-main')).toHaveCSS('border-radius', '0px');
+          expect(Math.round(mainBox.x)).toBe(0);
+          expect(Math.round(mainBox.width)).toBe(width);
           expect((await page.getByRole('button', { name: /^工作记录/ }).boundingBox())!.height).toBeGreaterThanOrEqual(44);
           await page.keyboard.press('Escape');
           await page.getByRole('button', { name: '分组操作 工作记录' }).click();
@@ -111,14 +116,39 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
         }
         if (width >= 1200) {
           const a = (await rail.boundingBox())!;
-          const main = (await page.locator('.wb-main').boundingBox())!;
+          const mainEl = page.locator('.wb-main');
+          const main = (await mainEl.boundingBox())!;
           const h = (await history.boundingBox())!;
+          await expect(mainEl).toHaveCSS('border-radius', '12px');
           expect(a.x).toBeGreaterThanOrEqual(12);
           expect(main.x - a.x - a.width).toBeGreaterThanOrEqual(12);
           expect(h.x - main.x - main.width).toBeGreaterThanOrEqual(12);
+          expect(Math.abs(a.y - main.y)).toBeLessThanOrEqual(1);
+          expect(Math.abs(h.y - main.y)).toBeLessThanOrEqual(1);
+          expect(Math.abs((a.y + a.height) - (main.y + main.height))).toBeLessThanOrEqual(1);
+          expect(Math.abs((h.y + h.height) - (main.y + main.height))).toBeLessThanOrEqual(1);
+
+          const railHead = (await page.locator('.wb-rail__head').boundingBox())!;
+          const toolbar = (await page.locator('.wb-toolbar').boundingBox())!;
+          const historyHead = (await page.locator('.wb-history__head').boundingBox())!;
+          expect(Math.abs(railHead.height - 48)).toBeLessThanOrEqual(1);
+          expect(Math.abs(toolbar.height - 48)).toBeLessThanOrEqual(1);
+          expect(Math.abs(historyHead.height - 48)).toBeLessThanOrEqual(1);
+          expect(Math.abs(railHead.y - toolbar.y)).toBeLessThanOrEqual(1);
+          expect(Math.abs(historyHead.y - toolbar.y)).toBeLessThanOrEqual(1);
+
           await left.click();
           await expect(rail).toBeHidden();
-          expect((await page.locator('.wb-main').boundingBox())!.x).toBeLessThan(main.x);
+          const collapsedLeftMain = (await mainEl.boundingBox())!;
+          expect(collapsedLeftMain.x).toBeLessThan(main.x);
+          expect(Math.abs(collapsedLeftMain.x - 12)).toBeLessThanOrEqual(1);
+
+          await right.click();
+          await expect(history).toBeHidden();
+          const collapsedBothMain = (await mainEl.boundingBox())!;
+          expect(Math.abs((collapsedBothMain.x + collapsedBothMain.width) - (width - 12))).toBeLessThanOrEqual(1);
+
+          await right.click();
           await left.click();
         }
       }
@@ -130,6 +160,65 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
         await expect(right).toBeFocused();
       }
       if (mode === 'dark') await write('settings', { themeMode: 'light' }, 'PATCH');
+    } finally {
+      await context.close();
+    }
+  }
+});
+
+test('keeps settings floating dual-column stage aligned at desktop, tablet, and mobile', async ({ appUrl, browser }) => {
+  for (const [mode, width, height] of [['light', 1280, 800], ['dark', 1280, 800], ['light', 768, 900], ['dark', 375, 812]] as const) {
+    const context = await browser.newContext({ viewport: { width, height }, hasTouch: width < 1000, reducedMotion: 'reduce' });
+    try {
+      const page = await context.newPage();
+      await connectWithToken(page, appUrl);
+      if (mode === 'dark') {
+        await fetch(`${appUrl}/api/v1/settings`, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${E2E_TOKEN}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ themeMode: 'dark' }),
+        });
+      }
+      await page.goto(`${appUrl}/settings/appearance`);
+      await expect(page.locator('html')).toHaveAttribute('data-theme', mode);
+      const rail = page.locator('.st-rail');
+      const main = page.locator('.st-main');
+
+      if (width >= 768) {
+        await expect(rail).toHaveCSS('border-radius', '12px');
+        await expect(main).toHaveCSS('border-radius', '12px');
+        const railBox = (await rail.boundingBox())!;
+        const mainBox = (await main.boundingBox())!;
+        expect(Math.abs(railBox.x - 12)).toBeLessThanOrEqual(1);
+        expect(Math.abs(mainBox.x - railBox.x - railBox.width - 12)).toBeLessThanOrEqual(1);
+        expect(Math.abs(railBox.y - mainBox.y)).toBeLessThanOrEqual(1);
+        expect(Math.abs((railBox.y + railBox.height) - (mainBox.y + mainBox.height))).toBeLessThanOrEqual(1);
+        const railHead = (await page.locator('.st-rail__head').boundingBox())!;
+        const toolbar = (await page.locator('.st-toolbar').boundingBox())!;
+        expect(Math.abs(railHead.height - 48)).toBeLessThanOrEqual(1);
+        expect(Math.abs(toolbar.height - 48)).toBeLessThanOrEqual(1);
+        expect(Math.abs(railHead.y - toolbar.y)).toBeLessThanOrEqual(1);
+      } else {
+        await expect(main).toHaveCSS('border-radius', '0px');
+        const mainBox = (await main.boundingBox())!;
+        expect(Math.round(mainBox.x)).toBe(0);
+        expect(Math.round(mainBox.width)).toBe(width);
+        await expect(rail).toBeHidden();
+        await page.getByRole('button', { name: '打开设置分类' }).click();
+        await expect(rail).toBeVisible();
+        await expect(rail).toHaveCSS('border-radius', '12px');
+        expect((await rail.boundingBox())!.x).toBeGreaterThanOrEqual(12);
+        await page.keyboard.press('Escape');
+        await expect(rail).toBeHidden();
+      }
+
+      if (mode === 'dark') {
+        await fetch(`${appUrl}/api/v1/settings`, {
+          method: 'PATCH',
+          headers: { Authorization: `Bearer ${E2E_TOKEN}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ themeMode: 'light' }),
+        });
+      }
     } finally {
       await context.close();
     }

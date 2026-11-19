@@ -4,9 +4,9 @@ import { useApp } from '../../app/AppProvider';
 import {
   Avatar,
   Button,
-  EmptyState,
   ErrorBanner,
   Icon,
+  IconButton,
   LoadingSpinner,
   Textarea,
 } from '../../components/ui';
@@ -264,22 +264,21 @@ export function ChatCanvas({
           }}
         />
         <div className="wb-msg-editor__actions">
-          <Button
+          <IconButton
             size="sm"
-            variant="ghost"
+            icon="close"
+            label="取消"
             disabled={savingEdit}
             onClick={cancelEdit}
-          >
-            取消
-          </Button>
-          <Button
+          />
+          <IconButton
             size="sm"
-            variant="primary"
-            disabled={savingEdit || !canSave}
+            icon="check"
+            label="保存"
+            loading={savingEdit}
+            disabled={!canSave}
             onClick={() => void saveEdit(msg)}
-          >
-            {savingEdit ? '保存中...' : '保存'}
-          </Button>
+          />
         </div>
       </div>
     );
@@ -320,10 +319,15 @@ export function ChatCanvas({
               }
             />
           ) : (
-            <EmptyState
-              icon="bot"
-              title={assistant.name}
-            />
+            <div className="wb-empty-focus">
+              <Avatar
+                kind="assistant"
+                src={assistant.avatarDataUrl}
+                size={48}
+                className="ui-avatar--lg"
+              />
+              <h2 className="wb-empty-focus__title">{assistant.name}</h2>
+            </div>
           )
         ) : (
           <CollapseStateProvider>

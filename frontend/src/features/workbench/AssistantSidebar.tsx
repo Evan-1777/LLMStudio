@@ -42,49 +42,52 @@ export function AssistantSidebar({
         />
       </div>
 
-      <div className="wb-section-bar">
-        <span className="wb-eyebrow">助手</span>
-      </div>
+      <div className="wb-rail__body">
+        <div className="wb-section-bar">
+          <span className="wb-eyebrow">助手</span>
+        </div>
 
-      <nav className="wb-list" aria-label="助手列表">
-        {assistants.map((assistant) => {
-          const active = assistant.id === activeAssistantId;
-          return (
-            <div
-              key={assistant.id}
-              className={`wb-nav-row ${active ? 'wb-nav-row--active' : ''}`.trim()}
-            >
-              <button
-                type="button"
-                className="wb-nav-row__btn"
-                aria-current={active ? 'true' : undefined}
-                onClick={() => onSelectAssistant(assistant.id)}
+        <nav className="wb-list" aria-label="助手列表">
+          {assistants.map((assistant) => {
+            const active = assistant.id === activeAssistantId;
+            return (
+              <div
+                key={assistant.id}
+                className={`wb-nav-row ${active ? 'wb-nav-row--active' : ''}`.trim()}
               >
-                <Avatar kind="assistant" src={assistant.avatarDataUrl} size={24} />
-                <span className="wb-nav-row__label">{assistant.name}</span>
-              </button>
-              <div className="wb-nav-row__actions">
-                <IconButton
-                  size="sm"
-                  icon="edit"
-                  label={`编辑 ${assistant.name}`}
-                  onClick={() => onEditAssistant(assistant)}
-                />
+                <button
+                  type="button"
+                  className="wb-nav-row__btn"
+                  aria-current={active ? 'true' : undefined}
+                  onClick={() => onSelectAssistant(assistant.id)}
+                >
+                  <Avatar kind="assistant" src={assistant.avatarDataUrl} size={24} />
+                  <span className="wb-nav-row__label">{assistant.name}</span>
+                </button>
+                <div className="wb-nav-row__actions">
+                  <IconButton
+                    size="sm"
+                    icon="edit"
+                    label={`编辑 ${assistant.name}`}
+                    onClick={() => onEditAssistant(assistant)}
+                  />
+                </div>
               </div>
-            </div>
-          );
-        })}
-      </nav>
+            );
+          })}
+        </nav>
+      </div>
 
       <div className="wb-rail__foot">
         <Link
           to="/settings/providers"
           state={{ from: fromPath }}
-          className="wb-settings-link"
+          className="ui-icon-btn"
+          aria-label="设置"
+          title="设置"
           onClick={onNavigateSettings}
         >
           <Icon name="settings" size={16} />
-          <span>设置</span>
         </Link>
         <span
           className="wb-status-dot"

@@ -64,6 +64,8 @@ export function Select({ compact = false, className = '', ...rest }: SelectProps
 export interface SegmentedOption<T extends string> {
   value: T;
   label: ReactNode;
+  ariaLabel?: string;
+  title?: string;
 }
 
 export function SegmentedControl<T extends string>({
@@ -87,6 +89,8 @@ export function SegmentedControl<T extends string>({
             type="button"
             role="radio"
             aria-checked={active}
+            aria-label={opt.ariaLabel}
+            title={opt.title ?? opt.ariaLabel}
             className={`ui-segmented__item ${
               active ? 'ui-segmented__item--active' : ''
             }`.trim()}

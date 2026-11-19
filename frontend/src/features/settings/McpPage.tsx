@@ -5,7 +5,6 @@ import {
   ConfirmDialog,
   EmptyState,
   ErrorBanner,
-  Icon,
   IconButton,
   Input,
   LoadingSpinner,
@@ -167,16 +166,14 @@ export function McpPage() {
             <span className="st-badge">{mcpServers.length}</span>
           </div>
           {mcpServers.length > 0 ? (
-            <Button
-              variant="primary"
+            <IconButton
+              icon="plus"
+              label="添加配置"
               onClick={() => {
                 setEditing(null);
                 setEditorOpen(true);
               }}
-            >
-              <Icon name="plus" size={15} />
-              <span>添加配置</span>
-            </Button>
+            />
           ) : null}
         </div>
 
@@ -267,16 +264,14 @@ export function McpPage() {
                       ) : null}
                     </div>
                     <div className="st-model-meta">
-                      <Button
+                      <IconButton
                         size="sm"
-                        variant="secondary"
+                        icon="refresh"
                         loading={Boolean(probe?.probing)}
                         disabled={saving}
-                        aria-label={`拉取工具 ${server.name}`}
+                        label={`拉取工具 ${server.name}`}
                         onClick={() => void handleProbe(server)}
-                      >
-                        拉取工具
-                      </Button>
+                      />
                       <Switch
                         checked={server.enabled}
                         disabled={busy}

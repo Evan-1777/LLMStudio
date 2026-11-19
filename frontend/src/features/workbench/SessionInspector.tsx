@@ -146,7 +146,7 @@ export function SessionInspector({
 
   return (
     <form className="wb-inspector" onSubmit={(e) => void handleSubmit(e)}>
-      <div className="wb-history__head" style={{ paddingLeft: 0, paddingRight: 0 }}>
+      <div className="wb-history__head">
         <span>话题参数</span>
         <IconButton
           size="sm"
@@ -156,7 +156,8 @@ export function SessionInspector({
         />
       </div>
 
-      {error ? <ErrorBanner message={error} /> : null}
+      <div className="wb-inspector__body">
+        {error ? <ErrorBanner message={error} /> : null}
 
       <Field label="系统提示词" htmlFor="session-system-prompt">
         <Textarea
@@ -164,7 +165,7 @@ export function SessionInspector({
           rows={5}
           value={systemPrompt}
           disabled={isBusy || saving}
-          placeholder="留空时继承当前助手提示词"
+          placeholder="继承助手"
           onChange={(e) => setSystemPrompt(e.target.value)}
         />
       </Field>
@@ -234,6 +235,7 @@ export function SessionInspector({
         >
           恢复继承值
         </Button>
+      </div>
       </div>
     </form>
   );

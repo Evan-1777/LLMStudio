@@ -1,6 +1,5 @@
 import type { ReactNode } from 'react';
-import { Button } from './Button';
-import { Icon, type IconName } from './Icon';
+import { Icon, IconButton, type IconName } from './Icon';
 
 export function LoadingSpinner({
   label,
@@ -63,9 +62,7 @@ export function ErrorBanner({
       </span>
       <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
         {onRetry ? (
-          <Button variant="secondary" size="sm" onClick={onRetry}>
-            重试
-          </Button>
+          <IconButton icon="refresh" size="sm" label="重试" onClick={onRetry} />
         ) : null}
         {action}
       </span>

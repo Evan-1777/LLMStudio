@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { Icon, IconButton, type IconName } from '../components/ui';
+import { Icon, type IconName } from '../components/ui';
 import './rendering.css';
 
 type ManualCollapseMap = Map<string, boolean>;
@@ -99,19 +99,11 @@ export function CollapsibleBlock({
           aria-expanded={!collapsed}
           onClick={toggle}
         >
-          <Icon name={collapsed ? 'chevronRight' : 'chevronDown'} size={14} />
+          <Icon name="chevronRight" size={14} className="block-card__chevron" />
           {icon ? <Icon name={icon} size={14} /> : null}
           <span className="block-card__title">{title}</span>
         </button>
-        <div className="block-card__actions">
-          {actions}
-          <IconButton
-            size="sm"
-            icon={collapsed ? 'chevronDown' : 'chevronUp'}
-            label={collapsed ? '展开内容' : '折叠内容'}
-            onClick={toggle}
-          />
-        </div>
+        {actions ? <div className="block-card__actions">{actions}</div> : null}
       </div>
       {!collapsed ? children : null}
     </div>

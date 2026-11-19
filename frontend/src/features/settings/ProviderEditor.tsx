@@ -512,7 +512,7 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
                 apiKeySet={provider.apiKeySet}
                 apiKeyMasked={provider.apiKeyMasked}
                 placeholder={
-                  authType === 'none' ? '当前鉴权无需密钥' : undefined
+                  authType === 'none' ? '无需密钥' : undefined
                 }
                 disabled={saving}
                 onValueChange={setApiKey}
@@ -606,21 +606,20 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
           ) : null}
           <span className="st-actions-bar__spacer" />
           {isDirty ? (
-            <Button
-              variant="ghost"
+            <IconButton
+              icon="undo"
+              label="还原"
               disabled={saving}
               onClick={() => syncDraftFromProvider(provider)}
-            >
-              还原
-            </Button>
+            />
           ) : null}
-          <Button
-            variant="danger-ghost"
+          <IconButton
+            icon="trash"
+            tone="danger"
+            label="删除供应商"
             disabled={saving || deleting}
             onClick={() => setConfirmDeleteOpen(true)}
-          >
-            删除供应商
-          </Button>
+          />
           <Button type="submit" variant="primary" disabled={saving}>
             {saving ? '保存中...' : '保存'}
           </Button>
@@ -651,9 +650,12 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
                 />
               </div>
             ) : null}
-            <Button size="sm" variant="secondary" onClick={openImport}>
-              获取模型
-            </Button>
+            <IconButton
+              size="sm"
+              icon="download"
+              label="获取模型"
+              onClick={openImport}
+            />
             <IconButton
               size="sm"
               icon="plus"

@@ -1,6 +1,6 @@
 .prose {
   font-size: 14.5px;
-  line-height: 1.7;
+  line-height: 1.72;
   color: var(--text-primary);
   word-break: break-word;
   overflow-wrap: anywhere;
@@ -24,7 +24,7 @@
 .prose h4,
 .prose h5,
 .prose h6 {
-  margin: 16px 0 8px;
+  margin: 18px 0 8px;
   font-weight: 620;
   line-height: 1.35;
   letter-spacing: -0.015em;
@@ -176,6 +176,15 @@
 
 .block-card__toggle:hover {
   color: var(--text-primary);
+}
+
+.block-card__chevron {
+  flex: none;
+  transition: transform var(--duration-fast) var(--ease-apple);
+}
+
+.block-card__toggle[aria-expanded='true'] .block-card__chevron {
+  transform: rotate(90deg);
 }
 
 .block-card__title {
@@ -370,6 +379,8 @@
 .tool-trace-entry__head::before {
   content: '▸';
   color: var(--text-secondary);
+  display: inline-block;
+  transition: transform var(--duration-fast) var(--ease-apple);
 }
 
 .tool-trace-entry[open] > summary::before {
@@ -451,4 +462,11 @@
   font-size: 11px;
   color: var(--text-secondary);
   word-break: break-all;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .block-card__chevron,
+  .tool-trace-entry__head::before {
+    transition: none;
+  }
 }

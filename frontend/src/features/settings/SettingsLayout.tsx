@@ -161,36 +161,40 @@ export function SettingsLayout({
         className={`st-rail ${drawerOpen ? 'st-rail--open' : ''}`.trim()}
         aria-label="设置分类"
       >
-        <button
-          type="button"
-          className="st-back-btn"
-          onClick={() => void handleBack()}
-        >
-          <Icon name="arrowLeft" size={16} />
-          <span>返回工作台</span>
-        </button>
+        <div className="st-rail__head">
+          <div className="st-brand">
+            <img src="/favicon.png" alt="" className="st-brand__mark" aria-hidden="true" />
+            <span>设置</span>
+          </div>
+          <IconButton
+            icon="arrowLeft"
+            size="sm"
+            label="返回工作台"
+            onClick={() => void handleBack()}
+          />
+        </div>
 
-        <div className="st-eyebrow">设置</div>
-
-        <nav className="st-nav" aria-label="设置导航">
-          {NAV_ITEMS.map((item) => {
-            const active = item.id === activeSection;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                className={`st-nav-item ${
-                  active ? 'st-nav-item--active' : ''
-                }`.trim()}
-                aria-current={active ? 'page' : undefined}
-                onClick={() => void handleSelectSection(item.id)}
-              >
-                <Icon name={item.icon} size={16} />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
-        </nav>
+        <div className="st-rail__body">
+          <nav className="st-nav" aria-label="设置导航">
+            {NAV_ITEMS.map((item) => {
+              const active = item.id === activeSection;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  className={`st-nav-item ${
+                    active ? 'st-nav-item--active' : ''
+                  }`.trim()}
+                  aria-current={active ? 'page' : undefined}
+                  onClick={() => void handleSelectSection(item.id)}
+                >
+                  <Icon name={item.icon} size={16} />
+                  <span>{item.label}</span>
+                </button>
+              );
+            })}
+          </nav>
+        </div>
 
         <div className="st-rail-foot">
           <span className={`st-status-dot ${dotClass}`.trim()} aria-hidden="true" />
@@ -212,6 +216,7 @@ export function SettingsLayout({
           <IconButton
             icon="close"
             label="关闭设置"
+            className="st-mobile-only"
             onClick={() => void handleBack()}
           />
         </header>

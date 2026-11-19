@@ -148,7 +148,12 @@ a {
   white-space: nowrap;
   transition: background-color var(--duration-fast) var(--ease-apple),
     border-color var(--duration-fast) var(--ease-apple),
-    color var(--duration-fast) var(--ease-apple);
+    color var(--duration-fast) var(--ease-apple),
+    transform var(--duration-fast) var(--ease-apple);
+}
+
+.ui-btn:active:not(:disabled) {
+  transform: scale(0.98);
 }
 
 .ui-btn--sm {
@@ -292,7 +297,7 @@ a {
   padding: 2px;
   gap: 2px;
   background: var(--bg-surface-secondary);
-  border: 1px solid var(--border-hairline);
+  border: 1px solid var(--border-panel);
   border-radius: var(--radius-md);
   box-shadow: inset var(--shadow-xs);
 }
@@ -547,9 +552,9 @@ a {
 .gate-card {
   width: min(420px, 100%);
   background: var(--bg-surface);
-  border: 1px solid var(--border-hairline);
+  border: 1px solid var(--border-panel);
   border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--shadow-panel);
   padding: 24px;
   display: flex;
   flex-direction: column;
@@ -599,8 +604,9 @@ a {
 /* Grouped Apple Inset Surface */
 .ui-group-card {
   background: var(--bg-surface);
-  border: 1px solid var(--border-hairline);
+  border: 1px solid var(--border-panel);
   border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-panel);
   overflow: hidden;
 }
 
@@ -698,7 +704,8 @@ a {
   .ui-menu-content {
     animation: none !important;
   }
-  .ui-icon-btn:active:not(:disabled) {
+  .ui-icon-btn:active:not(:disabled),
+  .ui-btn:active:not(:disabled) {
     transform: none;
   }
   .ui-icon-btn,

@@ -133,9 +133,12 @@ export function ConnectionPage() {
           <ErrorBanner
             message={settingsNotice}
             action={
-              <Button size="sm" variant="ghost" onClick={dismissSettingsNotice}>
-                关闭
-              </Button>
+              <IconButton
+                icon="close"
+                size="sm"
+                label="关闭"
+                onClick={dismissSettingsNotice}
+              />
             }
           />
         ) : null}
@@ -143,7 +146,7 @@ export function ConnectionPage() {
         {connectionError || connectionState === 'auth-required' ? (
           <ErrorBanner
             message={
-              connectionError || '网关需要有效访问令牌，请更新令牌后保存连接'
+              connectionError || '需要有效访问令牌'
             }
           />
         ) : null}

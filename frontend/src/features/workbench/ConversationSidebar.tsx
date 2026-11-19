@@ -674,46 +674,38 @@ export function ConversationSidebar({
               </div>
             </div>
 
-            <div className="wb-search-wrap">
-              <Icon name="search" size={14} className="wb-search-icon" />
-              <input
-                type="search"
-                className="wb-search-input"
-                aria-label="搜索话题"
-                placeholder="搜索话题"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-              />
-            </div>
+            <div className="wb-history__body">
+              <div className="wb-search-wrap">
+                <Icon name="search" size={14} className="wb-search-icon" />
+                <input
+                  type="search"
+                  className="wb-search-input"
+                  aria-label="搜索话题"
+                  placeholder="搜索话题"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+              </div>
 
             {manageMode ? (
               <div className="wb-manage-bar" role="region" aria-label="批量管理">
-                <div className="wb-manage-bar__top">
-                  <span className="wb-manage-bar__count">
-                    已选 {selectedIds.size} 项
-                  </span>
-                  <div style={{ display: 'inline-flex', gap: 4 }}>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      disabled={visibleFilteredIds.length === 0 || mutating}
-                      onClick={toggleSelectAllFiltered}
-                    >
-                      {allFilteredSelected ? '取消全选' : '全选'}
-                    </Button>
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      onClick={() => onManageModeChange(false)}
-                    >
-                      完成
-                    </Button>
-                  </div>
-                </div>
+                <span className="wb-manage-bar__count">
+                  <span aria-hidden="true">{selectedIds.size}</span>
+                  <span className="sr-only">已选 {selectedIds.size} 项</span>
+                </span>
                 <div className="wb-manage-bar__actions">
-                  <Button
+                  <IconButton
                     size="sm"
-                    variant="secondary"
+                    icon="checkSquare"
+                    active={allFilteredSelected}
+                    label={allFilteredSelected ? '取消全选' : '全选'}
+                    disabled={visibleFilteredIds.length === 0 || mutating}
+                    onClick={toggleSelectAllFiltered}
+                  />
+                  <IconButton
+                    size="sm"
+                    icon="folder"
+                    label="移至分组"
                     disabled={selectedIds.size === 0 || mutating}
                     onClick={() =>
                       openMoveModal(
@@ -721,12 +713,21 @@ export function ConversationSidebar({
                         selectedConvs[0]?.groupId ?? null,
                       )
                     }
-                  >
-                    移至分组
-                  </Button>
-                  <Button
+                  />
+                  <IconButton
                     size="sm"
-                    variant="secondary"
+                    icon={
+                      selectedConvs.length > 0 &&
+                      selectedConvs.every((c) => Boolean(c.pinned))
+                        ? 'pinOff'
+                        : 'pin'
+                    }
+                    label={
+                      selectedConvs.length > 0 &&
+                      selectedConvs.every((c) => Boolean(c.pinned))
+                        ? '取消置顶'
+                        : '置顶'
+                    }
                     disabled={selectedIds.size === 0 || mutating}
                     onClick={() => {
                       const allPinned =
@@ -734,20 +735,26 @@ export function ConversationSidebar({
                         selectedConvs.every((c) => Boolean(c.pinned));
                       void handleBatchPin(Array.from(selectedIds), !allPinned);
                     }}
-                  >
-                    {selectedConvs.length > 0 &&
-                    selectedConvs.every((c) => Boolean(c.pinned))
-                      ? '取消置顶'
-                      : '置顶'}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="danger"
+                  />
+                  <button
+                    type="button"
+                    className="ui-icon-btn ui-icon-btn--sm ui-icon-btn--danger wb-manage-bar__delete"
+                    aria-label={`删除 (${selectedIds.size})`}
+                    title={`删除 (${selectedIds.size})`}
                     disabled={selectedIds.size === 0 || mutating}
                     onClick={() => setDeletingConvs(selectedConvs)}
                   >
-                    删除 ({selectedIds.size})
-                  </Button>
+                    <Icon name="trash" size={14} />
+                    <span className="wb-badge-count" aria-hidden="true">
+                      {selectedIds.size}
+                    </span>
+                  </button>
+                  <IconButton
+                    size="sm"
+                    icon="close"
+                    label="完成"
+                    onClick={() => onManageModeChange(false)}
+                  />
                 </div>
               </div>
             ) : null}
@@ -1075,6 +1082,7 @@ export function ConversationSidebar({
                   );
                 })
               )}
+              </div>
             </div>
           </>
         )}

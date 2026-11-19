@@ -249,8 +249,8 @@ function SearchEngineCard({
             engine.apiKeySet
               ? `已保存 (${engine.apiKeyMasked || '****'})`
               : engine.requiresApiKey
-                ? '输入 API Key（必填）'
-                : '输入 API Key（可选）'
+                ? '必填'
+                : '可选'
           }
           disabled={saving}
           onValueChange={setApiKey}

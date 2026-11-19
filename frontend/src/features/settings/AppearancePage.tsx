@@ -2,9 +2,9 @@ import { useEffect, useState } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
   AvatarField,
-  Button,
   ErrorBanner,
   Icon,
+  IconButton,
   Input,
   SegmentedControl,
   Switch,
@@ -88,9 +88,12 @@ export function AppearancePage() {
           <ErrorBanner
             message={settingsNotice}
             action={
-              <Button size="sm" variant="ghost" onClick={dismissSettingsNotice}>
-                关闭
-              </Button>
+              <IconButton
+                icon="close"
+                size="sm"
+                label="关闭"
+                onClick={dismissSettingsNotice}
+              />
             }
           />
         ) : null}
@@ -130,30 +133,21 @@ export function AppearancePage() {
                 options={[
                   {
                     value: 'system',
-                    label: (
-                      <>
-                        <Icon name="monitor" size={14} />
-                        <span>系统</span>
-                      </>
-                    ),
+                    ariaLabel: '系统',
+                    title: '系统',
+                    label: <Icon name="monitor" size={14} />,
                   },
                   {
                     value: 'light',
-                    label: (
-                      <>
-                        <Icon name="sun" size={14} />
-                        <span>浅色</span>
-                      </>
-                    ),
+                    ariaLabel: '浅色',
+                    title: '浅色',
+                    label: <Icon name="sun" size={14} />,
                   },
                   {
                     value: 'dark',
-                    label: (
-                      <>
-                        <Icon name="moon" size={14} />
-                        <span>深色</span>
-                      </>
-                    ),
+                    ariaLabel: '深色',
+                    title: '深色',
+                    label: <Icon name="moon" size={14} />,
                   },
                 ]}
                 onChange={(themeMode) => void updatePreferences({ themeMode })}
@@ -224,21 +218,15 @@ export function AppearancePage() {
                 options={[
                   {
                     value: 'bubble',
-                    label: (
-                      <>
-                        <Icon name="messageSquare" size={14} />
-                        <span>气泡模式</span>
-                      </>
-                    ),
+                    ariaLabel: '气泡模式',
+                    title: '气泡模式',
+                    label: <Icon name="messageSquare" size={14} />,
                   },
                   {
                     value: 'feed',
-                    label: (
-                      <>
-                        <Icon name="layoutStream" size={14} />
-                        <span>信息流模式</span>
-                      </>
-                    ),
+                    ariaLabel: '信息流模式',
+                    title: '信息流模式',
+                    label: <Icon name="layoutStream" size={14} />,
                   },
                 ]}
                 onChange={(chatDisplayMode) =>

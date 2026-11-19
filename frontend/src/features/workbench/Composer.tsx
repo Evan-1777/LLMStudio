@@ -279,7 +279,7 @@ export function Composer({
           placeholder={
             selectedModelId
               ? '输入消息'
-              : '请先选择或配置可用模型'
+              : '未选择模型'
           }
           rows={1}
           value={draft}
