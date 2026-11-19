@@ -1,4 +1,5 @@
 import { Icon, IconButton } from '../../components/ui';
+import { formatBytes } from '../../core/formatBytes';
 import type { PendingAttachment } from './attachments';
 
 export function AttachmentChips({
@@ -14,11 +15,14 @@ export function AttachmentChips({
     <div className="wb-attachments-bar">
       {attachments.map((att) => {
         const isError = att.status === 'error';
+        const sizeLabel = att.originalSize !== undefined && att.originalSize !== att.size
+          ? `${formatBytes(att.originalSize)} → ${formatBytes(att.size)}`
+          : formatBytes(att.size);
         return (
           <div
             key={att.id}
             className={`wb-att-chip ${isError ? 'wb-att-chip--error' : ''}`.trim()}
-            title={att.error ? `${att.name}: ${att.error}` : att.name}
+            title={att.error ? `${att.name}: ${att.error}` : att.status === 'ready' ? `${att.name} (${sizeLabel})` : att.name}
           >
             {att.kind === 'image' && att.previewUrl && !isError ? (
               <img
@@ -40,7 +44,7 @@ export function AttachmentChips({
             )}
             <span className="wb-att-chip__name">
               {att.status === 'reading'
-                ? `${att.name}…`
+                ? `${att.name}${att.kind === 'image' ? ' · 压缩中' : ''}…`
                 : isError
                   ? `${att.name} · ${att.error}`
                   : att.name}

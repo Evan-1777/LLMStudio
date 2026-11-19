@@ -267,6 +267,19 @@ function buildToolExecutionTrace(blocks: ContentBlock[]) {
   return rounds;
 }
 
+function buildAssistantRenderItems(blocks: ContentBlock[]) {
+  const toolTrace = buildToolExecutionTrace(blocks);
+  if (toolTrace.size === 0) return { toolTrace };
+
+  const isTool = (block: ContentBlock) => block.type === 'toolCall' || block.type === 'toolResult';
+  const start = blocks.findIndex((block) => block.type === 'thinking' || isTool(block));
+  let end = blocks.findLastIndex(isTool);
+  while (blocks[end + 1]?.type === 'thinking') end++;
+  const thinkingCount = blocks.slice(start, end + 1).filter((block) => block.type === 'thinking').length;
+  const trace = thinkingCount + toolTrace.size >= 2 ? { start, end, thinkingCount } : undefined;
+  return { toolTrace, trace };
+}
+
 export const ContentRenderer = memo(function ContentRenderer({
   messageId,
   collapsePrefix,
@@ -296,11 +309,10 @@ export const ContentRenderer = memo(function ContentRenderer({
     [blocks],
   );
 
-  const toolTrace = useMemo(() => buildToolExecutionTrace(blocks), [blocks]);
-
-  const otherNodes: ReactNode[] = [];
-
-  blocks.forEach((block, blockIndex) => {
+  const { toolTrace, trace } = useMemo(() => buildAssistantRenderItems(blocks), [blocks]);
+  const ended = (entry: PairedToolCallEntry) => entry.resultIndex !== undefined &&
+    (!isStreaming || blockCompleted?.[entry.resultIndex] === true);
+  const renderBlock = (block: ContentBlock, blockIndex: number, nodes: ReactNode[], inTrace = false) => {
     const baseKey = `${effectivePrefix}:${blockIndex}`;
 
     if (block.type === 'text') {
@@ -308,7 +320,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       if (!text) return;
 
       if (isUser) {
-        otherNodes.push(
+        nodes.push(
           <div key={baseKey} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
             {text}
           </div>,
@@ -316,15 +328,20 @@ export const ContentRenderer = memo(function ContentRenderer({
         return;
       }
 
+      if (inTrace) {
+        nodes.push(<MarkdownProse key={baseKey} markdown={text} />);
+        return;
+      }
+
       const segments = parseAssistantContent(text, { isStreaming });
       segments.forEach((seg, segIdx) => {
         const segKey = `${baseKey}:${segIdx}`;
         if (seg.kind === 'prose') {
-          otherNodes.push(
+          nodes.push(
             <MarkdownProse key={segKey} markdown={seg.markdown} />,
           );
         } else if (seg.kind === 'code') {
-          otherNodes.push(
+          nodes.push(
             <CodeBlock
               key={segKey}
               language={seg.language}
@@ -335,7 +352,7 @@ export const ContentRenderer = memo(function ContentRenderer({
           );
         } else if (settings.visualHtmlRender) {
           if (seg.isClosed) {
-            otherNodes.push(
+            nodes.push(
               <SandboxedIframe
                 key={segKey}
                 html={seg.html}
@@ -344,14 +361,14 @@ export const ContentRenderer = memo(function ContentRenderer({
               />,
             );
           } else {
-            otherNodes.push(
+            nodes.push(
               <pre key={segKey} className="code-pre code-pre--streaming">
                 <code>{seg.html}</code>
               </pre>,
             );
           }
         } else {
-          otherNodes.push(
+          nodes.push(
             <RawHtmlCodeCard
               key={segKey}
               html={seg.html}
@@ -369,13 +386,9 @@ export const ContentRenderer = memo(function ContentRenderer({
         typeof block.thinking === 'string' ? block.thinking : '';
       const isBlockStreaming =
         isStreaming && blockCompleted?.[blockIndex] !== true;
-      const keepOpenForIncomplete =
-        stopReason === 'aborted' || stopReason === 'error';
-      const defaultCollapsed =
-        isBlockStreaming || keepOpenForIncomplete
-          ? false
-          : settings.autoCollapseThinkingOnComplete;
-      otherNodes.push(
+      const interrupted = !isStreaming && stopReason === 'aborted' && blockIndex === blocks.length - 1;
+      const defaultCollapsed = !isBlockStreaming && !interrupted && settings.autoCollapseThinkingOnComplete;
+      nodes.push(
         <CollapsibleBlock
           key={`${baseKey}:0`}
           collapseKey={`${baseKey}:0`}
@@ -383,6 +396,7 @@ export const ContentRenderer = memo(function ContentRenderer({
           icon="lightbulb"
           subtle
           defaultCollapsed={defaultCollapsed}
+          completion={isBlockStreaming ? 'pending' : defaultCollapsed ? 'collapse' : 'keep'}
         >
           <ThinkingScrollBody
             thinking={thinking}
@@ -404,7 +418,7 @@ export const ContentRenderer = memo(function ContentRenderer({
         ? `联网搜索 · 失败${ws.query ? ` (${ws.query})` : ''}`
         : `联网搜索${ws.query ? ` · ${ws.query}` : ''}${count > 0 ? ` (${count})` : ''}`;
 
-      otherNodes.push(
+      nodes.push(
         <CollapsibleBlock
           key={`${baseKey}:0`}
           collapseKey={`${baseKey}:0`}
@@ -461,25 +475,22 @@ export const ContentRenderer = memo(function ContentRenderer({
       const round = toolTrace.get(blockIndex);
       if (!round) return;
       const { entries, roundNumber } = round;
-      const ended = (entry: PairedToolCallEntry) => entry.resultIndex !== undefined &&
-        (!isStreaming || blockCompleted?.[entry.resultIndex] === true);
       const done = entries.filter(ended).length;
       const failed = entries.filter((entry) => ended(entry) && entry.result?.isError).length;
-      const successful = done === entries.length && failed === 0 &&
-        stopReason !== 'aborted' && stopReason !== 'error';
+      const successful = done === entries.length && failed === 0;
       const status = done < entries.length
         ? isStreaming ? `执行中 (${done}/${entries.length})` : '未完成'
         : failed ? `${failed} 个失败` : '完成';
       const title = roundNumber ? `工具调用 · 第 ${roundNumber} 轮` : '工具结果';
 
-      otherNodes.push(
+      nodes.push(
         <CollapsibleBlock
           key={`${baseKey}:tools`}
           collapseKey={`${baseKey}:tools`}
           title={`${title} · ${entries.length} 次 · ${status}`}
           icon={failed ? 'warning' : 'wrench'}
           subtle
-          defaultCollapsed={successful && (!isStreaming || settings.autoCollapseToolsOnComplete)}
+          defaultCollapsed={successful && settings.autoCollapseToolsOnComplete}
           completion={successful ? (settings.autoCollapseToolsOnComplete ? 'collapse' : 'keep') : 'pending'}
         >
           <div className="tool-trace-body" tabIndex={0} aria-label={`${title}详情`}>
@@ -638,7 +649,7 @@ export const ContentRenderer = memo(function ContentRenderer({
     }
 
     const ext = block as { type?: string; extra?: unknown };
-    otherNodes.push(
+    nodes.push(
       <CollapsibleBlock
         key={`${baseKey}:0`}
         collapseKey={`${baseKey}:0`}
@@ -652,7 +663,50 @@ export const ContentRenderer = memo(function ContentRenderer({
         </pre>
       </CollapsibleBlock>,
     );
-  });
+  };
+
+  const nodes: ReactNode[] = [];
+  for (let index = 0; index < blocks.length; index++) {
+    if (trace?.start !== index) {
+      renderBlock(blocks[index], index, nodes);
+      continue;
+    }
+
+    const steps: ReactNode[] = [];
+    let thinking = false;
+    for (let step = trace.start; step <= trace.end; step++) {
+      const block = blocks[step];
+      const stepNodes: ReactNode[] = [];
+      renderBlock(block, step, stepNodes, true);
+      if (stepNodes.length) {
+        steps.push(<li className="trace-step" key={step}>{stepNodes}</li>);
+      }
+      thinking ||= block.type === 'thinking' && isStreaming && blockCompleted?.[step] !== true;
+    }
+
+    const rounds = Array.from(toolTrace.values());
+    const entries = rounds.flatMap((round) => round.entries);
+    const failed = entries.filter((entry) => ended(entry) && entry.result?.isError).length;
+    const pendingRound = rounds.findLast((round) => round.entries.some((entry) => !ended(entry)));
+    const interruptedThinking = stopReason === 'aborted' && blocks.at(-1)?.type === 'thinking';
+    const label = trace.thinkingCount ? '思考与工具' : '工具调用';
+    const title = isStreaming
+      ? pendingRound ? `工具调用中 · 第 ${pendingRound.roundNumber ?? rounds.length} 轮` : thinking ? '思考中…' : `${label} · 生成中…`
+      : `${label} · ${rounds.length} 轮 (${entries.length} 次) · ${failed ? `${failed} 个失败` : pendingRound || interruptedThinking ? '未完成' : '完成'}`;
+    const autoCollapse = settings.autoCollapseToolsOnComplete &&
+      (!trace.thinkingCount || settings.autoCollapseThinkingOnComplete) &&
+      !failed && !interruptedThinking && (!pendingRound || stopReason === 'error');
+    const completion = isStreaming ? 'pending' : autoCollapse ? 'collapse' : 'keep';
+    const traceKey = `${effectivePrefix}:process-trace`;
+    nodes.push(
+      <CollapsibleBlock key={traceKey} collapseKey={traceKey} title={title}
+        icon={failed ? 'warning' : trace.thinkingCount ? 'lightbulb' : 'wrench'}
+        defaultCollapsed={completion === 'collapse'} completion={completion} subtle>
+        <ol className="trace-timeline">{steps}</ol>
+      </CollapsibleBlock>,
+    );
+    index = trace.end;
+  }
 
   return (
     <div className="content-stack">
@@ -684,7 +738,7 @@ export const ContentRenderer = memo(function ContentRenderer({
         </div>
       ) : null}
 
-      {otherNodes}
+      {nodes}
 
       <Modal
         open={zoomedSrc !== null}

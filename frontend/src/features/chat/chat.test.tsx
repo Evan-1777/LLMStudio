@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { AppProvider } from '../../app/AppProvider';
@@ -491,12 +491,13 @@ describe('chatReducer and ChatProvider', () => {
 
     expect(screen.getAllByText('用户').length).toBe(2);
     expect(screen.getAllByText('Friendly Model | MyProvider').length).toBeGreaterThan(0);
-    const usageTrigger = screen.getByText('Tokens: 30 ↑10 ↓20');
-    expect(usageTrigger).toBeInTheDocument();
-    expect(screen.queryByText(/缓存读|缓存写/)).not.toBeInTheDocument();
-    await user.click(usageTrigger);
+    const usageTrigger = screen.getByRole('button', { name: 'Token 用量' });
+    expect(screen.queryByText(/^Tokens:/)).not.toBeInTheDocument();
+    expect(screen.queryByText('总计')).not.toBeInTheDocument();
+    await user.hover(usageTrigger);
+    expect(screen.getByText('总计')).toBeInTheDocument();
     expect(screen.queryByText('缓存读取')).not.toBeInTheDocument();
-    await user.keyboard('{Escape}');
+    await user.unhover(usageTrigger);
 
     const editBtns = screen.getAllByRole('button', { name: '修改消息' });
     await user.click(editBtns[1]); // Edit A1 which has [thinking, text]
@@ -1052,6 +1053,7 @@ describe('chatReducer and ChatProvider', () => {
     let upstreamTurn = 0;
     let upstreamAuths: string[] = [];
     let abortToolExec = false;
+    let loopTools = false;
 
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = typeof input === 'string' ? input : input.toString();
@@ -1063,6 +1065,9 @@ describe('chatReducer and ChatProvider', () => {
 
       if (url.endsWith('/healthz')) {
         return new Response(JSON.stringify({ status: 'ok', version: '1.4.0', authRequired: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/settings')) {
+        return Response.json({ initialized: true, preferences: { mcpMaxToolRounds: 1 } });
       }
       if (url.endsWith('/api/v1/formats')) {
         return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
@@ -1138,7 +1143,7 @@ describe('chatReducer and ChatProvider', () => {
         upstreamTurn += 1;
         upstreamAuths.push(headers.Authorization ?? '');
         const sse =
-          upstreamTurn % 2 === 1
+          loopTools || upstreamTurn % 2 === 1
             ? 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_loc_1","function":{"name":"calc","arguments":"{\\"n\\":6}"}}]},"finish_reason":"tool_calls"}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}\n\ndata: [DONE]\n\n'
             : 'data: {"choices":[{"delta":{"content":"Result is 42"},"finish_reason":"stop"}]}\n\ndata: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":6,"total_tokens":26}}\n\ndata: [DONE]\n\n';
         return new Response(
@@ -1157,6 +1162,7 @@ describe('chatReducer and ChatProvider', () => {
           blocks: Message['blocks'];
           usage?: Message['usage'];
           stopReason?: string;
+          errorMessage?: string;
         };
         const saved: Message = {
           id: `srv-${persisted.length + 1}`,
@@ -1165,6 +1171,7 @@ describe('chatReducer and ChatProvider', () => {
           blocks: body.blocks,
           usage: body.usage,
           stopReason: body.stopReason,
+          errorMessage: body.errorMessage,
           createdAt: '2026-11-17T10:00:05Z',
         };
         persisted.push(saved);
@@ -1248,6 +1255,16 @@ describe('chatReducer and ChatProvider', () => {
     await user.click(screen.getByRole('button', { name: 'send' }));
     await waitFor(() => expect(screen.getByTestId('run-state')).toHaveTextContent('aborted'));
     expect(upstreamTurn).toBe(turnBeforeAbort + 1);
+
+    abortToolExec = false;
+    loopTools = true;
+    const beforeLimit = upstreamTurn;
+    const toolRequests = () => gatewayBodies.filter(({ url }) => url.endsWith('/tools/execute')).length;
+    const beforeTools = toolRequests();
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(persisted.at(-1)).toMatchObject({ stopReason: 'error', errorMessage: '达到最大工具调用轮数上限（1 轮）' }));
+    expect(upstreamTurn - beforeLimit).toBe(2);
+    expect(toolRequests() - beforeTools).toBe(1);
   });
 
   it('executes localRequest Gemini cache pre-request with the gateway credential, reuses gateway-owned CacheState, and follows credential rotation', async () => {
@@ -1576,12 +1593,38 @@ describe('chatReducer and ChatProvider', () => {
       </AppProvider>,
     );
 
-    const trigger = screen.getByRole('button', { name: '查看 Token 用量详情' });
-    expect(trigger).toHaveTextContent('1,000 in · 50 out · 缓存读 800 · 缓存写 150');
-    await user.click(trigger);
+    const trigger = screen.getByRole('button', { name: 'Token 用量' });
+    expect(trigger).not.toHaveAttribute('title');
+    expect(screen.queryByText(/1,000 in|缓存读|缓存写/)).not.toBeInTheDocument();
+    fireEvent.click(trigger, { detail: 1 });
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    await user.hover(trigger);
+    expect(trigger).not.toHaveFocus();
     expect(screen.getByText('缓存读取')).toBeInTheDocument();
     expect(screen.getByText('800')).toBeInTheDocument();
     expect(screen.getByText('缓存写入')).toBeInTheDocument();
     expect(screen.getByText('150')).toBeInTheDocument();
+    await user.click(trigger);
+    expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    await user.unhover(trigger);
+    await waitFor(() => expect(trigger).toHaveAttribute('aria-expanded', 'false'));
+
+    for (let i = 0; i < 6; i++) await user.tab();
+    expect(trigger).toHaveFocus();
+    expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    await user.keyboard('{Escape}');
+    expect(trigger).toHaveFocus();
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+    await user.tab({ shift: true });
+    await user.tab();
+    expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    await user.tab();
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
+
+    await user.pointer([{ keys: '[TouchA>]', target: trigger }, { keys: '[/TouchA]', target: trigger }]);
+    expect(trigger).toHaveAttribute('aria-expanded', 'true');
+    fireEvent.pointerDown(screen.getByText('Cached reply'), { pointerType: 'touch' });
+    fireEvent.click(screen.getByText('Cached reply'));
+    expect(trigger).toHaveAttribute('aria-expanded', 'false');
   });
 });

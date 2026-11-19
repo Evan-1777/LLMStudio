@@ -158,19 +158,20 @@ a {
 }
 
 .ui-btn--primary {
-  background: var(--accent);
+  background: var(--accent-fill);
   color: var(--accent-fg);
+  box-shadow: var(--shadow-xs), inset 0 1px 0 var(--glass-highlight);
 }
 
 .ui-btn--primary:hover:not(:disabled) {
-  background: var(--accent-hover);
+  background: var(--accent-fill-hover);
 }
 
 .ui-btn--secondary {
   background: var(--bg-surface);
   color: var(--text-primary);
   border: 1px solid var(--border-hairline);
-  box-shadow: var(--shadow-xs);
+  box-shadow: var(--shadow-xs), inset 0 1px 0 var(--glass-highlight);
 }
 
 .ui-btn--secondary:hover:not(:disabled) {
@@ -225,7 +226,7 @@ a {
 .ui-textarea:focus {
   outline: none;
   border-color: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  box-shadow: 0 0 0 3px var(--accent-soft), inset 0 1px 0 var(--glass-highlight);
 }
 
 .ui-input--sm,
@@ -293,6 +294,7 @@ a {
   background: var(--bg-surface-secondary);
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-md);
+  box-shadow: inset var(--shadow-xs);
 }
 
 .ui-segmented__item {
@@ -313,7 +315,7 @@ a {
 .ui-segmented__item--active {
   background: var(--bg-surface);
   color: var(--text-primary);
-  box-shadow: var(--shadow-xs);
+  box-shadow: var(--shadow-xs), 0 0 0 1px var(--border-hairline);
 }
 
 /* Layer 3 Dialog & Popover */
@@ -346,7 +348,7 @@ a {
   background: var(--bg-overlay);
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-xl);
-  box-shadow: var(--shadow-lg);
+  box-shadow: var(--shadow-lg), inset 0 1px 0 var(--glass-highlight);
   z-index: var(--z-modal);
   overflow: hidden;
 }
@@ -407,10 +409,20 @@ a {
   background: var(--bg-overlay);
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md);
+  box-shadow: var(--shadow-md), inset 0 1px 0 var(--glass-highlight);
   padding: 4px;
   z-index: var(--z-popover);
   transform-origin: var(--radix-popover-content-transform-origin, top center);
+}
+
+@supports (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px)) {
+  .ui-dialog-content,
+  .ui-popover-content,
+  .ui-menu-content {
+    background: var(--bg-overlay-glass);
+    backdrop-filter: saturate(180%) blur(24px);
+    -webkit-backdrop-filter: saturate(180%) blur(24px);
+  }
 }
 
 .ui-popover-content[data-state='open'],

@@ -1,6 +1,6 @@
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import * as PopoverPrimitive from '@radix-ui/react-popover';
-import type { ReactNode } from 'react';
+import type { ComponentPropsWithoutRef, ReactNode } from 'react';
 
 export function Popover({
   open,
@@ -9,7 +9,9 @@ export function Popover({
   children,
   align = 'start',
   side = 'bottom',
+  contentProps,
 }: {
+  contentProps?: Omit<ComponentPropsWithoutRef<typeof PopoverPrimitive.Content>, 'children' | 'className'>;
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   trigger: ReactNode;
@@ -27,6 +29,7 @@ export function Popover({
           sideOffset={6}
           collisionPadding={10}
           className="ui-popover-content"
+          {...contentProps}
         >
           {children}
         </PopoverPrimitive.Content>

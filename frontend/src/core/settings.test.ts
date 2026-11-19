@@ -6,6 +6,7 @@ import {
   SETTINGS_STORAGE_KEY,
   clearLegacyPreferences,
   defaultSettings,
+  normalizeSettings,
   loadConnectionSettings,
   loadSettings,
   readLegacyPreferences,
@@ -56,6 +57,7 @@ describe('settings storage and migration', () => {
       collapseCharThreshold: 120,
       userAvatarDataUrl: '',
       composerReasoningEffort: '',
+      mcpMaxToolRounds: 20,
     });
 
     expect(defaultSettings()).toMatchObject({
@@ -74,6 +76,10 @@ describe('settings storage and migration', () => {
     const second = loadSettings();
     expect(second.migratedFromLegacy).toBe(false);
     expect(second.settings).toEqual(first.settings);
+  });
+
+  it.each([[undefined, 20], [0, 1], [101, 100], [12, 12]])('normalizes the tool round limit %s to %d', (value, expected) => {
+    expect(normalizeSettings({ mcpMaxToolRounds: value }).mcpMaxToolRounds).toBe(expected);
   });
 
   it('prefers v2 over legacy key', () => {
@@ -140,7 +146,7 @@ describe('settings storage and migration', () => {
   it('imports legacy preferences once and clears browser copies afterwards', () => {
     localStorage.setItem(
       SETTINGS_STORAGE_KEY,
-      JSON.stringify({ ...defaultSettings(), themeMode: 'light', enterToSend: false, composerReasoningEffort: 'high' }),
+      JSON.stringify({ ...defaultSettings(), themeMode: 'light', enterToSend: false, composerReasoningEffort: 'high', mcpMaxToolRounds: 91 }),
     );
 
     expect(readLegacyPreferences()).toMatchObject({
@@ -149,6 +155,7 @@ describe('settings storage and migration', () => {
     });
 
     expect(readLegacyPreferences()).not.toHaveProperty('composerReasoningEffort');
+    expect(readLegacyPreferences()).not.toHaveProperty('mcpMaxToolRounds');
 
     clearLegacyPreferences();
     expect(localStorage.getItem(SETTINGS_STORAGE_KEY)).toBeNull();

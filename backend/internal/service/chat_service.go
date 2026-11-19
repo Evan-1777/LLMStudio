@@ -128,7 +128,7 @@ func (s *ChatService) WithSearch(searchReg *plugin.SearchRegistry, searchStore *
 }
 
 // WithPreferences injects the gateway-managed preferences used to resolve the
-// automatic caching policy for each generation.
+// automatic caching policy and tool round limit for each generation.
 func (s *ChatService) WithPreferences(preferences *PreferenceService) *ChatService {
 	s.preferences = preferences
 	return s
@@ -146,6 +146,15 @@ func (s *ChatService) autoCreateCachePreference(ctx context.Context) bool {
 	return prefs.AutoCreateCache
 }
 
+func (s *ChatService) mcpMaxToolRoundsPreference(ctx context.Context) int {
+	if s.preferences != nil {
+		if prefs, _, err := s.preferences.Get(ctx); err == nil {
+			return prefs.MCPMaxToolRounds
+		}
+	}
+	return domain.DefaultMCPMaxToolRounds
+}
+
 // WithMCP injects MCP server metadata and runtime boundary for tool discovery and execution.
 func (s *ChatService) WithMCP(mcpStore *store.MCPServerStore, mcpClient plugin.MCPClientBoundary) *ChatService {
 	s.mcpStore = mcpStore
@@ -155,6 +164,7 @@ func (s *ChatService) WithMCP(mcpStore *store.MCPServerStore, mcpClient plugin.M
 
 // PreparedStream holds a validated, open upstream HTTP response ready to stream SSE events to the client.
 type PreparedStream struct {
+	maxToolRounds        int
 	service              *ChatService
 	conversation         domain.Conversation
 	provider             domain.ProviderConfig
@@ -293,6 +303,7 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	}
 
 	return &PreparedStream{
+		maxToolRounds:        s.mcpMaxToolRoundsPreference(ctx),
 		service:              s,
 		conversation:         conv,
 		provider:             prep.provider,
@@ -861,6 +872,10 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 	var cumulativeUsage *domain.Usage
 	finalStopReason := domain.StopReasonStop
 	resp := p.resp
+	maxRounds := p.maxToolRounds
+	if maxRounds <= 0 {
+		maxRounds = domain.DefaultMCPMaxToolRounds
+	}
 
 	for round := 0; ; round++ {
 		var (
@@ -1002,8 +1017,8 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 			break
 		}
 
-		if round >= MCPRoundLimit {
-			limitMsg := fmt.Sprintf("达到最大工具调用轮数上限（%d 轮）", MCPRoundLimit)
+		if round >= maxRounds {
+			limitMsg := fmt.Sprintf("达到最大工具调用轮数上限（%d 轮）", maxRounds)
 			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, limitMsg)
 			_ = emit(domain.StreamEvent{
 				Type:           domain.StreamEventError,

@@ -389,27 +389,29 @@ test.describe('Rendering, HTML Sandbox Isolation, and Responsive Navigation', ()
     const thinkingBody = page.locator('.thinking-body').first();
     await expect(thinkingBody).toBeVisible();
 
-    for (const vp of [
-      { width: 1280, height: 800, maxH: 320 },
-      { width: 768, height: 1024, maxH: 320 },
-      { width: 375, height: 812, maxH: 240 },
-    ]) {
-      await page.setViewportSize({ width: vp.width, height: vp.height });
-      const metrics = await thinkingBody.evaluate((el) => {
-        const rect = el.getBoundingClientRect();
-        return {
-          height: rect.height,
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await page.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
+      await expect(page.locator('html')).toHaveAttribute('data-theme', colorScheme);
+      await expect(page.locator('.wb-composer')).toHaveCSS('transition-duration', '0s');
+      await expect(page.locator('.wb-send-btn')).toHaveCSS('transform', 'none');
+      for (const vp of [
+        { width: 1280, height: 800, maxH: 320 },
+        { width: 768, height: 1024, maxH: 320 },
+        { width: 375, height: 812, maxH: 240 },
+      ]) {
+        await page.setViewportSize({ width: vp.width, height: vp.height });
+        const metrics = await thinkingBody.evaluate((el) => ({
+          height: el.getBoundingClientRect().height,
           scrollHeight: el.scrollHeight,
           clientHeight: el.clientHeight,
           overflowY: getComputedStyle(el).overflowY,
-          pageOverflow:
-            document.documentElement.scrollWidth > window.innerWidth,
-        };
-      });
-      expect(metrics.overflowY).toBe('auto');
-      expect(metrics.height).toBeLessThanOrEqual(vp.maxH + 1);
-      expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
-      expect(metrics.pageOverflow).toBe(false);
+          pageOverflow: document.documentElement.scrollWidth > window.innerWidth,
+        }));
+        expect(metrics.overflowY).toBe('auto');
+        expect(metrics.height).toBeLessThanOrEqual(vp.maxH + 1);
+        expect(metrics.scrollHeight).toBeGreaterThan(metrics.clientHeight);
+        expect(metrics.pageOverflow).toBe(false);
+      }
     }
   });
 });

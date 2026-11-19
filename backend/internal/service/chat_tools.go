@@ -14,8 +14,6 @@ import (
 )
 
 const (
-	// MCPRoundLimit caps consecutive tool-calling model turns in a single generation.
-	MCPRoundLimit       = 8
 	mcpDiscoveryTimeout = 10 * time.Second
 	mcpToolCallTimeout  = 30 * time.Second
 )

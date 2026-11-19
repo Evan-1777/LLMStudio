@@ -350,7 +350,7 @@ export function AppProvider({
       // A gateway switch while the request was in flight must not apply stale values.
       if (connectionGateway !== settingsRef.current.gatewayBaseUrl) return;
 
-      const { composerReasoningEffort: _, ...fallback } = pickAppPreferences(settingsRef.current);
+      const { composerReasoningEffort: _, mcpMaxToolRounds: __, ...fallback } = pickAppPreferences(settingsRef.current);
       const seed = legacy ?? fallback;
       let resolved = envelope;
       if (!envelope.initialized) {

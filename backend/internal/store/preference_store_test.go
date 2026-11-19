@@ -27,13 +27,20 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if initialized {
 		t.Fatal("expected a fresh database to report initialized=false")
 	}
-	if got != domain.DefaultPreferences() {
+	if got != domain.DefaultPreferences() || got.MCPMaxToolRounds != 20 {
 		t.Fatalf("unexpected defaults: %+v", got)
 	}
 
+	for _, rounds := range []int{0, 101} {
+		_, _, err := prefs.Update(ctx, domain.PreferencesPatch{MCPMaxToolRounds: &rounds}, false, validatePrefs)
+		if appErr, ok := domain.AsAppError(err); !ok || appErr.Code != domain.ErrCodeInvalidArgument {
+			t.Fatalf("round limit %d: got %v, want invalid argument", rounds, err)
+		}
+	}
+	rounds := 30
 	theme := domain.ThemeModeDark
 	enter := false
-	if _, initialized, err = prefs.Update(ctx, domain.PreferencesPatch{ThemeMode: &theme, EnterToSend: &enter}, false, validatePrefs); err != nil {
+	if _, initialized, err = prefs.Update(ctx, domain.PreferencesPatch{ThemeMode: &theme, EnterToSend: &enter, MCPMaxToolRounds: &rounds}, false, validatePrefs); err != nil {
 		t.Fatalf("partial update: %v", err)
 	} else if !initialized {
 		t.Fatal("expected update to report initialized=true")
@@ -46,7 +53,7 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if !initialized {
 		t.Fatal("expected persisted row to report initialized=true")
 	}
-	if got.ThemeMode != domain.ThemeModeDark || got.EnterToSend {
+	if got.ThemeMode != domain.ThemeModeDark || got.EnterToSend || got.MCPMaxToolRounds != rounds {
 		t.Fatalf("update not applied: %+v", got)
 	}
 	if got.SeedColorValue != domain.DefaultAppleBlue || got.CollapseLineThreshold != 24 || got.ChatDisplayMode != domain.ChatDisplayBubble {
@@ -71,7 +78,7 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after explicit false: %v", err)
 	}
-	if got.ThemeMode != domain.ThemeModeDark || got.EnterToSend {
+	if got.ThemeMode != domain.ThemeModeDark || got.EnterToSend || got.MCPMaxToolRounds != rounds {
 		t.Fatalf("restart lost previous values: %+v", got)
 	}
 

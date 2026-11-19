@@ -338,10 +338,11 @@ test.describe('Prompt caching, persisted cacheMode, and localRequest MCP E2E', (
       expect(stats.cacheCreateCount).toBe(1);
 
       // Verify on-demand cache read token display & reload persistence.
-      const usageTrigger = page.getByRole('button', { name: '查看 Token 用量详情' }).first();
-      await expect(usageTrigger).toContainText('缓存读 280');
-      await usageTrigger.click();
-      await expect(page.getByText('缓存读取')).toBeVisible();
+      const usageTrigger = page.getByRole('button', { name: 'Token 用量' }).first();
+      const usage = page.getByRole('dialog', { name: 'Token 用量明细' });
+      await expect(usage).toHaveCount(0);
+      await usageTrigger.hover();
+      await expect(usage).toContainText(/缓存读取\s*280/);
       await page.keyboard.press('Escape');
 
       await page.reload({ waitUntil: 'networkidle' });

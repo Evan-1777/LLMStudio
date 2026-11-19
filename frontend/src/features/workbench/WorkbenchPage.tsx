@@ -581,7 +581,6 @@ function WorkbenchInner() {
         />
 
         <Composer
-          selectedModel={targetModel?.model ?? null}
           selectedProviderId={selectedProviderId}
           selectedModelId={selectedModelId}
           reasoningEffort={reasoningEffort}

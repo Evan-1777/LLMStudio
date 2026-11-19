@@ -193,7 +193,17 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await expect(
       page.locator('.wb-feed-author', { hasText: 'Mock Chat | Direct Local' }),
     ).toBeVisible();
-    await expect(page.getByText(/Tokens: 40 ↑15 ↓25/)).toBeVisible();
+    const token = page.locator('article').filter({ hasText: 'Direct browser chat' }).getByRole('button', { name: 'Token 用量' });
+    const usage = page.getByRole('dialog', { name: 'Token 用量明细' });
+    await expect(page.getByText(/^Tokens:/)).toHaveCount(0);
+    await expect(usage).toHaveCount(0);
+    await token.hover();
+    await expect(usage).toContainText(/输入\s*15/);
+    await expect(usage).toContainText(/输出\s*25/);
+    await expect(usage).toContainText(/总计\s*40/);
+    await token.click();
+    await page.getByLabel('消息输入框').hover();
+    await expect(usage).toBeHidden();
 
     // Reload preserves persisted local chat history and Feed mode.
     await page.reload({ waitUntil: 'networkidle' });

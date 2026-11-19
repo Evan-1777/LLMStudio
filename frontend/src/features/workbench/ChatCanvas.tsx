@@ -391,7 +391,6 @@ export function ChatCanvas({
                         <MessageActions
                           message={msg}
                           disabled={isBusy}
-                          displayMode="feed"
                           onEdit={startEdit}
                           onRetry={onRetryMessage}
                           onDelete={onDeleteMessage}

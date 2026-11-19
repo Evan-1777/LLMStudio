@@ -417,7 +417,7 @@ func TestMCPDisabledToolsKeepSiblingAliasesAndRejectExecution(t *testing.T) {
 func TestChatServiceMCPRoundLimitAbortAndPersistFailure(t *testing.T) {
 	ctx := context.Background()
 
-	// Loop LLM always returning toolUse to hit MCPRoundLimit=8 cleanly on 9th response.
+	// Always request another tool round to exercise the cutoff.
 	llmCalls := 0
 	var llmSrv *httptest.Server
 	llmSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -438,36 +438,48 @@ func TestChatServiceMCPRoundLimitAbortAndPersistFailure(t *testing.T) {
 			"srv-1": {{Name: "step", InputSchema: json.RawMessage(`{"type":"object"}`)}},
 		},
 	}
-	svc, _, _, mcpStore, conv, _ := setupChatMCPFixture(t, llmSrv.URL, stubMCP)
+	svc, _, _, mcpStore, conv, db := setupChatMCPFixture(t, llmSrv.URL, stubMCP)
 	_, _ = mcpStore.Create(ctx, domain.MCPServerConfig{
 		ID: "srv-1", Name: "srv-1", Transport: domain.MCPTransportStdio, Command: "mock", Enabled: true,
 	})
 
-	prep, err := svc.Prepare(ctx, service.StreamChatInput{ConversationID: conv.ID, Text: "Loop forever"})
-	if err != nil {
-		t.Fatalf("Prepare loop: %v", err)
-	}
-	var gotEvents []domain.StreamEvent
-	if err := prep.Stream(ctx, func(ev domain.StreamEvent) error {
-		gotEvents = append(gotEvents, ev)
-		return nil
-	}); err != nil {
-		t.Fatalf("Stream loop: %v", err)
-	}
-	if len(stubMCP.calls) != service.MCPRoundLimit {
-		t.Fatalf("expected exactly %d tool rounds executed before limit, got %d", service.MCPRoundLimit, len(stubMCP.calls))
-	}
-	var sawLimitErr, sawMsgEnd bool
-	for _, ev := range gotEvents {
-		if ev.Type == domain.StreamEventError && ev.Error != nil && ev.Error.Code == "MCP_ROUND_LIMIT" {
-			sawLimitErr = true
-		}
-		if ev.Type == domain.StreamEventMessageEnd {
-			sawMsgEnd = true
-		}
-	}
-	if !sawLimitErr || sawMsgEnd {
-		t.Fatalf("expected MCP_ROUND_LIMIT error and no fake message_end: sawLimit=%v sawEnd=%v", sawLimitErr, sawMsgEnd)
+	prefs := service.NewPreferenceService(store.NewPreferenceStore(db))
+	for _, rounds := range []int{domain.DefaultMCPMaxToolRounds, 3, 12} {
+		t.Run(fmt.Sprint(rounds), func(t *testing.T) {
+			stubMCP.calls = nil
+			if rounds != domain.DefaultMCPMaxToolRounds {
+				if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{MCPMaxToolRounds: &rounds}); err != nil {
+					t.Fatal(err)
+				}
+				svc.WithPreferences(prefs)
+			}
+			prep, err := svc.Prepare(ctx, service.StreamChatInput{ConversationID: conv.ID, Text: "Loop forever"})
+			if err != nil {
+				t.Fatalf("Prepare loop: %v", err)
+			}
+			var gotEvents []domain.StreamEvent
+			if err := prep.Stream(ctx, func(ev domain.StreamEvent) error {
+				gotEvents = append(gotEvents, ev)
+				return nil
+			}); err != nil {
+				t.Fatalf("Stream loop: %v", err)
+			}
+			if len(stubMCP.calls) != rounds {
+				t.Fatalf("expected exactly %d tool rounds executed before limit, got %d", rounds, len(stubMCP.calls))
+			}
+			var sawLimitErr, sawMsgEnd bool
+			for _, ev := range gotEvents {
+				if ev.Type == domain.StreamEventError && ev.Error != nil && ev.Error.Code == "MCP_ROUND_LIMIT" && strings.Contains(ev.Error.Message, fmt.Sprintf("%d 轮", rounds)) {
+					sawLimitErr = true
+				}
+				if ev.Type == domain.StreamEventMessageEnd {
+					sawMsgEnd = true
+				}
+			}
+			if !sawLimitErr || sawMsgEnd {
+				t.Fatalf("expected MCP_ROUND_LIMIT error and no fake message_end: sawLimit=%v sawEnd=%v", sawLimitErr, sawMsgEnd)
+			}
+		})
 	}
 
 	// Test mid-tool abort stops subsequent calls & next model request.

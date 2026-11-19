@@ -12,8 +12,10 @@ import {
   defaultAttachmentName,
   isWithinRequestLimit,
   readAttachmentFile,
+  revokeAttachmentResources,
 } from './attachments';
 import { WorkbenchPage } from './WorkbenchPage';
+import * as imageCompression from './imageCompression';
 
 function makeWorkbenchFetch() {
   const conversations = [
@@ -84,7 +86,6 @@ function makeWorkbenchFetch() {
                   name: 'GPT-4.1',
                   apiFormat: 'openai-responses',
                   reasoning: false,
-                  inputModalities: ['text', 'image'],
                 },
               ],
               enabled: true,
@@ -281,7 +282,7 @@ describe('Workbench flows and attachments', () => {
     expect(screen.getByRole('button', { name: /思考强度 \(极高\)/ })).toBeInTheDocument();
   });
 
-  it('validates attachments (types, 8 MiB, XML attribute escaping, 16 MiB body cap, image modality)', () => {
+  it('validates attachments (types, size limits, XML attribute escaping, 16 MiB body cap)', () => {
     expect(classifyFile({ name: 'report.pdf', type: 'application/pdf' })).toBe(
       'unsupported',
     );
@@ -295,19 +296,23 @@ describe('Workbench flows and attachments', () => {
     const hugeFile = new File(['x'], 'big.txt', { type: 'text/plain' });
     Object.defineProperty(hugeFile, 'size', { value: MAX_ATTACHMENT_BYTES + 1 });
     const hugeRes = readAttachmentFile(hugeFile, {
-      supportsImageInput: true,
       onUpdate: () => {},
     });
     expect(hugeRes.status).toBe('error');
     expect(hugeRes.error).toContain('8 MiB');
 
+    expect(classifyFile({ name: 'vector.svg', type: '' })).toBe('text');
+    expect(classifyFile({ name: 'vector', type: 'image/svg+xml' })).toBe('text');
+    for (const ext of ['bmp', 'avif', 'jfif', 'ico']) {
+      expect(classifyFile({ name: `image.${ext}`, type: '' })).toBe('image');
+    }
+    expect(classifyFile({ name: 'image.tif', type: 'image/tiff' })).toBe('unsupported');
+    expect(classifyFile({ name: 'archive.zip', type: 'application/zip' })).toBe('unsupported');
     const imgFile = new File(['abc'], 'pic.png', { type: 'image/png' });
-    const imgDenied = readAttachmentFile(imgFile, {
-      supportsImageInput: false,
-      onUpdate: () => {},
+    Object.defineProperty(imgFile, 'size', { value: 25 * 1024 * 1024 + 1 });
+    expect(readAttachmentFile(imgFile, { onUpdate: () => {} })).toMatchObject({
+      status: 'error', error: '图片原文件超过 25 MiB 上限',
     });
-    expect(imgDenied.status).toBe('error');
-    expect(imgDenied.error).toContain('不支持图片');
 
     const textBlock = attachmentToContentBlock({
       id: '1',
@@ -379,9 +384,50 @@ describe('Workbench flows and attachments', () => {
     expect(defaultAttachmentName({ name: 'keep.png', type: 'image/png' })).toBe('keep.png');
     const boundaryFile = new File(['x'], 'limit.png', { type: 'image/png' });
     Object.defineProperty(boundaryFile, 'size', { value: MAX_ATTACHMENT_BYTES });
-    expect(
-      readAttachmentFile(boundaryFile, { supportsImageInput: true, onUpdate: () => {} }).status,
-    ).toBe('reading');
+    const boundary = readAttachmentFile(boundaryFile, { onUpdate: () => {} });
+    expect(boundary.status).toBe('reading');
+    revokeAttachmentResources(boundary);
+  });
+
+  it('uses compressed bytes and MIME, revokes the thumbnail, and cancels reads', async () => {
+    const source = new File(['source'], 'source.avif', { type: 'image/avif' });
+    const encoded = new Blob(['ok'], { type: 'image/webp' });
+    const compressed = { blob: encoded, mimeType: encoded.type, originalSize: source.size, compressedSize: encoded.size, compressed: true };
+    const compress = vi.spyOn(imageCompression, 'compressImageFile').mockResolvedValue(compressed);
+    const create = vi.fn(() => 'blob:thumbnail');
+    const revoke = vi.fn();
+    vi.stubGlobal('URL', class extends URL {
+      static createObjectURL = create;
+      static revokeObjectURL = revoke;
+    });
+    try {
+      const ready = await new Promise<Parameters<typeof attachmentToContentBlock>[0]>((onUpdate) => {
+        expect(readAttachmentFile(source, { onUpdate }).status).toBe('reading');
+      });
+      expect(attachmentToContentBlock(ready)).toEqual({ type: 'image', mimeType: 'image/webp', data: 'b2s=' });
+      expect(ready).toMatchObject({ originalSize: 6, size: 2, previewUrl: 'blob:thumbnail' });
+      expect(create).toHaveBeenCalledWith(encoded);
+      revokeAttachmentResources(ready);
+      expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:thumbnail');
+
+      const onUpdate = vi.fn();
+      const pending = readAttachmentFile(source, { onUpdate });
+      revokeAttachmentResources(pending);
+      expect(compress.mock.lastCall?.[1]?.signal?.aborted).toBe(true);
+      await Promise.resolve();
+      expect(onUpdate).not.toHaveBeenCalled();
+      expect(create).toHaveBeenCalledOnce();
+
+      compress.mockResolvedValueOnce({ ...compressed, compressedSize: MAX_ATTACHMENT_BYTES + 1 });
+      await new Promise<void>((resolve) => readAttachmentFile(source, { onUpdate: (attachment) => {
+        onUpdate(attachment);
+        resolve();
+      } }));
+      expect(onUpdate).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'error', error: '压缩后图片仍超过 8 MiB 上限' }));
+    } finally {
+      compress.mockRestore();
+      vi.unstubAllGlobals();
+    }
   });
 
   it('adds pasted clipboard images to the attachment pipeline without disturbing the draft', async () => {

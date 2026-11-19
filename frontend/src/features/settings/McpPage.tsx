@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
   Button,
@@ -7,6 +7,7 @@ import {
   ErrorBanner,
   Icon,
   IconButton,
+  Input,
   LoadingSpinner,
   Switch,
 } from '../../components/ui';
@@ -49,12 +50,32 @@ export function McpPage() {
     gateway,
     connectionEpoch,
     resources,
+    settings: { mcpMaxToolRounds },
+    updatePreferences,
     refreshPlugins,
     upsertLocalMcpServer,
     removeLocalMcpServer,
     toast,
   } = useApp();
   const { mcpServers } = resources;
+  const [roundsInput, setRoundsInput] = useState(String(mcpMaxToolRounds));
+  const [roundsError, setRoundsError] = useState<string | null>(null);
+  const [savingRounds, setSavingRounds] = useState(false);
+
+  useEffect(() => setRoundsInput(String(mcpMaxToolRounds)), [mcpMaxToolRounds]);
+
+  const saveRounds = async () => {
+    const rounds = Number(roundsInput);
+    if (!Number.isInteger(rounds) || rounds < 1 || rounds > 100) {
+      setRoundsError('须为 1–100 的整数');
+      return;
+    }
+    if (rounds === mcpMaxToolRounds || savingRounds) return;
+    setSavingRounds(true);
+    const result = await updatePreferences({ mcpMaxToolRounds: rounds });
+    setSavingRounds(false);
+    if (!result.ok) setRoundsError(result.error ?? '保存失败');
+  };
 
   const [editorOpen, setEditorOpen] = useState(false);
   const [editing, setEditing] = useState<MCPServerConfig | null>(null);
@@ -167,6 +188,29 @@ export function McpPage() {
         ) : null}
 
         {actionError ? <ErrorBanner message={actionError} /> : null}
+
+        <section>
+          <h3 className="st-subhead">调用设置</h3>
+          <div className="st-group">
+            <div className="st-row">
+              <label className="st-row__label" htmlFor="mcp-max-tool-rounds">最大工具调用轮次</label>
+              <div className="st-row__control">
+                <Input
+                  id="mcp-max-tool-rounds"
+                  type="number" min={1} max={100} step={1}
+                  value={roundsInput}
+                  readOnly={savingRounds}
+                  aria-describedby={roundsError ? 'mcp-rounds-error' : undefined}
+                  onChange={(event) => { setRoundsInput(event.target.value); setRoundsError(null); }}
+                  onBlur={() => void saveRounds()}
+                  onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }}
+                  style={{ width: 100 }}
+                />
+                {roundsError ? <span id="mcp-rounds-error" className="ui-field__error" role="alert">{roundsError}</span> : null}
+              </div>
+            </div>
+          </div>
+        </section>
 
         {mcpServers.length === 0 ? (
           <div className="st-group">

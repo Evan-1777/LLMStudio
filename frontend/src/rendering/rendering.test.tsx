@@ -107,7 +107,7 @@ describe('ContentRenderer and HTML sandbox', () => {
     expect(screen.getByText('Final text')).toBeInTheDocument();
   });
 
-  it('respects autoCollapseThinkingOnComplete=false, keeps aborted/error thinking open, and keeps code blocks governed by autoCollapseEnabled', async () => {
+  it('respects autoCollapseThinkingOnComplete=false, keeps only interrupted thinking open when auto-collapse is enabled, and keeps code blocks governed by autoCollapseEnabled', async () => {
     const longCode = Array.from({ length: 30 }, (_, i) => `const x${i} = ${i};`).join('\n');
     localStorage.setItem(
       SETTINGS_STORAGE_KEY,
@@ -156,6 +156,13 @@ describe('ContentRenderer and HTML sandbox', () => {
       </AppProvider>,
     );
     expect(screen.getByText('aborted trace')).toBeInTheDocument();
+    render(
+      <AppProvider skipInitialBootstrap>
+        <ContentRenderer messageId="m-error" stopReason="error"
+          blocks={[{ type: 'thinking', thinking: 'failed trace' }]} />
+      </AppProvider>,
+    );
+    expect(screen.queryByText('failed trace')).not.toBeInTheDocument();
   });
 
   it('renders closed raw HTML seamlessly by default, hides iframe when visualHtmlRender=false, and keeps fenced HTML code preview gated', async () => {
@@ -282,15 +289,70 @@ describe('ContentRenderer and HTML sandbox', () => {
 
     await user.click(first);
     rerender(view(7, Array(7).fill(true)));
+    const trace = screen.getByRole('button', { name: /工具调用中 · 第 2 轮/ });
     const second = screen.getByRole('button', { name: /工具调用 · 第 2 轮/ });
     expect(second).toHaveAttribute('aria-expanded', 'true');
     expect(second).toHaveTextContent('执行中 (0/1)');
+    await user.click(trace);
+    await user.click(trace);
     rerender(view(blocks.length, [], false, 'server-message'));
+    expect(trace).toHaveAttribute('aria-expanded', 'true');
+    const reopenedFirst = screen.getByRole('button', { name: /工具调用 · 第 1 轮/ });
     const orphan = screen.getByRole('button', { name: /工具结果/ });
-    const inOrder = [screen.getByText('First text'), first, screen.getByText('Between rounds'), second, orphan, screen.getByText('Final answer')];
+    const note = screen.getByText('Between rounds');
+    const answer = screen.getByText('Final answer');
+    const inOrder = [screen.getByText('First text'), trace, reopenedFirst, note, second, orphan, answer];
     inOrder.slice(1).forEach((node, i) => expect(inOrder[i].compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy());
-    expect(first).toHaveAttribute('aria-expanded', 'true');
-    expect(second).toHaveAttribute('aria-expanded', 'false');
+    expect(note.closest('.trace-timeline')).not.toBeNull();
+    expect(answer.closest('.trace-timeline')).toBeNull();
+    expect(reopenedFirst).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: /工具调用 · 第 2 轮/ })).toHaveAttribute('aria-expanded', 'false');
+  });
+
+  it('folds a multi-round thinking and tool timeline once and never reopens completed steps on error', async () => {
+    const user = userEvent.setup();
+    const blocks: ContentBlock[] = [
+      { type: 'thinking', thinking: 'first thought' },
+      { type: 'toolCall', id: 'a', name: 'firstTool' },
+      { type: 'toolResult', toolCallId: 'a', content: 'first result' },
+      { type: 'text', text: 'Progress update' },
+      { type: 'thinking', thinking: 'second thought' },
+      { type: 'toolCall', id: 'b', name: 'secondTool' },
+      { type: 'toolResult', toolCallId: 'b', content: 'second result' },
+      { type: 'thinking', thinking: 'third thought' },
+    ];
+    const view = (items: ContentBlock[], streaming = false, stopReason = 'stop') => (
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer messageId="multi" blocks={items} isStreaming={streaming}
+            blockCompleted={streaming ? [true, true, true, true, true, true, true, false] : undefined}
+            stopReason={stopReason} />
+        </CollapseStateProvider>
+      </AppProvider>
+    );
+    const { rerender, unmount } = render(view(blocks, true));
+    expect(screen.getByRole('button', { name: '思考中…' })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getAllByRole('button', { name: '思考过程' })).toHaveLength(2);
+    expect(screen.getByText('third thought')).toBeVisible();
+    rerender(view([...blocks, { type: 'text', text: 'Final text' }]));
+    const trace = screen.getByRole('button', { name: /思考与工具 · 2 轮.*完成/ });
+    expect(trace).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText('Final text')).toBeVisible();
+    await user.click(trace);
+    expect(screen.getByText('Progress update')).toBeVisible();
+    expect(screen.getAllByRole('button', { name: '思考过程' })).toHaveLength(3);
+    expect(screen.getAllByRole('button', { name: /工具调用 · 第/ })).toHaveLength(2);
+
+    const errorBlocks: ContentBlock[] = [...blocks, { type: 'toolCall', id: 'c', name: 'thirdTool' }];
+    rerender(view(errorBlocks, false, 'error'));
+    expect(trace).toHaveAttribute('aria-expanded', 'true');
+    for (const completed of screen.getAllByRole('button', { name: /^(思考过程|工具调用 · 第 [12] 轮)/ })) {
+      expect(completed).toHaveAttribute('aria-expanded', 'false');
+    }
+    expect(screen.getByRole('button', { name: /第 3 轮.*未完成/ })).toHaveAttribute('aria-expanded', 'true');
+    unmount();
+    render(view(errorBlocks, false, 'error'));
+    expect(screen.getByRole('button', { name: /思考与工具 · 3 轮.*未完成/ })).toHaveAttribute('aria-expanded', 'false');
   });
 
   it('keeps failed and incomplete rounds visible but hides details until expanded', async () => {
@@ -304,7 +366,8 @@ describe('ContentRenderer and HTML sandbox', () => {
         ]} />
       </AppProvider>,
     );
-    expect(screen.getByRole('button', { name: /1 个失败/ })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: /工具调用 · 2 轮.*1 个失败/ })).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByRole('button', { name: /第 1 轮.*1 个失败/ })).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByRole('button', { name: /未完成/ })).toHaveAttribute('aria-expanded', 'true');
     const detail = screen.getByText('broken').closest('summary')!;
     expect(detail.closest('details')).not.toHaveAttribute('open');

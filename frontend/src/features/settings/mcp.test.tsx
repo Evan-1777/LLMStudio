@@ -11,6 +11,8 @@ interface McpMockState {
   createBodies: Array<Record<string, unknown>>;
   updateBodies: Array<{ id: string; body: Record<string, unknown> }>;
   requestedUrls: string[];
+  rounds?: number;
+  failSettings?: boolean;
 }
 
 function makeFetchMock(state: McpMockState) {
@@ -28,6 +30,13 @@ function makeFetchMock(state: McpMockState) {
         JSON.stringify({ status: 'ok', version: '1.2.0', authRequired: false }),
         { status: 200 },
       );
+    }
+    if (url.endsWith('/api/v1/settings')) {
+      if (method === 'PATCH') {
+        if (state.failSettings) return Response.json({ message: '保存失败' }, { status: 500 });
+        state.rounds = Number(parsedBody.mcpMaxToolRounds);
+      }
+      return Response.json({ initialized: true, preferences: { mcpMaxToolRounds: state.rounds ?? 20 } });
     }
     if (url.endsWith('/api/v1/formats')) {
       return new Response(JSON.stringify({ formats: [], adapters: [] }), {
@@ -125,6 +134,32 @@ function makeFetchMock(state: McpMockState) {
 describe('McpPage and McpEditor', () => {
   beforeEach(() => {
     localStorage.clear();
+  });
+
+  it('validates tool round limits before saving and rolls back failed saves', async () => {
+    const state: McpMockState = { servers: [], createBodies: [], updateBodies: [], requestedUrls: [] };
+    const user = userEvent.setup();
+    render(<AppProvider fetchImpl={makeFetchMock(state)}><MemoryRouter><McpPage /></MemoryRouter></AppProvider>);
+    const rounds = await screen.findByRole('spinbutton', { name: '最大工具调用轮次' });
+    expect(rounds).toHaveValue(20);
+    async function enter(value: string) {
+      await user.clear(rounds);
+      await user.type(rounds, value);
+      await user.tab();
+    }
+    for (const invalid of ['0', '101']) {
+      await enter(invalid);
+      expect(screen.getByRole('alert')).toHaveTextContent('须为 1–100 的整数');
+    }
+    expect(state.requestedUrls.filter((url) => url.startsWith('PATCH '))).toHaveLength(0);
+    await enter('25');
+    await waitFor(() => expect(state.rounds).toBe(25));
+    expect(rounds).toHaveValue(25);
+    state.failSettings = true;
+    await enter('26');
+    expect(await screen.findByRole('alert')).toHaveTextContent('保存失败');
+    expect(rounds).toHaveValue(25);
+    expect(state.rounds).toBe(25);
   });
 
   it('supports stdio/sse/streamable-http CRUD, field-level validation, transport switching without corruption, and omits runtime execution UI', async () => {

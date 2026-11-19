@@ -610,6 +610,7 @@ export interface ApiErrorEnvelope {
 // in browser connection storage and are not part of this contract.
 export interface ServerPreferences {
   composerReasoningEffort: ReasoningEffort | '';
+  mcpMaxToolRounds: number;
   themeMode: 'system' | 'light' | 'dark';
   seedColorValue: number;
   enterToSend: boolean;
@@ -631,7 +632,7 @@ export interface ServerPreferencesEnvelope {
 }
 
 /** Full preference payload used for the one-shot legacy browser import. */
-export type ServerPreferencesImport = Omit<ServerPreferences, 'composerReasoningEffort'>;
+export type ServerPreferencesImport = Omit<ServerPreferences, 'composerReasoningEffort' | 'mcpMaxToolRounds'>;
 
 export interface StorageUsage {
   mainBytes: number;

@@ -119,6 +119,7 @@ export interface AppSettings {
   // User avatar owned by the gateway; empty means the built-in avatar.
   userAvatarDataUrl: string;
   composerReasoningEffort: ReasoningEffort | '';
+  mcpMaxToolRounds: number;
 }
 
 export interface SettingsLoadResult {
@@ -150,6 +151,7 @@ export const APP_PREFERENCE_KEYS = [
   'collapseCharThreshold',
   'userAvatarDataUrl',
   'composerReasoningEffort',
+  'mcpMaxToolRounds',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -172,6 +174,7 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     collapseCharThreshold: settings.collapseCharThreshold,
     userAvatarDataUrl: settings.userAvatarDataUrl,
     composerReasoningEffort: settings.composerReasoningEffort,
+    mcpMaxToolRounds: settings.mcpMaxToolRounds,
   };
 }
 
@@ -198,6 +201,7 @@ export function defaultSettings(): AppSettings {
     collapseCharThreshold: 1200,
     userAvatarDataUrl: '',
     composerReasoningEffort: '',
+    mcpMaxToolRounds: 20,
   };
 }
 
@@ -287,6 +291,7 @@ export function normalizeSettings(raw: unknown): AppSettings {
       20000,
       defaults.collapseCharThreshold,
     ),
+    mcpMaxToolRounds: clampInt(obj.mcpMaxToolRounds, 1, 100, defaults.mcpMaxToolRounds),
     composerReasoningEffort: isReasoningEffort(obj.composerReasoningEffort) ? obj.composerReasoningEffort : '',
     userAvatarDataUrl:
       typeof obj.userAvatarDataUrl === 'string'
@@ -480,12 +485,12 @@ export function readLegacyPreferences(
   try {
     const raw = storage.getItem(SETTINGS_STORAGE_KEY);
     if (raw) {
-      const { composerReasoningEffort: _, ...legacy } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
+      const { composerReasoningEffort: _, mcpMaxToolRounds: __, ...legacy } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
       return legacy;
     }
     const flutterRaw = storage.getItem(LEGACY_FLUTTER_SETTINGS_KEY);
     if (flutterRaw) {
-      const { composerReasoningEffort: _, ...legacy } = pickAppPreferences(
+      const { composerReasoningEffort: _, mcpMaxToolRounds: __, ...legacy } = pickAppPreferences(
         normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),
       );
       return legacy;

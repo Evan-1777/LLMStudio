@@ -143,6 +143,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const {
     gateway,
     resources,
+    settings: { mcpMaxToolRounds },
     connectionEpoch,
     upsertLocalConversation,
     toast,
@@ -821,7 +822,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         };
       };
 
-      const LOCAL_MCP_ROUND_LIMIT = 8;
       let caughtDecodeErr: unknown = null;
       const seenCallIds = new Set<string>();
       let cumulativeUsage: TokenUsage | undefined;
@@ -979,8 +979,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             break;
           }
 
-          if (round >= LOCAL_MCP_ROUND_LIMIT) {
-            streamErrorMsg = `达到最大工具调用轮数上限（${LOCAL_MCP_ROUND_LIMIT} 轮）`;
+          if (round >= mcpMaxToolRounds) {
+            streamErrorMsg = `达到最大工具调用轮数上限（${mcpMaxToolRounds} 轮）`;
             emitEvent({
               type: 'error',
               conversationId: opts.conversationId,
@@ -1168,6 +1168,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     },
     [
       gateway,
+      mcpMaxToolRounds,
       prepareAndOpenLocalUpstream,
       reconcileAfterStream,
       resources.providers,

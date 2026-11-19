@@ -1,39 +1,8 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState, type PointerEvent } from 'react';
 import { useApp } from '../../app/AppProvider';
-import { ConfirmDialog, IconButton, Popover } from '../../components/ui';
-import type { ChatDisplayMode } from '../../core/settings';
-import type { Message, TokenUsage } from '../../core/types';
+import { ConfirmDialog, Icon, IconButton, Popover } from '../../components/ui';
+import type { Message } from '../../core/types';
 import { isLocalMessageId } from './chatReducer';
-
-function formatUsageTriggerText(
-  usage: TokenUsage,
-  displayMode: ChatDisplayMode,
-): string {
-  const cacheRead = usage.cacheReadInputTokens ?? 0;
-  const cacheWrite = usage.cacheCreationInputTokens ?? 0;
-  if (displayMode === 'feed') {
-    const parts = [
-      `Tokens: ${usage.totalTokens} ↑${usage.inputTokens} ↓${usage.outputTokens}`,
-    ];
-    if (cacheRead > 0) parts.push(`缓存读 ${cacheRead.toLocaleString()}`);
-    if (cacheWrite > 0) parts.push(`缓存写 ${cacheWrite.toLocaleString()}`);
-    return parts.join(' · ');
-  }
-  const parts = [
-    `${usage.inputTokens.toLocaleString()} in`,
-    `${usage.outputTokens.toLocaleString()} out`,
-  ];
-  if (usage.thinkingTokens && usage.thinkingTokens > 0) {
-    parts.push(`${usage.thinkingTokens.toLocaleString()} think`);
-  }
-  if (cacheRead > 0) {
-    parts.push(`缓存读 ${cacheRead.toLocaleString()}`);
-  }
-  if (cacheWrite > 0) {
-    parts.push(`缓存写 ${cacheWrite.toLocaleString()}`);
-  }
-  return parts.join(' · ');
-}
 
 export function extractMessageCopyText(message: Message): string {
   return message.blocks
@@ -46,7 +15,6 @@ export function extractMessageCopyText(message: Message): string {
 export function MessageActions({
   message,
   disabled = false,
-  displayMode = 'bubble',
   onEdit,
   onRetry,
   onDelete,
@@ -54,7 +22,6 @@ export function MessageActions({
 }: {
   message: Message;
   disabled?: boolean;
-  displayMode?: ChatDisplayMode;
   onEdit?: (message: Message) => void;
   onRetry: (message: Message) => Promise<boolean> | void;
   onDelete: (message: Message) => Promise<boolean> | void;
@@ -69,6 +36,22 @@ export function MessageActions({
   const isLocal = isLocalMessageId(message.id);
   const copyText = extractMessageCopyText(message);
   const usage = message.usage;
+  const [usageMode, setUsageMode] = useState<'hover' | 'focus' | 'touch' | null>(null);
+  const lastPointerType = useRef('');
+  const closeTimer = useRef<number>(undefined);
+  const cancelClose = () => window.clearTimeout(closeTimer.current);
+  useEffect(() => () => window.clearTimeout(closeTimer.current), []);
+
+  const hoverUsage = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') return;
+    cancelClose();
+    setUsageMode((mode) => mode ?? 'hover');
+  };
+  const leaveUsage = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') return;
+    cancelClose();
+    closeTimer.current = window.setTimeout(() => setUsageMode((mode) => mode === 'hover' ? null : mode), 120);
+  };
 
   const handleCopy = async () => {
     if (!copyText) {
@@ -159,15 +142,42 @@ export function MessageActions({
           <Popover
             align="end"
             side="top"
+            open={usageMode !== null}
+            onOpenChange={(open) => { if (!open) setUsageMode(null); }}
+            contentProps={{
+              'aria-label': 'Token 用量明细',
+              onPointerEnter: hoverUsage,
+              onPointerLeave: leaveUsage,
+              onOpenAutoFocus: (event) => event.preventDefault(),
+              onCloseAutoFocus: (event) => event.preventDefault(),
+            }}
             trigger={
               <button
                 type="button"
-                className={`msg-usage msg-usage--trigger ${
-                  displayMode === 'feed' ? 'msg-usage--feed' : ''
-                }`.trim()}
-                aria-label="查看 Token 用量详情"
+                className="ui-icon-btn ui-icon-btn--sm msg-usage-btn"
+                aria-label="Token 用量"
+                onPointerEnter={hoverUsage}
+                onPointerLeave={leaveUsage}
+                onPointerDown={(event) => {
+                  lastPointerType.current = event.pointerType;
+                  if (event.pointerType !== 'touch') event.preventDefault();
+                }}
+                onPointerCancel={() => { lastPointerType.current = ''; }}
+                onFocus={(event) => {
+                  if (lastPointerType.current !== 'touch' && event.currentTarget.matches(':focus-visible')) setUsageMode('focus');
+                }}
+                onBlur={() => setUsageMode((mode) => mode === 'focus' ? null : mode)}
+                onClick={(event) => {
+                  event.preventDefault();
+                  if (lastPointerType.current === 'touch') {
+                    setUsageMode((mode) => mode === 'touch' ? null : 'touch');
+                  } else if (event.detail === 0) {
+                    setUsageMode('focus');
+                  }
+                  lastPointerType.current = '';
+                }}
               >
-                {formatUsageTriggerText(usage, displayMode)}
+                <Icon name="token" size={15} />
               </button>
             }
           >
@@ -180,20 +190,19 @@ export function MessageActions({
                 <span>输出</span>
                 <span>{usage.outputTokens.toLocaleString()}</span>
               </div>
-              {usage.thinkingTokens && usage.thinkingTokens > 0 ? (
+              {usage.thinkingTokens !== undefined ? (
                 <div className="msg-usage-detail__row">
                   <span>思考</span>
                   <span>{usage.thinkingTokens.toLocaleString()}</span>
                 </div>
               ) : null}
-              {usage.cacheReadInputTokens && usage.cacheReadInputTokens > 0 ? (
+              {usage.cacheReadInputTokens !== undefined ? (
                 <div className="msg-usage-detail__row">
                   <span>缓存读取</span>
                   <span>{usage.cacheReadInputTokens.toLocaleString()}</span>
                 </div>
               ) : null}
-              {usage.cacheCreationInputTokens &&
-              usage.cacheCreationInputTokens > 0 ? (
+              {usage.cacheCreationInputTokens !== undefined ? (
                 <div className="msg-usage-detail__row">
                   <span>缓存写入</span>
                   <span>{usage.cacheCreationInputTokens.toLocaleString()}</span>

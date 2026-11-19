@@ -1,6 +1,6 @@
 .prose {
   font-size: 14.5px;
-  line-height: 1.65;
+  line-height: 1.7;
   color: var(--text-primary);
   word-break: break-word;
   overflow-wrap: anywhere;
@@ -49,8 +49,10 @@
 
 .prose blockquote {
   margin: 10px 0;
-  padding: 4px 12px;
-  border-left: 3px solid var(--border-strong);
+  padding: 8px 12px;
+  background: var(--bg-surface-secondary);
+  border-left: 2px solid var(--border-strong);
+  border-radius: var(--radius-sm);
   color: var(--text-secondary);
 }
 
@@ -64,12 +66,20 @@
   font-family: var(--font-mono);
   font-size: 0.88em;
   background: var(--bg-subtle);
-  padding: 1.5px 5px;
+  border: 1px solid var(--border-hairline);
+  padding: 0 4px;
   border-radius: 5px;
 }
 
 .prose pre {
   margin: 0;
+  overflow-x: auto;
+}
+
+.prose pre code {
+  border: 0;
+  padding: 0;
+  background: transparent;
 }
 
 .prose a {
@@ -105,7 +115,7 @@
 
 .prose th {
   font-weight: 600;
-  color: var(--text-secondary);
+  color: var(--text-primary);
   background: var(--bg-surface-secondary);
 }
 
@@ -121,6 +131,7 @@
   border: 1px solid var(--border-hairline);
   border-radius: var(--radius-lg);
   background: var(--bg-surface);
+  box-shadow: var(--shadow-card);
   overflow: hidden;
   min-width: 0;
 }
@@ -137,9 +148,14 @@
   min-height: 34px;
   padding: 4px 8px 4px 10px;
   background: var(--bg-surface-secondary);
+  box-shadow: inset 0 1px 0 var(--glass-highlight);
   border-bottom: 1px solid var(--border-hairline);
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+.block-card__head:hover {
+  background: color-mix(in srgb, var(--bg-surface-secondary), var(--text-primary) 4%);
 }
 
 .block-card__head--collapsed {
@@ -173,6 +189,37 @@
   align-items: center;
   gap: 2px;
   flex: none;
+}
+
+.trace-timeline {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 12px;
+  padding: 0 0 0 12px;
+  border-inline-start: 1px solid var(--border-strong);
+}
+
+.trace-step {
+  min-width: 0;
+  position: relative;
+}
+
+.trace-step::before {
+  content: '';
+  position: absolute;
+  inset: 14px auto auto -16px;
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: var(--bg-surface);
+}
+
+.trace-step > .prose {
+  padding: 6px 8px;
+  font-size: 13px;
+  color: var(--text-secondary);
 }
 
 .code-pre {
@@ -353,8 +400,8 @@
 }
 
 .tool-trace-entry__status--success {
-  color: #166534;
-  background: color-mix(in srgb, #22c55e 14%, transparent);
+  color: var(--success);
+  background: var(--success-bg);
 }
 
 .tool-trace-entry__status--error {

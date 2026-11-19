@@ -27,6 +27,9 @@ const (
 	MaxCollapseLineThreshold = 200
 	MinCollapseCharThreshold = 120
 	MaxCollapseCharThreshold = 20000
+	MinMCPMaxToolRounds      = 1
+	MaxMCPMaxToolRounds      = 100
+	DefaultMCPMaxToolRounds  = 20
 )
 
 // Preferences holds the single-user application preferences managed by the gateway.
@@ -46,6 +49,7 @@ type Preferences struct {
 	CollapseCharThreshold        int    `json:"collapseCharThreshold"`
 	UserAvatarDataURL            string `json:"userAvatarDataUrl"`
 	ComposerReasoningEffort      string `json:"composerReasoningEffort"`
+	MCPMaxToolRounds             int    `json:"mcpMaxToolRounds"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -63,6 +67,7 @@ func DefaultPreferences() Preferences {
 		AutoCreateCache:              false,
 		CollapseLineThreshold:        24,
 		CollapseCharThreshold:        1200,
+		MCPMaxToolRounds:             DefaultMCPMaxToolRounds,
 	}
 }
 
@@ -84,6 +89,7 @@ type PreferencesPatch struct {
 	CollapseCharThreshold        *int    `json:"collapseCharThreshold"`
 	UserAvatarDataURL            *string `json:"userAvatarDataUrl"`
 	ComposerReasoningEffort      *string `json:"composerReasoningEffort"`
+	MCPMaxToolRounds             *int    `json:"mcpMaxToolRounds"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -131,6 +137,9 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	if p.ComposerReasoningEffort != nil {
 		out.ComposerReasoningEffort = *p.ComposerReasoningEffort
 	}
+	if p.MCPMaxToolRounds != nil {
+		out.MCPMaxToolRounds = *p.MCPMaxToolRounds
+	}
 	return out
 }
 
@@ -174,6 +183,9 @@ func (p Preferences) Validate() error {
 	case "", EffortNone, EffortLow, EffortMedium, EffortHigh, EffortXHigh, EffortMax:
 	default:
 		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("unsupported composerReasoningEffort %q", p.ComposerReasoningEffort), nil)
+	}
+	if p.MCPMaxToolRounds < MinMCPMaxToolRounds || p.MCPMaxToolRounds > MaxMCPMaxToolRounds {
+		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("mcpMaxToolRounds must be between %d and %d", MinMCPMaxToolRounds, MaxMCPMaxToolRounds), nil)
 	}
 	return ValidateAvatarDataURL(p.UserAvatarDataURL)
 }

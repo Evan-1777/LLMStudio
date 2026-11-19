@@ -1,4 +1,5 @@
 import http from 'node:http';
+import type { Locator } from '@playwright/test';
 import {
   connectWithToken,
   E2E_TOKEN,
@@ -260,6 +261,17 @@ async function startE2EMcpAndLlmServer() {
         return;
       }
 
+      if (JSON.stringify(latestUser ?? {}).includes('[ROUND_LIMIT]')) {
+        const alias = toolNames.find((name) => name.startsWith('bump_state'));
+        const reasoning = messages[messages.length - 1]?.role === 'tool' ? 'Second attempt' : 'First attempt';
+        res.write('data: ' + JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] }) + '\n\n');
+        res.write('data: ' + JSON.stringify({ choices: [{ delta: { tool_calls: [
+          { index: 0, id: reasoning.replace(' ', '-'), function: { name: alias, arguments: '{}' } },
+        ] }, finish_reason: 'tool_calls' }] }) + '\n\n');
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+
       if (rawMsgs.includes('[LONG_TOOL]') && !rawMsgs.includes('Tool output line 1:')) {
         const safeAlias =
           toolNames.find((n) => n.startsWith('safe_note')) || toolNames[0];
@@ -338,6 +350,8 @@ async function startE2EMcpAndLlmServer() {
         }
         if (flowTurn % 3 === 2) {
           await roundGate;
+          res.write('data: {"choices":[{"delta":{"content":"Checking the next step."}}]}\n\n');
+          res.write('data: {"choices":[{"delta":{"reasoning_content":"Second round reasoning"}}]}\n\n');
           res.write(
             `data: ${JSON.stringify({
               choices: [
@@ -435,6 +449,31 @@ async function apiPost(appUrl: string, path: string, body: unknown) {
   return res.json() as Promise<Record<string, unknown>>;
 }
 
+async function badgeContrast(badge: Locator) {
+  return badge.evaluate((element) => {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = 1;
+    const ctx = canvas.getContext('2d')!;
+    const layers: string[] = [];
+    for (let node: Element | null = element; node; node = node.parentElement) {
+      layers.unshift(getComputedStyle(node).backgroundColor);
+    }
+    for (const layer of layers) {
+      ctx.fillStyle = layer;
+      ctx.fillRect(0, 0, 1, 1);
+    }
+    const luminance = () => Array.from(ctx.getImageData(0, 0, 1, 1).data.slice(0, 3), (byte) => {
+      const value = byte / 255;
+      return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+    }).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
+    const background = luminance();
+    ctx.fillStyle = getComputedStyle(element).color;
+    ctx.fillRect(0, 0, 1, 1);
+    const foreground = luminance();
+    return (Math.max(foreground, background) + 0.05) / (Math.min(foreground, background) + 0.05);
+  });
+}
+
 test.describe('MCP End-to-End Integration', () => {
   test('probes MCP catalog, executes forward & localRequest multi-round traces safely, respects disable and mobile scroll', async ({
     page,
@@ -476,7 +515,13 @@ test.describe('MCP End-to-End Integration', () => {
       await expect(page.getByText('mcp-http', { exact: true })).toBeVisible();
 
       await page.getByRole('button', { name: '拉取工具 mcp-http' }).click();
-      await expect(page.getByText(/已连通 · 2 个工具/)).toBeVisible();
+      const connected = page.getByText(/已连通 · 2 个工具/);
+      await expect(connected).toBeVisible();
+      for (const colorScheme of ['dark', 'light'] as const) {
+        await page.emulateMedia({ colorScheme });
+        await expect(page.locator('html')).toHaveAttribute('data-theme', colorScheme);
+        expect(await badgeContrast(connected)).toBeGreaterThanOrEqual(4.5);
+      }
       await expect(page.getByText('bump_state', { exact: true })).toBeVisible();
       await expect(page.getByText('safe_note', { exact: true })).toBeVisible();
       const noteDetails = page.locator('summary').filter({ hasText: /^safe_note$/ });
@@ -508,10 +553,22 @@ test.describe('MCP End-to-End Integration', () => {
       await trace1.click();
       mockSrv.releaseRound();
       await expect(page.getByText('MCP Final Reply (count=2)', { exact: true })).toBeVisible();
+      const timeline = page.getByRole('button', { name: /思考与工具 · 2 轮.*完成/ });
+      await expect(timeline).toHaveAttribute('aria-expanded', 'false');
+      await expect(page.getByText('Checking the next step.')).toBeHidden();
+      await timeline.click();
+      await expect(page.getByText('Checking the next step.')).toBeVisible();
       await expect(trace1).toHaveAttribute('aria-expanded', 'true');
       await expect(trace2).toHaveAttribute('aria-expanded', 'false');
       const toolDetails = page.locator('.tool-trace-entry > summary');
       await expect(toolDetails).toHaveCount(2);
+      const successBadge = page.locator('.tool-trace-entry__status--success').first();
+      await page.emulateMedia({ colorScheme: 'dark' });
+      await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
+      expect(await badgeContrast(successBadge)).toBeGreaterThanOrEqual(4.5);
+      await page.emulateMedia({ colorScheme: 'light' });
+      await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
+      expect(await badgeContrast(successBadge)).toBeGreaterThanOrEqual(4.5);
       for (const tool of await toolDetails.all()) await tool.click();
       await expect(page.getByText('count=1', { exact: true })).toBeVisible();
       await expect(page.getByText(/doc:\/\/guide/)).toBeVisible();
@@ -530,7 +587,10 @@ test.describe('MCP End-to-End Integration', () => {
       await expect(
         page.getByText('MCP Final Reply (count=2)', { exact: true }),
       ).toBeVisible();
-      await expect(page.getByText('60 in · 20 out')).toBeVisible();
+      await expect(timeline).toHaveAttribute('aria-expanded', 'false');
+      await page.getByRole('button', { name: 'Token 用量' }).hover();
+      await expect(page.getByRole('dialog', { name: 'Token 用量明细' })).toContainText('80');
+      await page.keyboard.press('Escape');
 
       // 3. Disable mcp-sse server -> next model call no longer sees echo_sse tool.
       await page.getByRole('link', { name: '设置' }).click();
@@ -683,6 +743,57 @@ test.describe('MCP End-to-End Integration', () => {
       };
       expect(parsedDetail.messages).toHaveLength(2);
       expect(parsedDetail.messages[1].usage?.totalTokens).toBe(80);
+
+      const settings = '/api/v1/settings';
+      const headers = { Authorization: `Bearer ${E2E_TOKEN}` };
+      await page.getByRole('link', { name: '设置' }).click();
+      await page.getByRole('button', { name: 'MCP 配置' }).click();
+      const rounds = page.getByRole('spinbutton', { name: '最大工具调用轮次' });
+      await expect(rounds).toHaveValue('20');
+      for (const value of [0, 101]) {
+        const response = await page.request.patch(`${appUrl}${settings}`, { headers, data: { mcpMaxToolRounds: value } });
+        expect(response.status()).toBe(400);
+        expect(await response.json()).toMatchObject({ code: 'INVALID_ARGUMENT' });
+      }
+      const patch = page.waitForResponse((res) => res.url().endsWith(settings) && res.request().method() === 'PATCH');
+      await rounds.fill('1');
+      await rounds.press('Enter');
+      expect((await patch).ok()).toBe(true);
+      await page.reload({ waitUntil: 'networkidle' });
+      await expect(rounds).toHaveValue('1');
+      await page.getByRole('button', { name: '外观与显示' }).click();
+      const collapsePatch = page.waitForResponse((res) => res.url().endsWith(settings) && res.request().method() === 'PATCH');
+      await toolCollapseSwitch.click();
+      expect((await collapsePatch).ok()).toBe(true);
+      await page.getByRole('button', { name: '返回工作台' }).click();
+
+      for (const model of ['Fwd Chat', 'Local Chat']) {
+        await page.getByRole('button', { name: '新建话题' }).click();
+        await page.getByRole('button', { name: '选择模型' }).click();
+        await page.getByRole('option', { name: model }).click();
+        const beforeTools = mockSrv.mcpCalls.length;
+        const beforeLlm = mockSrv.llmCalls.length;
+        const saved = model === 'Local Chat' ? page.waitForResponse((response) =>
+          response.url().endsWith('/messages') && response.request().method() === 'POST' &&
+          response.request().postDataJSON()?.role === 'assistant',
+        ) : null;
+        await page.getByLabel('消息输入框').fill('[ROUND_LIMIT]');
+        await page.getByLabel('发送消息').click();
+        await expect(page.getByRole('article').getByText('达到最大工具调用轮数上限（1 轮）')).toBeVisible();
+        if (saved) expect((await saved).ok()).toBe(true);
+        expect(mockSrv.mcpCalls.length - beforeTools).toBe(1);
+        expect(mockSrv.llmCalls.length - beforeLlm).toBe(2);
+        const errorTrace = page.getByRole('button', { name: /思考与工具 · 2 轮.*未完成/ });
+        await expect(errorTrace).toHaveAttribute('aria-expanded', 'false');
+        await page.reload({ waitUntil: 'networkidle' });
+        await expect(errorTrace).toHaveAttribute('aria-expanded', 'false');
+        await errorTrace.click();
+        await expect(page.getByRole('button', { name: '思考过程' })).toHaveCount(2);
+        for (const thought of await page.getByRole('button', { name: '思考过程' }).all()) {
+          await expect(thought).toHaveAttribute('aria-expanded', 'false');
+        }
+        await expect(page.getByRole('button', { name: /第 1 轮.*完成/ })).toHaveAttribute('aria-expanded', 'false');
+      }
     } finally {
       await mockSrv.close();
     }

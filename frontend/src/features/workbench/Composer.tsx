@@ -21,7 +21,6 @@ import {
 import {
   REASONING_EFFORT_LEVELS,
   type ContentBlock,
-  type ModelConfig,
   type ReasoningEffort,
 } from '../../core/types';
 import { AttachmentChips } from './AttachmentChips';
@@ -46,7 +45,6 @@ const EFFORT_LABELS: Record<ReasoningEffort, string> = {
 };
 
 export function Composer({
-  selectedModel,
   selectedProviderId,
   selectedModelId,
   reasoningEffort,
@@ -56,7 +54,6 @@ export function Composer({
   onStop,
   onSend,
 }: {
-  selectedModel: ModelConfig | null;
   selectedProviderId: string;
   selectedModelId: string;
   reasoningEffort: ReasoningEffort;
@@ -110,11 +107,6 @@ export function Composer({
     );
   }, [enabledEngines, selectedEngineId]);
 
-  const supportsImageInput = useMemo(() => {
-    if (!selectedModel?.inputModalities) return false;
-    return selectedModel.inputModalities.includes('image');
-  }, [selectedModel]);
-
   const readyAttachments = attachments.filter((a) => a.status === 'ready');
   const hasReading = attachments.some((a) => a.status === 'reading');
   const hasAttachmentErrors = attachments.some((a) => a.status === 'error');
@@ -140,7 +132,6 @@ export function Composer({
       if (!file) continue;
       added.push(
         readAttachmentFile(file, {
-          supportsImageInput,
           onUpdate: (updated) => {
             setAttachments((prev) =>
               prev.map((p) => (p.id === updated.id ? updated : p)),
@@ -173,11 +164,9 @@ export function Composer({
   };
 
   const handleRemoveAttachment = (id: string) => {
-    setAttachments((prev) => {
-      const target = prev.find((a) => a.id === id);
-      if (target) revokeAttachmentResources(target);
-      return prev.filter((a) => a.id !== id);
-    });
+    const target = attachmentsRef.current.find((a) => a.id === id);
+    if (target) revokeAttachmentResources(target);
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
     setBodyError(null);
   };
 

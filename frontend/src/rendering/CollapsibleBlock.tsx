@@ -62,9 +62,9 @@ export function CollapsibleBlock({
     undefined,
   );
 
-  const [initialCollapsed] = useState(defaultCollapsed);
+  const [autoCollapsed, setAutoCollapsed] = useState(defaultCollapsed);
   const manual = ctx ? ctx.getManual(collapseKey) : localOverride;
-  const collapsed = manual ?? (completion === undefined ? defaultCollapsed : initialCollapsed);
+  const collapsed = manual ?? (completion === undefined ? defaultCollapsed : autoCollapsed);
 
   const completed = useRef(completion !== 'pending');
   const card = useRef<HTMLDivElement>(null);
@@ -80,9 +80,9 @@ export function CollapsibleBlock({
   useLayoutEffect(() => {
     if (!completion || completion === 'pending' || completed.current) return;
     completed.current = true;
-    if (completion !== 'collapse' || collapsed) return;
+    if (completion !== 'collapse' || manual !== undefined || collapsed) return;
     if (card.current?.contains(document.activeElement)) trigger.current?.focus();
-    setCollapsed(true);
+    setAutoCollapsed(true);
   });
 
   const toggle = () => setCollapsed(!collapsed);

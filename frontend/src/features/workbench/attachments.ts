@@ -4,6 +4,7 @@ import {
   type ContentBlock,
 } from '../../core/types';
 import { measureUtf8Bytes } from '../../core/gateway';
+import { compressImageFile } from './imageCompression';
 
 export const ALLOWED_TEXT_EXTENSIONS = new Set([
   'txt',
@@ -14,6 +15,7 @@ export const ALLOWED_TEXT_EXTENSIONS = new Set([
   'yaml',
   'yml',
   'xml',
+  'svg',
   'html',
   'htm',
   'css',
@@ -33,16 +35,23 @@ export const ALLOWED_TEXT_EXTENSIONS = new Set([
   'h',
 ]);
 
-export const ALLOWED_IMAGE_EXTENSIONS = new Set([
-  'png',
-  'jpg',
-  'jpeg',
-  'webp',
-  'gif',
-]);
+const IMAGE_EXTENSION_MIME: Readonly<Record<string, string>> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  jfif: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  avif: 'image/avif',
+  ico: 'image/x-icon',
+};
+const ALLOWED_IMAGE_EXTENSIONS = new Set(Object.keys(IMAGE_EXTENSION_MIME));
+export const MAX_RAW_IMAGE_BYTES = 25 * 1024 * 1024;
 
 export const FILE_INPUT_ACCEPT = [
   'image/*',
+  ...Array.from(ALLOWED_IMAGE_EXTENSIONS, (ext) => `.${ext}`),
   ...Array.from(ALLOWED_TEXT_EXTENSIONS, (ext) => `.${ext}`),
 ].join(',');
 
@@ -51,6 +60,7 @@ export interface PendingAttachment {
   name: string;
   mimeType: string;
   size: number;
+  originalSize?: number;
   kind: 'image' | 'text';
   status: 'reading' | 'ready' | 'error';
   error?: string;
@@ -70,13 +80,18 @@ const IMAGE_MIME_EXTENSIONS: Record<string, string> = {
   'image/jpeg': 'jpg',
   'image/webp': 'webp',
   'image/gif': 'gif',
+  'image/bmp': 'bmp',
+  'image/avif': 'avif',
+  'image/x-icon': 'ico',
+  'image/vnd.microsoft.icon': 'ico',
+  'image/svg+xml': 'svg',
 };
 
 // defaultAttachmentName gives clipboard images without a filename a stable name.
 export function defaultAttachmentName(file: Pick<File, 'name' | 'type'>): string {
   const name = file.name?.trim();
   if (name) return name;
-  const ext = IMAGE_MIME_EXTENSIONS[file.type];
+  const ext = IMAGE_MIME_EXTENSIONS[file.type.toLowerCase()];
   return ext ? `pasted-image.${ext}` : 'pasted-file';
 }
 
@@ -92,7 +107,7 @@ export function collectClipboardImageFiles(data: DataTransfer | null): File[] {
   const images: File[] = [];
   const seen = new Set<string>();
   const push = (file: File | null | undefined) => {
-    if (!file || !file.type.startsWith('image/')) return;
+    if (!file || (!file.type.toLowerCase().startsWith('image/') && classifyFile(file) !== 'image')) return;
     const key = clipboardFileKey(file);
     if (seen.has(key)) return;
     seen.add(key);
@@ -122,10 +137,13 @@ export function classifyFile(
   file: Pick<File, 'name' | 'type'>,
 ): 'image' | 'text' | 'unsupported' {
   const ext = getExtension(file.name);
-  if (file.type.startsWith('image/') || ALLOWED_IMAGE_EXTENSIONS.has(ext)) {
+  const mime = file.type.toLowerCase();
+  if (ext === 'svg' || mime === 'image/svg+xml') return 'text';
+  if (ext === 'tif' || ext === 'tiff') return 'unsupported';
+  if (mime.startsWith('image/') || ALLOWED_IMAGE_EXTENSIONS.has(ext)) {
     return 'image';
   }
-  if (file.type.startsWith('text/') || ALLOWED_TEXT_EXTENSIONS.has(ext)) {
+  if (mime.startsWith('text/') || ALLOWED_TEXT_EXTENSIONS.has(ext)) {
     return 'text';
   }
   return 'unsupported';
@@ -156,7 +174,6 @@ export function attachmentToContentBlock(att: PendingAttachment): ContentBlock {
 export function readAttachmentFile(
   file: File,
   opts: {
-    supportsImageInput: boolean;
     onUpdate: (att: PendingAttachment) => void;
   },
 ): PendingAttachment {
@@ -176,19 +193,8 @@ export function readAttachmentFile(
     };
   }
 
-  if (classified === 'image' && !opts.supportsImageInput) {
-    return {
-      id,
-      name,
-      mimeType: file.type || 'image/png',
-      size: file.size,
-      kind: 'image',
-      status: 'error',
-      error: '当前模型不支持图片输入',
-    };
-  }
-
-  if (file.size > MAX_ATTACHMENT_BYTES) {
+  const maxSize = classified === 'image' ? MAX_RAW_IMAGE_BYTES : MAX_ATTACHMENT_BYTES;
+  if (file.size > maxSize) {
     return {
       id,
       name,
@@ -196,97 +202,75 @@ export function readAttachmentFile(
       size: file.size,
       kind: classified,
       status: 'error',
-      error: '单文件超过 8 MiB 上限',
+      error: classified === 'image' ? '图片原文件超过 25 MiB 上限' : '单文件超过 8 MiB 上限',
     };
   }
 
   const reader = new FileReader();
-  let canceled = false;
-  const previewUrl =
-    classified === 'image' && typeof URL.createObjectURL === 'function'
-      ? URL.createObjectURL(file)
-      : undefined;
-
+  const controller = new AbortController();
+  const { signal } = controller;
+  let previewUrl: string | undefined;
+  const abortRead = () => {
+    controller.abort();
+    if (reader.readyState === FileReader.LOADING) reader.abort();
+    if (previewUrl) {
+      URL.revokeObjectURL(previewUrl);
+      previewUrl = undefined;
+    }
+  };
   const initial: PendingAttachment = {
     id,
     name,
-    mimeType:
-      file.type || (classified === 'image' ? 'image/png' : 'text/plain'),
+    mimeType: classified === 'image' && !file.type.toLowerCase().startsWith('image/')
+      ? IMAGE_EXTENSION_MIME[getExtension(file.name)]
+      : file.type || 'text/plain',
     size: file.size,
     kind: classified,
     status: 'reading',
-    previewUrl,
-    abortRead: () => {
-      canceled = true;
-      if (reader.readyState === FileReader.LOADING) {
-        reader.abort();
-      }
-      if (previewUrl && typeof URL.revokeObjectURL === 'function') {
-        URL.revokeObjectURL(previewUrl);
-      }
-    },
+    abortRead,
   };
-
-  reader.onload = () => {
-    if (canceled) return;
-    const raw = typeof reader.result === 'string' ? reader.result : '';
-    if (classified === 'image') {
-      let mime = initial.mimeType;
-      let base64Data = raw;
-      const commaIdx = raw.indexOf(',');
-      if (raw.startsWith('data:') && commaIdx > 0) {
-        const header = raw.slice(5, commaIdx);
-        const semiIdx = header.indexOf(';');
-        if (semiIdx > 0) {
-          mime = header.slice(0, semiIdx);
-        }
-        base64Data = raw.slice(commaIdx + 1);
-      }
-      opts.onUpdate({
-        ...initial,
-        mimeType: mime,
-        base64Data,
-        status: 'ready',
-      });
-    } else {
-      if (raw.includes('\u0000')) {
-        opts.onUpdate({
-          ...initial,
-          status: 'error',
-          error: '检测到二进制内容，无法作为文本附加',
-        });
-        return;
-      }
-      opts.onUpdate({
-        ...initial,
-        textContent: raw,
-        status: 'ready',
-      });
-    }
+  const fail = (error: string) => {
+    if (signal.aborted) return;
+    abortRead();
+    opts.onUpdate({ ...initial, status: 'error', error });
   };
-
-  reader.onerror = () => {
-    if (canceled) return;
-    if (previewUrl && typeof URL.revokeObjectURL === 'function') {
-      URL.revokeObjectURL(previewUrl);
-    }
-    opts.onUpdate({
-      ...initial,
-      previewUrl: undefined,
-      status: 'error',
-      error: '读取文件失败',
-    });
-  };
-
-  reader.onabort = () => {
-    if (previewUrl && typeof URL.revokeObjectURL === 'function') {
-      URL.revokeObjectURL(previewUrl);
-    }
-  };
+  reader.onerror = () => fail('读取文件失败');
 
   if (classified === 'image') {
-    reader.readAsDataURL(file);
+    void compressImageFile(file, { signal, mimeType: initial.mimeType }).then((result) => {
+      if (signal.aborted) return;
+      if (result.compressedSize > MAX_ATTACHMENT_BYTES) {
+        fail('压缩后图片仍超过 8 MiB 上限');
+        return;
+      }
+      reader.onload = () => {
+        if (signal.aborted) return;
+        const dataUrl = reader.result as string;
+        previewUrl = typeof URL.createObjectURL === 'function' ? URL.createObjectURL(result.blob) : undefined;
+        opts.onUpdate({
+          ...initial,
+          status: 'ready',
+          mimeType: result.mimeType,
+          originalSize: result.originalSize,
+          size: result.compressedSize,
+          base64Data: dataUrl.slice(dataUrl.indexOf(',') + 1),
+          previewUrl,
+        });
+      };
+      reader.readAsDataURL(result.blob);
+    }).catch((error: unknown) => fail(error instanceof Error && error.message === '无法解码该图片格式'
+      ? error.message
+      : '读取图片失败'));
   } else {
+    reader.onload = () => {
+      if (signal.aborted) return;
+      const textContent = reader.result as string;
+      if (textContent.includes('\u0000')) {
+        fail('检测到二进制内容，无法作为文本附加');
+        return;
+      }
+      opts.onUpdate({ ...initial, textContent, status: 'ready' });
+    };
     reader.readAsText(file);
   }
 
@@ -295,9 +279,6 @@ export function readAttachmentFile(
 
 export function revokeAttachmentResources(att: PendingAttachment) {
   att.abortRead?.();
-  if (att.previewUrl && typeof URL.revokeObjectURL === 'function') {
-    URL.revokeObjectURL(att.previewUrl);
-  }
 }
 
 export function estimateStreamRequestBytes(payload: unknown): number {

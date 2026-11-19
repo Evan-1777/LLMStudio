@@ -10,7 +10,7 @@ import {
 const PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
 
-test.describe('Clipboard image attachments', () => {
+test.describe('Image attachments', () => {
   test('sends a pasted clipboard image upstream with its data and MIME and keeps it in history', async ({
     appUrl,
     upstream,
@@ -82,5 +82,50 @@ test.describe('Clipboard image attachments', () => {
     expect(stored).toContain('"type":"image"');
     expect(stored).toContain('"mimeType":"image/png"');
     expect(stored).toContain(PNG_BASE64);
+  });
+
+  test('compresses a large file before sending from a model without a vision label', async ({ appUrl, upstream, page }) => {
+    await seedMockProviderViaApi(appUrl, upstream.url, [
+      { id: 'mock-chat', name: 'Mock Chat', apiFormat: 'openai-completions' },
+    ]);
+    await connectWithToken(page, appUrl);
+    await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/Mock Chat/);
+    const originalBytes = await page.locator('input[type="file"]').evaluate(async (input: HTMLInputElement) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = 2400;
+      canvas.height = 1400;
+      const ctx = canvas.getContext('2d')!;
+      const pixels = ctx.createImageData(canvas.width, canvas.height);
+      let seed = 42;
+      for (let i = 0; i < pixels.data.length; i += 4) {
+        seed ^= seed << 13;
+        seed ^= seed >>> 17;
+        seed ^= seed << 5;
+        pixels.data[i] = seed & 255;
+        pixels.data[i + 1] = (seed >>> 8) & 255;
+        pixels.data[i + 2] = (seed >>> 16) & 255;
+        pixels.data[i + 3] = 255;
+      }
+      ctx.putImageData(pixels, 0, 0);
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob((image) => image ? resolve(image) : reject(new Error('PNG encoding failed')), 'image/png');
+      });
+      const transfer = new DataTransfer();
+      transfer.items.add(new File([blob], 'large.png', { type: blob.type }));
+      input.files = transfer.files;
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      return blob.size;
+    });
+    expect(originalBytes).toBeGreaterThan(8 * 1024 * 1024);
+    const thumbnail = page.getByRole('img', { name: 'large.png' });
+    await expect(thumbnail).toBeVisible();
+    await expect.poll(() => thumbnail.evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(1600);
+    await expect(thumbnail.locator('..')).toHaveAttribute('title', /→/);
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await expect(page.getByText(/Reply #1 to:/)).toBeVisible();
+    const payload = JSON.stringify(upstream.lastChatBodies[0]);
+    const encoded = payload.match(/data:image\/webp;base64,([A-Za-z0-9+/=]+)/)?.[1];
+    expect(encoded).toBeTruthy();
+    expect(Buffer.from(encoded!, 'base64').byteLength).toBeLessThan(originalBytes / 4);
   });
 });
