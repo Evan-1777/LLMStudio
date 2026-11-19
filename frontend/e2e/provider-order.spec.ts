@@ -104,11 +104,17 @@ test('scrolls the narrow provider strip normally and sorts by horizontal long pr
     const quartzBox = (await quartz.boundingBox())!;
     const x = Math.round(slateBox.x + 40);
     const y = Math.round(slateBox.y + slateBox.height / 2);
+    // Register before swiping: the fling can outlive touchEnd and overwrite the reset.
+    const swipe = await list.evaluateHandle((el) => ({
+      end: new Promise<void>((resolve) => el.addEventListener('scrollend', () => resolve(), { once: true })),
+    }));
     await touch('touchStart', x, y);
     for (let i = 1; i <= 6; i++) await touch('touchMove', x - i * 22, y);
     await touch('touchEnd');
     await expect.poll(() => list.evaluate((el) => el.scrollLeft)).toBeGreaterThan(0);
     expect(requestBodies).toEqual([]);
+    await swipe.evaluate(({ end }) => end);
+    await swipe.dispose();
     await list.evaluate((el) => { el.scrollLeft = 0; });
     await touch('touchStart', x, y);
     await page.waitForTimeout(370); // Longer than the production long-press threshold.
