@@ -304,6 +304,7 @@ test('persists Enter behavior on the gateway and preserves multiline and IME inp
   await seedMockProviderViaApi(appUrl, upstream.url);
   await connectWithToken(page, appUrl);
   const composer = page.getByLabel('消息输入框');
+  const sendButton = page.getByRole('button', { name: '发送消息' });
   const sent: string[] = [];
   page.on('request', req => {
     if (req.method() === 'POST' && /\/api\/v1\/conversations\/[^/]+\/messages\/stream$/.test(req.url())) sent.push(req.url());
@@ -314,6 +315,7 @@ test('persists Enter behavior on the gateway and preserves multiline and IME inp
   await composer.dispatchEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true });
   await expect(composer).toHaveValue('First draft\n');
   expect(sent).toEqual([]);
+  await expect(sendButton).toBeEnabled();
   await composer.press('Enter');
   await expect(page.getByText(/Reply #1 to: First draft/)).toBeVisible();
   expect(upstream.lastChatBodies).toHaveLength(1);
@@ -340,13 +342,16 @@ test('persists Enter behavior on the gateway and preserves multiline and IME inp
   await composer.press('Enter');
   await expect(composer).toHaveValue('Second draft\n');
   expect(upstream.lastChatBodies).toHaveLength(1);
+  await expect(sendButton).toBeEnabled();
   await composer.press('Control+Enter');
   await expect(page.getByText(/Reply #2 to: Second draft/)).toBeVisible();
   await composer.fill('Third draft');
+  // Reply text can become visible before the previous send finishes reconciling.
+  await expect(sendButton).toBeEnabled();
   await composer.press('Meta+Enter');
   await expect(page.getByText(/Reply #3 to: Third draft/)).toBeVisible();
   await composer.fill('Fourth draft');
-  await page.getByRole('button', { name: '发送消息' }).click();
+  await sendButton.click();
   await expect(page.getByText(/Reply #4 to: Fourth draft/)).toBeVisible();
   expect(upstream.lastChatBodies).toHaveLength(4);
 });
