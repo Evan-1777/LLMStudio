@@ -56,13 +56,10 @@ test('uploads, restores, disables, replaces, and removes one local TTF', async (
   await page.setViewportSize({ width: 1280, height: 800 });
 
   await page.getByRole('button', { name: '返回工作台' }).click();
-  await expect
-    .poll(() =>
-      page.evaluate(
-        () => getComputedStyle(document.querySelector('.wb-draft')!).fontFamily,
-      ),
-    )
-    .toContain('LLMStudioCustom');
+  await expect(page.locator('.wb-draft')).toHaveCSS(
+    'font-family',
+    /LLMStudioCustom/,
+  );
   await openAppearance(page);
   await expect(page.getByText(FONT_NAME)).toBeVisible();
 
