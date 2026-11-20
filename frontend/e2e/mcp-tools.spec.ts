@@ -131,6 +131,19 @@ async function startE2EMcpAndLlmServer() {
           );
           return;
         }
+        if (rpc.params?.arguments?.fail) {
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: rpc.id,
+              result: {
+                isError: true,
+                content: [{ type: 'text', text: 'tool execution failed intentionally' }],
+              },
+            }),
+          );
+          return;
+        }
         if (rpc.params?.arguments?.long) {
           const lines = Array.from(
             { length: 45 },
@@ -256,6 +269,39 @@ async function startE2EMcpAndLlmServer() {
           res.write('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n');
         } else {
           res.write('data: {"choices":[{"delta":{"content":"Tool policy confirmed"},"finish_reason":"stop"}]}\n\n');
+        }
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+
+      if (JSON.stringify(latestUser ?? {}).includes('[FAILED_TOOL]')) {
+        if (!messages.some((msg) => msg.role === 'tool')) {
+          const safeAlias =
+            toolNames.find((n) => n.startsWith('safe_note')) || toolNames[0];
+          res.write(
+            'data: ' +
+              JSON.stringify({
+                choices: [
+                  {
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: 'tc_fail_1',
+                          function: { name: safeAlias, arguments: '{"fail":true}' },
+                        },
+                      ],
+                    },
+                    finish_reason: 'tool_calls',
+                  },
+                ],
+              }) +
+              '\n\n',
+          );
+        } else {
+          res.write(
+            'data: {"choices":[{"delta":{"content":"Handled tool failure"},"finish_reason":"stop"}]}\n\n',
+          );
         }
         res.end('data: [DONE]\n\n');
         return;
@@ -794,6 +840,23 @@ test.describe('MCP End-to-End Integration', () => {
         }
         await expect(page.getByRole('button', { name: /第 1 轮.*完成/ })).toHaveAttribute('aria-expanded', 'false');
       }
+
+      // Failed tool call round auto-collapses when complete and stays collapsed across reload.
+      await page.getByRole('button', { name: '新建话题' }).click();
+      await page.getByRole('button', { name: '选择模型' }).click();
+      await page.getByRole('option', { name: 'Fwd Chat' }).click();
+      await page.getByLabel('消息输入框').fill('[FAILED_TOOL]');
+      await page.getByLabel('发送消息').click();
+      await expect(page.getByText('Handled tool failure')).toBeVisible();
+      const failedRound = page.getByRole('button', { name: /工具调用 · 第 1 轮 · 1 次 · 1 个失败/ }).last();
+      await expect(failedRound).toHaveAttribute('aria-expanded', 'false');
+      await page.reload({ waitUntil: 'networkidle' });
+      await expect(page.getByText('Handled tool failure')).toBeVisible();
+      await expect(failedRound).toHaveAttribute('aria-expanded', 'false');
+      await failedRound.click();
+      await expect(failedRound).toHaveAttribute('aria-expanded', 'true');
+      await page.locator('.tool-trace-entry > summary').last().click();
+      await expect(page.getByText('tool execution failed intentionally')).toBeVisible();
     } finally {
       await mockSrv.close();
     }

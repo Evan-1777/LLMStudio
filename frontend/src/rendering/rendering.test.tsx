@@ -355,26 +355,115 @@ describe('ContentRenderer and HTML sandbox', () => {
     expect(screen.getByRole('button', { name: /思考与工具 · 3 轮.*未完成/ })).toHaveAttribute('aria-expanded', 'false');
   });
 
-  it('keeps failed and incomplete rounds visible but hides details until expanded', async () => {
+  it('collapses completed failed rounds while keeping incomplete aborted rounds open, and hides details until expanded', async () => {
     const user = userEvent.setup();
     render(
       <AppProvider skipInitialBootstrap>
-        <ContentRenderer messageId="m-err" stopReason="aborted" blocks={[
-          { type: 'toolCall', id: 'a', name: 'broken' },
-          { type: 'toolResult', toolCallId: 'a', content: 'connection lost', isError: true },
-          { type: 'toolCall', id: 'b', name: 'interrupted' },
-        ]} />
+        <CollapseStateProvider>
+          <ContentRenderer messageId="m-err" stopReason="aborted" blocks={[
+            { type: 'toolCall', id: 'a', name: 'broken' },
+            { type: 'toolResult', toolCallId: 'a', content: 'connection lost', isError: true },
+            { type: 'toolCall', id: 'b', name: 'interrupted' },
+          ]} />
+        </CollapseStateProvider>
       </AppProvider>,
     );
     expect(screen.getByRole('button', { name: /工具调用 · 2 轮.*1 个失败/ })).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByRole('button', { name: /第 1 轮.*1 个失败/ })).toHaveAttribute('aria-expanded', 'true');
+    const failedRound = screen.getByRole('button', { name: /第 1 轮.*1 个失败/ });
+    expect(failedRound).toHaveAttribute('aria-expanded', 'false');
     expect(screen.getByRole('button', { name: /未完成/ })).toHaveAttribute('aria-expanded', 'true');
+    await user.click(failedRound);
     const detail = screen.getByText('broken').closest('summary')!;
     expect(detail.closest('details')).not.toHaveAttribute('open');
     await user.click(detail);
     expect(screen.getByText('connection lost')).toBeVisible();
     await user.click(detail);
     expect(detail.closest('details')).not.toHaveAttribute('open');
+  });
+
+  it('auto-collapses failed tool rounds and timelines on completion and keeps them collapsed on reload unless auto-collapse is disabled', async () => {
+    const user = userEvent.setup();
+    const singleBlocks: ContentBlock[] = [
+      { type: 'toolCall', id: 'tc-fail', name: 'broken_tool', arguments: { target: 'x' } },
+      { type: 'toolResult', toolCallId: 'tc-fail', toolName: 'broken_tool', content: 'boom', isError: true },
+      { type: 'text', text: 'Handled failure' },
+    ];
+    const renderSingle = (count: number, completed?: boolean[], isStreaming = false) => (
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer
+            messageId="m-fail-single"
+            collapsePrefix="fail-single"
+            isStreaming={isStreaming}
+            blockCompleted={completed}
+            stopReason={isStreaming ? undefined : 'stop'}
+            blocks={singleBlocks.slice(0, count)}
+          />
+        </CollapseStateProvider>
+      </AppProvider>
+    );
+
+    const { rerender, unmount } = render(renderSingle(2, [true, false], true));
+    const singleRound = screen.getByRole('button', { name: /工具调用 · 第 1 轮/ });
+    expect(singleRound).toHaveAttribute('aria-expanded', 'true');
+
+    rerender(renderSingle(2, [true, true], true));
+    expect(singleRound).toHaveAttribute('aria-expanded', 'false');
+    expect(singleRound).toHaveTextContent('1 个失败');
+
+    await user.click(singleRound);
+    expect(singleRound).toHaveAttribute('aria-expanded', 'true');
+    rerender(renderSingle(3, undefined, false));
+    expect(singleRound).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Handled failure')).toBeVisible();
+
+    // Simulate page reload: fresh CollapseStateProvider mounts with auto-collapsed failed round.
+    unmount();
+    const reloadedSingle = render(renderSingle(3, undefined, false));
+    expect(screen.getByRole('button', { name: /工具调用 · 第 1 轮.*1 个失败/ })).toHaveAttribute('aria-expanded', 'false');
+    reloadedSingle.unmount();
+
+    // Multi-step thinking + failed tool timeline also auto-collapses and remains collapsed after reload.
+    const traceBlocks: ContentBlock[] = [
+      { type: 'thinking', thinking: 'planning call' },
+      { type: 'toolCall', id: 'tc-t', name: 'failing_step' },
+      { type: 'toolResult', toolCallId: 'tc-t', toolName: 'failing_step', content: 'upstream 500', isError: true },
+      { type: 'text', text: 'Final summary' },
+    ];
+    const renderTrace = (count: number, completed?: boolean[], isStreaming = false) => (
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer
+            messageId="m-fail-trace"
+            blocks={traceBlocks.slice(0, count)}
+            isStreaming={isStreaming}
+            blockCompleted={completed}
+            stopReason={isStreaming ? undefined : 'stop'}
+          />
+        </CollapseStateProvider>
+      </AppProvider>
+    );
+    const traceView = render(renderTrace(3, [true, true, false], true));
+    expect(screen.getByRole('button', { name: /工具调用中 · 第 1 轮/ })).toHaveAttribute('aria-expanded', 'true');
+    traceView.rerender(renderTrace(4, undefined, false));
+    const traceBtn = screen.getByRole('button', { name: /思考与工具 · 1 轮.*1 个失败/ });
+    expect(traceBtn).toHaveAttribute('aria-expanded', 'false');
+    traceView.unmount();
+
+    const reloadedTrace = render(renderTrace(4, undefined, false));
+    const reloadedBtn = screen.getByRole('button', { name: /思考与工具 · 1 轮.*1 个失败/ });
+    expect(reloadedBtn).toHaveAttribute('aria-expanded', 'false');
+    await user.click(reloadedBtn);
+    expect(screen.getByRole('button', { name: /第 1 轮.*1 个失败/ })).toHaveAttribute('aria-expanded', 'false');
+    reloadedTrace.unmount();
+
+    // Respects autoCollapseToolsOnComplete=false for failed tool rounds too.
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...defaultSettings(), autoCollapseToolsOnComplete: false }),
+    );
+    render(renderSingle(3, undefined, false));
+    expect(screen.getByRole('button', { name: /工具调用 · 第 1 轮.*1 个失败/ })).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('keeps ThinkingScrollBody auto-following across large streaming deltas unless the user scrolls away', async () => {

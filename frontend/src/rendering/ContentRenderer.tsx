@@ -477,7 +477,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       const { entries, roundNumber } = round;
       const done = entries.filter(ended).length;
       const failed = entries.filter((entry) => ended(entry) && entry.result?.isError).length;
-      const successful = done === entries.length && failed === 0;
+      const roundCompleted = done === entries.length;
       const status = done < entries.length
         ? isStreaming ? `执行中 (${done}/${entries.length})` : '未完成'
         : failed ? `${failed} 个失败` : '完成';
@@ -490,8 +490,12 @@ export const ContentRenderer = memo(function ContentRenderer({
           title={`${title} · ${entries.length} 次 · ${status}`}
           icon={failed ? 'warning' : 'wrench'}
           subtle
-          defaultCollapsed={successful && settings.autoCollapseToolsOnComplete}
-          completion={successful ? (settings.autoCollapseToolsOnComplete ? 'collapse' : 'keep') : 'pending'}
+          defaultCollapsed={roundCompleted && settings.autoCollapseToolsOnComplete}
+          completion={
+            roundCompleted
+              ? settings.autoCollapseToolsOnComplete ? 'collapse' : 'keep'
+              : isStreaming ? 'pending' : 'keep'
+          }
         >
           <div className="tool-trace-body" tabIndex={0} aria-label={`${title}详情`}>
             {entries.map((entry) => {
@@ -695,7 +699,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       : `${label} · ${rounds.length} 轮 (${entries.length} 次) · ${failed ? `${failed} 个失败` : pendingRound || interruptedThinking ? '未完成' : '完成'}`;
     const autoCollapse = settings.autoCollapseToolsOnComplete &&
       (!trace.thinkingCount || settings.autoCollapseThinkingOnComplete) &&
-      !failed && !interruptedThinking && (!pendingRound || stopReason === 'error');
+      !interruptedThinking && (!pendingRound || stopReason === 'error');
     const completion = isStreaming ? 'pending' : autoCollapse ? 'collapse' : 'keep';
     const traceKey = `${effectivePrefix}:process-trace`;
     nodes.push(
