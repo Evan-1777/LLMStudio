@@ -153,12 +153,14 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
     expect(healthCallsAfterToggle).toBe(healthCallsBeforeToggle);
     // Navigating away without editing URL/token must NOT trigger dirty prompt.
     await user.click(screen.getByRole('button', { name: '关于' }));
+    await screen.findByRole('heading', { level: 1, name: '关于' });
     expect(screen.queryByText('放弃未保存的更改？')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '连接' }));
+    await screen.findByRole('heading', { level: 1, name: '连接' });
 
     // Test connection with unsaved URL & token without overwriting saved settings.
-    const gwInput = screen.getByLabelText('网关地址');
-    const tokenInput = screen.getByLabelText('访问令牌');
+    const gwInput = await screen.findByLabelText('网关地址');
+    const tokenInput = await screen.findByLabelText('访问令牌');
     await user.clear(gwInput);
     await user.type(gwInput, 'https://custom-gw.example');
     await user.type(tokenInput, 'bad-token');
@@ -172,7 +174,7 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
 
     // Dirty guard triggers when leaving ConnectionPage with unsaved edits.
     await user.click(screen.getByRole('button', { name: '关于' }));
-    expect(screen.getByText('放弃未保存的更改？')).toBeInTheDocument();
+    await screen.findByText('放弃未保存的更改？');
     await user.click(screen.getByRole('button', { name: '取消' }));
     expect(screen.getByLabelText('网关地址')).toHaveValue(
       'https://custom-gw.example',
@@ -199,6 +201,7 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
 
     // Appearance: system theme tracks OS changes, accent color & thresholds persist and validate.
     await user.click(screen.getByRole('button', { name: '外观与显示' }));
+    await screen.findByRole('heading', { level: 1, name: '外观与显示' });
     expect(document.documentElement.dataset.theme).toBe('light');
 
     act(() => {
@@ -247,7 +250,7 @@ describe('SettingsLayout, ConnectionPage, AppearancePage, and AboutPage', () => 
 
     // Back to workbench navigates to /chat.
     await user.click(screen.getByRole('button', { name: '返回工作台' }));
-    expect(screen.getByTestId('chat-route')).toBeInTheDocument();
+    expect(await screen.findByTestId('chat-route')).toBeInTheDocument();
   });
 
   it('redirects unknown settings section to providers and toggles mobile drawer with Escape', async () => {
