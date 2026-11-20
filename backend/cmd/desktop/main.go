@@ -173,6 +173,7 @@ func startDesktopRuntime(paths desktop.StoragePaths) (*desktopRuntime, error) {
 		return nil, err
 	}
 
+	store.SetCredentialProtector(desktop.PlatformCredentialProtector())
 	cloud := desktop.NewCloudClient(conn.GatewayBaseURL, conn.AccessToken)
 	credCache := desktop.NewMemoryCredentialCache(cloud)
 	store.SetMemoryCacheInvalidator(credCache.ClearAll)

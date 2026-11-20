@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,9 @@ import (
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/plugin"
 )
+
+// ErrUpstreamAuth identifies a 401/403 before an upstream stream has opened.
+var ErrUpstreamAuth = errors.New("upstream authentication rejected")
 
 const (
 	defaultPromptCacheMaxEntries = 64
@@ -600,9 +604,13 @@ func (s *ChatService) encodeAndOpenMainRequest(
 	if msg == "" {
 		msg = http.StatusText(statusCode)
 	}
+	var cause error
+	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+		cause = ErrUpstreamAuth
+	}
 	return nil, chatInput.PromptCache, domain.NewError(
 		domain.ErrCodeUpstreamError,
 		fmt.Sprintf("upstream returned HTTP %d: %s", statusCode, msg),
-		nil,
+		cause,
 	)
 }

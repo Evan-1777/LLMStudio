@@ -9,7 +9,6 @@ import {
   Icon,
   IconButton,
   LoadingSpinner,
-  Textarea,
 } from '../../components/ui';
 import type {
   Assistant,
@@ -17,41 +16,18 @@ import type {
   ContentBlock,
   Message,
   ProviderConfig,
+  TopicScope,
 } from '../../core/types';
 import { CollapseStateProvider } from '../../rendering/CollapsibleBlock';
 import { ContentRenderer } from '../../rendering/ContentRenderer';
 import { formatCompactTokens, parseCompactionMeta } from './contextUsage';
-import { MessageActions, extractMessageCopyText } from '../chat/MessageActions';
+import { MessageActions } from '../chat/MessageActions';
+import { MessageEditor } from './MessageEditor';
 import {
   insertMessageAt,
   materializeStreamingMessage,
   type ChatState,
 } from '../chat/chatReducer';
-
-function buildEditedBlocks(
-  blocks: ContentBlock[],
-  nextText: string,
-): ContentBlock[] {
-  const firstTextIdx = blocks.findIndex((b) => b.type === 'text');
-  if (firstTextIdx < 0) {
-    return nextText.trim() !== ''
-      ? [...blocks, { type: 'text', text: nextText }]
-      : blocks;
-  }
-  const out: ContentBlock[] = [];
-  let inserted = false;
-  for (const block of blocks) {
-    if (block.type === 'text') {
-      if (!inserted) {
-        out.push({ type: 'text', text: nextText });
-        inserted = true;
-      }
-    } else {
-      out.push(block);
-    }
-  }
-  return out;
-}
 
 function resolveMessageSource(
   msg: Message,
@@ -172,6 +148,7 @@ export function ChatCanvas({
   assistant,
   providers = [],
   hasConversationId,
+  scope,
   isTemporary = false,
   onUpdateMessage,
   onRetryMessage,
@@ -184,6 +161,7 @@ export function ChatCanvas({
   assistant: Assistant;
   providers?: readonly ProviderConfig[];
   hasConversationId: boolean;
+  scope?: TopicScope;
   isTemporary?: boolean;
   onUpdateMessage: (messageId: string, blocks: ContentBlock[]) => Promise<boolean>;
   onRetryMessage: (message: Message) => Promise<boolean>;
@@ -192,7 +170,7 @@ export function ChatCanvas({
   onReloadConversation: () => Promise<void>;
   onResetToNewTopic: () => void;
 }) {
-  const { settings } = useApp();
+  const { settings, connectionEpoch } = useApp();
   const displayMode = settings.chatDisplayMode;
   const location = useLocation();
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -200,9 +178,11 @@ export function ChatCanvas({
   const programmaticTopRef = useRef<number | null>(null);
   const scrollRafRef = useRef<number | null>(null);
   const [showScrollBottom, setShowScrollBottom] = useState(false);
-  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
-  const [editingText, setEditingText] = useState('');
-  const [savingEdit, setSavingEdit] = useState(false);
+  const editScope = JSON.stringify([connectionEpoch, scope, location.pathname, state.conversation?.id, hasConversationId]);
+  const [editTarget, setEditTarget] = useState<{ message: Message; scope: string } | null>(null);
+  const [savingTarget, setSavingTarget] = useState<typeof editTarget>(null);
+  const editing = editTarget?.scope === editScope ? editTarget : null;
+  const savingEdit = editing !== null && savingTarget === editing;
   const [deletingCompactionMsg, setDeletingCompactionMsg] =
     useState<Message | null>(null);
   const [deletingCompactionBusy, setDeletingCompactionBusy] = useState(false);
@@ -230,9 +210,8 @@ export function ChatCanvas({
     stickToBottomRef.current = true;
     programmaticTopRef.current = null;
     setShowScrollBottom(false);
-    setEditingMessageId(null);
-    setEditingText('');
-  }, [state.conversation?.id, hasConversationId]);
+    setEditTarget(null);
+  }, [editScope]);
 
   const handleScroll = () => {
     const el = scrollRef.current;
@@ -304,77 +283,25 @@ export function ChatCanvas({
     setShowScrollBottom(false);
   };
 
-  const startEdit = (msg: Message) => {
-    setEditingMessageId(msg.id);
-    setEditingText(extractMessageCopyText(msg));
-  };
+  const startEdit = (message: Message) => setEditTarget({ message, scope: editScope });
 
-  const cancelEdit = () => {
-    if (savingEdit) return;
-    setEditingMessageId(null);
-    setEditingText('');
-  };
-
-  const saveEdit = async (msg: Message) => {
-    const hasNonText = msg.blocks.some((b) => b.type !== 'text');
-    if (savingEdit || (!editingText.trim() && !hasNonText)) return;
-    const nextBlocks = buildEditedBlocks(msg.blocks, editingText);
-    if (nextBlocks.length === 0) return;
-    setSavingEdit(true);
-    try {
-      const ok = await onUpdateMessage(msg.id, nextBlocks);
-      if (ok) {
-        setEditingMessageId(null);
-        setEditingText('');
-      }
-    } finally {
-      setSavingEdit(false);
-    }
-  };
-
-  const renderInlineEditor = (msg: Message) => {
-    const hasNonText = msg.blocks.some((b) => b.type !== 'text');
-    const canSave = editingText.trim().length > 0 || hasNonText;
-    return (
-      <div className="wb-msg-editor">
-        <Textarea
-          aria-label="编辑消息内容"
-          className="wb-msg-editor__textarea"
-          value={editingText}
-          autoFocus
-          rows={Math.min(10, Math.max(3, editingText.split('\n').length))}
-          disabled={savingEdit}
-          onChange={(e) => setEditingText(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Escape') {
-              e.preventDefault();
-              cancelEdit();
-            } else if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-              e.preventDefault();
-              void saveEdit(msg);
-            }
-          }}
-        />
-        <div className="wb-msg-editor__actions">
-          <IconButton
-            size="sm"
-            icon="close"
-            label="取消"
-            disabled={savingEdit}
-            onClick={cancelEdit}
-          />
-          <IconButton
-            size="sm"
-            icon="check"
-            label="保存"
-            loading={savingEdit}
-            disabled={!canSave}
-            onClick={() => void saveEdit(msg)}
-          />
-        </div>
-      </div>
-    );
-  };
+  const inlineEditor = editing ? (
+    <MessageEditor
+      message={editing.message}
+      saving={savingEdit}
+      onCancel={() => setEditTarget(null)}
+      onSave={async (blocks) => {
+        setSavingTarget(editing);
+        try {
+          if (await onUpdateMessage(editing.message.id, blocks)) {
+            setEditTarget((current) => current === editing ? null : current);
+          }
+        } finally {
+          setSavingTarget((current) => current === editing ? null : current);
+        }
+      }}
+    />
+  ) : null;
 
   return (
     <div
@@ -442,7 +369,7 @@ export function ChatCanvas({
               const isStreamingThis =
                 Boolean(state.streaming) &&
                 msg.id === state.streaming?.messageId;
-              const isEditingThis = editingMessageId === msg.id;
+              const isEditingThis = editing?.message.id === msg.id;
 
               if (displayMode === 'feed') {
                 const isUser = msg.role === 'user';
@@ -474,7 +401,7 @@ export function ChatCanvas({
 
                     <div className="wb-feed-body">
                       {isEditingThis ? (
-                        renderInlineEditor(msg)
+                        inlineEditor
                       ) : isStreamingThis && msg.blocks.length === 0 ? (
                         <LoadingSpinner size="sm" label="等待响应" />
                       ) : (
@@ -534,7 +461,7 @@ export function ChatCanvas({
                 return (
                   <div key={uiKey} className="wb-user-msg">
                     {isEditingThis ? (
-                      renderInlineEditor(msg)
+                      inlineEditor
                     ) : (
                       <>
                         <div className="wb-user-row">
@@ -580,7 +507,7 @@ export function ChatCanvas({
                   </div>
 
                   {isEditingThis ? (
-                    renderInlineEditor(msg)
+                    inlineEditor
                   ) : isStreamingThis && msg.blocks.length === 0 ? (
                     <LoadingSpinner size="sm" label="等待响应" />
                   ) : (

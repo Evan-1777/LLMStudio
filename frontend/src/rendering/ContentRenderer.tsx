@@ -69,6 +69,12 @@ function sanitizeLinkUrl(raw?: string): string | undefined {
   return undefined;
 }
 
+export function imageBlockSource(image: Extract<ContentBlock, { type: 'image' }>): string | undefined {
+  return image.data && image.mimeType
+    ? `data:${image.mimeType};base64,${image.data}`
+    : sanitizeLinkUrl(image.url);
+}
+
 const MarkdownProse = memo(function MarkdownProse({ markdown }: { markdown: string }) {
   return (
     <div className="prose">
@@ -717,11 +723,7 @@ export const ContentRenderer = memo(function ContentRenderer({
       {imageBlocks.length > 0 ? (
         <div className="msg-image-grid">
           {imageBlocks.map((img, idx) => {
-            const safeExternal = sanitizeLinkUrl(img.url);
-            const src =
-              img.data && img.mimeType
-                ? `data:${img.mimeType};base64,${img.data}`
-                : safeExternal;
+            const src = imageBlockSource(img);
             if (!src) {
               return (
                 <span key={`img-${idx}`} style={{ fontSize: 12, color: 'var(--text-secondary)' }}>

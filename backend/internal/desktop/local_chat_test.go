@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -23,6 +24,17 @@ import (
 	"llmstudio/backend/internal/service"
 	"llmstudio/backend/internal/store"
 )
+
+type desktopRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f desktopRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type onResponseClose struct {
+	io.ReadCloser
+	after func()
+}
+
+func (r onResponseClose) Close() error { err := r.ReadCloser.Close(); r.after(); return err }
 
 func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testing.T) {
 	ctx := context.Background()
@@ -45,8 +57,15 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 		llmRequests    []map[string]any
 		blockAfterText bool
 	)
+	var rotated atomic.Bool
+	var authFailures atomic.Int32
 	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if auth := r.Header.Get("Authorization"); auth != "Bearer sk-cloud-upstream-key" {
+		expected := "Bearer sk-cloud-upstream-key"
+		if rotated.Load() {
+			expected = "Bearer sk-rotated"
+		}
+		if r.Header.Get("Authorization") != expected {
+			authFailures.Add(1)
 			http.Error(w, "invalid api key", http.StatusUnauthorized)
 			return
 		}
@@ -123,7 +142,7 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 		t.Fatalf("create cloud conv: %v", err)
 	}
 
-	var credHits atomic.Int32
+	var credHits, listHits atomic.Int32
 	var cloudReceivedPrepareLocal atomic.Bool
 	var cloudReceivedLocalImage atomic.Bool
 
@@ -139,6 +158,9 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 		PreferenceService:   service.NewPreferenceService(cloudPrefStore),
 	})
 	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/providers" {
+			listHits.Add(1)
+		}
 		if r.URL.Path == "/api/v1/providers/prov-1/credential" {
 			credHits.Add(1)
 		}
@@ -158,12 +180,20 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 	if err != nil {
 		t.Fatalf("OpenDesktopStore: %v", err)
 	}
-	defer localStore.Close()
-
+	defer func() { _ = localStore.Close() }()
+	if _, err := localStore.SaveConnection(ctx, cloudSrv.URL, "cloud-secret"); err != nil {
+		t.Fatal(err)
+	}
+	protector := newTestProtector(t, 1)
 	cloud := NewCloudClient(cloudSrv.URL, "cloud-secret")
-	credCache := NewMemoryCredentialCache(cloud)
-	composite := NewCompositeToolRuntime(localStore.MCPs, nil, cloud)
-	engine := NewDesktopChatEngine(localStore, cloud, credCache, formats, adapters, nil, composite, &http.Client{})
+	newEngine := func() (*DesktopChatEngine, *MemoryCredentialCache) {
+		localStore.SetCredentialProtector(protector)
+		cache := NewMemoryCredentialCache(cloud)
+		localStore.SetMemoryCacheInvalidator(cache.ClearAll)
+		composite := NewCompositeToolRuntime(localStore.MCPs, nil, cloud)
+		return NewDesktopChatEngine(localStore, cloud, cache, formats, adapters, nil, composite, &http.Client{}), cache
+	}
+	engine, _ := newEngine()
 
 	// Mirror cloud assistants locally and create a local topic bound to the cloud custom assistant.
 	assistants, err := cloud.ListAssistants(ctx)
@@ -214,6 +244,18 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 		t.Fatalf("unexpected local persisted messages: %+v", localMsgs)
 	}
 
+	if listHits.Load() != 1 {
+		t.Fatalf("first generation fetched %d provider lists", listHits.Load())
+	}
+	if err := localStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	localStore, err = OpenDesktopStore(ctx, localDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, cache := newEngine()
+
 	// 3. Contract test: identical request via standard ChatService (Web) vs Desktop local vs Desktop cloud produces equivalent events & usage.
 	webConv, err := cloudConvStore.Create(ctx, domain.Conversation{
 		ID:          "web-conv-contract",
@@ -228,7 +270,9 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 	webChatSvc := service.NewChatService(cloudProvStore, cloudConvStore, cloudMsgStore, formats, adapters, &http.Client{}).
 		WithAssistants(cloudAssistStore)
 
-	runAndCollect := func(prep *service.PreparedStream) ([]string, *domain.Usage, string) {
+	runAndCollect := func(prep interface {
+		Stream(context.Context, func(domain.StreamEvent) error) error
+	}) ([]string, *domain.Usage, string) {
 		var kinds []string
 		var text strings.Builder
 		var finalUsage *domain.Usage
@@ -272,6 +316,8 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 	}
 	deskLocalKinds, deskLocalUsage, deskLocalText := runAndCollect(deskLocalPrep)
 
+	now := time.Now()
+	cache.nowFn = func() time.Time { return now.Add(2 * defaultCredentialTTL) }
 	deskCloudPrep, err := engine.Prepare(ctx, plugin.ExecutionScopeCloud, service.StreamChatInput{
 		ConversationID: cloudConv.ID,
 		Text:           "contract hello",
@@ -291,8 +337,8 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 		t.Fatalf("stream text diverged: web=%q local=%q cloud=%q", webText, deskLocalText, deskCloudText)
 	}
 	// Cached credential reused across local & cloud contract turns without extra fetches.
-	if credHits.Load() != 1 {
-		t.Fatalf("expected credential cache hit (still 1 fetch), got %d", credHits.Load())
+	if listHits.Load() != 1 || credHits.Load() != 1 {
+		t.Fatalf("reopen and TTL expiry made provider calls: list=%d credentials=%d", listHits.Load(), credHits.Load())
 	}
 
 	// 4. Cloud topic mid-stream cancel preserves user message saved before stream + partial assistant message.
@@ -335,5 +381,83 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 	last := afterMsgs[3]
 	if last.Role != domain.RoleAssistant || last.StopReason != domain.StopReasonAborted || len(last.Blocks) == 0 || !strings.Contains(last.Blocks[0].Text, "Part 1") {
 		t.Fatalf("expected partial aborted assistant message persisted on cloud, got %+v", last)
+	}
+
+	llmMu.Lock()
+	blockAfterText = false
+	llmMu.Unlock()
+	if _, err := engine.Compact(ctx, plugin.ExecutionScopeLocal, service.CompactConversationInput{ConversationID: localConv.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if listHits.Load() != 1 || credHits.Load() != 1 {
+		t.Fatal("warm compaction fetched provider metadata or credential")
+	}
+
+	prov.APIKey = "sk-rotated"
+	if _, err := cloudProvStore.Update(ctx, prov); err != nil {
+		t.Fatal(err)
+	}
+	rotated.Store(true)
+	prep, err := engine.Prepare(ctx, plugin.ExecutionScopeLocal, imgInput)
+	if err != nil {
+		t.Fatalf("one-shot credential refresh: %v", err)
+	}
+	runAndCollect(prep)
+	localMsgs, _ = localStore.Messages.ListByConversation(ctx, localConv.ID)
+	var users int
+	for _, msg := range localMsgs {
+		if msg.Role == domain.RoleUser {
+			users++
+		}
+	}
+	if users != 2 || authFailures.Load() != 1 || listHits.Load() != 2 || credHits.Load() != 2 {
+		t.Fatalf("refresh duplicated work: users=%d auth=%d list=%d cred=%d", users, authFailures.Load(), listHits.Load(), credHits.Load())
+	}
+
+	// A second 401 stops recovery without writing another user message.
+	rotated.Store(false)
+	if _, err := engine.Prepare(ctx, plugin.ExecutionScopeLocal, imgInput); err == nil {
+		t.Fatal("repeated 401 was swallowed")
+	}
+	afterRejected, _ := localStore.Messages.ListByConversation(ctx, localConv.ID)
+	if len(afterRejected) != len(localMsgs) || authFailures.Load() != 3 || listHits.Load() != 3 || credHits.Load() != 3 {
+		t.Fatalf("persistent 401 was retried more than once or wrote messages: auth=%d list=%d cred=%d", authFailures.Load(), listHits.Load(), credHits.Load())
+	}
+	rotated.Store(true)
+
+	// Switch exactly after A's detail is decoded, before looking up the provider.
+	var bRequests atomic.Int32
+	gatewayB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bRequests.Add(1)
+		t.Errorf("old request reached gateway B: %s %s", r.Method, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer gatewayB.Close()
+	llmMu.Lock()
+	before := len(llmRequests)
+	llmMu.Unlock()
+	cloud.SetHTTPClient(&http.Client{Transport: desktopRoundTripper(func(r *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err == nil && r.Method == http.MethodGet && r.URL.Path == "/api/v1/conversations/"+cloudConv.ID {
+			resp.Body = onResponseClose{resp.Body, func() { cloud.SetCredentials(gatewayB.URL, "token-b") }}
+		}
+		return resp, err
+	})})
+	for _, compact := range []bool{false, true} {
+		cloud.SetCredentials(cloudSrv.URL, "cloud-secret")
+		if compact {
+			_, err = engine.Compact(ctx, plugin.ExecutionScopeCloud, service.CompactConversationInput{ConversationID: cloudConv.ID})
+		} else {
+			_, err = engine.Prepare(ctx, plugin.ExecutionScopeCloud, service.StreamChatInput{ConversationID: cloudConv.ID, Text: "must not cross gateways"})
+		}
+		if err == nil {
+			t.Fatalf("request survived connection change (compact=%v)", compact)
+		}
+	}
+	llmMu.Lock()
+	sent := len(llmRequests) - before
+	llmMu.Unlock()
+	if sent != 0 || bRequests.Load() != 0 {
+		t.Fatalf("obsolete request reached upstream=%d or gateway B=%d", sent, bRequests.Load())
 	}
 }

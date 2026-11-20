@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"llmstudio/backend/internal/config"
@@ -186,10 +187,43 @@ func TestDesktopLoopbackServerAuthCORSAndRoutes(t *testing.T) {
 		t.Fatalf("cloud list polluted: %s", cloudList.Body.String())
 	}
 
+	originalBlocks := []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "caption"}, {Type: domain.BlockTypeImage, MimeType: "image/png", Data: "b2xk"}}
+	original, err := localStore.Messages.Create(ctx, domain.Message{ConversationID: locOut.Conversation.ID, Role: domain.RoleUser, Blocks: originalBlocks})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// Upload local topic via desktop endpoint.
 	uploadRec := doReq(http.MethodPost, "/api/v1/desktop/conversations/"+locOut.Conversation.ID+"/upload", tok, "", map[string]any{})
 	if uploadRec.Code != http.StatusOK {
 		t.Fatalf("upload conversation status=%d body=%s", uploadRec.Code, uploadRec.Body.String())
+	}
+
+	// The same message ID exists on both sides after upload. PATCH must update only its requested scope.
+	patchPath := "/api/v1/conversations/" + locOut.Conversation.ID + "/messages/" + original.ID
+	withImage := []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "caption"}, {Type: domain.BlockTypeImage, MimeType: "image/png", Data: "bmV3"}}
+	if rec := doReq(http.MethodPatch, patchPath+"?scope=local", tok, "", map[string]any{"blocks": withImage}); rec.Code != http.StatusOK {
+		t.Fatalf("local PATCH: %d %s", rec.Code, rec.Body.String())
+	}
+	conv, err := localStore.Conversations.Get(ctx, locOut.Conversation.ID)
+	if err != nil || conv.SyncState != domain.SyncStatePending {
+		t.Fatalf("local PATCH sync state=%s err=%v", conv.SyncState, err)
+	}
+	cloudMessage, err := cloudMsgStore.Get(ctx, original.ID)
+	if err != nil || !reflect.DeepEqual(cloudMessage.Blocks, originalBlocks) {
+		t.Fatalf("local PATCH altered cloud message: %v", err)
+	}
+	withoutImage := originalBlocks[:1]
+	if rec := doReq(http.MethodPatch, patchPath+"?scope=cloud", tok, "", map[string]any{"blocks": withoutImage}); rec.Code != http.StatusOK {
+		t.Fatalf("cloud PATCH: %d %s", rec.Code, rec.Body.String())
+	}
+	cloudMessage, err = cloudMsgStore.Get(ctx, original.ID)
+	if err != nil || !reflect.DeepEqual(cloudMessage.Blocks, withoutImage) {
+		t.Fatalf("cloud PATCH did not forward replacement blocks: %v", err)
+	}
+	localMessage, err := localStore.Messages.Get(ctx, original.ID)
+	if err != nil || !reflect.DeepEqual(localMessage.Blocks, withImage) {
+		t.Fatalf("cloud PATCH altered local message: %v", err)
 	}
 
 	// Local storage stats, compact, and clear-cache (preserving local topic).

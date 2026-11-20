@@ -5,9 +5,11 @@ import type { PendingAttachment } from './attachments';
 export function AttachmentChips({
   attachments,
   onRemove,
+  disabled,
 }: {
-  attachments: PendingAttachment[];
+  attachments: (Pick<PendingAttachment, 'id' | 'name' | 'status' | 'kind' | 'previewUrl' | 'error' | 'originalSize'> & { size?: number })[];
   onRemove: (id: string) => void;
+  disabled?: boolean;
 }) {
   if (attachments.length === 0) return null;
 
@@ -15,14 +17,14 @@ export function AttachmentChips({
     <div className="wb-attachments-bar">
       {attachments.map((att) => {
         const isError = att.status === 'error';
-        const sizeLabel = att.originalSize !== undefined && att.originalSize !== att.size
+        const sizeLabel = att.size === undefined ? null : att.originalSize !== undefined && att.originalSize !== att.size
           ? `${formatBytes(att.originalSize)} → ${formatBytes(att.size)}`
           : formatBytes(att.size);
         return (
           <div
             key={att.id}
             className={`wb-att-chip ${isError ? 'wb-att-chip--error' : ''}`.trim()}
-            title={att.error ? `${att.name}: ${att.error}` : att.status === 'ready' ? `${att.name} (${sizeLabel})` : att.name}
+            title={att.error ? `${att.name}: ${att.error}` : att.status === 'ready' && sizeLabel ? `${att.name} (${sizeLabel})` : att.name}
           >
             {att.kind === 'image' && att.previewUrl && !isError ? (
               <img
@@ -53,6 +55,7 @@ export function AttachmentChips({
               size="sm"
               icon="close"
               label={`移除 ${att.name}`}
+              disabled={disabled}
               onClick={() => onRemove(att.id)}
               style={{ width: 20, height: 20, minWidth: 20, minHeight: 20 }}
             />

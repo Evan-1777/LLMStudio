@@ -16,6 +16,8 @@ import {
   revokeAttachmentResources,
 } from './attachments';
 import { WorkbenchPage } from './WorkbenchPage';
+import { MessageEditor } from './MessageEditor';
+import type { Message } from '../../core/types';
 import { AppearancePage } from '../settings/AppearancePage';
 import * as imageCompression from './imageCompression';
 
@@ -392,6 +394,57 @@ describe('Workbench flows and attachments', () => {
     const boundary = readAttachmentFile(boundaryFile, { onUpdate: () => {} });
     expect(boundary.status).toBe('reading');
     revokeAttachmentResources(boundary);
+  });
+
+  it('changes historical image blocks without altering other blocks and allows save retries', async () => {
+    const duplicate = { type: 'image' as const, url: 'https://example.test/same.png' };
+    const thinking = { type: 'thinking' as const, thinking: 'process', signature: 'sig' };
+    const tool = { type: 'toolCall' as const, id: 'tool-1', name: 'lookup' };
+    const firstText = { type: 'text' as const, text: 'first' };
+    const lastText = { type: 'text' as const, text: 'second' };
+    const message: Message = { id: 'm1', conversationId: 'c1', createdAt: '', role: 'assistant',
+      blocks: [firstText, duplicate, thinking, duplicate, tool, lastText] };
+    const saved = vi.fn().mockResolvedValue(undefined);
+    const canceled = vi.fn();
+    const user = userEvent.setup();
+    const onFile = new File(['file'], 'new.png', { type: 'image/png' });
+    const encoded = new Blob(['ok'], { type: 'image/png' });
+    const compress = vi.spyOn(imageCompression, 'compressImageFile');
+    compress.mockRejectedValueOnce(new Error('无法解码该图片格式'));
+    compress.mockResolvedValue({ blob: encoded, mimeType: encoded.type, originalSize: onFile.size, compressedSize: encoded.size, compressed: true });
+    try {
+      const view = render(<MessageEditor message={message} saving={false} onCancel={canceled} onSave={saved} />);
+      const textarea = screen.getByLabelText('编辑消息内容');
+      const save = screen.getByRole('button', { name: '保存' });
+      const input = view.container.querySelector('input[type=file]')!;
+      await user.click(screen.getByRole('button', { name: '移除 图片 1' }));
+      expect(screen.getByRole('button', { name: '移除 图片 2' })).toBeInTheDocument();
+      fireEvent.change(input, { target: { files: [onFile] } });
+      expect(save).toBeDisabled();
+      await screen.findByText(/无法解码该图片格式/);
+      fireEvent.keyDown(textarea, { key: 'Enter', ctrlKey: true });
+      expect(saved).not.toHaveBeenCalled();
+      await user.click(screen.getByRole('button', { name: '移除 new.png' }));
+      fireEvent.change(input, { target: { files: [onFile] } });
+      await waitFor(() => expect(save).toBeEnabled());
+      fireEvent.keyDown(textarea, { key: 'Enter', ctrlKey: true });
+      expect(saved).toHaveBeenCalledWith([firstText, thinking, duplicate, tool, lastText,
+        { type: 'image', mimeType: 'image/png', data: 'b2s=' }]);
+      await user.click(save);
+      expect(saved).toHaveBeenCalledTimes(2);
+      fireEvent.keyDown(textarea, { key: 'Escape' });
+      expect(canceled).toHaveBeenCalledOnce();
+      expect(saved).toHaveBeenCalledTimes(2);
+      view.rerender(<MessageEditor key="next" message={{ ...message, blocks: [duplicate] }} saving={false} onCancel={canceled} onSave={saved} />);
+      expect(screen.queryByRole('button', { name: '移除 new.png' })).not.toBeInTheDocument();
+      await user.click(screen.getByRole('button', { name: '移除 图片 1' }));
+      expect(screen.getByRole('button', { name: '保存' })).toBeDisabled();
+      fireEvent.change(view.container.querySelector('input[type=file]')!, { target: { files: [onFile] } });
+      const replace = screen.getByRole('button', { name: '保存' });
+      await waitFor(() => expect(replace).toBeEnabled());
+      await user.click(replace);
+      expect(saved).toHaveBeenLastCalledWith([{ type: 'image', mimeType: 'image/png', data: 'b2s=' }]);
+    } finally { compress.mockRestore(); }
   });
 
   it('uses compressed bytes and MIME, revokes the thumbnail, and cancels reads', async () => {

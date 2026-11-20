@@ -1,14 +1,15 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
+import { useState } from 'react';
 import { AppProvider } from '../../app/AppProvider';
 import { SETTINGS_STORAGE_KEY, defaultSettings } from '../../core/settings';
 import { ChatCanvas } from '../workbench/ChatCanvas';
 import { ChatProvider, useChat } from './ChatProvider';
 import { chatReducer, initialChatState } from './chatReducer';
 import { MessageActions } from './MessageActions';
-import type { Conversation, Message } from '../../core/types';
+import type { Conversation, Message, TopicScope } from '../../core/types';
 
 function makeConv(id = 'c1'): Conversation {
   return {
@@ -526,6 +527,70 @@ describe('chatReducer and ChatProvider', () => {
     await waitFor(() => expect(nextEdit).toBeEnabled());
     await user.click(nextEdit);
     expect(screen.getByLabelText('编辑消息内容')).toHaveValue('A2');
+  });
+
+  it('ignores a late local PATCH after opening the same message ID in cloud scope', async () => {
+    vi.stubGlobal('__LLMSTUDIO_DESKTOP__', {
+      apiBaseUrl: 'http://localhost:1234', sessionToken: 'test', platform: 'windows', dataMode: 'portable', version: 'test',
+    });
+    const message: Message = {
+      id: 'same-message', conversationId: 'same-topic', role: 'user',
+      blocks: [{ type: 'text', text: '本地内容' }, { type: 'image', url: 'https://example.test/local.png' }],
+      createdAt: '2026-11-20T00:00:00Z',
+    };
+    const cloudMessage: Message = { ...message, blocks: [{ type: 'text', text: '云端内容' }] };
+    let resolvePatch!: (response: Response) => void;
+    const patch = vi.fn(() => new Promise<Response>((resolve) => { resolvePatch = resolve; }));
+    const fetchImpl = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      const scope = url.searchParams.get('scope');
+      if (init?.method === 'PATCH') return patch();
+      return Promise.resolve(Response.json({ conversation: makeConv('same-topic'), messages: [scope === 'local' ? message : cloudMessage] }));
+    });
+    let lastSave: Promise<boolean> | undefined;
+    function Harness() {
+      const chat = useChat();
+      const [scope, setScope] = useState<TopicScope>('local');
+      const open = (next: TopicScope) => {
+        setScope(next);
+        void chat.loadConversation('same-topic', next);
+      };
+      return <>
+        <button onClick={() => open('local')}>打开本地</button>
+        <button onClick={() => open('cloud')}>打开云端</button>
+        <ChatCanvas state={chat.state} scope={scope} hasConversationId
+          assistant={{ id: 'default', name: '助手', params: {}, isDefault: true }}
+          onUpdateMessage={(id, blocks) => { lastSave = chat.updateMessage(id, blocks, scope); return lastSave; }}
+          onRetryMessage={vi.fn()} onDeleteMessage={vi.fn()} onBranchMessage={vi.fn()}
+          onReloadConversation={vi.fn()} onResetToNewTopic={vi.fn()} />
+      </>;
+    }
+    try {
+      const user = userEvent.setup();
+      render(<AppProvider fetchImpl={fetchImpl as typeof fetch} skipInitialBootstrap>
+        <MemoryRouter><ChatProvider><Harness /></ChatProvider></MemoryRouter>
+      </AppProvider>);
+      await user.click(screen.getByRole('button', { name: '打开本地' }));
+      await screen.findByText('本地内容');
+      await user.click(screen.getByRole('button', { name: '修改消息' }));
+      await user.click(screen.getByRole('button', { name: '移除 图片 1' }));
+      await user.click(screen.getByRole('button', { name: '保存' }));
+      expect(patch).toHaveBeenCalledOnce();
+      await user.click(screen.getByRole('button', { name: '打开云端' }));
+      await screen.findByText('云端内容');
+      await user.click(screen.getByRole('button', { name: '修改消息' }));
+      expect(screen.getByLabelText('编辑消息内容')).toHaveValue('云端内容');
+      await act(async () => {
+        resolvePatch(Response.json({ message: { ...message, blocks: [{ type: 'text', text: '迟到的本地保存' }] } }));
+        expect(await lastSave).toBe(false);
+      });
+      expect(screen.getByLabelText('编辑消息内容')).toHaveValue('云端内容');
+      await user.click(screen.getByRole('button', { name: '取消' }));
+      expect(screen.getByText('云端内容')).toBeInTheDocument();
+      expect(screen.queryByText('迟到的本地保存')).not.toBeInTheDocument();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('routes localRequest providers via prepare-local -> direct upstream -> createMessage and preserves reply on persist failure', async () => {

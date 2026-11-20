@@ -346,14 +346,15 @@ func (s *Server) requireCloud(w http.ResponseWriter) bool {
 }
 
 func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
 	if s.cfg.Cloud != nil && s.cfg.Cloud.IsConfigured() {
-		if providers, err := s.cfg.Cloud.ListProviders(r.Context()); err == nil {
-			_ = s.cfg.Store.SaveCachedProviders(r.Context(), providers)
+		if providers, err := s.cfg.Cloud.refreshProviderSnapshot(ctx, s.cfg.Store); err == nil {
 			httpapi.WriteJSON(w, http.StatusOK, map[string]any{"providers": providers})
 			return
 		}
 	}
-	cached, err := s.cfg.Store.LoadCachedProviders(r.Context())
+	cached, err := s.cfg.Store.LoadCachedProviders(ctx)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
@@ -362,29 +363,37 @@ func (s *Server) handleListProviders(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) refreshProvidersCache(ctx context.Context) {
-	if s.cfg.Cloud == nil || !s.cfg.Cloud.IsConfigured() {
-		return
+	_, _ = s.cfg.Cloud.refreshProviderSnapshot(ctx, s.cfg.Store)
+}
+
+func (s *Server) providerChanged(ctx context.Context, id string) error {
+	if err := s.cfg.Store.invalidateProviderSnapshot(context.WithoutCancel(ctx), id); err != nil {
+		return err
 	}
-	if list, err := s.cfg.Cloud.ListProviders(ctx); err == nil {
-		_ = s.cfg.Store.SaveCachedProviders(ctx, list)
-	}
+	s.refreshProvidersCache(ctx)
+	return checkCloudConnection(ctx)
 }
 
 func (s *Server) handleCreateProvider(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCloud(w) {
 		return
 	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
 	body, err := readRawBody(r, 16*1024*1024)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	raw, err := s.cfg.Cloud.CreateProvider(r.Context(), body)
+	raw, err := s.cfg.Cloud.CreateProvider(ctx, body)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	s.refreshProvidersCache(r.Context())
+	if err := s.providerChanged(ctx, ""); err != nil {
+		writeDesktopError(w, err)
+		return
+	}
 	writeRawJSON(w, http.StatusCreated, raw)
 }
 
@@ -392,17 +401,19 @@ func (s *Server) handleReorderProviders(w http.ResponseWriter, r *http.Request) 
 	if !s.requireCloud(w) {
 		return
 	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
 	body, err := readRawBody(r, 16*1024*1024)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	raw, err := s.cfg.Cloud.ReorderProviders(r.Context(), body)
+	raw, err := s.cfg.Cloud.ReorderProviders(ctx, body)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	s.refreshProvidersCache(r.Context())
+	s.refreshProvidersCache(ctx)
 	writeRawJSON(w, http.StatusOK, raw)
 }
 
@@ -410,21 +421,23 @@ func (s *Server) handleUpdateProvider(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCloud(w) {
 		return
 	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
 	id := r.PathValue("id")
 	body, err := readRawBody(r, 16*1024*1024)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	raw, err := s.cfg.Cloud.UpdateProvider(r.Context(), id, body)
+	raw, err := s.cfg.Cloud.UpdateProvider(ctx, id, body)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	if s.cfg.CredCache != nil {
-		s.cfg.CredCache.InvalidateProvider(id)
+	if err := s.providerChanged(ctx, id); err != nil {
+		writeDesktopError(w, err)
+		return
 	}
-	s.refreshProvidersCache(r.Context())
 	writeRawJSON(w, http.StatusOK, raw)
 }
 
@@ -432,15 +445,17 @@ func (s *Server) handleDeleteProvider(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCloud(w) {
 		return
 	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
 	id := r.PathValue("id")
-	if err := s.cfg.Cloud.DeleteProvider(r.Context(), id); err != nil {
+	if err := s.cfg.Cloud.DeleteProvider(ctx, id); err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	if s.cfg.CredCache != nil {
-		s.cfg.CredCache.InvalidateProvider(id)
+	if err := s.providerChanged(ctx, id); err != nil {
+		writeDesktopError(w, err)
+		return
 	}
-	s.refreshProvidersCache(r.Context())
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -482,21 +497,23 @@ func (s *Server) handleImportProviderKey(w http.ResponseWriter, r *http.Request)
 	if !s.requireCloud(w) {
 		return
 	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
 	id := r.PathValue("id")
 	body, err := readRawBody(r, 16*1024*1024)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	raw, err := s.cfg.Cloud.ImportProviderKey(r.Context(), id, body)
+	raw, err := s.cfg.Cloud.ImportProviderKey(ctx, id, body)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
 	}
-	if s.cfg.CredCache != nil {
-		s.cfg.CredCache.InvalidateProvider(id)
+	if err := s.providerChanged(ctx, id); err != nil {
+		writeDesktopError(w, err)
+		return
 	}
-	s.refreshProvidersCache(r.Context())
 	writeRawJSON(w, http.StatusOK, raw)
 }
 
@@ -1467,6 +1484,7 @@ func (s *Server) handleSaveDesktopConnection(w http.ResponseWriter, r *http.Requ
 		writeDesktopError(w, domain.NewError(domain.ErrCodeInvalidArgument, "gatewayBaseUrl is required", nil))
 		return
 	}
+	s.cfg.Cloud.mu.Lock()
 	token := strings.TrimSpace(in.AccessToken)
 	if token == "" && !in.ClearToken {
 		if existing, err := s.cfg.Store.GetConnection(r.Context()); err == nil && existing.GatewayBaseURL == cleanURL {
@@ -1474,13 +1492,13 @@ func (s *Server) handleSaveDesktopConnection(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	saved, err := s.cfg.Store.SaveConnection(r.Context(), cleanURL, token)
+	if err == nil {
+		s.cfg.Cloud.setCredentials(saved.GatewayBaseURL, saved.AccessToken)
+	}
+	s.cfg.Cloud.mu.Unlock()
 	if err != nil {
 		writeDesktopError(w, err)
 		return
-	}
-	s.cfg.Cloud.SetCredentials(saved.GatewayBaseURL, saved.AccessToken)
-	if s.cfg.CredCache != nil {
-		s.cfg.CredCache.ClearAll()
 	}
 	// Best-effort initial warm sync of assistants, providers, search, and preferences.
 	s.warmSyncFromCloud(r.Context())
@@ -1495,14 +1513,14 @@ func (s *Server) warmSyncFromCloud(ctx context.Context) {
 	if s.cfg.Cloud == nil || !s.cfg.Cloud.IsConfigured() {
 		return
 	}
+	ctx, release := s.cfg.Cloud.bind(ctx)
+	defer release()
 	syncCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if assistants, err := s.cfg.Cloud.ListAssistants(syncCtx); err == nil {
 		_ = s.cfg.Store.SyncCloudAssistants(syncCtx, assistants)
 	}
-	if providers, err := s.cfg.Cloud.ListProviders(syncCtx); err == nil {
-		_ = s.cfg.Store.SaveCachedProviders(syncCtx, providers)
-	}
+	s.refreshProvidersCache(syncCtx)
 	if engines, err := s.cfg.Cloud.ListSearchEngines(syncCtx); err == nil {
 		_ = s.cfg.Store.SaveCachedSearchEngines(syncCtx, engines)
 	}
@@ -1512,13 +1530,15 @@ func (s *Server) warmSyncFromCloud(ctx context.Context) {
 }
 
 func (s *Server) handleDeleteDesktopConnection(w http.ResponseWriter, r *http.Request) {
-	if err := s.cfg.Store.DisconnectCloud(r.Context()); err != nil {
+	s.cfg.Cloud.mu.Lock()
+	err := s.cfg.Store.DisconnectCloud(r.Context())
+	if err == nil {
+		s.cfg.Cloud.setCredentials("", "")
+	}
+	s.cfg.Cloud.mu.Unlock()
+	if err != nil {
 		writeDesktopError(w, err)
 		return
-	}
-	s.cfg.Cloud.SetCredentials("", "")
-	if s.cfg.CredCache != nil {
-		s.cfg.CredCache.ClearAll()
 	}
 	httpapi.WriteJSON(w, http.StatusOK, s.computeDesktopStatus(r.Context()))
 }

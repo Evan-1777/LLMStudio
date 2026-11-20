@@ -190,6 +190,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   const epochRef = useRef(0);
   const prevConnectionEpochRef = useRef(connectionEpoch);
+  const connectionEpochRef = useRef(connectionEpoch);
+  connectionEpochRef.current = connectionEpoch;
   const activeAbortRef = useRef<AbortController | null>(null);
   const manualAbortRef = useRef(false);
   const sendingRef = useRef(false);
@@ -1506,7 +1508,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       scope?: TopicScope,
     ): Promise<boolean> => {
       const conv = stateRef.current.conversation;
-      if (!conv || sendingRef.current) return false;
+      const reqScope = resolveScope(scope);
+      if (!conv || sendingRef.current || reqScope !== resolveScope()) return false;
+      const epoch = epochRef.current;
+      const connection = connectionEpochRef.current;
+      const isCurrent = () =>
+        epoch === epochRef.current && connection === connectionEpochRef.current &&
+        stateRef.current.conversation?.id === conv.id && reqScope === resolveScope();
       if (isLocalMessageId(messageId)) {
         toast('该消息尚未确认落盘，请先重新加载', 'error');
         return false;
@@ -1517,12 +1525,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           messageId,
           blocks,
           undefined,
-          resolveScope(scope),
+          reqScope,
         );
+        if (!isCurrent()) return false;
         dispatch({ type: 'UPDATE_MESSAGE', message: updated });
         return true;
       } catch (err) {
-        toast(formatError(err).message, 'error');
+        if (isCurrent()) toast(formatError(err).message, 'error');
         return false;
       }
     },

@@ -28,8 +28,7 @@ type CloudConnectionTestResult struct {
 // CloudClient communicates with the remote LLMStudio gateway over HTTP/JSON.
 type CloudClient struct {
 	mu           sync.RWMutex
-	baseURL      string
-	accessToken  string
+	connection   *cloudConnection
 	stdClient    *http.Client
 	streamClient *http.Client
 }
@@ -37,8 +36,7 @@ type CloudClient struct {
 // NewCloudClient constructs a CloudClient targeting baseURL with optional Bearer accessToken.
 func NewCloudClient(baseURL, accessToken string) *CloudClient {
 	return &CloudClient{
-		baseURL:      strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		accessToken:  strings.TrimSpace(accessToken),
+		connection:   newCloudConnection(baseURL, accessToken),
 		stdClient:    &http.Client{Timeout: 20 * time.Second},
 		streamClient: &http.Client{},
 	}
@@ -55,26 +53,75 @@ func (c *CloudClient) SetHTTPClient(client *http.Client) {
 	c.mu.Unlock()
 }
 
-// SetCredentials updates the target gateway URL and access token atomically.
+type cloudConnection struct {
+	baseURL, token string
+	lifetime       context.Context
+	cancel         context.CancelFunc
+	requests       map[context.Context]context.CancelFunc
+}
+
+type cloudConnectionKey struct{}
+
+func newCloudConnection(baseURL, token string) *cloudConnection {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &cloudConnection{strings.TrimRight(strings.TrimSpace(baseURL), "/"), strings.TrimSpace(token), ctx, cancel, make(map[context.Context]context.CancelFunc)}
+}
+
+func (c *CloudClient) bind(ctx context.Context) (context.Context, func()) {
+	if c == nil || ctx.Value(cloudConnectionKey{}) != nil {
+		return ctx, func() {}
+	}
+	c.mu.Lock()
+	conn := c.connection
+	bound, cancel := context.WithCancel(context.WithValue(ctx, cloudConnectionKey{}, conn))
+	conn.requests[bound] = cancel
+	c.mu.Unlock()
+	return bound, func() {
+		cancel()
+		c.mu.Lock()
+		delete(conn.requests, bound)
+		c.mu.Unlock()
+	}
+}
+
+func checkCloudConnection(ctx context.Context) error {
+	if conn, _ := ctx.Value(cloudConnectionKey{}).(*cloudConnection); conn != nil && conn.lifetime.Err() != nil {
+		return domain.NewError(domain.ErrCodeConflict, "cloud connection changed", nil)
+	}
+	return ctx.Err()
+}
+
+// SetCredentials updates the target atomically and cancels in-flight bound operations.
 func (c *CloudClient) SetCredentials(baseURL, accessToken string) {
 	c.mu.Lock()
-	c.baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
-	c.accessToken = strings.TrimSpace(accessToken)
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	c.setCredentials(baseURL, accessToken)
+}
+
+func (c *CloudClient) setCredentials(baseURL, accessToken string) {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	accessToken = strings.TrimSpace(accessToken)
+	if c.connection.baseURL == baseURL && c.connection.token == accessToken {
+		return
+	}
+	c.connection.cancel()
+	for _, cancel := range c.connection.requests {
+		cancel()
+	}
+	c.connection = newCloudConnection(baseURL, accessToken)
 }
 
 // Credentials returns the current gateway base URL and token snapshot.
 func (c *CloudClient) Credentials() (baseURL, accessToken string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.baseURL, c.accessToken
+	return c.connection.baseURL, c.connection.token
 }
 
 // IsConfigured reports whether a remote gateway URL is currently configured.
 func (c *CloudClient) IsConfigured() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.baseURL != ""
+	baseURL, _ := c.Credentials()
+	return baseURL != ""
 }
 
 func (c *CloudClient) clients() (*http.Client, *http.Client) {
@@ -94,7 +141,15 @@ func (c *CloudClient) doRequest(
 	body any,
 	out any,
 ) error {
-	baseURL, token := c.Credentials()
+	if err := checkCloudConnection(ctx); err != nil {
+		return err
+	}
+	var baseURL, token string
+	if conn, _ := ctx.Value(cloudConnectionKey{}).(*cloudConnection); conn != nil {
+		baseURL, token = conn.baseURL, conn.token
+	} else {
+		baseURL, token = c.Credentials()
+	}
 	if useOverride {
 		baseURL = strings.TrimRight(strings.TrimSpace(overrideBaseURL), "/")
 		token = strings.TrimSpace(overrideToken)
@@ -142,6 +197,9 @@ func (c *CloudClient) doRequest(
 	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024*1024))
 	if err != nil {
 		return domain.NewError(domain.ErrCodeUpstreamError, "failed to read cloud gateway response", err)
+	}
+	if err := checkCloudConnection(ctx); err != nil {
+		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return parseCloudHTTPError(resp.StatusCode, respBytes)

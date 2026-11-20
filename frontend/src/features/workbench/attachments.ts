@@ -49,9 +49,10 @@ const IMAGE_EXTENSION_MIME: Readonly<Record<string, string>> = {
 const ALLOWED_IMAGE_EXTENSIONS = new Set(Object.keys(IMAGE_EXTENSION_MIME));
 export const MAX_RAW_IMAGE_BYTES = 25 * 1024 * 1024;
 
+export const IMAGE_INPUT_ACCEPT = ['image/*', ...Array.from(ALLOWED_IMAGE_EXTENSIONS, (ext) => `.${ext}`)].join(',');
+
 export const FILE_INPUT_ACCEPT = [
-  'image/*',
-  ...Array.from(ALLOWED_IMAGE_EXTENSIONS, (ext) => `.${ext}`),
+  IMAGE_INPUT_ACCEPT,
   ...Array.from(ALLOWED_TEXT_EXTENSIONS, (ext) => `.${ext}`),
 ].join(',');
 

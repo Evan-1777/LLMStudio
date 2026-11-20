@@ -2,7 +2,9 @@ package desktop
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -12,8 +14,7 @@ import (
 	"llmstudio/backend/internal/service"
 )
 
-// DesktopProviderLookup resolves provider metadata from cloud/local cache and
-// injects upstream API keys strictly from MemoryCredentialCache.
+// DesktopProviderLookup resolves upstream configuration from the current provider snapshot.
 type DesktopProviderLookup struct {
 	store     *DesktopStore
 	cloud     *CloudClient
@@ -21,65 +22,50 @@ type DesktopProviderLookup struct {
 }
 
 func (l *DesktopProviderLookup) Get(ctx context.Context, id string) (domain.ProviderConfig, error) {
-	var (
-		providers []CachedProvider
-		err       error
-	)
-	if l.cloud != nil && l.cloud.IsConfigured() {
-		if cloudList, cErr := l.cloud.ListProviders(ctx); cErr == nil {
-			providers = cloudList
-			_ = l.store.SaveCachedProviders(ctx, cloudList)
-		}
-	}
-	if providers == nil {
-		providers, err = l.store.LoadCachedProviders(ctx)
+	ctx, release := l.cloud.bind(ctx)
+	defer release()
+	for attempt := 0; attempt < 2; attempt++ {
+		providers, revision, err := l.store.providerSnapshot(ctx)
 		if err != nil {
 			return domain.ProviderConfig{}, err
 		}
-	}
-
-	var (
-		meta  CachedProvider
-		found bool
-	)
-	for _, p := range providers {
-		if p.ID == id {
-			meta = p
-			found = true
-			break
+		if providers == nil && l.cloud != nil && l.cloud.IsConfigured() {
+			if _, err := l.cloud.refreshProviderSnapshot(ctx, l.store); err != nil {
+				return domain.ProviderConfig{}, err
+			}
+			providers, revision, err = l.store.providerSnapshot(ctx)
+			if err != nil {
+				return domain.ProviderConfig{}, err
+			}
 		}
-	}
-	if !found {
-		return domain.ProviderConfig{}, domain.NewError(domain.ErrCodeNotFound, "provider not found", nil)
-	}
-
-	cfg := meta.ToDomainConfig()
-	authType := strings.TrimSpace(cfg.AuthType)
-	if authType == "" {
-		authType = domain.AuthTypeBearer
-	}
-	needsCred := meta.APIKeySet || authType != domain.AuthTypeNone
-	if needsCred && l.credCache != nil {
-		cred, cErr := l.credCache.ResolveProviderCredential(ctx, id, meta.UpdatedAt)
-		if cErr == nil {
+		index := slices.IndexFunc(providers, func(p CachedProvider) bool { return p.ID == id })
+		if index < 0 {
+			return domain.ProviderConfig{}, domain.NewError(domain.ErrCodeNotFound, "provider not found", nil)
+		}
+		meta := providers[index]
+		cfg := meta.ToDomainConfig()
+		if meta.APIKeySet && l.credCache != nil {
+			cred, err := l.credCache.resolveProviderCredential(ctx, l.store, revision, id, meta.UpdatedAt)
+			if err != nil {
+				return domain.ProviderConfig{}, err
+			}
+			if !cred.UpdatedAt.Equal(meta.UpdatedAt) {
+				if attempt == 0 {
+					if _, err := l.cloud.refreshProviderSnapshot(ctx, l.store); err != nil {
+						return domain.ProviderConfig{}, err
+					}
+				}
+				continue
+			}
 			cfg.APIKey = cred.APIKey
-			if strings.TrimSpace(cred.Adapter) != "" {
-				cfg.Adapter = cred.Adapter
-			}
-			if strings.TrimSpace(cred.BaseURL) != "" {
-				cfg.BaseURL = cred.BaseURL
-			}
-			if strings.TrimSpace(cred.AuthType) != "" {
-				cfg.AuthType = cred.AuthType
-			}
-			if cred.Headers != nil {
-				cfg.Headers = cred.Headers
-			}
-		} else if meta.APIKeySet {
-			return domain.ProviderConfig{}, cErr
 		}
+		l.store.providerMu.Lock()
+		err = l.store.checkProviderRevision(ctx, revision)
+		l.store.providerMu.Unlock()
+		return cfg, err
 	}
-	return cfg, nil
+
+	return domain.ProviderConfig{}, domain.NewError(domain.ErrCodeConflict, "provider credential version does not match snapshot", nil)
 }
 
 // DesktopSearchLookup resolves search engine config from cloud/local cache and
@@ -470,31 +456,56 @@ func (e *DesktopChatEngine) serviceForScope(scope plugin.ExecutionScope) (*servi
 	}
 }
 
-// Prepare opens an upstream stream for either a local or cloud conversation, refreshing
-// cached credentials once if upstream rejects with HTTP 401 or 403.
-func (e *DesktopChatEngine) Prepare(ctx context.Context, scope plugin.ExecutionScope, in service.StreamChatInput) (*service.PreparedStream, error) {
+// DesktopPreparedStream keeps the connection bound through stream completion.
+type DesktopPreparedStream struct {
+	stream  *service.PreparedStream
+	ctx     context.Context
+	release func()
+}
+
+func (p *DesktopPreparedStream) Stream(ctx context.Context, emit func(domain.StreamEvent) error) error {
+	defer p.release()
+	streamCtx, cancel := context.WithCancel(p.ctx)
+	defer cancel()
+	stop := context.AfterFunc(ctx, cancel)
+	defer stop()
+	return p.stream.Stream(streamCtx, emit)
+}
+
+// Prepare opens an upstream stream, refreshing credentials at most once on 401/403.
+func (e *DesktopChatEngine) Prepare(ctx context.Context, scope plugin.ExecutionScope, in service.StreamChatInput) (*DesktopPreparedStream, error) {
+	ctx, release := e.cloud.bind(ctx)
 	svc, err := e.serviceForScope(scope)
 	if err != nil {
+		release()
 		return nil, err
 	}
 	prepared, err := svc.Prepare(ctx, in)
-	if err != nil && isUpstreamAuthError(err) && e.credCache != nil {
-		e.invalidateProvider(ctx, scope, in.ConversationID, in.ProviderID)
-		prepared, err = svc.Prepare(ctx, in)
+	if errors.Is(err, service.ErrUpstreamAuth) && e.credCache != nil {
+		if err = e.refreshProvider(ctx, scope, in.ConversationID, in.ProviderID); err == nil {
+			prepared, err = svc.Prepare(ctx, in)
+		}
 	}
-	return prepared, err
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return &DesktopPreparedStream{prepared, ctx, release}, nil
 }
 
-// Compact compacts conversation history in either local or cloud scope directly via upstream.
+// Compact compacts conversation history without switching connections mid-request.
 func (e *DesktopChatEngine) Compact(ctx context.Context, scope plugin.ExecutionScope, in service.CompactConversationInput) (service.CompactConversationResult, error) {
+	ctx, release := e.cloud.bind(ctx)
+	defer release()
 	svc, err := e.serviceForScope(scope)
 	if err != nil {
 		return service.CompactConversationResult{}, err
 	}
 	res, err := svc.Compact(ctx, in)
-	if err != nil && isUpstreamAuthError(err) && e.credCache != nil {
-		e.invalidateProvider(ctx, scope, in.ConversationID, in.ProviderID)
-		res, err = svc.Compact(ctx, in)
+	if errors.Is(err, service.ErrUpstreamAuth) && e.credCache != nil {
+		if err = e.refreshProvider(ctx, scope, in.ConversationID, in.ProviderID); err == nil {
+			return svc.Compact(ctx, in)
+		}
 	}
 	return res, err
 }
@@ -508,7 +519,10 @@ func (e *DesktopChatEngine) ExecuteTools(ctx context.Context, scope plugin.Execu
 	return svc.ExecuteTools(ctx, in, emit)
 }
 
-func (e *DesktopChatEngine) invalidateProvider(ctx context.Context, scope plugin.ExecutionScope, convID, providerID string) {
+func (e *DesktopChatEngine) refreshProvider(ctx context.Context, scope plugin.ExecutionScope, convID, providerID string) error {
+	if err := checkCloudConnection(ctx); err != nil {
+		return err
+	}
 	pid := strings.TrimSpace(providerID)
 	if pid == "" {
 		if scope == plugin.ExecutionScopeCloud && e.cloud != nil {
@@ -521,17 +535,12 @@ func (e *DesktopChatEngine) invalidateProvider(ctx context.Context, scope plugin
 			}
 		}
 	}
-	if pid != "" {
-		e.credCache.InvalidateProvider(pid)
-	} else {
-		e.credCache.ClearAll()
+	if pid == "" {
+		return domain.NewError(domain.ErrCodeNotFound, "provider not found for credential refresh", nil)
 	}
-}
-
-func isUpstreamAuthError(err error) bool {
-	if err == nil {
-		return false
+	if err := e.store.invalidateProviderSnapshot(ctx, pid); err != nil {
+		return err
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "HTTP 401") || strings.Contains(msg, "HTTP 403")
+	_, err := e.cloud.refreshProviderSnapshot(ctx, e.store)
+	return err
 }

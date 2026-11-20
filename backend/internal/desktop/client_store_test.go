@@ -1,10 +1,126 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+type testProtector struct{ cipher.AEAD }
+
+func newTestProtector(t *testing.T, seed byte) testProtector {
+	t.Helper()
+	block, err := aes.NewCipher(bytes.Repeat([]byte{seed}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCMWithRandomNonce(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return testProtector{aead}
+}
+func (p testProtector) Protect(b []byte) ([]byte, error)   { return p.Seal(nil, nil, b, nil), nil }
+func (p testProtector) Unprotect(b []byte) ([]byte, error) { return p.Open(nil, nil, b, nil) }
+
+func TestDesktopProviderKeyStorage(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "credentials.db")
+	open := func() *DesktopStore {
+		s, err := OpenDesktopStore(ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = s.Close() })
+		return s
+	}
+	s := open()
+	conn, err := s.SaveConnection(ctx, "https://example.test", "token-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeat, err := s.SaveConnection(ctx, " https://example.test/ ", " token-a ")
+	if err != nil || !repeat.UpdatedAt.Equal(conn.UpdatedAt) {
+		t.Fatal("same normalized connection advanced generation")
+	}
+	const key = "fake-model-key-not-on-disk"
+	version := time.Now().UTC()
+	s.saveProviderKey(ctx, "model", version, key)
+	var rows int
+	if err := s.DB.QueryRow(`SELECT count(*) FROM desktop_provider_credentials`).Scan(&rows); err != nil || rows != 0 {
+		t.Fatal("stored key without a protector")
+	}
+	s.SetCredentialProtector(newTestProtector(t, 1))
+	s.saveProviderKey(ctx, "model", version, key)
+	for _, file := range []string{path, path + "-wal"} {
+		data, err := os.ReadFile(file)
+		if os.IsNotExist(err) && file != path {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte(key)) {
+			t.Fatal("found plaintext in SQLite")
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open()
+	s.SetCredentialProtector(newTestProtector(t, 2))
+	if s.loadProviderKey(ctx, "model", version) != "" {
+		t.Fatal("wrong protector decrypted key")
+	}
+	s.SetCredentialProtector(newTestProtector(t, 1))
+	if s.loadProviderKey(ctx, "model", version) != key || s.loadProviderKey(ctx, "model", version.Add(time.Second)) != "" {
+		t.Fatal("reopen or version check failed")
+	}
+	if _, err := s.SaveConnection(ctx, "https://example.test", "token-b"); err != nil {
+		t.Fatal(err)
+	}
+	if s.loadProviderKey(ctx, "model", version) != "" {
+		t.Fatal("previous connection key survived")
+	}
+	s.saveProviderKey(ctx, "model", version, key)
+	if err := s.ClearLocalCache(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if s.loadProviderKey(ctx, "model", version) != "" {
+		t.Fatal("cache clear retained key")
+	}
+}
+
+func TestDesktopUpgradeRetiresUnboundProviderMetadata(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	s, err := OpenDesktopStore(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveCachedProviders(ctx, []CachedProvider{{ID: "unbound-legacy-provider"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.Exec(`DROP TABLE desktop_provider_credentials`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = OpenDesktopStore(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if providers, err := s.LoadCachedProviders(ctx); err != nil || len(providers) != 0 {
+		t.Fatalf("legacy provider snapshot survived upgrade: %v", err)
+	}
+}
 
 func TestCloseToTrayPersistsAcrossReopenAndIgnoresCloudState(t *testing.T) {
 	ctx := context.Background()

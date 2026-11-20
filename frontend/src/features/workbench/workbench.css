@@ -637,6 +637,10 @@
   background: var(--bg-surface-secondary);
 }
 
+.wb-msg-editor .wb-attachments-bar {
+  margin-bottom: 0;
+}
+
 .wb-msg-editor__textarea {
   min-height: 76px;
   background: var(--bg-surface);
@@ -646,6 +650,10 @@
   display: flex;
   justify-content: flex-end;
   gap: 6px;
+}
+
+.wb-msg-editor__actions > :first-child {
+  margin-inline-end: auto;
 }
 
 /* Feed Display Mode */

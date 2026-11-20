@@ -1,13 +1,16 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -147,10 +150,10 @@ func TestMemoryCredentialCacheAndNoDiskKeyPersistence(t *testing.T) {
 		t.Fatalf("expected cache cleared on DisconnectCloud (hits=%d)", provHits.Load())
 	}
 
-	// Verify cached models/compat survive while zero plaintext API keys ever hit SQLite disk.
+	// Disconnect retires the supplier snapshot together with its credentials.
 	cachedProvs, err := st.LoadCachedProviders(ctx)
-	if err != nil || len(cachedProvs) != 1 || cachedProvs[0].Models[0].Compat.CacheMode != domain.CacheModeExplicit {
-		t.Fatalf("expected cached models/compat preserved, got %+v err=%v", cachedProvs, err)
+	if err != nil || len(cachedProvs) != 0 {
+		t.Fatalf("expected disconnected provider cache to be empty, got %+v err=%v", cachedProvs, err)
 	}
 	_ = st.Close()
 	dbBytes, err := os.ReadFile(dbPath)
@@ -159,5 +162,128 @@ func TestMemoryCredentialCacheAndNoDiskKeyPersistence(t *testing.T) {
 	}
 	if strings.Contains(string(dbBytes), rawProvSecret) || strings.Contains(string(dbBytes), rawSearchSecret) {
 		t.Fatal("plaintext API key found on disk in SQLite database")
+	}
+}
+
+func TestProviderCredentialFlightsAndSnapshotInvalidation(t *testing.T) {
+	ctx := context.Background()
+	version := time.Now().UTC()
+	const id = "same-id"
+	var hits atomic.Int32
+	started, release := make(chan struct{}), make(chan struct{})
+	cloud := NewCloudClient("http://gateway.test", "token-a")
+	cloud.SetHTTPClient(&http.Client{Transport: desktopRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/api/v1/providers/"+id+"/credential" {
+			if hits.Add(1) == 1 {
+				close(started)
+				<-release
+			}
+			key := "key-a"
+			if r.Header.Get("Authorization") == "Bearer token-b" {
+				key = "key-b"
+			}
+			raw, _ := json.Marshal(service.ProviderRuntimeCredential{ProviderID: id, UpdatedAt: version, APIKey: key})
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(raw))}, nil
+		}
+		return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader("not found"))}, nil
+	})})
+	st, err := OpenDesktopStore(ctx, filepath.Join(t.TempDir(), "desktop.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	st.SetCredentialProtector(newTestProtector(t, 1))
+	cache := NewMemoryCredentialCache(cloud)
+	st.SetMemoryCacheInvalidator(cache.ClearAll)
+	lookup := DesktopProviderLookup{st, cloud, cache}
+	if _, err := st.SaveConnection(ctx, "http://gateway.test", "token-a"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := []CachedProvider{{ID: id, APIKeySet: true, UpdatedAt: version}}
+	if err := st.SaveCachedProviders(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			p, err := lookup.Get(ctx, id)
+			if err != nil || p.APIKey != "key-a" {
+				t.Errorf("same version did not resolve: %v", err)
+			}
+		})
+	}
+	<-started
+	close(release)
+	wg.Wait()
+	if hits.Load() != 1 {
+		t.Fatalf("credential requests = %d; want 1", hits.Load())
+	}
+
+	cache.nowFn = func() time.Time { return time.Now().Add(2 * defaultCredentialTTL) }
+	if err := st.ClearLocalCache(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveCachedProviders(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	// Start a fetch and hold the response while SQLite retires the old generation.
+	oldStarted, oldRelease := make(chan struct{}), make(chan struct{})
+	cloud.SetHTTPClient(&http.Client{Transport: desktopRoundTripper(func(r *http.Request) (*http.Response, error) {
+		key := "key-b"
+		if r.Header.Get("Authorization") == "Bearer token-a" {
+			close(oldStarted)
+			<-oldRelease
+			key = "key-a"
+		}
+		raw, _ := json.Marshal(service.ProviderRuntimeCredential{ProviderID: id, UpdatedAt: version, APIKey: key})
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(raw))}, nil
+	})})
+	old := make(chan error, 1)
+	go func() { _, err := lookup.Get(ctx, id); old <- err }()
+	<-oldStarted
+	t.Cleanup(func() {
+		select {
+		case <-oldRelease:
+		default:
+			close(oldRelease)
+		}
+	})
+	oldRevision := st.providerSnapshotRevision()
+	if _, err := st.SaveConnection(ctx, "http://gateway.test", "token-b"); err != nil {
+		t.Fatal(err)
+	}
+	cloud.SetCredentials("http://gateway.test", "token-b")
+	if err := st.publishProviders(ctx, oldRevision, snapshot); err == nil {
+		t.Fatal("old list was allowed to repopulate snapshot")
+	}
+	if err := st.SaveCachedProviders(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	p, err := lookup.Get(ctx, id)
+	if err != nil || p.APIKey != "key-b" {
+		t.Fatalf("new connection did not resolve: %v", err)
+	}
+	close(oldRelease)
+	if err := <-old; err == nil {
+		t.Fatal("old credential was returned after switch")
+	}
+	if st.loadProviderKey(ctx, id, version) != "key-b" {
+		t.Fatal("old credential overwrote the new encrypted key")
+	}
+
+	snapshot[0].APIKeySet = false
+	snapshot[0].UpdatedAt = version.Add(time.Second)
+	if err := st.SaveCachedProviders(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	p, err = lookup.Get(ctx, id)
+	if err != nil || p.APIKey != "" || st.loadProviderKey(ctx, id, version) != "" {
+		t.Fatalf("clearing key retained the previous version: %v", err)
+	}
+	if err := st.SaveCachedProviders(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lookup.Get(ctx, id); err == nil {
+		t.Fatal("deleted provider remained available")
 	}
 }

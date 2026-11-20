@@ -1071,6 +1071,7 @@ function WorkbenchInner() {
           ) : null}
 
           <ChatCanvas
+            scope={reqScope}
             state={chatState}
             assistant={activeAssistant}
             providers={resources.providers}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"llmstudio/backend/internal/domain"
@@ -92,6 +93,9 @@ type DesktopStore struct {
 	Preferences   *store.PreferenceStore
 	Storage       *store.StorageMaintenance
 
+	providerMu              sync.Mutex
+	providerRevision        uint64
+	credentialProtector     CredentialProtector
 	onInvalidateMemoryCache func()
 }
 
@@ -150,6 +154,16 @@ func ensureDesktopTables(ctx context.Context, db *sql.DB) error {
 			value_json TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);
+		-- Older builds did not retire provider snapshots on connection switches.
+		DELETE FROM desktop_cache WHERE key = 'providers' AND NOT EXISTS (
+			SELECT 1 FROM sqlite_schema WHERE name = 'desktop_provider_credentials'
+		);
+		CREATE TABLE IF NOT EXISTS desktop_provider_credentials (
+			provider_id TEXT PRIMARY KEY,
+			connection_version TEXT NOT NULL,
+			provider_version TEXT NOT NULL,
+			ciphertext BLOB NOT NULL
+		);
 		CREATE TABLE IF NOT EXISTS desktop_settings (
 			id INTEGER PRIMARY KEY CHECK (id = 1),
 			close_to_tray INTEGER NOT NULL DEFAULT 0
@@ -187,46 +201,59 @@ func (s *DesktopStore) GetConnection(ctx context.Context) (DesktopConnection, er
 	return conn, nil
 }
 
-// SaveConnection persists the remote cloud gateway URL and access token.
+// SaveConnection persists normalized credentials and retires the previous provider snapshot atomically.
 func (s *DesktopStore) SaveConnection(ctx context.Context, gatewayBaseURL, accessToken string) (DesktopConnection, error) {
 	cleanURL := strings.TrimRight(strings.TrimSpace(gatewayBaseURL), "/")
 	cleanTok := strings.TrimSpace(accessToken)
-	now := time.Now().UTC()
-	if _, err := s.DB.ExecContext(ctx, `
-		INSERT INTO desktop_connection (id, gateway_base_url, access_token, updated_at)
-		VALUES (1, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			gateway_base_url = excluded.gateway_base_url,
-			access_token = excluded.access_token,
-			updated_at = excluded.updated_at
-	`, cleanURL, cleanTok, now.Format(time.RFC3339Nano)); err != nil {
-		return DesktopConnection{}, fmt.Errorf("save desktop connection: %w", err)
+	s.providerMu.Lock()
+	defer s.providerMu.Unlock()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return DesktopConnection{}, err
 	}
-	return DesktopConnection{
-		GatewayBaseURL: cleanURL,
-		AccessToken:    cleanTok,
-		TokenSet:       cleanTok != "",
-		UpdatedAt:      now,
-	}, nil
+	defer tx.Rollback()
+	now := time.Now().UTC()
+	result, err := tx.ExecContext(ctx, `
+  INSERT INTO desktop_connection (id, gateway_base_url, access_token, updated_at)
+  VALUES (1, ?, ?, ?)
+  ON CONFLICT(id) DO UPDATE SET gateway_base_url = excluded.gateway_base_url,
+   access_token = excluded.access_token, updated_at = excluded.updated_at
+  WHERE gateway_base_url != excluded.gateway_base_url OR access_token != excluded.access_token
+ `, cleanURL, cleanTok, now.Format(time.RFC3339Nano))
+	if err != nil {
+		return DesktopConnection{}, err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return DesktopConnection{}, err
+	}
+	if changed != 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM desktop_cache WHERE key = ?`, cacheKeyProviders); err != nil {
+			return DesktopConnection{}, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM desktop_provider_credentials`); err != nil {
+			return DesktopConnection{}, err
+		}
+	} else {
+		var stamp string
+		if err := tx.QueryRowContext(ctx, `SELECT updated_at FROM desktop_connection WHERE id = 1`).Scan(&stamp); err != nil {
+			return DesktopConnection{}, err
+		}
+		now, _ = time.Parse(time.RFC3339Nano, stamp)
+	}
+	if err := tx.Commit(); err != nil {
+		return DesktopConnection{}, err
+	}
+	if changed != 0 {
+		s.invalidateProviderState()
+	}
+	return DesktopConnection{GatewayBaseURL: cleanURL, AccessToken: cleanTok, TokenSet: cleanTok != "", UpdatedAt: now}, nil
 }
 
-// DisconnectCloud clears the stored gateway URL and access token and invalidates in-memory credentials.
+// DisconnectCloud clears the stored connection and its provider cache.
 func (s *DesktopStore) DisconnectCloud(ctx context.Context) error {
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	if _, err := s.DB.ExecContext(ctx, `
-		INSERT INTO desktop_connection (id, gateway_base_url, access_token, updated_at)
-		VALUES (1, '', '', ?)
-		ON CONFLICT(id) DO UPDATE SET
-			gateway_base_url = '',
-			access_token = '',
-			updated_at = excluded.updated_at
-	`, now); err != nil {
-		return fmt.Errorf("disconnect desktop cloud: %w", err)
-	}
-	if s.onInvalidateMemoryCache != nil {
-		s.onInvalidateMemoryCache()
-	}
-	return nil
+	_, err := s.SaveConnection(ctx, "", "")
+	return err
 }
 
 // GetCloseToTray reports whether the window close button hides to the tray.
@@ -320,15 +347,7 @@ func (s *DesktopStore) SyncCloudAssistants(ctx context.Context, assistants []dom
 
 // SaveCachedProviders stores redacted provider metadata (stripping all plaintext API keys).
 func (s *DesktopStore) SaveCachedProviders(ctx context.Context, providers []CachedProvider) error {
-	sanitized := make([]CachedProvider, 0, len(providers))
-	for _, p := range providers {
-		cp := p
-		if cp.Models == nil {
-			cp.Models = []domain.ModelConfig{}
-		}
-		sanitized = append(sanitized, cp)
-	}
-	return s.putCacheJSON(ctx, cacheKeyProviders, sanitized)
+	return s.publishProviders(ctx, s.providerSnapshotRevision(), providers)
 }
 
 // SaveCachedProviderConfigs converts domain ProviderConfig entries into redacted cache records.
@@ -361,15 +380,11 @@ func (s *DesktopStore) SaveCachedProviderConfigs(ctx context.Context, providers 
 
 // LoadCachedProviders loads cached provider view records from desktop_cache.
 func (s *DesktopStore) LoadCachedProviders(ctx context.Context) ([]CachedProvider, error) {
-	var out []CachedProvider
-	found, err := s.getCacheJSON(ctx, cacheKeyProviders, &out)
-	if err != nil || !found {
-		return []CachedProvider{}, err
+	providers, _, err := s.providerSnapshot(ctx)
+	if providers == nil {
+		providers = []CachedProvider{}
 	}
-	if out == nil {
-		return []CachedProvider{}, nil
-	}
-	return out, nil
+	return providers, err
 }
 
 // SaveCachedSearchEngines stores masked search engine metadata in desktop_cache (no plaintext apiKey).
@@ -514,11 +529,19 @@ func (s *DesktopStore) CleanupLocalUngrouped(ctx context.Context) ([]domain.Dele
 // ClearLocalCache removes cached cloud metadata and invalidates in-memory credentials,
 // preserving local conversations, messages, groups, MCP configs, and connection settings.
 func (s *DesktopStore) ClearLocalCache(ctx context.Context) error {
-	if _, err := s.DB.ExecContext(ctx, `DELETE FROM desktop_cache`); err != nil {
-		return fmt.Errorf("clear desktop_cache: %w", err)
+	s.providerMu.Lock()
+	defer s.providerMu.Unlock()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
 	}
-	if s.onInvalidateMemoryCache != nil {
-		s.onInvalidateMemoryCache()
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM desktop_cache; DELETE FROM desktop_provider_credentials`); err != nil {
+		return err
 	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.invalidateProviderState()
 	return nil
 }

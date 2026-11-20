@@ -1,3 +1,4 @@
+import type { Locator } from '@playwright/test';
 import {
   E2E_TOKEN,
   connectWithToken,
@@ -9,6 +10,15 @@ import {
 // 1x1 transparent PNG, small enough to inline in the test.
 const PNG_BASE64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+async function pastePNG(target: Locator, base64: string, name: string) {
+  return target.evaluate((element, { base64, name }) => {
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(new File([bytes], name, { type: 'image/png' }));
+    element.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dataTransfer, bubbles: true, cancelable: true }));
+  }, { base64, name });
+}
 
 test.describe('Image attachments', () => {
   test('sends a pasted clipboard image upstream with its data and MIME and keeps it in history', async ({
@@ -31,27 +41,7 @@ test.describe('Image attachments', () => {
       /Mock Vision/,
     );
 
-    await page.evaluate((base64) => {
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i += 1) {
-        bytes[i] = binary.charCodeAt(i);
-      }
-      const dataTransfer = new DataTransfer();
-      dataTransfer.items.add(
-        new File([bytes], 'clipboard.png', { type: 'image/png' }),
-      );
-      const textarea = document.querySelector('textarea');
-      if (!textarea) throw new Error('composer textarea missing');
-      textarea.focus();
-      textarea.dispatchEvent(
-        new ClipboardEvent('paste', {
-          clipboardData: dataTransfer,
-          bubbles: true,
-          cancelable: true,
-        }),
-      );
-    }, PNG_BASE64);
+    await pastePNG(page.getByLabel('消息输入框'), PNG_BASE64, 'clipboard.png');
 
     // The pasted image becomes a removable attachment chip without touching the draft.
     await expect(page.getByText('clipboard.png')).toBeVisible();
@@ -82,6 +72,121 @@ test.describe('Image attachments', () => {
     expect(stored).toContain('"type":"image"');
     expect(stored).toContain('"mimeType":"image/png"');
     expect(stored).toContain(PNG_BASE64);
+  });
+
+  test('saves historical image changes in both layouts without regenerating until the user retries', async ({ appUrl, page, upstream }) => {
+    const headers = { Authorization: 'Bearer ' + E2E_TOKEN };
+    const providerId = await seedMockProviderViaApi(appUrl, upstream.url, [
+      { id: 'mock-vision', name: 'Mock Vision', apiFormat: 'openai-completions', inputModalities: ['text', 'image'] },
+    ]);
+    await page.setViewportSize({ width: 375, height: 800 });
+    await connectWithToken(page, appUrl);
+    const [kept, removed, selected, pasted] = await page.evaluate(() => {
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 8;
+      const ctx = canvas.getContext('2d')!;
+      return ['red', 'green', 'blue', 'purple'].map((color) => {
+        ctx.fillStyle = color;
+        ctx.fillRect(0, 0, 8, 8);
+        return canvas.toDataURL('image/png').split(',')[1];
+      });
+    });
+    const img = (data: string) => ({ type: 'image', mimeType: 'image/png', data });
+    const text = (value: string) => ({ type: 'text', text: value });
+    const setMode = async (chatDisplayMode: 'bubble' | 'feed') => {
+      const res = await page.request.patch(appUrl + '/api/v1/settings', { headers, data: { chatDisplayMode } });
+      expect(res.ok()).toBe(true);
+    };
+    await setMode('bubble');
+    const create = await page.request.post(appUrl + '/api/v1/conversations', { headers, data: { title: 'Image history', providerId, modelId: 'mock-vision' } });
+    expect(create.ok()).toBe(true);
+    const { conversation } = await create.json();
+    const path = appUrl + '/api/v1/conversations/' + conversation.id;
+    const send = async (role: string, blocks: Array<ReturnType<typeof img> | ReturnType<typeof text>>) => {
+      const response = await page.request.post(path + '/messages', { headers, data: { role, blocks } });
+      expect(response.ok()).toBe(true);
+      return (await response.json()).message;
+    };
+    const firstText = text('Compare the image colors');
+    const first = await send('user', [firstText, img(kept), img(removed)]);
+    await send('assistant', [text('Initial comparison')]);
+    await send('user', [text('Follow-up question')]);
+    await send('assistant', [text('Follow-up reply')]);
+    const detail = async () => {
+      const response = await page.request.get(path, { headers });
+      expect(response.ok()).toBe(true);
+      return (await response.json()).messages;
+    };
+    const before = await detail();
+    const messagePath = path + '/messages/' + first.id;
+    let patches = 0;
+    page.on('request', (r) => { if (r.url() === messagePath && r.method() === 'PATCH') patches++; });
+    await page.goto(appUrl + '/chat/' + conversation.id);
+    const bubble = page.locator('.wb-user-msg').filter({ hasText: 'Compare the image colors' });
+    const save = page.getByRole('button', { name: '保存' });
+    const edit = bubble.getByRole('button', { name: '修改消息' });
+    await edit.click();
+    await page.getByRole('button', { name: '移除 图片 2' }).click();
+    await page.getByRole('button', { name: '取消' }).click();
+    await expect(bubble.locator('.msg-image-thumb')).toHaveCount(2);
+    expect(patches).toBe(0);
+    expect(await detail()).toEqual(before);
+
+    await edit.click();
+    await page.getByRole('button', { name: '移除 图片 2' }).click();
+    const choose = page.waitForEvent('filechooser');
+    await page.getByRole('button', { name: '添加图片' }).click();
+    await (await choose).setFiles({ name: 'selected.png', mimeType: 'image/png', buffer: Buffer.from(selected, 'base64') });
+    await expect(page.getByRole('img', { name: 'selected.png' })).toBeVisible();
+    const editor = page.locator('.wb-msg-editor');
+    expect(await editor.evaluate((el) => el.scrollWidth <= el.clientWidth + 1 && el.getBoundingClientRect().right <= innerWidth)).toBe(true);
+    const failOnce = async (route: import('@playwright/test').Route) => {
+      await route.fulfill({ status: 500, json: { code: 'INTERNAL_ERROR', message: '图片保存失败' } });
+    };
+    await page.route(messagePath, failOnce, { times: 1 });
+    await save.click();
+    await expect(page.getByText('图片保存失败')).toBeVisible();
+    await expect(page.getByRole('img', { name: 'selected.png' })).toBeVisible();
+    const patch = () => page.waitForResponse((res) => res.url() === messagePath && res.request().method() === 'PATCH');
+    const bubblePatch = patch();
+    await save.click();
+    expect((await bubblePatch).ok()).toBe(true);
+    await expect(editor).toHaveCount(0);
+    expect((await detail())[0].blocks).toEqual([firstText, img(kept), img(selected)]);
+
+    await setMode('feed');
+    await page.reload();
+    const feed = page.locator('.wb-feed-msg--user').filter({ hasText: 'Compare the image colors' });
+    await feed.getByRole('button', { name: '修改消息' }).click();
+    const textarea = page.getByLabel('编辑消息内容');
+    await pastePNG(textarea, pasted, 'pasted.png');
+    await expect(page.getByRole('img', { name: 'pasted.png' })).toBeVisible();
+    await expect(textarea).toHaveValue(firstText.text);
+    const feedPatch = patch();
+    await textarea.press('Control+Enter');
+    expect((await feedPatch).ok()).toBe(true);
+    await expect(editor).toHaveCount(0);
+    expect(patches).toBe(3);
+    expect(upstream.lastChatBodies).toHaveLength(0);
+    const saved = await detail();
+    expect(saved.map((m: { id: string }) => m.id)).toEqual(before.map((m: { id: string }) => m.id));
+    expect(saved.slice(1)).toEqual(before.slice(1));
+    expect(saved[0].blocks).toEqual([firstText, img(kept), img(selected), img(pasted)]);
+    await page.reload();
+    await expect(page.getByText('Follow-up reply')).toBeVisible();
+    const thumbnails = feed.locator('.msg-image-thumb');
+    await expect(thumbnails).toHaveCount(3);
+    for (const [index, data] of [kept, selected, pasted].entries()) {
+      await expect(thumbnails.nth(index)).toHaveAttribute('src', 'data:image/png;base64,' + data);
+    }
+    await feed.getByRole('button', { name: '重试消息' }).click();
+    await page.getByRole('dialog').getByRole('button', { name: '重新生成' }).click();
+    await expect.poll(() => upstream.lastChatBodies.length).toBe(1);
+    const request = JSON.stringify(upstream.lastChatBodies[0]);
+    for (const data of [kept, selected, pasted]) expect(request).toContain('data:image/png;base64,' + data);
+    expect(request).not.toContain(removed);
+    await expect(page.getByText(/Reply #1 to:.*Compare the image colors/)).toBeVisible();
+    await expect(page.getByText('Follow-up reply')).toBeVisible();
   });
 
   test('compresses a large file before sending from a model without a vision label', async ({ appUrl, upstream, page }) => {
