@@ -11,6 +11,7 @@ import { useApp } from './AppProvider';
 
 export function ConnectionGate({ children }: { children: ReactNode }) {
   const {
+    isDesktop,
     connectionState,
     connectionError,
     settings,
@@ -30,7 +31,7 @@ export function ConnectionGate({ children }: { children: ReactNode }) {
   } | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  if (connectionState === 'connected') {
+  if (isDesktop || connectionState === 'connected') {
     return <>{children}</>;
   }
 

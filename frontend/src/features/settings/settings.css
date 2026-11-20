@@ -1037,3 +1037,28 @@
   max-height: 160px;
   overflow: auto;
 }
+
+:root[data-desktop='true'] .st-toolbar {
+  padding-right: max(20px, var(--mygo-titlebar-inset-right, 0px));
+}
+
+.st-status-dot--muted {
+  background: var(--text-tertiary);
+  box-shadow: 0 0 0 3px var(--bg-subtle);
+}
+
+.st-path-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.st-path-code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+}

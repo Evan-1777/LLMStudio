@@ -19,16 +19,114 @@ const (
 )
 
 type mcpToolBinding struct {
+	Scope      plugin.ExecutionScope
 	ServerID   string
 	ServerName string
 	ToolName   string
+}
+
+// ScopedMCPServer pairs an MCP server configuration with its execution scope.
+type ScopedMCPServer struct {
+	Scope  plugin.ExecutionScope
+	Server domain.MCPServerConfig
+}
+
+// ScopedMCPCatalog is optionally implemented by dual-domain catalogs to expose
+// servers partitioned by execution scope without ID collisions.
+type ScopedMCPCatalog interface {
+	ListScoped(ctx context.Context) ([]ScopedMCPServer, error)
+	GetScoped(ctx context.Context, scope plugin.ExecutionScope, id string) (domain.MCPServerConfig, error)
+}
+
+// ScopedMCPClient is optionally implemented by dual-domain MCP runtimes to route
+// list/call operations using both scope and original server ID.
+type ScopedMCPClient interface {
+	ListScopedTools(ctx context.Context, scope plugin.ExecutionScope, server domain.MCPServerConfig) ([]plugin.MCPToolDescriptor, error)
+	CallScopedTool(ctx context.Context, scope plugin.ExecutionScope, server domain.MCPServerConfig, name string, arguments json.RawMessage) (plugin.MCPCallToolResult, error)
+	CloseScopedServer(scope plugin.ExecutionScope, serverID string) error
+}
+
+func listNormalizedScopedServers(ctx context.Context, catalog MCPCatalog) ([]ScopedMCPServer, bool, error) {
+	if scoped, ok := catalog.(ScopedMCPCatalog); ok {
+		entries, err := scoped.ListScoped(ctx)
+		if err != nil {
+			return nil, true, err
+		}
+		out := make([]ScopedMCPServer, 0, len(entries))
+		for _, entry := range entries {
+			if entry.Server.Enabled {
+				out = append(out, entry)
+			}
+		}
+		sort.Slice(out, func(i, j int) bool {
+			if out[i].Scope != out[j].Scope {
+				return out[i].Scope < out[j].Scope
+			}
+			return out[i].Server.ID < out[j].Server.ID
+		})
+		return out, true, nil
+	}
+	servers, err := catalog.List(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	norm := normalizedServers(servers)
+	out := make([]ScopedMCPServer, len(norm))
+	for i, srv := range norm {
+		out[i] = ScopedMCPServer{Server: srv}
+	}
+	return out, false, nil
+}
+
+func mcpServerAliasKey(entry ScopedMCPServer) string {
+	if entry.Scope != "" {
+		return string(entry.Scope) + "\x00" + entry.Server.ID
+	}
+	return entry.Server.ID
+}
+
+func listServerTools(ctx context.Context, client plugin.MCPClientBoundary, entry ScopedMCPServer) ([]plugin.MCPToolDescriptor, error) {
+	if entry.Scope != "" {
+		if sc, ok := client.(ScopedMCPClient); ok {
+			return sc.ListScopedTools(ctx, entry.Scope, entry.Server)
+		}
+	}
+	return client.ListTools(ctx, entry.Server)
+}
+
+func lookupMCPServer(ctx context.Context, catalog MCPCatalog, scope plugin.ExecutionScope, serverID string) (domain.MCPServerConfig, error) {
+	if scope != "" {
+		if sc, ok := catalog.(ScopedMCPCatalog); ok {
+			return sc.GetScoped(ctx, scope, serverID)
+		}
+	}
+	return catalog.Get(ctx, serverID)
+}
+
+func callMCPServerTool(ctx context.Context, client plugin.MCPClientBoundary, scope plugin.ExecutionScope, srv domain.MCPServerConfig, toolName string, args json.RawMessage) (plugin.MCPCallToolResult, error) {
+	if scope != "" {
+		if sc, ok := client.(ScopedMCPClient); ok {
+			return sc.CallScopedTool(ctx, scope, srv, toolName, args)
+		}
+	}
+	return client.CallTool(ctx, srv, toolName, args)
+}
+
+func closeMCPServer(client plugin.MCPClientBoundary, scope plugin.ExecutionScope, serverID string) {
+	if scope != "" {
+		if sc, ok := client.(ScopedMCPClient); ok {
+			_ = sc.CloseScopedServer(scope, serverID)
+			return
+		}
+	}
+	_ = client.CloseServer(serverID)
 }
 
 func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatTool, map[string]mcpToolBinding, error) {
 	if s.mcpStore == nil || s.mcpClient == nil {
 		return nil, nil, nil
 	}
-	servers, err := s.mcpStore.List(ctx)
+	entries, _, err := listNormalizedScopedServers(ctx, s.mcpStore)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -37,11 +135,12 @@ func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatToo
 	var tools []plugin.ChatTool
 	var bindings map[string]mcpToolBinding
 
-	// Upstream servers may report the same tool set in any order; sorting by server
-	// ID and tool name keeps aliases and the encoded tool block byte-stable.
-	for _, srv := range normalizedServers(servers) {
+	// Upstream servers may report the same tool set in any order; sorting by (scope, server
+	// ID) and tool name keeps aliases and the encoded tool block byte-stable.
+	for _, entry := range entries {
+		srv := entry.Server
 		discCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
-		descriptors, listErr := s.mcpClient.ListTools(discCtx, srv)
+		descriptors, listErr := listServerTools(discCtx, s.mcpClient, entry)
 		cancel()
 		if listErr != nil {
 			if ctx.Err() != nil {
@@ -50,7 +149,7 @@ func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatToo
 			return nil, nil, listErr
 		}
 		for _, desc := range normalizedDescriptors(descriptors) {
-			alias := plugin.BuildChatToolAlias(srv.ID, desc.Name, usedAliases)
+			alias := plugin.BuildChatToolAlias(mcpServerAliasKey(entry), desc.Name, usedAliases)
 			if !srv.ToolEnabled(desc.Name) {
 				continue
 			}
@@ -58,6 +157,7 @@ func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatToo
 				bindings = make(map[string]mcpToolBinding)
 			}
 			bindings[alias] = mcpToolBinding{
+				Scope:      entry.Scope,
 				ServerID:   srv.ID,
 				ServerName: srv.Name,
 				ToolName:   desc.Name,
@@ -94,21 +194,42 @@ func normalizedDescriptors(descriptors []plugin.MCPToolDescriptor) []plugin.MCPT
 	return out
 }
 
-func (s *ChatService) filterEnabledTools(ctx context.Context, tools []plugin.ChatTool) []plugin.ChatTool {
+func (s *ChatService) filterEnabledToolsWithBindings(ctx context.Context, tools []plugin.ChatTool, bindings map[string]mcpToolBinding) []plugin.ChatTool {
 	if len(tools) == 0 || s.mcpStore == nil {
 		return tools
 	}
-	servers, err := s.mcpStore.List(ctx)
+	entries, scoped, err := listNormalizedScopedServers(ctx, s.mcpStore)
 	if err != nil {
 		return nil
 	}
-	byID := make(map[string]domain.MCPServerConfig, len(servers))
-	for _, srv := range servers {
-		byID[srv.ID] = srv
+	if !scoped {
+		byID := make(map[string]domain.MCPServerConfig, len(entries))
+		for _, entry := range entries {
+			byID[entry.Server.ID] = entry.Server
+		}
+		filtered := make([]plugin.ChatTool, 0, len(tools))
+		for _, t := range tools {
+			if byID[t.ServerID].ToolEnabled(t.ToolName) {
+				filtered = append(filtered, t)
+			}
+		}
+		return filtered
+	}
+	type scopedKey struct {
+		scope plugin.ExecutionScope
+		id    string
+	}
+	byScoped := make(map[scopedKey]domain.MCPServerConfig, len(entries))
+	for _, entry := range entries {
+		byScoped[scopedKey{scope: entry.Scope, id: entry.Server.ID}] = entry.Server
 	}
 	filtered := make([]plugin.ChatTool, 0, len(tools))
 	for _, t := range tools {
-		if byID[t.ServerID].ToolEnabled(t.ToolName) {
+		var scope plugin.ExecutionScope
+		if b, ok := bindings[t.Alias]; ok {
+			scope = b.Scope
+		}
+		if byScoped[scopedKey{scope: scope, id: t.ServerID}].ToolEnabled(t.ToolName) {
 			filtered = append(filtered, t)
 		}
 	}
@@ -120,30 +241,57 @@ func (s *ChatService) executeToolCall(
 	bindings map[string]mcpToolBinding,
 	call domain.ContentBlock,
 ) (domain.ContentBlock, error) {
+	return executeToolCallWithRuntime(ctx, s.mcpStore, s.mcpClient, bindings, call)
+}
+
+func executeToolCallWithRuntime(
+	ctx context.Context,
+	mcpStore MCPCatalog,
+	mcpClient plugin.MCPClientBoundary,
+	bindings map[string]mcpToolBinding,
+	call domain.ContentBlock,
+) (domain.ContentBlock, error) {
+	binding, ok := bindings[call.Name]
+	if !ok {
+		return domain.ContentBlock{
+			Type:       domain.BlockTypeToolResult,
+			ToolCallID: call.ID,
+			ToolName:   call.Name,
+			IsError:    true,
+			Content:    fmt.Sprintf("unknown or disabled tool %q", call.Name),
+		}, nil
+	}
+	return executeResolvedToolCall(ctx, mcpStore, mcpClient, binding, call)
+}
+
+func executeResolvedToolCall(
+	ctx context.Context,
+	mcpStore MCPCatalog,
+	mcpClient plugin.MCPClientBoundary,
+	binding mcpToolBinding,
+	call domain.ContentBlock,
+) (domain.ContentBlock, error) {
 	resultBlock := domain.ContentBlock{
 		Type:       domain.BlockTypeToolResult,
 		ToolCallID: call.ID,
 		ToolName:   call.Name,
 	}
 
-	binding, ok := bindings[call.Name]
-	if !ok {
-		resultBlock.IsError = true
-		resultBlock.Content = fmt.Sprintf("unknown or disabled tool %q", call.Name)
-		return resultBlock, nil
-	}
-
-	if s.mcpStore == nil || s.mcpClient == nil {
+	if mcpStore == nil || mcpClient == nil {
 		resultBlock.IsError = true
 		resultBlock.Content = "MCP runtime is unavailable"
 		return resultBlock, nil
 	}
 
-	srv, err := s.mcpStore.Get(ctx, binding.ServerID)
+	srv, err := lookupMCPServer(ctx, mcpStore, binding.Scope, binding.ServerID)
 	if err != nil || !srv.Enabled {
-		_ = s.mcpClient.CloseServer(binding.ServerID)
+		closeMCPServer(mcpClient, binding.Scope, binding.ServerID)
+		serverLabel := binding.ServerName
+		if serverLabel == "" {
+			serverLabel = binding.ServerID
+		}
 		resultBlock.IsError = true
-		resultBlock.Content = fmt.Sprintf("MCP server %q is unavailable or disabled", binding.ServerName)
+		resultBlock.Content = fmt.Sprintf("MCP server %q is unavailable or disabled", serverLabel)
 		return resultBlock, nil
 	}
 
@@ -161,7 +309,7 @@ func (s *ChatService) executeToolCall(
 	}
 
 	callCtx, cancel := context.WithTimeout(ctx, mcpToolCallTimeout)
-	res, callErr := s.mcpClient.CallTool(callCtx, srv, binding.ToolName, argsJSON)
+	res, callErr := callMCPServerTool(callCtx, mcpClient, binding.Scope, srv, binding.ToolName, argsJSON)
 	cancel()
 	if ctx.Err() != nil {
 		return domain.ContentBlock{}, ctx.Err()
@@ -318,6 +466,16 @@ type ToolCallInput struct {
 	Arguments json.RawMessage `json:"arguments"`
 }
 
+// StatelessToolCallInput describes a single stateless MCP tool invocation, targeting
+// either explicit (serverId, toolName) or an alias name fallback.
+type StatelessToolCallInput struct {
+	ID        string          `json:"id"`
+	Name      string          `json:"name,omitempty"`
+	ServerID  string          `json:"serverId,omitempty"`
+	ToolName  string          `json:"toolName,omitempty"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
 // ExecuteToolsInput holds validated parameters for streaming gateway-side MCP tool execution.
 type ExecuteToolsInput struct {
 	ConversationID string          `json:"-"`
@@ -359,34 +517,122 @@ func (s *ChatService) ExecuteTools(
 		if trBlock.IsError && strings.HasPrefix(trBlock.Content, "unknown or disabled tool ") && len(serverErrs) > 0 {
 			trBlock.Content = fmt.Sprintf("%s (%s)", trBlock.Content, strings.Join(serverErrs, "; "))
 		}
-		trCopy := trBlock
-		if err := emit(domain.StreamEvent{
-			Type:           domain.StreamEventBlockStart,
-			ConversationID: in.ConversationID,
-			Index:          domain.IntPtr(idx),
-			BlockType:      domain.BlockTypeToolResult,
-			Block:          &trCopy,
-		}); err != nil {
-			return err
-		}
-		if err := emit(domain.StreamEvent{
-			Type:           domain.StreamEventBlockEnd,
-			ConversationID: in.ConversationID,
-			Index:          domain.IntPtr(idx),
-			BlockType:      domain.BlockTypeToolResult,
-			Block:          &trCopy,
-		}); err != nil {
+		if err := emitToolResultEvents(emit, in.ConversationID, idx, trBlock); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// ExecuteToolsStateless runs tool calls without requiring an existing conversation record.
+func (s *ChatService) ExecuteToolsStateless(
+	ctx context.Context,
+	calls []StatelessToolCallInput,
+	emit func(domain.StreamEvent) error,
+) error {
+	return executeToolsStateless(ctx, s.mcpStore, s.mcpClient, calls, emit)
+}
+
+func executeToolsStateless(
+	ctx context.Context,
+	mcpStore MCPCatalog,
+	mcpClient plugin.MCPClientBoundary,
+	calls []StatelessToolCallInput,
+	emit func(domain.StreamEvent) error,
+) error {
+	if len(calls) == 0 {
+		return domain.NewError(domain.ErrCodeInvalidArgument, "calls are required", nil)
+	}
+	var (
+		bindings          map[string]mcpToolBinding
+		serverErrs        []string
+		bindingsDiscovered bool
+	)
+	for idx, call := range calls {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		serverID := strings.TrimSpace(call.ServerID)
+		toolName := strings.TrimSpace(call.ToolName)
+		displayName := strings.TrimSpace(call.Name)
+		if displayName == "" {
+			displayName = toolName
+		}
+		blockCall := domain.ContentBlock{
+			Type:      domain.BlockTypeToolCall,
+			ID:        strings.TrimSpace(call.ID),
+			Name:      displayName,
+			Arguments: call.Arguments,
+		}
+
+		var (
+			trBlock domain.ContentBlock
+			execErr error
+		)
+		if serverID != "" && toolName != "" {
+			trBlock, execErr = executeResolvedToolCall(ctx, mcpStore, mcpClient, mcpToolBinding{
+				ServerID:   serverID,
+				ServerName: serverID,
+				ToolName:   toolName,
+			}, blockCall)
+		} else {
+			if !bindingsDiscovered {
+				bindings, serverErrs, execErr = discoverActiveBindingsLenientWithRuntime(ctx, mcpStore, mcpClient)
+				if execErr != nil {
+					return execErr
+				}
+				bindingsDiscovered = true
+			}
+			trBlock, execErr = executeToolCallWithRuntime(ctx, mcpStore, mcpClient, bindings, blockCall)
+			if trBlock.IsError && strings.HasPrefix(trBlock.Content, "unknown or disabled tool ") && len(serverErrs) > 0 {
+				trBlock.Content = fmt.Sprintf("%s (%s)", trBlock.Content, strings.Join(serverErrs, "; "))
+			}
+		}
+		if execErr != nil {
+			return execErr
+		}
+		if emit != nil {
+			if err := emitToolResultEvents(emit, "", idx, trBlock); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func emitToolResultEvents(emit func(domain.StreamEvent) error, conversationID string, idx int, trBlock domain.ContentBlock) error {
+	trCopy := trBlock
+	if err := emit(domain.StreamEvent{
+		Type:           domain.StreamEventBlockStart,
+		ConversationID: conversationID,
+		Index:          domain.IntPtr(idx),
+		BlockType:      domain.BlockTypeToolResult,
+		Block:          &trCopy,
+	}); err != nil {
+		return err
+	}
+	return emit(domain.StreamEvent{
+		Type:           domain.StreamEventBlockEnd,
+		ConversationID: conversationID,
+		Index:          domain.IntPtr(idx),
+		BlockType:      domain.BlockTypeToolResult,
+		Block:          &trCopy,
+	})
+}
+
 func (s *ChatService) discoverActiveBindingsLenient(ctx context.Context) (map[string]mcpToolBinding, []string, error) {
-	if s.mcpStore == nil || s.mcpClient == nil {
+	return discoverActiveBindingsLenientWithRuntime(ctx, s.mcpStore, s.mcpClient)
+}
+
+func discoverActiveBindingsLenientWithRuntime(
+	ctx context.Context,
+	mcpStore MCPCatalog,
+	mcpClient plugin.MCPClientBoundary,
+) (map[string]mcpToolBinding, []string, error) {
+	if mcpStore == nil || mcpClient == nil {
 		return nil, nil, nil
 	}
-	servers, err := s.mcpStore.List(ctx)
+	entries, _, err := listNormalizedScopedServers(ctx, mcpStore)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -396,9 +642,10 @@ func (s *ChatService) discoverActiveBindingsLenient(ctx context.Context) (map[st
 
 	// Execute the same deterministic ordering as discoverActiveTools so aliases
 	// produced while encoding the request resolve back to the same tool here.
-	for _, srv := range normalizedServers(servers) {
+	for _, entry := range entries {
+		srv := entry.Server
 		discCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
-		descriptors, listErr := s.mcpClient.ListTools(discCtx, srv)
+		descriptors, listErr := listServerTools(discCtx, mcpClient, entry)
 		cancel()
 		if listErr != nil {
 			if ctx.Err() != nil {
@@ -408,11 +655,12 @@ func (s *ChatService) discoverActiveBindingsLenient(ctx context.Context) (map[st
 			continue
 		}
 		for _, desc := range normalizedDescriptors(descriptors) {
-			alias := plugin.BuildChatToolAlias(srv.ID, desc.Name, usedAliases)
+			alias := plugin.BuildChatToolAlias(mcpServerAliasKey(entry), desc.Name, usedAliases)
 			if !srv.ToolEnabled(desc.Name) {
 				continue
 			}
 			bindings[alias] = mcpToolBinding{
+				Scope:      entry.Scope,
 				ServerID:   srv.ID,
 				ServerName: srv.Name,
 				ToolName:   desc.Name,

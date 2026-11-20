@@ -1,3 +1,4 @@
+import { isDesktopApp } from './desktop';
 import { isReasoningEffort, type ChatWidthMode, type FontFamily, type ReasoningEffort, type ServerPreferencesImport } from './types';
 
 // Legacy single-blob key: pre-migration browser state, removed once the gateway
@@ -11,6 +12,9 @@ export const CONNECTION_STORAGE_KEY = 'llmstudio.connection.v1';
 export const THEME_HINT_STORAGE_PREFIX = 'llmstudio.themeHint.v1::';
 
 export function themeHintKey(gatewayBaseUrl: string): string {
+  if (isDesktopApp()) {
+    return `${THEME_HINT_STORAGE_PREFIX}desktop`;
+  }
   return `${THEME_HINT_STORAGE_PREFIX}${canonicalGateway(gatewayBaseUrl)}`;
 }
 

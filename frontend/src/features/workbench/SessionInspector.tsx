@@ -9,7 +9,7 @@ import {
   Textarea,
 } from '../../components/ui';
 import { GatewayError } from '../../core/gateway';
-import type { Conversation, GenerationParams } from '../../core/types';
+import type { Conversation, GenerationParams, TopicScope } from '../../core/types';
 
 export interface DraftSessionParams {
   systemPrompt: string;
@@ -20,6 +20,7 @@ export function SessionInspector({
   conversation,
   draftParams,
   isBusy,
+  scope,
   onClose,
   onSaved,
   onSaveDraft,
@@ -27,6 +28,7 @@ export function SessionInspector({
   conversation: Conversation | null;
   draftParams?: DraftSessionParams;
   isBusy: boolean;
+  scope?: TopicScope;
   onClose: () => void;
   onSaved: (updated: Conversation) => void;
   onSaveDraft?: (next: DraftSessionParams) => void;
@@ -96,13 +98,18 @@ export function SessionInspector({
 
     setSaving(true);
     try {
-      const updated = await gateway.patchConversation(conversation.id, {
-        systemPrompt,
-        params: {
-          temperature: tempEnabled ? temperature : null,
-          maxTokens: parsedMaxTokens,
+      const updated = await gateway.patchConversation(
+        conversation.id,
+        {
+          systemPrompt,
+          params: {
+            temperature: tempEnabled ? temperature : null,
+            maxTokens: parsedMaxTokens,
+          },
         },
-      });
+        undefined,
+        scope,
+      );
       onSaved(updated);
       toast('话题参数已保存');
     } catch (err) {
@@ -129,10 +136,15 @@ export function SessionInspector({
 
     setSaving(true);
     try {
-      const updated = await gateway.patchConversation(conversation.id, {
-        systemPrompt: '',
-        params: null,
-      });
+      const updated = await gateway.patchConversation(
+        conversation.id,
+        {
+          systemPrompt: '',
+          params: null,
+        },
+        undefined,
+        scope,
+      );
       onSaved(updated);
       toast('已恢复继承值');
     } catch (err) {

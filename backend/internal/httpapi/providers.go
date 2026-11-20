@@ -27,6 +27,17 @@ func (h *ProviderHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *ProviderHandler) GetCredential(w http.ResponseWriter, r *http.Request) {
+	cred, err := h.svc.GetRuntimeCredential(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	WriteJSON(w, http.StatusOK, cred)
+}
+
 func (h *ProviderHandler) Reorder(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		ID       string  `json:"id"`

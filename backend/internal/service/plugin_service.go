@@ -106,6 +106,51 @@ func (s *PluginService) WithMCPClient(client plugin.MCPClientBoundary) *PluginSe
 	return s
 }
 
+// SearchEngineRuntimeCredential holds unmasked runtime search engine credentials.
+type SearchEngineRuntimeCredential struct {
+	EngineID   string    `json:"engineId"`
+	Enabled    bool      `json:"enabled"`
+	Endpoint   string    `json:"endpoint"`
+	APIKey     string    `json:"apiKey"`
+	MaxResults int       `json:"maxResults"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+// GetSearchEngineRuntimeCredential returns raw runtime credentials for a registered search engine.
+func (s *PluginService) GetSearchEngineRuntimeCredential(ctx context.Context, id string) (SearchEngineRuntimeCredential, error) {
+	engine, ok := s.searchReg.Get(id)
+	if !ok {
+		return SearchEngineRuntimeCredential{}, domain.NewError(domain.ErrCodeNotFound, fmt.Sprintf("unknown search engine %q", id), nil)
+	}
+	cfg, err := s.searchStore.Get(ctx, id)
+	if err != nil {
+		if appErr, isApp := domain.AsAppError(err); !isApp || appErr.Code != domain.ErrCodeNotFound {
+			return SearchEngineRuntimeCredential{}, err
+		}
+		cfg = domain.SearchEngineConfig{
+			EngineID:   id,
+			Endpoint:   engine.DefaultEndpoint(),
+			MaxResults: 5,
+		}
+	}
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	if endpoint == "" {
+		endpoint = engine.DefaultEndpoint()
+	}
+	maxResults := cfg.MaxResults
+	if maxResults <= 0 {
+		maxResults = 5
+	}
+	return SearchEngineRuntimeCredential{
+		EngineID:   id,
+		Enabled:    cfg.Enabled,
+		Endpoint:   endpoint,
+		APIKey:     cfg.APIKey,
+		MaxResults: maxResults,
+		UpdatedAt:  cfg.UpdatedAt,
+	}, nil
+}
+
 // ListSearchEngines returns all registered search engines merged with persisted settings.
 func (s *PluginService) ListSearchEngines(ctx context.Context) ([]SearchEngineView, error) {
 	infos := s.searchReg.List()
@@ -426,6 +471,15 @@ func (s *PluginService) TestMCPServer(ctx context.Context, id string) (MCPServer
 		Message:   fmt.Sprintf("连接正常（%d 个工具）", len(tools)),
 		Tools:     tools,
 	}, nil
+}
+
+// ExecuteMCPTools runs stateless MCP tool calls against currently configured servers.
+func (s *PluginService) ExecuteMCPTools(
+	ctx context.Context,
+	calls []StatelessToolCallInput,
+	emit func(domain.StreamEvent) error,
+) error {
+	return executeToolsStateless(ctx, s.mcpStore, s.mcpClient, calls, emit)
 }
 
 func validateMCPServer(srv *domain.MCPServerConfig) error {

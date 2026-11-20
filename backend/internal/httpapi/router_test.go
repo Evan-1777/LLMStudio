@@ -531,6 +531,7 @@ func TestRouterEndpointsAndStreamCancellation(t *testing.T) {
 	})
 
 	cancelCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	slowReqBody, _ := json.Marshal(map[string]any{"text": "Stream slowly"})
 	slowReq, _ := http.NewRequestWithContext(cancelCtx, http.MethodPost, gw.URL+"/api/v1/conversations/"+convID+"/messages/stream", bytes.NewReader(slowReqBody))
 	slowReq.Header.Set("Authorization", "Bearer "+tok)
@@ -688,5 +689,138 @@ func TestRouterEndpointsAndStreamCancellation(t *testing.T) {
 	delGrpRec := doJSONReq(t, router, http.MethodDelete, "/api/v1/conversation-groups/"+grpOut.Group.ID, tok, nil)
 	if delGrpRec.Code != http.StatusOK {
 		t.Fatalf("DELETE /conversation-groups status=%d body=%s", delGrpRec.Code, delGrpRec.Body.String())
+	}
+}
+
+func TestRuntimeCredentialEndpointsAndConversationImport(t *testing.T) {
+	const tok = "cred-secret-token"
+	router := setupTestRouter(t, tok, false)
+
+	// Seed provider and search engine with API keys.
+	provRec := doJSONReq(t, router, http.MethodPost, "/api/v1/providers", tok, map[string]any{
+		"id":       "prov-cred",
+		"name":     "OpenAI",
+		"adapter":  "generic-http",
+		"baseURL":  "https://api.openai.com/v1",
+		"authType": "bearer",
+		"apiKey":   "sk-live-very-secret-key",
+		"models":   []map[string]any{{"id": "gpt-4o", "name": "GPT-4o", "apiFormat": "openai-completions"}},
+	})
+	if provRec.Code != http.StatusCreated {
+		t.Fatalf("create provider status=%d body=%s", provRec.Code, provRec.Body.String())
+	}
+	searchRec := doJSONReq(t, router, http.MethodPut, "/api/v1/plugins/search/tavily", tok, map[string]any{
+		"enabled": true,
+		"apiKey":  "tvly-secret-token",
+	})
+	if searchRec.Code != http.StatusOK {
+		t.Fatalf("update search status=%d body=%s", searchRec.Code, searchRec.Body.String())
+	}
+
+	// Unauthenticated credential requests must be rejected with 401.
+	if rec := doJSONReq(t, router, http.MethodGet, "/api/v1/providers/prov-cred/credential", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauth provider credential, got %d", rec.Code)
+	}
+	if rec := doJSONReq(t, router, http.MethodGet, "/api/v1/plugins/search/tavily/credential", "", nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauth search credential, got %d", rec.Code)
+	}
+
+	// Authenticated credential fetches return raw key + Cache-Control: no-store.
+	provCredRec := doJSONReq(t, router, http.MethodGet, "/api/v1/providers/prov-cred/credential", tok, nil)
+	if provCredRec.Code != http.StatusOK {
+		t.Fatalf("GET provider credential status=%d body=%s", provCredRec.Code, provCredRec.Body.String())
+	}
+	if cc := provCredRec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("expected Cache-Control=no-store, got %q", cc)
+	}
+	var provCred struct {
+		ProviderID string `json:"providerId"`
+		APIKey     string `json:"apiKey"`
+		UpdatedAt  string `json:"updatedAt"`
+	}
+	_ = json.Unmarshal(provCredRec.Body.Bytes(), &provCred)
+	if provCred.ProviderID != "prov-cred" || provCred.APIKey != "sk-live-very-secret-key" || provCred.UpdatedAt == "" {
+		t.Fatalf("unexpected provider credential payload: %+v", provCred)
+	}
+
+	searchCredRec := doJSONReq(t, router, http.MethodGet, "/api/v1/plugins/search/tavily/credential", tok, nil)
+	if searchCredRec.Code != http.StatusOK || searchCredRec.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("GET search credential failed: status=%d cc=%q", searchCredRec.Code, searchCredRec.Header().Get("Cache-Control"))
+	}
+	if !strings.Contains(searchCredRec.Body.String(), "tvly-secret-token") {
+		t.Fatalf("expected search credential apiKey, got %s", searchCredRec.Body.String())
+	}
+
+	// Standard list endpoints remain masked.
+	listProv := doJSONReq(t, router, http.MethodGet, "/api/v1/providers", tok, nil)
+	if strings.Contains(listProv.Body.String(), "sk-live-very-secret-key") {
+		t.Fatalf("GET /providers leaked raw apiKey: %s", listProv.Body.String())
+	}
+	listSearch := doJSONReq(t, router, http.MethodGet, "/api/v1/plugins/search", tok, nil)
+	if strings.Contains(listSearch.Body.String(), "tvly-secret-token") {
+		t.Fatalf("GET /plugins/search leaked raw apiKey: %s", listSearch.Body.String())
+	}
+
+	// Conversation import: ephemeral rejected, missing assistant falls back to default, conflict + force.
+	if badEph := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/import", tok, map[string]any{
+		"conversation": map[string]any{"id": "eph-1", "title": "Temp", "ephemeral": true},
+		"messages":     []any{},
+	}); badEph.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for ephemeral import, got %d", badEph.Code)
+	}
+
+	t0 := time.Now().UTC().Add(-time.Hour)
+	impRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/import", tok, map[string]any{
+		"conversation": map[string]any{
+			"id":          "imp-http-1",
+			"assistantId": "missing-assistant",
+			"title":       "Imported HTTP",
+			"createdAt":   t0.Format(time.RFC3339Nano),
+			"updatedAt":   t0.Format(time.RFC3339Nano),
+		},
+		"messages": []map[string]any{
+			{
+				"id":        "imp-m1",
+				"role":      "user",
+				"blocks":    []map[string]any{{"type": "text", "text": "hello import"}},
+				"createdAt": t0.Format(time.RFC3339Nano),
+			},
+		},
+	})
+	if impRec.Code != http.StatusOK {
+		t.Fatalf("POST /conversations/import status=%d body=%s", impRec.Code, impRec.Body.String())
+	}
+	var detail struct {
+		Conversation domain.Conversation `json:"conversation"`
+		Messages     []domain.Message    `json:"messages"`
+	}
+	_ = json.Unmarshal(impRec.Body.Bytes(), &detail)
+	if detail.Conversation.AssistantID != domain.DefaultAssistantID || len(detail.Messages) != 1 {
+		t.Fatalf("unexpected imported detail: %+v", detail)
+	}
+
+	// Add a cloud message so target is newer -> subsequent import without force returns 409.
+	addMsgRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/imp-http-1/messages", tok, map[string]any{
+		"role":   "assistant",
+		"blocks": []map[string]any{{"type": "text", "text": "cloud reply"}},
+	})
+	if addMsgRec.Code != http.StatusCreated {
+		t.Fatalf("create cloud message status=%d body=%s", addMsgRec.Code, addMsgRec.Body.String())
+	}
+	conflictRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/import", tok, map[string]any{
+		"conversation": detail.Conversation,
+		"messages":     detail.Messages,
+	})
+	if conflictRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 CONFLICT on stale import, got %d body=%s", conflictRec.Code, conflictRec.Body.String())
+	}
+
+	forcedRec := doJSONReq(t, router, http.MethodPost, "/api/v1/conversations/import", tok, map[string]any{
+		"conversation": detail.Conversation,
+		"messages":     detail.Messages,
+		"force":        true,
+	})
+	if forcedRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on forced import, got %d body=%s", forcedRec.Code, forcedRec.Body.String())
 	}
 }

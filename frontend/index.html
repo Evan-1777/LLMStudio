@@ -35,8 +35,18 @@
             connection && typeof connection.gatewayBaseUrl === 'string'
               ? connection.gatewayBaseUrl
               : '/';
+          var desktop = window.__LLMSTUDIO_DESKTOP__;
+          var isDesktop = Boolean(
+            desktop &&
+              typeof desktop.apiBaseUrl === 'string' &&
+              desktop.apiBaseUrl.trim() &&
+              typeof desktop.sessionToken === 'string' &&
+              desktop.sessionToken.trim(),
+          );
           var hint = JSON.parse(
-            storage.getItem('llmstudio.themeHint.v1::' + gateway) || 'null',
+            storage.getItem(
+              'llmstudio.themeHint.v1::' + (isDesktop ? 'desktop' : gateway),
+            ) || 'null',
           );
           if (!hint) return;
           var mode = hint.themeMode;

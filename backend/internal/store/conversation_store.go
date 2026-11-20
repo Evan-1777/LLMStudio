@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"llmstudio/backend/internal/domain"
@@ -143,26 +144,9 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 		groupID = sql.NullString{String: *c.GroupID, Valid: true}
 	}
 
-	var nextHead int
-	switch {
-	case c.Pinned:
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 1
-		`, c.AssistantID).Scan(&nextHead); err != nil {
-			return domain.Conversation{}, fmt.Errorf("compute pinned head sort_order: %w", err)
-		}
-	case groupID.Valid:
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 0 AND group_id = ?
-		`, c.AssistantID, groupID.String).Scan(&nextHead); err != nil {
-			return domain.Conversation{}, fmt.Errorf("compute group head sort_order: %w", err)
-		}
-	default:
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 0 AND group_id IS NULL
-		`, c.AssistantID).Scan(&nextHead); err != nil {
-			return domain.Conversation{}, fmt.Errorf("compute ungrouped head sort_order: %w", err)
-		}
+	nextHead, err := nextConversationHeadSortOrder(ctx, tx, c.AssistantID, c.Pinned, groupID)
+	if err != nil {
+		return domain.Conversation{}, err
 	}
 	c.SortOrder = nextHead
 
@@ -182,6 +166,191 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 		return domain.Conversation{}, fmt.Errorf("commit create conversation tx: %w", err)
 	}
 	return s.Get(ctx, c.ID)
+}
+
+func nextConversationHeadSortOrder(ctx context.Context, tx *sql.Tx, assistantID string, pinned bool, groupID sql.NullString) (int, error) {
+	var nextHead int
+	switch {
+	case pinned:
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 1
+		`, assistantID).Scan(&nextHead); err != nil {
+			return 0, fmt.Errorf("compute pinned head sort_order: %w", err)
+		}
+	case groupID.Valid:
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 0 AND group_id = ?
+		`, assistantID, groupID.String).Scan(&nextHead); err != nil {
+			return 0, fmt.Errorf("compute group head sort_order: %w", err)
+		}
+	default:
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COALESCE(MIN(sort_order), 1) - 1 FROM conversations WHERE assistant_id = ? AND pinned = 0 AND group_id IS NULL
+		`, assistantID).Scan(&nextHead); err != nil {
+			return 0, fmt.Errorf("compute ungrouped head sort_order: %w", err)
+		}
+	}
+	return nextHead, nil
+}
+
+// ImportConversation atomically inserts or overwrites a conversation and its full message history.
+// When an existing record has newer unsynced edits and force is false, it returns ErrCodeConflict.
+func (s *ConversationStore) ImportConversation(
+	ctx context.Context,
+	conv domain.Conversation,
+	messages []domain.Message,
+	force bool,
+) (domain.Conversation, []domain.Message, error) {
+	if conv.Ephemeral {
+		return domain.Conversation{}, nil, domain.NewError(domain.ErrCodeInvalidArgument, "ephemeral conversations cannot be imported", nil)
+	}
+	now := time.Now().UTC()
+	conv.ID = strings.TrimSpace(conv.ID)
+	if conv.ID == "" {
+		conv.ID = domain.NewUUID()
+	}
+	if conv.CreatedAt.IsZero() {
+		conv.CreatedAt = now
+	}
+	if conv.UpdatedAt.IsZero() {
+		conv.UpdatedAt = conv.CreatedAt
+	}
+	conv.AssistantID = strings.TrimSpace(conv.AssistantID)
+	domain.NewConversationDefaults(&conv)
+
+	syncTime := now
+	if conv.UpdatedAt.After(syncTime) {
+		syncTime = conv.UpdatedAt
+	}
+	paramsBytes, err := json.Marshal(conv.Params)
+	if err != nil {
+		return domain.Conversation{}, nil, fmt.Errorf("encode conversation params: %w", err)
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Conversation{}, nil, fmt.Errorf("begin import conversation tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var (
+		existing domain.Conversation
+		exists   bool
+	)
+	row := tx.QueryRowContext(ctx, `
+		SELECT `+conversationSelectCols+`
+		FROM conversations c
+		WHERE c.id = ?
+	`, conv.ID)
+	existing, err = scanConversation(row)
+	switch {
+	case err == nil:
+		exists = true
+		if !force {
+			hasNewerTarget := existing.SyncState == domain.SyncStatePending ||
+				existing.LastSyncedAt == nil ||
+				existing.UpdatedAt.After(*existing.LastSyncedAt) ||
+				existing.UpdatedAt.After(conv.UpdatedAt)
+			if hasNewerTarget {
+				return domain.Conversation{}, nil, domain.NewError(domain.ErrCodeConflict, "target conversation has newer unsynced changes", nil)
+			}
+		}
+	case errors.Is(err, sql.ErrNoRows):
+	default:
+		return domain.Conversation{}, nil, fmt.Errorf("lookup import conversation %s: %w", conv.ID, err)
+	}
+
+	var groupArg sql.NullString
+	if conv.GroupID != nil && strings.TrimSpace(*conv.GroupID) != "" {
+		gid := strings.TrimSpace(*conv.GroupID)
+		var present int
+		gErr := tx.QueryRowContext(ctx, `
+			SELECT 1 FROM conversation_groups WHERE id = ? AND assistant_id = ?
+		`, gid, conv.AssistantID).Scan(&present)
+		switch {
+		case gErr == nil:
+			groupArg = sql.NullString{String: gid, Valid: true}
+		case errors.Is(gErr, sql.ErrNoRows):
+			conv.GroupID = nil
+		default:
+			return domain.Conversation{}, nil, fmt.Errorf("verify import group %s: %w", gid, gErr)
+		}
+	} else {
+		conv.GroupID = nil
+	}
+
+	syncVersion := conv.SyncVersion
+	if exists && existing.SyncVersion > syncVersion {
+		syncVersion = existing.SyncVersion
+	}
+	syncVersion++
+
+	if exists {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE conversations
+			SET assistant_id = ?, title = ?, provider_id = ?, model_id = ?, system_prompt = ?, params_json = ?,
+				sync_enabled = ?, sync_state = ?, sync_version = ?, last_synced_at = ?,
+				created_at = ?, updated_at = ?, group_id = ?, pinned = ?, ephemeral = 0
+			WHERE id = ?
+		`, conv.AssistantID, conv.Title, conv.ProviderID, conv.ModelID, conv.SystemPrompt, string(paramsBytes),
+			boolToInt(conv.SyncEnabled), domain.SyncStateSynced, syncVersion, formatTime(syncTime),
+			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), conv.ID); err != nil {
+			return domain.Conversation{}, nil, fmt.Errorf("update imported conversation %s: %w", conv.ID, err)
+		}
+	} else {
+		nextHead, err := nextConversationHeadSortOrder(ctx, tx, conv.AssistantID, conv.Pinned, groupArg)
+		if err != nil {
+			return domain.Conversation{}, nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO conversations (
+				id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
+				sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at,
+				group_id, pinned, sort_order, ephemeral
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+		`, conv.ID, conv.AssistantID, conv.Title, conv.ProviderID, conv.ModelID, conv.SystemPrompt, string(paramsBytes),
+			boolToInt(conv.SyncEnabled), domain.SyncStateSynced, syncVersion, formatTime(syncTime),
+			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), nextHead); err != nil {
+			return domain.Conversation{}, nil, fmt.Errorf("insert imported conversation %s: %w", conv.ID, err)
+		}
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ?`, conv.ID); err != nil {
+		return domain.Conversation{}, nil, fmt.Errorf("clear imported conversation messages %s: %w", conv.ID, err)
+	}
+	for i, m := range messages {
+		if strings.TrimSpace(m.ID) == "" {
+			m.ID = domain.NewUUID()
+		}
+		if m.CreatedAt.IsZero() {
+			m.CreatedAt = conv.CreatedAt.Add(time.Duration(i) * time.Microsecond)
+		}
+		blocksJSON, usageJSON, err := encodeMessagePayloads(m.Blocks, m.Usage)
+		if err != nil {
+			return domain.Conversation{}, nil, err
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO messages (
+				id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, m.ID, conv.ID, m.Role, blocksJSON, m.ProviderID, m.ModelID, usageJSON, m.StopReason, m.ErrorMessage, formatTime(m.CreatedAt)); err != nil {
+			return domain.Conversation{}, nil, fmt.Errorf("insert imported message %s: %w", m.ID, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return domain.Conversation{}, nil, fmt.Errorf("commit import conversation tx: %w", err)
+	}
+
+	savedConv, err := s.Get(ctx, conv.ID)
+	if err != nil {
+		return domain.Conversation{}, nil, err
+	}
+	savedMsgs, err := NewMessageStore(s.db).ListByConversation(ctx, conv.ID)
+	if err != nil {
+		return domain.Conversation{}, nil, err
+	}
+	return savedConv, savedMsgs, nil
 }
 
 // Update persists mutable conversation settings including the reserved sync_enabled flag,

@@ -279,6 +279,68 @@ export interface ConversationGroup {
   createdAt: string;
 }
 
+export type TopicScope = 'local' | 'cloud';
+
+export type DesktopDataMode = 'portable' | 'installed';
+
+export type CloudConnectionState =
+  | 'checking'
+  | 'connected'
+  | 'disconnected'
+  | 'auth-required'
+  | 'error';
+
+export interface DesktopStatus {
+  mode: DesktopDataMode | string;
+  dataDir: string;
+  dbPath: string;
+  cloudConfigured: boolean;
+  cloudState: CloudConnectionState | string;
+  gatewayBaseUrl: string;
+  tokenSet: boolean;
+  authRequired: boolean;
+  version: string;
+}
+
+export interface DesktopConnectionConfig {
+  gatewayBaseUrl: string;
+  accessToken?: string;
+  tokenSet: boolean;
+  updatedAt?: string;
+}
+
+export interface DesktopConnectionTestResult {
+  ok: boolean;
+  authRequired: boolean;
+  latencyMs: number;
+  message: string;
+}
+
+export interface DesktopStorageUsage extends StorageUsage {
+  mode: DesktopDataMode | string;
+  dataDir: string;
+  conversationCount: number;
+  messageCount: number;
+}
+
+export interface ConversationTransferResult {
+  conversation: Conversation;
+  messages: Message[];
+}
+
+export interface BatchTransferItemError {
+  id: string;
+  code: string;
+  message: string;
+  conflict?: boolean;
+}
+
+export interface BatchTransferResult {
+  direction: 'upload' | 'pull';
+  succeeded: string[];
+  failed: BatchTransferItemError[];
+}
+
 export interface Conversation {
   id: string;
   assistantId: string;
@@ -291,6 +353,7 @@ export interface Conversation {
   pinned?: boolean;
   sortOrder?: number;
   ephemeral?: boolean;
+  scope?: TopicScope;
   syncEnabled: boolean;
   syncState: string;
   syncVersion: number;

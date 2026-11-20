@@ -40,6 +40,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("GET /api/v1/providers", ph.List)
 		mux.HandleFunc("POST /api/v1/providers", ph.Create)
 		mux.HandleFunc("POST /api/v1/providers/reorder", ph.Reorder)
+		mux.HandleFunc("GET /api/v1/providers/{id}/credential", ph.GetCredential)
 		mux.HandleFunc("PUT /api/v1/providers/{id}", ph.Update)
 		mux.HandleFunc("DELETE /api/v1/providers/{id}", ph.Delete)
 		mux.HandleFunc("POST /api/v1/providers/{id}/test", ph.TestConnection)
@@ -62,6 +63,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("DELETE /api/v1/conversation-groups/{id}", ch.DeleteGroup)
 		mux.HandleFunc("GET /api/v1/conversations", ch.List)
 		mux.HandleFunc("POST /api/v1/conversations", ch.Create)
+		mux.HandleFunc("POST /api/v1/conversations/import", ch.Import)
 		mux.HandleFunc("POST /api/v1/conversations/batch", ch.Batch)
 		mux.HandleFunc("POST /api/v1/conversations/cleanup-ungrouped", ch.CleanupUngrouped)
 		mux.HandleFunc("POST /api/v1/conversations/reorder", ch.Reorder)
@@ -74,8 +76,9 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("POST /api/v1/conversations/{id}/messages/{messageId}/branch", ch.BranchFromMessage)
 	}
 	if deps.PluginService != nil {
-		plh := NewPluginHandler(deps.PluginService)
+		plh := NewPluginHandler(deps.PluginService).WithChatService(deps.ChatService)
 		mux.HandleFunc("GET /api/v1/plugins/search", plh.ListSearchEngines)
+		mux.HandleFunc("GET /api/v1/plugins/search/{id}/credential", plh.GetSearchEngineCredential)
 		mux.HandleFunc("PUT /api/v1/plugins/search/{id}", plh.UpdateSearchEngine)
 		mux.HandleFunc("POST /api/v1/plugins/search/{id}/test", plh.TestSearchEngine)
 		mux.HandleFunc("GET /api/v1/mcp/servers", plh.ListMCPServers)
@@ -84,6 +87,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("DELETE /api/v1/mcp/servers/{id}", plh.DeleteMCPServer)
 		mux.HandleFunc("GET /api/v1/mcp/servers/{id}/tools", plh.ListMCPServerTools)
 		mux.HandleFunc("POST /api/v1/mcp/servers/{id}/test", plh.TestMCPServer)
+		mux.HandleFunc("POST /api/v1/mcp/tools/execute", plh.ExecuteMCPTools)
 	}
 	if deps.PreferenceService != nil {
 		prefHandler := NewPreferenceHandler(deps.PreferenceService)

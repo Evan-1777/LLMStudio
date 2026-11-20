@@ -5,22 +5,30 @@ import {
   useState,
   type FormEvent,
 } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import {
   Button,
   ConfirmDialog,
   Dropdown,
   DropdownItem,
+  EmptyState,
   ErrorBanner,
   Field,
   Icon,
   IconButton,
   Input,
   Modal,
+  SegmentedControl,
 } from '../../components/ui';
 import { useRowDrag } from '../../components/ui/useRowDrag';
 import { GatewayError } from '../../core/gateway';
-import type { Conversation, ConversationGroup } from '../../core/types';
+import type {
+  CloudConnectionState,
+  Conversation,
+  ConversationGroup,
+  TopicScope,
+} from '../../core/types';
 import {
   SessionInspector,
   type DraftSessionParams,
@@ -30,6 +38,42 @@ function formatShortTime(iso: string): string {
   const dt = new Date(iso);
   if (Number.isNaN(dt.getTime())) return '';
   return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function cloudDotClass(state: CloudConnectionState): string {
+  switch (state) {
+    case 'connected':
+      return '';
+    case 'checking':
+    case 'auth-required':
+      return 'wb-status-dot--warn';
+    case 'error':
+      return 'wb-status-dot--error';
+    case 'disconnected':
+      return 'wb-status-dot--muted';
+  }
+}
+
+function cloudStatusLabel(state: CloudConnectionState): string {
+  switch (state) {
+    case 'connected':
+      return '云端在线';
+    case 'checking':
+      return '连接中';
+    case 'auth-required':
+      return '云端需令牌';
+    case 'error':
+      return '云端异常';
+    case 'disconnected':
+      return '云端离线';
+  }
+}
+
+function isConflictError(err: unknown): boolean {
+  return (
+    err instanceof GatewayError &&
+    (err.statusCode === 409 || err.code === 'CONFLICT')
+  );
 }
 
 interface DropTarget {
@@ -66,6 +110,8 @@ export function ConversationSidebar({
   drawerOpen,
   manageMode,
   isBusy,
+  scope = 'cloud',
+  onScopeChange,
   onManageModeChange,
   onSelectConversation,
   onNewConversation,
@@ -88,6 +134,8 @@ export function ConversationSidebar({
   drawerOpen: boolean;
   manageMode: boolean;
   isBusy: boolean;
+  scope?: TopicScope;
+  onScopeChange?: (next: TopicScope) => void;
   onManageModeChange: (next: boolean) => void;
   onSelectConversation: (id: string) => void;
   onNewConversation: () => void;
@@ -103,13 +151,22 @@ export function ConversationSidebar({
   syncingServer?: boolean;
   onSyncServer?: () => void;
 }) {
+  const navigate = useNavigate();
   const {
     gateway,
+    isDesktop,
+    cloudConnectionState,
+    resources,
     connectionEpoch,
     upsertLocalConversation,
     applyConversationOrganizationSnapshot,
+    uploadConversations,
+    pullConversations,
     toast,
   } = useApp();
+
+  const reqScope: TopicScope | undefined = isDesktop ? scope : undefined;
+  const cloudOffline = isDesktop && scope === 'cloud' && cloudConnectionState !== 'connected';
 
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
@@ -117,6 +174,15 @@ export function ConversationSidebar({
     () => new Set(),
   );
   const [mutating, setMutating] = useState(false);
+  const [transferringIds, setTransferringIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [batchTransferring, setBatchTransferring] = useState(false);
+  const [conflictPrompt, setConflictPrompt] = useState<{
+    direction: 'upload' | 'pull';
+    ids: string[];
+  } | null>(null);
+  const [forcingConflict, setForcingConflict] = useState(false);
 
   // Conversation rename modal
   const [renamingConv, setRenamingConv] = useState<Conversation | null>(null);
@@ -155,12 +221,12 @@ export function ConversationSidebar({
   const currentEpoch = useRef(connectionEpoch);
   currentEpoch.current = connectionEpoch;
 
-  // Clear local selection & search on assistant or gateway switch.
+  // Clear local selection & search on assistant, scope, or gateway switch.
   useEffect(() => {
     setSelectedIds(new Set());
     setSearchQuery('');
     onManageModeChange(false);
-  }, [assistantId, connectionEpoch, onManageModeChange]);
+  }, [assistantId, connectionEpoch, onManageModeChange, scope]);
 
   useEffect(() => {
     setExpandedGroupIds(new Set());
@@ -280,10 +346,13 @@ export function ConversationSidebar({
     setRenaming(true);
     setRenameError(null);
     try {
-      const updated = await gateway.patchConversation(renamingConv.id, {
-        title: trimmed,
-      });
-      upsertLocalConversation(updated);
+      const updated = await gateway.patchConversation(
+        renamingConv.id,
+        { title: trimmed },
+        undefined,
+        reqScope,
+      );
+      upsertLocalConversation(updated, reqScope);
       onConversationPatched(updated);
       setRenamingConv(null);
     } catch (err) {
@@ -308,14 +377,23 @@ export function ConversationSidebar({
     try {
       const res =
         groupModalMode.kind === 'create'
-          ? await gateway.createConversationGroup({ assistantId, name: trimmed })
-          : await gateway.renameConversationGroup(groupModalMode.group.id, {
-              name: trimmed,
-            });
-      applyConversationOrganizationSnapshot(assistantId, {
-        conversations: res.conversations,
-        groups: res.groups,
-      });
+          ? await gateway.createConversationGroup(
+              { assistantId, name: trimmed },
+              undefined,
+              reqScope,
+            )
+          : await gateway.renameConversationGroup(
+              groupModalMode.group.id,
+              { name: trimmed },
+              undefined,
+              reqScope,
+            );
+      applyConversationOrganizationSnapshot(
+        assistantId,
+        { conversations: res.conversations, groups: res.groups },
+        undefined,
+        reqScope,
+      );
       setGroupModalMode(null);
     } catch (err) {
       setGroupFormError(
@@ -330,11 +408,17 @@ export function ConversationSidebar({
     if (!deletingGroup) return;
     setDeletingGroupBusy(true);
     try {
-      const res = await gateway.deleteConversationGroup(deletingGroup.id);
-      applyConversationOrganizationSnapshot(assistantId, {
-        conversations: res.conversations,
-        groups: res.groups,
-      });
+      const res = await gateway.deleteConversationGroup(
+        deletingGroup.id,
+        undefined,
+        reqScope,
+      );
+      applyConversationOrganizationSnapshot(
+        assistantId,
+        { conversations: res.conversations, groups: res.groups },
+        undefined,
+        reqScope,
+      );
       setDeletingGroup(null);
       toast('分组已删除，话题已移至未分组');
     } catch (err) {
@@ -349,15 +433,21 @@ export function ConversationSidebar({
     const ids = deletingConvs.map((c) => c.id);
     setDeleting(true);
     try {
-      const snap = await gateway.batchConversations({
+      const snap = await gateway.batchConversations(
+        {
+          assistantId,
+          ids,
+          operation: 'delete',
+        },
+        undefined,
+        reqScope,
+      );
+      applyConversationOrganizationSnapshot(
         assistantId,
-        ids,
-        operation: 'delete',
-      });
-      applyConversationOrganizationSnapshot(assistantId, {
-        conversations: snap.conversations,
-        groups: snap.groups,
-      });
+        { conversations: snap.conversations, groups: snap.groups },
+        undefined,
+        reqScope,
+      );
       setSelectedIds((prev) => {
         const next = new Set(prev);
         for (const id of ids) next.delete(id);
@@ -377,16 +467,22 @@ export function ConversationSidebar({
     if (ids.length === 0 || mutating) return;
     setMutating(true);
     try {
-      const snap = await gateway.batchConversations({
+      const snap = await gateway.batchConversations(
+        {
+          assistantId,
+          ids,
+          operation: 'pin',
+          pinned,
+        },
+        undefined,
+        reqScope,
+      );
+      applyConversationOrganizationSnapshot(
         assistantId,
-        ids,
-        operation: 'pin',
-        pinned,
-      });
-      applyConversationOrganizationSnapshot(assistantId, {
-        conversations: snap.conversations,
-        groups: snap.groups,
-      });
+        { conversations: snap.conversations, groups: snap.groups },
+        undefined,
+        reqScope,
+      );
     } catch (err) {
       toast(err instanceof GatewayError ? err.message : '置顶操作失败', 'error');
     } finally {
@@ -404,16 +500,22 @@ export function ConversationSidebar({
     if (!moveTargetIds || moveTargetIds.length === 0) return;
     setMovingBusy(true);
     try {
-      const snap = await gateway.batchConversations({
+      const snap = await gateway.batchConversations(
+        {
+          assistantId,
+          ids: moveTargetIds,
+          operation: 'move',
+          groupId: selectedMoveGroupId ?? null,
+        },
+        undefined,
+        reqScope,
+      );
+      applyConversationOrganizationSnapshot(
         assistantId,
-        ids: moveTargetIds,
-        operation: 'move',
-        groupId: selectedMoveGroupId ?? null,
-      });
-      applyConversationOrganizationSnapshot(assistantId, {
-        conversations: snap.conversations,
-        groups: snap.groups,
-      });
+        { conversations: snap.conversations, groups: snap.groups },
+        undefined,
+        reqScope,
+      );
       setMoveTargetIds(null);
     } catch (err) {
       toast(err instanceof GatewayError ? err.message : '移动分组失败', 'error');
@@ -430,7 +532,7 @@ export function ConversationSidebar({
     setMutating(true);
     try {
       const snap = await request();
-      applyConversationOrganizationSnapshot(assistantId, snap, connectionEpoch);
+      applyConversationOrganizationSnapshot(assistantId, snap, connectionEpoch, reqScope);
     } catch (err) {
       if (connectionEpoch === currentEpoch.current) {
         toast(err instanceof GatewayError ? err.message : '排序保存失败', 'error');
@@ -450,18 +552,131 @@ export function ConversationSidebar({
       const i = items.findIndex((c) => c.id === conv.id);
       if (i < 0 || (items[i + 1]?.id ?? null) === target.beforeId) return;
     }
-    return runReorder(() => gateway.reorderConversations({
-      assistantId,
-      ids: [conv.id],
-      ...(target.pinned ? { pinned: true } : { pinned: false, groupId: target.groupId }),
-      beforeId: target.beforeId,
-    }));
+    return runReorder(() =>
+      gateway.reorderConversations(
+        {
+          assistantId,
+          ids: [conv.id],
+          ...(target.pinned ? { pinned: true } : { pinned: false, groupId: target.groupId }),
+          beforeId: target.beforeId,
+        },
+        undefined,
+        reqScope,
+      ),
+    );
   };
 
   const moveGroup = (id: string, beforeId: string | null) => {
     const i = sortedGroups.findIndex((g) => g.id === id);
     if (i < 0 || (sortedGroups[i + 1]?.id ?? null) === beforeId) return;
-    return runReorder(() => gateway.reorderConversationGroup({ assistantId, id, beforeId }));
+    return runReorder(() =>
+      gateway.reorderConversationGroup({ assistantId, id, beforeId }, undefined, reqScope),
+    );
+  };
+
+  const handleSingleTransfer = async (
+    direction: 'upload' | 'pull',
+    conv: Conversation,
+  ) => {
+    if (transferringIds.has(conv.id) || batchTransferring) return;
+    setTransferringIds((prev) => new Set(prev).add(conv.id));
+    try {
+      if (direction === 'upload') {
+        await uploadConversations([conv.id], false);
+        toast('已上传至云端');
+      } else {
+        await pullConversations([conv.id], false);
+        toast('已拉取至本地');
+      }
+    } catch (err) {
+      if (isConflictError(err)) {
+        setConflictPrompt({ direction, ids: [conv.id] });
+      } else {
+        toast(err instanceof GatewayError ? err.message : '传输失败', 'error');
+      }
+    } finally {
+      setTransferringIds((prev) => {
+        const next = new Set(prev);
+        next.delete(conv.id);
+        return next;
+      });
+    }
+  };
+
+  const handleBatchTransfer = async () => {
+    const ids = Array.from(selectedIds);
+    if (ids.length === 0 || batchTransferring) return;
+    const direction: 'upload' | 'pull' = scope === 'local' ? 'upload' : 'pull';
+    setBatchTransferring(true);
+    try {
+      const result =
+        direction === 'upload'
+          ? await uploadConversations(ids, false)
+          : await pullConversations(ids, false);
+      if ('succeeded' in result) {
+        const conflicts = result.failed.filter(
+          (item) => item.conflict || item.code === 'CONFLICT',
+        );
+        const nonConflicts = result.failed.filter(
+          (item) => !(item.conflict || item.code === 'CONFLICT'),
+        );
+        if (result.succeeded.length > 0 && conflicts.length === 0 && nonConflicts.length === 0) {
+          toast(
+            direction === 'upload'
+              ? `已上传 ${result.succeeded.length} 个话题`
+              : `已拉取 ${result.succeeded.length} 个话题`,
+          );
+          onManageModeChange(false);
+        } else if (nonConflicts.length > 0) {
+          toast(nonConflicts[0].message || '部分话题传输失败', 'error');
+        }
+        if (conflicts.length > 0) {
+          setConflictPrompt({ direction, ids: conflicts.map((c) => c.id) });
+        }
+      } else {
+        toast(direction === 'upload' ? '已上传至云端' : '已拉取至本地');
+        onManageModeChange(false);
+      }
+    } catch (err) {
+      if (isConflictError(err)) {
+        setConflictPrompt({ direction, ids });
+      } else {
+        toast(err instanceof GatewayError ? err.message : '批量传输失败', 'error');
+      }
+    } finally {
+      setBatchTransferring(false);
+    }
+  };
+
+  const handleConfirmConflictForce = async () => {
+    if (!conflictPrompt || forcingConflict) return;
+    const { direction, ids } = conflictPrompt;
+    setForcingConflict(true);
+    try {
+      const result =
+        direction === 'upload'
+          ? await uploadConversations(ids, true)
+          : await pullConversations(ids, true);
+      if ('succeeded' in result) {
+        if (result.failed.length > 0) {
+          toast(result.failed[0].message || '覆盖失败', 'error');
+        } else {
+          toast(
+            direction === 'upload'
+              ? `已覆盖云端 ${result.succeeded.length} 个话题`
+              : `已覆盖本地 ${result.succeeded.length} 个话题`,
+          );
+        }
+      } else {
+        toast(direction === 'upload' ? '已覆盖云端话题' : '已覆盖本地话题');
+      }
+      setConflictPrompt(null);
+      if (manageMode) onManageModeChange(false);
+    } catch (err) {
+      toast(err instanceof GatewayError ? err.message : '覆盖失败', 'error');
+    } finally {
+      setForcingConflict(false);
+    }
   };
 
   const handleStepMove = (conv: Conversation, direction: 'up' | 'down') => {
@@ -636,9 +851,10 @@ export function ConversationSidebar({
             conversation={activeConversation}
             draftParams={draftSessionParams}
             isBusy={isBusy}
+            scope={reqScope}
             onClose={onCloseInspector}
             onSaved={(updated) => {
-              upsertLocalConversation(updated);
+              upsertLocalConversation(updated, reqScope);
               onConversationPatched(updated);
             }}
             onSaveDraft={onSaveDraftSessionParams}
@@ -652,7 +868,7 @@ export function ConversationSidebar({
                   size="sm"
                   icon="folderPlus"
                   label="新建分组"
-                  disabled={mutating}
+                  disabled={mutating || cloudOffline}
                   onClick={() => {
                     setGroupNameInput('');
                     setGroupFormError(null);
@@ -664,12 +880,14 @@ export function ConversationSidebar({
                   icon="checkSquare"
                   label={manageMode ? '退出管理' : '管理话题'}
                   active={manageMode}
+                  disabled={cloudOffline}
                   onClick={() => onManageModeChange(!manageMode)}
                 />
                 <IconButton
                   size="sm"
                   icon="plus"
                   label="新建话题"
+                  disabled={cloudOffline}
                   onClick={onNewConversation}
                 />
                 {drawerOpen ? (
@@ -685,19 +903,64 @@ export function ConversationSidebar({
             </div>
 
             <div className="wb-history__body">
-              <div className="wb-search-wrap">
-                <Icon name="search" size={14} className="wb-search-icon" />
-                <input
-                  type="search"
-                  className="wb-search-input"
-                  aria-label="搜索话题"
-                  placeholder="搜索话题"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                />
-              </div>
+              {isDesktop ? (
+                <div className="wb-scope-switch">
+                  <SegmentedControl<TopicScope>
+                    ariaLabel="话题存储域"
+                    value={scope}
+                    onChange={(next) => onScopeChange?.(next)}
+                    options={[
+                      {
+                        value: 'local',
+                        ariaLabel: '本地话题',
+                        title: '本地话题',
+                        label: (
+                          <>
+                            <Icon name="hardDrive" size={14} />
+                            {resources.localConversations.length > 0 ? (
+                              <span className="wb-scope-count">
+                                {resources.localConversations.length}
+                              </span>
+                            ) : null}
+                          </>
+                        ),
+                      },
+                      {
+                        value: 'cloud',
+                        ariaLabel: '云端话题',
+                        title: '云端话题',
+                        label: (
+                          <>
+                            <Icon name="cloud" size={14} />
+                            {cloudConnectionState === 'connected' &&
+                            resources.cloudConversations.length > 0 ? (
+                              <span className="wb-scope-count">
+                                {resources.cloudConversations.length}
+                              </span>
+                            ) : null}
+                          </>
+                        ),
+                      },
+                    ]}
+                  />
+                </div>
+              ) : null}
 
-            {manageMode ? (
+              {!cloudOffline ? (
+                <div className="wb-search-wrap">
+                  <Icon name="search" size={14} className="wb-search-icon" />
+                  <input
+                    type="search"
+                    className="wb-search-input"
+                    aria-label="搜索话题"
+                    placeholder="搜索话题"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                </div>
+              ) : null}
+
+            {manageMode && !cloudOffline ? (
               <div className="wb-manage-bar" role="region" aria-label="批量管理">
                 <span className="wb-manage-bar__count">
                   <span aria-hidden="true">{selectedIds.size}</span>
@@ -712,6 +975,20 @@ export function ConversationSidebar({
                     disabled={visibleFilteredIds.length === 0 || mutating}
                     onClick={toggleSelectAllFiltered}
                   />
+                  {isDesktop ? (
+                    <IconButton
+                      size="sm"
+                      icon={scope === 'local' ? 'cloudUpload' : 'cloudDownload'}
+                      label={scope === 'local' ? '批量上传至云端' : '批量拉取至本地'}
+                      loading={batchTransferring}
+                      disabled={
+                        selectedIds.size === 0 ||
+                        mutating ||
+                        cloudConnectionState !== 'connected'
+                      }
+                      onClick={() => void handleBatchTransfer()}
+                    />
+                  ) : null}
                   <IconButton
                     size="sm"
                     icon="folder"
@@ -770,7 +1047,23 @@ export function ConversationSidebar({
             ) : null}
 
             <div className="wb-topic-groups" ref={listContainerRef}>
-              {conversations.length === 0 && sortedGroups.length === 0 ? (
+              {cloudOffline ? (
+                <div className="wb-scope-empty">
+                  <EmptyState
+                    icon="cloud"
+                    title="未连接云端"
+                    action={
+                      <Button
+                        variant="primary"
+                        size="sm"
+                        onClick={() => navigate('/settings/connection')}
+                      >
+                        连接云端
+                      </Button>
+                    }
+                  />
+                </div>
+              ) : conversations.length === 0 && sortedGroups.length === 0 ? (
                 <div className="wb-topic-empty">暂无话题</div>
               ) : isSearching && filtered.length === 0 ? (
                 <div className="wb-topic-empty">无匹配话题</div>
@@ -997,6 +1290,13 @@ export function ConversationSidebar({
                                           conv.updatedAt || conv.createdAt,
                                         )}
                                       </span>
+                                      {isDesktop && conv.syncState === 'synced' ? (
+                                        <span
+                                          className="wb-topic-sync-dot"
+                                          aria-label="已同步"
+                                          title="已同步"
+                                        />
+                                      ) : null}
                                       {pinnedGroupName ? (
                                         <span className="wb-topic-row__group-tag">
                                           {pinnedGroupName}
@@ -1010,6 +1310,33 @@ export function ConversationSidebar({
                                       className="wb-topic-row__actions"
                                       onClick={(e) => e.stopPropagation()}
                                     >
+                                      {isDesktop && !conv.ephemeral ? (
+                                        <IconButton
+                                          size="sm"
+                                          icon={
+                                            scope === 'local'
+                                              ? 'cloudUpload'
+                                              : 'cloudDownload'
+                                          }
+                                          label={
+                                            scope === 'local'
+                                              ? '上传至云端'
+                                              : '拉取至本地'
+                                          }
+                                          loading={transferringIds.has(conv.id)}
+                                          disabled={
+                                            mutating ||
+                                            batchTransferring ||
+                                            cloudConnectionState !== 'connected'
+                                          }
+                                          onClick={() =>
+                                            void handleSingleTransfer(
+                                              scope === 'local' ? 'upload' : 'pull',
+                                              conv,
+                                            )
+                                          }
+                                        />
+                                      ) : null}
                                       <Dropdown
                                         align="end"
                                         trigger={
@@ -1021,6 +1348,35 @@ export function ConversationSidebar({
                                           />
                                         }
                                       >
+                                        {isDesktop && !conv.ephemeral ? (
+                                          <DropdownItem
+                                            disabled={
+                                              cloudConnectionState !== 'connected' ||
+                                              transferringIds.has(conv.id) ||
+                                              batchTransferring
+                                            }
+                                            onSelect={() =>
+                                              void handleSingleTransfer(
+                                                scope === 'local' ? 'upload' : 'pull',
+                                                conv,
+                                              )
+                                            }
+                                          >
+                                            <Icon
+                                              name={
+                                                scope === 'local'
+                                                  ? 'cloudUpload'
+                                                  : 'cloudDownload'
+                                              }
+                                              size={14}
+                                            />
+                                            <span>
+                                              {scope === 'local'
+                                                ? '上传至云端'
+                                                : '拉取至本地'}
+                                            </span>
+                                          </DropdownItem>
+                                        ) : null}
                                         <DropdownItem
                                           onSelect={() => openRename(conv)}
                                         >
@@ -1095,28 +1451,59 @@ export function ConversationSidebar({
               </div>
             </div>
             <div className="wb-history__foot">
-              <button
-                type="button"
-                className="wb-sync-bar"
-                aria-label="刷新服务端数据"
-                title="从服务端刷新最新数据"
-                aria-busy={syncingServer || undefined}
-                disabled={Boolean(syncingServer || isBusy)}
-                onClick={() => onSyncServer?.()}
-              >
-                <Icon
-                  name="refresh"
-                  size={13}
-                  className={syncingServer ? 'wb-spin' : undefined}
-                />
-                <span>
-                  {syncingServer
-                    ? '同步中…'
-                    : lastSyncedAt
-                      ? `${formatShortTime(lastSyncedAt)} 已同步`
-                      : '同步服务端'}
-                </span>
-              </button>
+              {isDesktop ? (
+                <div className="wb-foot-status">
+                  <button
+                    type="button"
+                    className="wb-foot-status__cloud"
+                    onClick={() => navigate('/settings/connection')}
+                    title={
+                      cloudConnectionState === 'connected'
+                        ? '云端连接设置'
+                        : '前往连接云端'
+                    }
+                  >
+                    <span
+                      className={`wb-status-dot ${cloudDotClass(cloudConnectionState)}`.trim()}
+                      aria-hidden="true"
+                    />
+                    <span className="wb-foot-status__label">
+                      {cloudStatusLabel(cloudConnectionState)}
+                    </span>
+                  </button>
+                  <IconButton
+                    size="sm"
+                    icon="refresh"
+                    label="刷新数据"
+                    loading={Boolean(syncingServer)}
+                    disabled={Boolean(syncingServer || isBusy)}
+                    onClick={() => onSyncServer?.()}
+                  />
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="wb-sync-bar"
+                  aria-label="刷新服务端数据"
+                  title="从服务端刷新最新数据"
+                  aria-busy={syncingServer || undefined}
+                  disabled={Boolean(syncingServer || isBusy)}
+                  onClick={() => onSyncServer?.()}
+                >
+                  <Icon
+                    name="refresh"
+                    size={13}
+                    className={syncingServer ? 'wb-spin' : undefined}
+                  />
+                  <span>
+                    {syncingServer
+                      ? '同步中…'
+                      : lastSyncedAt
+                        ? `${formatShortTime(lastSyncedAt)} 已同步`
+                        : '同步服务端'}
+                  </span>
+                </button>
+              )}
             </div>
           </>
         )}
@@ -1311,6 +1698,24 @@ export function ConversationSidebar({
         confirmLabel="删除"
         busy={deletingGroupBusy}
         onConfirm={handleDeleteGroupConfirm}
+      />
+
+      {/* Conflict Transfer Confirm */}
+      <ConfirmDialog
+        open={conflictPrompt !== null}
+        onOpenChange={(open) => {
+          if (!open && !forcingConflict) setConflictPrompt(null);
+        }}
+        title={
+          conflictPrompt?.direction === 'upload'
+            ? '覆盖云端话题？'
+            : '覆盖本地话题？'
+        }
+        message="目标端存在较新未同步更改。确认覆盖将继续传输；话题分组不跨端迁移，覆盖后将落入目标端未分组（保留置顶状态）。"
+        confirmLabel="覆盖"
+        danger={false}
+        busy={forcingConflict}
+        onConfirm={handleConfirmConflictForce}
       />
     </>
   );

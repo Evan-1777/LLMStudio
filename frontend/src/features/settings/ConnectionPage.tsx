@@ -12,6 +12,11 @@ import { validateGatewayUrl } from '../../core/gateway';
 
 export function ConnectionPage() {
   const {
+    gateway,
+    isDesktop,
+    desktopStatus,
+    cloudConnectionState,
+    connectionEpoch,
     settings,
     settingsNotice,
     dismissSettingsNotice,
@@ -20,12 +25,23 @@ export function ConnectionPage() {
     connectionError,
     saveConnection,
     testGatewayConnection,
+    disconnectDesktopCloud,
     registerDirtyGuard,
     toast,
   } = useApp();
 
-  const [gatewayUrl, setGatewayUrl] = useState(settings.gatewayBaseUrl);
-  const [accessToken, setAccessToken] = useState(settings.accessToken);
+  const [savedDesktopUrl, setSavedDesktopUrl] = useState(
+    desktopStatus?.gatewayBaseUrl ?? '',
+  );
+  const [tokenSet, setTokenSet] = useState(
+    Boolean(desktopStatus?.tokenSet),
+  );
+  const [gatewayUrl, setGatewayUrl] = useState(
+    isDesktop ? (desktopStatus?.gatewayBaseUrl ?? '') : settings.gatewayBaseUrl,
+  );
+  const [accessToken, setAccessToken] = useState(
+    isDesktop ? '' : settings.accessToken,
+  );
   const [showToken, setShowToken] = useState(false);
 
   const [urlError, setUrlError] = useState<string | null>(null);
@@ -35,15 +51,38 @@ export function ConnectionPage() {
   } | null>(null);
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
 
   // Reset the draft only when the persisted connection actually changes, so the
   // mount-time effect cannot overwrite edits typed before React flushes effects.
   const syncedConnectionRef = useRef({
-    gatewayBaseUrl: settings.gatewayBaseUrl,
-    accessToken: settings.accessToken,
+    gatewayBaseUrl: isDesktop
+      ? (desktopStatus?.gatewayBaseUrl ?? '')
+      : settings.gatewayBaseUrl,
+    accessToken: isDesktop ? '' : settings.accessToken,
   });
 
   useEffect(() => {
+    if (isDesktop) {
+      let alive = true;
+      void gateway
+        .getDesktopConnection()
+        .then((conn) => {
+          if (!alive) return;
+          setSavedDesktopUrl(conn.gatewayBaseUrl);
+          setTokenSet(Boolean(conn.tokenSet));
+          syncedConnectionRef.current = {
+            gatewayBaseUrl: conn.gatewayBaseUrl,
+            accessToken: '',
+          };
+          setGatewayUrl(conn.gatewayBaseUrl);
+          setAccessToken('');
+        })
+        .catch(() => {});
+      return () => {
+        alive = false;
+      };
+    }
     const { gatewayBaseUrl, accessToken } = settings;
     const synced = syncedConnectionRef.current;
     if (
@@ -55,12 +94,19 @@ export function ConnectionPage() {
     syncedConnectionRef.current = { gatewayBaseUrl, accessToken };
     setGatewayUrl(gatewayBaseUrl);
     setAccessToken(accessToken);
-  }, [settings.accessToken, settings.gatewayBaseUrl]);
+  }, [
+    connectionEpoch,
+    gateway,
+    isDesktop,
+    settings.accessToken,
+    settings.gatewayBaseUrl,
+  ]);
 
-  const normalizedUrl = gatewayUrl.trim() || '/';
-  const isDirty =
-    normalizedUrl !== settings.gatewayBaseUrl ||
-    accessToken.trim() !== settings.accessToken;
+  const normalizedUrl = isDesktop ? gatewayUrl.trim() : gatewayUrl.trim() || '/';
+  const isDirty = isDesktop
+    ? normalizedUrl !== savedDesktopUrl || accessToken.trim() !== ''
+    : normalizedUrl !== settings.gatewayBaseUrl ||
+      accessToken.trim() !== settings.accessToken;
 
   const isDirtyRef = useRef(isDirty);
   isDirtyRef.current = isDirty;
@@ -70,8 +116,15 @@ export function ConnectionPage() {
     return () => registerDirtyGuard(null);
   }, [registerDirtyGuard]);
 
+  const validateDraftUrl = (raw: string): string | null => {
+    if (isDesktop && (!raw || raw === '/')) {
+      return '请输入完整的云端网关地址（如 https://example.com）';
+    }
+    return validateGatewayUrl(raw);
+  };
+
   const handleTest = async () => {
-    const err = validateGatewayUrl(normalizedUrl);
+    const err = validateDraftUrl(normalizedUrl);
     setUrlError(err);
     if (err) return;
 
@@ -103,7 +156,7 @@ export function ConnectionPage() {
 
   const handleSave = async (e: FormEvent) => {
     e.preventDefault();
-    const err = validateGatewayUrl(normalizedUrl);
+    const err = validateDraftUrl(normalizedUrl);
     setUrlError(err);
     if (err) return;
 
@@ -118,9 +171,35 @@ export function ConnectionPage() {
         setUrlError(res.error ?? '网关地址无效');
         return;
       }
+      if (isDesktop) {
+        setSavedDesktopUrl(normalizedUrl);
+        if (accessToken.trim()) {
+          setTokenSet(true);
+          setAccessToken('');
+        }
+      }
       toast('连接已保存');
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleDisconnect = async () => {
+    if (!isDesktop || disconnecting) return;
+    setDisconnecting(true);
+    setTestResult(null);
+    setUrlError(null);
+    try {
+      await disconnectDesktopCloud();
+      setSavedDesktopUrl('');
+      setTokenSet(false);
+      setGatewayUrl('');
+      setAccessToken('');
+      toast('已断开云端连接');
+    } catch (err) {
+      toast(err instanceof Error ? err.message : '断开连接失败', 'error');
+    } finally {
+      setDisconnecting(false);
     }
   };
 
@@ -143,7 +222,13 @@ export function ConnectionPage() {
           />
         ) : null}
 
-        {connectionError || connectionState === 'auth-required' ? (
+        {isDesktop ? (
+          cloudConnectionState === 'auth-required' ? (
+            <ErrorBanner message="云端需要有效访问令牌" />
+          ) : cloudConnectionState === 'error' ? (
+            <ErrorBanner message="云端网关连接失败" />
+          ) : null
+        ) : connectionError || connectionState === 'auth-required' ? (
           <ErrorBanner
             message={
               connectionError || '需要有效访问令牌'
@@ -170,7 +255,7 @@ export function ConnectionPage() {
                       setGatewayUrl(e.target.value);
                       if (urlError) setUrlError(null);
                     }}
-                    placeholder="/"
+                    placeholder={isDesktop ? 'https://example.com' : '/'}
                     required
                   />
                 </Field>
@@ -187,6 +272,11 @@ export function ConnectionPage() {
                     id="conn-access-token"
                     type={showToken ? 'text' : 'password'}
                     value={accessToken}
+                    placeholder={
+                      isDesktop && tokenSet
+                        ? '已保存访问令牌（留空保持不变）'
+                        : undefined
+                    }
                     onChange={(e) => setAccessToken(e.target.value)}
                     autoComplete="off"
                   />
@@ -204,7 +294,7 @@ export function ConnectionPage() {
           <div className="st-actions-bar">
             <Button
               variant="secondary"
-              disabled={testing || saving}
+              disabled={testing || saving || disconnecting}
               onClick={() => void handleTest()}
             >
               {testing ? '测试中...' : '测试连接'}
@@ -222,7 +312,21 @@ export function ConnectionPage() {
               </span>
             ) : null}
             <span className="st-actions-bar__spacer" />
-            <Button type="submit" variant="primary" disabled={saving}>
+            {isDesktop && (tokenSet || Boolean(savedDesktopUrl)) ? (
+              <Button
+                variant="danger-ghost"
+                loading={disconnecting}
+                disabled={saving || testing}
+                onClick={() => void handleDisconnect()}
+              >
+                断开云端
+              </Button>
+            ) : null}
+            <Button
+              type="submit"
+              variant="primary"
+              disabled={saving || disconnecting}
+            >
               {saving ? '保存中...' : '保存连接'}
             </Button>
           </div>

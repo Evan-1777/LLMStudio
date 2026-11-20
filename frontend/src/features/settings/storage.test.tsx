@@ -279,5 +279,101 @@ describe('StoragePage', () => {
     expect(compactCalls).toBe(0);
     await user.click(screen.getByRole('button', { name: '压缩数据库' }));
     expect(compactCalls).toBe(1);
+    expect(screen.queryByText('本地存储')).toBeNull();
+    expect(screen.queryByRole('button', { name: '打开数据目录' })).toBeNull();
+  });
+
+  it('renders desktop local storage panel with compact, clear-cache, local cleanup, and open-dir bridge', async () => {
+    const openDirSpy = vi.fn().mockResolvedValue(undefined);
+    window.__LLMSTUDIO_DESKTOP__ = {
+      apiBaseUrl: 'http://127.0.0.1:45123',
+      sessionToken: 'desktop-tok',
+      platform: 'windows',
+      dataMode: 'portable',
+      version: '1.5.0',
+    };
+    window.mygo = { call: openDirSpy };
+
+    try {
+      const requested: string[] = [];
+      let localBytes = 16384;
+      const fetchMock = baseFetch((url, init) => {
+        const method = (init?.method ?? 'GET').toUpperCase();
+        requested.push(`${method} ${url}`);
+        if (url.endsWith('/api/v1/desktop/status')) {
+          return jsonResponse({
+            mode: 'portable',
+            dataDir: 'D:\\Portable\\data',
+            dbPath: 'D:\\Portable\\data\\llmstudio.db',
+            cloudConfigured: false,
+            cloudState: 'disconnected',
+            gatewayBaseUrl: '',
+            tokenSet: false,
+            authRequired: false,
+            version: '1.5.0',
+          });
+        }
+        if (url.endsWith('/api/v1/desktop/storage')) {
+          return jsonResponse({
+            mainBytes: localBytes,
+            walBytes: 2048,
+            totalBytes: localBytes + 2048,
+            compactable: true,
+            mode: 'portable',
+            dataDir: 'D:\\Portable\\data',
+            conversationCount: 3,
+            messageCount: 12,
+          });
+        }
+        if (url.endsWith('/api/v1/desktop/storage/compact') && method === 'POST') {
+          localBytes = 8192;
+          return jsonResponse({
+            beforeBytes: 18432,
+            afterBytes: 8192,
+            freedBytes: 10240,
+            usage: {
+              mainBytes: 8192,
+              walBytes: 0,
+              totalBytes: 8192,
+              compactable: true,
+            },
+          });
+        }
+        if (url.endsWith('/api/v1/desktop/storage/clear-cache') && method === 'POST') {
+          return jsonResponse({ cleared: true });
+        }
+        if (url.endsWith('/api/v1/desktop/storage/cleanup-ungrouped') && method === 'POST') {
+          return jsonResponse({ deleted: [{ id: 'loc-1', assistantId: 'default' }] });
+        }
+        return null;
+      });
+
+      const user = setups(fetchMock);
+      await waitFor(() => expect(screen.getByText('本地存储')).toBeInTheDocument());
+      expect(screen.getByText('便携模式')).toBeInTheDocument();
+      expect(screen.getByText('D:\\Portable\\data')).toBeInTheDocument();
+      expect(screen.getByText('3 话题 · 12 消息')).toBeInTheDocument();
+      expect(screen.getByText('云端存储')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '前往连接' })).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: '打开数据目录' }));
+      expect(openDirSpy).toHaveBeenCalledWith('DesktopBridge.OpenDataDir');
+
+      await user.click(screen.getByRole('button', { name: '压缩本地库' }));
+      expect(await screen.findByText('已释放 10.0 KB')).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: '清空缓存' }));
+      expect(await screen.findByText('缓存已清空')).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: '删除本地未分组话题' }));
+      const dlg = within(screen.getByRole('dialog', { name: '删除本地未分组话题' }));
+      await user.click(dlg.getByRole('button', { name: '删除' }));
+      expect(await screen.findByText('已删除 1 个话题')).toBeInTheDocument();
+      expect(requested.some((r) => r.includes('/api/v1/desktop/storage/cleanup-ungrouped'))).toBe(true);
+    } finally {
+      delete window.__LLMSTUDIO_DESKTOP__;
+      delete window.mygo;
+      delete document.documentElement.dataset.desktop;
+    }
   });
 });

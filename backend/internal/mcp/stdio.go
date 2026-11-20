@@ -66,6 +66,7 @@ func startStdioTransport(
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(ctx, command, server.Args...)
+	configureStdioCmd(cmd)
 	cmd.Env = buildStdioEnv(os.Environ(), server.Env)
 	cmd.WaitDelay = stdioWaitDelay
 

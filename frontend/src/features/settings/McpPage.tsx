@@ -1,16 +1,19 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import {
   Button,
   ConfirmDialog,
   EmptyState,
   ErrorBanner,
+  Icon,
   IconButton,
   Input,
   LoadingSpinner,
+  SegmentedControl,
   Switch,
 } from '../../components/ui';
-import type { MCPServerConfig, MCPServerTestResult } from '../../core/types';
+import type { MCPServerConfig, MCPServerTestResult, TopicScope } from '../../core/types';
 import { McpEditor } from './McpEditor';
 import { errorMessageOf } from './jsonValidation';
 
@@ -21,9 +24,9 @@ interface ServerProbeState {
   error?: string;
 }
 
-function catalogKey(epoch: number, s: MCPServerConfig) {
+function catalogKey(epoch: number, scope: string, s: MCPServerConfig) {
   const pairs = (values?: Record<string, string>) => Object.entries(values ?? {}).sort(([a], [b]) => a.localeCompare(b));
-  return JSON.stringify([epoch, s.id, s.transport, s.endpoint, s.command, s.args, pairs(s.env), pairs(s.headers)]);
+  return JSON.stringify([epoch, scope, s.id, s.transport, s.endpoint, s.command, s.args, pairs(s.env), pairs(s.headers)]);
 }
 
 function formatSchema(schema: unknown): string {
@@ -45,8 +48,11 @@ function summarizeTarget(server: MCPServerConfig): string {
 }
 
 export function McpPage() {
+  const navigate = useNavigate();
   const {
     gateway,
+    isDesktop,
+    cloudConnectionState,
     connectionEpoch,
     resources,
     settings: { mcpMaxToolRounds },
@@ -56,7 +62,15 @@ export function McpPage() {
     removeLocalMcpServer,
     toast,
   } = useApp();
-  const { mcpServers } = resources;
+  const [mcpScope, setMcpScope] = useState<TopicScope>('local');
+  const reqScope: TopicScope | undefined = isDesktop ? mcpScope : undefined;
+  const cloudOffline =
+    isDesktop && mcpScope === 'cloud' && cloudConnectionState !== 'connected';
+  const mcpServers = isDesktop
+    ? mcpScope === 'local'
+      ? resources.localMcpServers
+      : resources.cloudMcpServers
+    : resources.mcpServers;
   const [roundsInput, setRoundsInput] = useState(String(mcpMaxToolRounds));
   const [roundsError, setRoundsError] = useState<string | null>(null);
   const [savingRounds, setSavingRounds] = useState(false);
@@ -87,7 +101,10 @@ export function McpPage() {
 
   const [savingIds, setSavingIds] = useState<ReadonlySet<string>>(new Set());
   const pending = useRef(new Set<string>());
-  const keys = new Map(mcpServers.map((s) => [s.id, catalogKey(connectionEpoch, s)]));
+  const scopeTag = reqScope ?? 'cloud';
+  const keys = new Map(
+    mcpServers.map((s) => [s.id, catalogKey(connectionEpoch, scopeTag, s)]),
+  );
   const currentKeys = useRef(keys);
   useLayoutEffect(() => {
     currentKeys.current = keys;
@@ -98,6 +115,7 @@ export function McpPage() {
     const key = keys.get(server.id)!;
     if (pending.current.has(key)) return;
     pending.current.add(key);
+    const targetScope = reqScope;
     const update = (state: Partial<ServerProbeState>) => {
       if (currentKeys.current.get(server.id) !== key) return;
       setProbeById((prev) => ({
@@ -107,7 +125,10 @@ export function McpPage() {
     };
     update({ probing: true, error: undefined });
     try {
-      update({ probing: false, result: await gateway.testMcpServer(server.id) });
+      update({
+        probing: false,
+        result: await gateway.testMcpServer(server.id, undefined, targetScope),
+      });
     } catch (err) {
       update({ probing: false, error: errorMessageOf(err, '拉取工具失败') });
     } finally {
@@ -119,11 +140,19 @@ export function McpPage() {
     const key = keys.get(server.id)!;
     if (pending.current.has(key)) return;
     pending.current.add(key);
+    const targetScope = reqScope;
     setSavingIds((prev) => new Set(prev).add(key));
     setActionError(null);
     try {
-      const updated = await gateway.updateMcpServer(server.id, patch);
-      if (currentKeys.current.get(server.id) === key) upsertLocalMcpServer(updated);
+      const updated = await gateway.updateMcpServer(
+        server.id,
+        patch,
+        undefined,
+        targetScope,
+      );
+      if (currentKeys.current.get(server.id) === key) {
+        upsertLocalMcpServer(updated, targetScope);
+      }
     } catch (err) {
       if (currentKeys.current.get(server.id) === key) setActionError(errorMessageOf(err, '更新 MCP 配置失败'));
     } finally {
@@ -136,9 +165,10 @@ export function McpPage() {
     if (!deleteTarget) return;
     setDeleting(true);
     setActionError(null);
+    const targetScope = reqScope;
     try {
-      await gateway.deleteMcpServer(deleteTarget.id);
-      removeLocalMcpServer(deleteTarget.id);
+      await gateway.deleteMcpServer(deleteTarget.id, undefined, targetScope);
+      removeLocalMcpServer(deleteTarget.id, targetScope);
       setDeleteTarget(null);
       toast('MCP 配置已删除');
     } catch (err) {
@@ -149,7 +179,7 @@ export function McpPage() {
     }
   };
 
-  if (resources.loading.plugins && mcpServers.length === 0) {
+  if (resources.loading.plugins && mcpServers.length === 0 && !cloudOffline) {
     return (
       <div className="st-scroll">
         <LoadingSpinner label="正在加载 MCP 配置" />
@@ -161,11 +191,46 @@ export function McpPage() {
     <div className="st-scroll">
       <div className="st-container">
         <div className="st-section-head">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
             <h2 className="st-section-title">MCP 配置</h2>
             <span className="st-badge">{mcpServers.length}</span>
+            {isDesktop ? (
+              <SegmentedControl<TopicScope>
+                ariaLabel="MCP 作用域"
+                value={mcpScope}
+                onChange={(next) => {
+                  setActionError(null);
+                  setMcpScope(next);
+                  if (next === 'cloud' && cloudConnectionState === 'connected') {
+                    void refreshPlugins('cloud');
+                  }
+                }}
+                options={[
+                  {
+                    value: 'local',
+                    ariaLabel: '本地 MCP',
+                    label: (
+                      <>
+                        <Icon name="hardDrive" size={14} />
+                        <span>本地</span>
+                      </>
+                    ),
+                  },
+                  {
+                    value: 'cloud',
+                    ariaLabel: '云端 MCP',
+                    label: (
+                      <>
+                        <Icon name="cloud" size={14} />
+                        <span>云端</span>
+                      </>
+                    ),
+                  },
+                ]}
+              />
+            ) : null}
           </div>
-          {mcpServers.length > 0 ? (
+          {!cloudOffline && mcpServers.length > 0 ? (
             <IconButton
               icon="plus"
               label="添加配置"
@@ -180,7 +245,7 @@ export function McpPage() {
         {resources.error.plugins ? (
           <ErrorBanner
             message={resources.error.plugins}
-            onRetry={() => void refreshPlugins()}
+            onRetry={() => void refreshPlugins(reqScope)}
           />
         ) : null}
 
@@ -209,7 +274,22 @@ export function McpPage() {
           </div>
         </section>
 
-        {mcpServers.length === 0 ? (
+        {cloudOffline ? (
+          <div className="st-group">
+            <EmptyState
+              icon="cloud"
+              title="云端未连接"
+              action={
+                <Button
+                  variant="primary"
+                  onClick={() => navigate('/settings/connection')}
+                >
+                  前往连接
+                </Button>
+              }
+            />
+          </div>
+        ) : mcpServers.length === 0 ? (
           <div className="st-group">
             <EmptyState
               icon="wrench"
@@ -350,6 +430,7 @@ export function McpPage() {
         open={editorOpen}
         onOpenChange={setEditorOpen}
         existing={editing}
+        scope={reqScope}
       />
 
       <ConfirmDialog

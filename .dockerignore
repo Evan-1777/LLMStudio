@@ -25,3 +25,5 @@ frontend/blob-report
 frontend/e2e
 frontend/*.tsbuildinfo
 temp
+build
+.mygo

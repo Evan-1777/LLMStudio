@@ -8,6 +8,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { getDesktopBootstrap } from '../core/desktop';
 import { GatewayClient, GatewayError, validateGatewayUrl } from '../core/gateway';
 import {
   clearLegacyPreferences,
@@ -28,9 +29,13 @@ import {
 } from '../core/settings';
 import type {
   Assistant,
+  BatchTransferResult,
+  CloudConnectionState,
   Conversation,
   ConversationGroup,
+  ConversationTransferResult,
   DeletedConversation,
+  DesktopStatus,
   FormatInfo,
   HealthResponse,
   MCPServerConfig,
@@ -38,6 +43,7 @@ import type {
   ProviderConfig,
   SearchEngineView,
   ServerPreferences,
+  TopicScope,
 } from '../core/types';
 import { ConfirmDialog } from '../components/ui/Modal';
 
@@ -50,8 +56,14 @@ export interface AppResources {
   assistants: Assistant[];
   conversations: Conversation[];
   conversationGroups: ConversationGroup[];
+  localConversations: Conversation[];
+  localConversationGroups: ConversationGroup[];
+  cloudConversations: Conversation[];
+  cloudConversationGroups: ConversationGroup[];
   searchEngines: SearchEngineView[];
   mcpServers: MCPServerConfig[];
+  localMcpServers: MCPServerConfig[];
+  cloudMcpServers: MCPServerConfig[];
   loading: {
     providers: boolean;
     assistants: boolean;
@@ -68,6 +80,22 @@ export interface AppResources {
 
 export interface AppContextValue {
   gateway: GatewayClient;
+  isDesktop: boolean;
+  desktopStatus: DesktopStatus | null;
+  cloudConnectionState: CloudConnectionState;
+  topicScope: TopicScope;
+  setTopicScope: (scope: TopicScope) => void;
+  refreshDesktopStatus: () => Promise<DesktopStatus | null>;
+  disconnectDesktopCloud: () => Promise<DesktopStatus | null>;
+  uploadConversations: (
+    ids: string[],
+    force?: boolean,
+  ) => Promise<ConversationTransferResult | BatchTransferResult>;
+  pullConversations: (
+    ids: string[],
+    force?: boolean,
+  ) => Promise<ConversationTransferResult | BatchTransferResult>;
+  cleanupLocalUngrouped: () => Promise<DeletedConversation[] | null>;
   connectionEpoch: number;
   settings: AppSettings;
   resolvedTheme: 'light' | 'dark';
@@ -102,8 +130,8 @@ export interface AppContextValue {
   refreshProviders: () => Promise<boolean>;
   reorderProviders: (id: string, beforeId: string | null) => Promise<void>;
   refreshAssistants: () => Promise<boolean>;
-  refreshConversations: () => Promise<Conversation[] | null>;
-  refreshPlugins: () => Promise<boolean>;
+  refreshConversations: (scope?: TopicScope) => Promise<Conversation[] | null>;
+  refreshPlugins: (scope?: TopicScope) => Promise<boolean>;
   refreshPreferences: () => Promise<boolean>;
   refreshAll: () => Promise<void>;
   syncFromServer: () => Promise<{
@@ -113,21 +141,24 @@ export interface AppContextValue {
   }>;
   lastSyncedAt: string | null;
   syncingServer: boolean;
-  upsertLocalConversation: (conv: Conversation) => void;
-  removeLocalConversation: (id: string) => void;
-  cleanupUngroupedConversations: () => Promise<DeletedConversation[] | null>;
+  upsertLocalConversation: (conv: Conversation, scope?: TopicScope) => void;
+  removeLocalConversation: (id: string, scope?: TopicScope) => void;
+  cleanupUngroupedConversations: (
+    scope?: TopicScope,
+  ) => Promise<DeletedConversation[] | null>;
   applyConversationOrganizationSnapshot: (
     assistantId: string,
     snapshot: { conversations: Conversation[]; groups: ConversationGroup[] },
     expectedEpoch?: number,
+    scope?: TopicScope,
   ) => void;
   upsertLocalAssistant: (assistant: Assistant) => void;
   removeLocalAssistant: (id: string) => void;
   upsertLocalProvider: (provider: ProviderConfig) => void;
   removeLocalProvider: (id: string) => void;
   upsertLocalSearchEngine: (engine: SearchEngineView) => void;
-  upsertLocalMcpServer: (server: MCPServerConfig) => void;
-  removeLocalMcpServer: (id: string) => void;
+  upsertLocalMcpServer: (server: MCPServerConfig, scope?: TopicScope) => void;
+  removeLocalMcpServer: (id: string, scope?: TopicScope) => void;
   toast: (message: string, tone?: 'default' | 'error') => void;
   registerDirtyGuard: (guard: (() => boolean) | null) => void;
   confirmLeaveIfDirty: () => Promise<boolean>;
@@ -143,8 +174,14 @@ function emptyResources(): AppResources {
     assistants: [],
     conversations: [],
     conversationGroups: [],
+    localConversations: [],
+    localConversationGroups: [],
+    cloudConversations: [],
+    cloudConversationGroups: [],
     searchEngines: [],
     mcpServers: [],
+    localMcpServers: [],
+    cloudMcpServers: [],
     loading: {
       providers: false,
       assistants: false,
@@ -158,6 +195,19 @@ function emptyResources(): AppResources {
       plugins: null,
     },
   };
+}
+
+function normalizeCloudState(raw: string | undefined): CloudConnectionState {
+  switch (raw) {
+    case 'connected':
+    case 'checking':
+    case 'auth-required':
+    case 'error':
+    case 'disconnected':
+      return raw;
+    default:
+      return 'disconnected';
+  }
 }
 
 export function sortConversationsByOrg(
@@ -219,8 +269,21 @@ export function AppProvider({
   fetchImpl?: typeof fetch;
   skipInitialBootstrap?: boolean;
 }) {
+  const desktopBootstrap = useMemo(() => getDesktopBootstrap(), []);
+  const isDesktop = desktopBootstrap !== null;
+
   const initialLoad = useMemo(() => {
     const loaded = loadSettings();
+    if (desktopBootstrap) {
+      return {
+        ...loaded,
+        settings: {
+          ...loaded.settings,
+          gatewayBaseUrl: desktopBootstrap.apiBaseUrl,
+          accessToken: desktopBootstrap.sessionToken,
+        },
+      };
+    }
     // Connection info lives in its own key so the workspace can reconnect after
     // a reload without re-entering the gateway token.
     const connection = loadConnectionSettings();
@@ -228,7 +291,7 @@ export function AppProvider({
       ...loaded,
       settings: { ...loaded.settings, ...connection },
     };
-  }, []);
+  }, [desktopBootstrap]);
   const [settings, setSettings] = useState<AppSettings>(initialLoad.settings);
   const settingsRef = useRef<AppSettings>(initialLoad.settings);
   const [settingsNotice, setSettingsNotice] = useState<string | null>(
@@ -245,8 +308,22 @@ export function AppProvider({
   const activeControllersRef = useRef<Set<AbortController>>(new Set());
 
   const [connectionState, setConnectionState] = useState<ConnectionState>(
-    skipInitialBootstrap ? 'connected' : 'checking',
+    isDesktop || skipInitialBootstrap ? 'connected' : 'checking',
   );
+  const [desktopStatus, setDesktopStatus] = useState<DesktopStatus | null>(null);
+  const [cloudConnectionState, setCloudConnectionState] =
+    useState<CloudConnectionState>(isDesktop ? 'checking' : 'disconnected');
+  const cloudStateRef = useRef<CloudConnectionState>(
+    isDesktop ? 'checking' : 'disconnected',
+  );
+  cloudStateRef.current = cloudConnectionState;
+
+  const [topicScope, setTopicScopeState] = useState<TopicScope>(
+    isDesktop ? 'local' : 'cloud',
+  );
+  const topicScopeRef = useRef<TopicScope>(isDesktop ? 'local' : 'cloud');
+  topicScopeRef.current = topicScope;
+
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [gatewayHealth, setGatewayHealth] = useState<HealthResponse | null>(
     null,
@@ -271,12 +348,23 @@ export function AppProvider({
   const gatewayRef = useRef<GatewayClient | null>(null);
   if (!gatewayRef.current) {
     gatewayRef.current = new GatewayClient({
-      baseUrl: initialLoad.settings.gatewayBaseUrl,
-      accessToken: initialLoad.settings.accessToken,
+      baseUrl: desktopBootstrap?.apiBaseUrl ?? initialLoad.settings.gatewayBaseUrl,
+      accessToken: desktopBootstrap?.sessionToken ?? initialLoad.settings.accessToken,
       fetchImpl,
     });
   }
   const gateway = gatewayRef.current;
+
+  useEffect(() => {
+    if (desktopBootstrap) {
+      document.documentElement.dataset.desktop = 'true';
+      return () => {
+        delete document.documentElement.dataset.desktop;
+      };
+    }
+    delete document.documentElement.dataset.desktop;
+    return undefined;
+  }, [desktopBootstrap]);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.matchMedia) return;
@@ -350,13 +438,15 @@ export function AppProvider({
       setSettings(normalized);
       // Only browser-owned connection info is persisted locally; preferences live
       // in the gateway and are written through updatePreferences.
-      saveConnectionSettings({
-        gatewayBaseUrl: normalized.gatewayBaseUrl,
-        accessToken: normalized.accessToken,
-      });
+      if (!isDesktop) {
+        saveConnectionSettings({
+          gatewayBaseUrl: normalized.gatewayBaseUrl,
+          accessToken: normalized.accessToken,
+        });
+      }
       return { settings: normalized, persisted: true, notice: null };
     },
-    [],
+    [isDesktop],
   );
 
   const applyConfirmedPreferences = useCallback((next: AppPreferences) => {
@@ -481,15 +571,22 @@ export function AppProvider({
     };
   }, []);
 
-  const handleAuthFailureIf401 = useCallback((err: unknown, epoch: number) => {
-    if (epoch !== epochRef.current) return false;
-    if (err instanceof GatewayError && err.statusCode === 401) {
-      setConnectionState('auth-required');
-      setConnectionError(err.message || '访问令牌无效或未授权');
-      return true;
-    }
-    return false;
-  }, []);
+  const handleAuthFailureIf401 = useCallback(
+    (err: unknown, epoch: number) => {
+      if (epoch !== epochRef.current) return false;
+      if (err instanceof GatewayError && err.statusCode === 401) {
+        if (isDesktop) {
+          setCloudConnectionState('auth-required');
+          return true;
+        }
+        setConnectionState('auth-required');
+        setConnectionError(err.message || '访问令牌无效或未授权');
+        return true;
+      }
+      return false;
+    },
+    [isDesktop],
+  );
 
   const providerOrderRevision = useRef(0);
   const providerReorderEpoch = useRef<number | null>(null);
@@ -568,84 +665,148 @@ export function AppProvider({
   }, [gateway, handleAuthFailureIf401, trackSignal]);
 
   const conversationCleanupRevision = useRef(0);
-  const refreshConversations = useCallback(async (): Promise<Conversation[] | null> => {
-    const { epoch, signal, cleanup } = trackSignal();
-    const cleanupRevision = conversationCleanupRevision.current;
-    setResources((prev) => ({
-      ...prev,
-      loading: { ...prev.loading, conversations: true },
-      error: { ...prev.error, conversations: null },
-    }));
-    try {
-      const [conversations, conversationGroups] = await Promise.all([
-        gateway.listConversations(signal),
-        gateway.listConversationGroups(undefined, signal),
-      ]);
-      if (epoch !== epochRef.current) return null;
-      const nextConversations =
-        cleanupRevision === conversationCleanupRevision.current ? conversations : null;
-      setResources((prev) => ({
-        ...prev,
-        conversations: nextConversations ?? prev.conversations,
-        conversationGroups,
-        loading: { ...prev.loading, conversations: false },
-      }));
-      return conversations;
-    } catch (err) {
-      if (epoch !== epochRef.current) return null;
-      if (err instanceof DOMException && err.name === 'AbortError') return null;
-      if (err instanceof Error && err.name === 'AbortError') return null;
-      handleAuthFailureIf401(err, epoch);
-      const message = errorMessageOf(err);
-      lastRefreshErrorRef.current = message;
-      setResources((prev) => ({
-        ...prev,
-        loading: { ...prev.loading, conversations: false },
-        error: { ...prev.error, conversations: message },
-      }));
-      return null;
-    } finally {
-      cleanup();
-    }
-  }, [gateway, handleAuthFailureIf401, trackSignal]);
+  const refreshConversations = useCallback(
+    async (explicitScope?: TopicScope): Promise<Conversation[] | null> => {
+      const effectiveScope: TopicScope | undefined = isDesktop
+        ? (explicitScope ?? topicScopeRef.current)
+        : undefined;
+      const targetBucket: TopicScope = effectiveScope ?? 'cloud';
+      const { epoch, signal, cleanup } = trackSignal();
+      const cleanupRevision = conversationCleanupRevision.current;
+      const affectsActive = !isDesktop || targetBucket === topicScopeRef.current;
+      if (affectsActive) {
+        setResources((prev) => ({
+          ...prev,
+          loading: { ...prev.loading, conversations: true },
+          error: { ...prev.error, conversations: null },
+        }));
+      }
+      try {
+        const [conversations, conversationGroups] = await Promise.all([
+          gateway.listConversations(signal, effectiveScope),
+          gateway.listConversationGroups(undefined, signal, effectiveScope),
+        ]);
+        if (epoch !== epochRef.current) return null;
+        const preserveList = cleanupRevision !== conversationCleanupRevision.current;
+        setResources((prev) => {
+          const prevBucketList =
+            targetBucket === 'local' ? prev.localConversations : prev.cloudConversations;
+          const nextBucketList = preserveList ? prevBucketList : conversations;
+          const nextLocalConvs =
+            targetBucket === 'local' ? nextBucketList : prev.localConversations;
+          const nextLocalGroups =
+            targetBucket === 'local' ? conversationGroups : prev.localConversationGroups;
+          const nextCloudConvs =
+            targetBucket === 'cloud' ? nextBucketList : prev.cloudConversations;
+          const nextCloudGroups =
+            targetBucket === 'cloud' ? conversationGroups : prev.cloudConversationGroups;
+          const activeScopeNow = isDesktop ? topicScopeRef.current : 'cloud';
+          return {
+            ...prev,
+            localConversations: nextLocalConvs,
+            localConversationGroups: nextLocalGroups,
+            cloudConversations: nextCloudConvs,
+            cloudConversationGroups: nextCloudGroups,
+            conversations:
+              activeScopeNow === 'local' ? nextLocalConvs : nextCloudConvs,
+            conversationGroups:
+              activeScopeNow === 'local' ? nextLocalGroups : nextCloudGroups,
+            loading: affectsActive
+              ? { ...prev.loading, conversations: false }
+              : prev.loading,
+          };
+        });
+        return conversations;
+      } catch (err) {
+        if (epoch !== epochRef.current) return null;
+        if (err instanceof DOMException && err.name === 'AbortError') return null;
+        if (err instanceof Error && err.name === 'AbortError') return null;
+        handleAuthFailureIf401(err, epoch);
+        const message = errorMessageOf(err);
+        lastRefreshErrorRef.current = message;
+        if (affectsActive) {
+          setResources((prev) => ({
+            ...prev,
+            loading: { ...prev.loading, conversations: false },
+            error: { ...prev.error, conversations: message },
+          }));
+        }
+        return null;
+      } finally {
+        cleanup();
+      }
+    },
+    [gateway, handleAuthFailureIf401, isDesktop, trackSignal],
+  );
 
-  const refreshPlugins = useCallback(async (): Promise<boolean> => {
-    const { epoch, signal, cleanup } = trackSignal();
-    setResources((prev) => ({
-      ...prev,
-      loading: { ...prev.loading, plugins: true },
-      error: { ...prev.error, plugins: null },
-    }));
-    try {
-      const [searchEngines, mcpServers] = await Promise.all([
-        gateway.listSearchEngines(signal),
-        gateway.listMcpServers(signal),
-      ]);
-      if (epoch !== epochRef.current) return false;
+  const refreshPlugins = useCallback(
+    async (explicitScope?: TopicScope): Promise<boolean> => {
+      const { epoch, signal, cleanup } = trackSignal();
       setResources((prev) => ({
         ...prev,
-        searchEngines,
-        mcpServers,
-        loading: { ...prev.loading, plugins: false },
+        loading: { ...prev.loading, plugins: true },
+        error: { ...prev.error, plugins: null },
       }));
-      return true;
-    } catch (err) {
-      if (epoch !== epochRef.current) return false;
-      if (err instanceof DOMException && err.name === 'AbortError') return false;
-      if (err instanceof Error && err.name === 'AbortError') return false;
-      handleAuthFailureIf401(err, epoch);
-      const message = errorMessageOf(err);
-      lastRefreshErrorRef.current = message;
-      setResources((prev) => ({
-        ...prev,
-        loading: { ...prev.loading, plugins: false },
-        error: { ...prev.error, plugins: message },
-      }));
-      return false;
-    } finally {
-      cleanup();
-    }
-  }, [gateway, handleAuthFailureIf401, trackSignal]);
+      try {
+        if (!isDesktop) {
+          const [searchEngines, mcpServers] = await Promise.all([
+            gateway.listSearchEngines(signal),
+            gateway.listMcpServers(signal),
+          ]);
+          if (epoch !== epochRef.current) return false;
+          setResources((prev) => ({
+            ...prev,
+            searchEngines,
+            mcpServers,
+            cloudMcpServers: mcpServers,
+            loading: { ...prev.loading, plugins: false },
+          }));
+          return true;
+        }
+
+        const shouldFetchCloud =
+          explicitScope === 'cloud' || cloudStateRef.current === 'connected';
+        const [searchEngines, localMcpServers, cloudMcpServers] = await Promise.all([
+          gateway.listSearchEngines(signal),
+          gateway.listMcpServers(signal, 'local'),
+          shouldFetchCloud
+            ? gateway.listMcpServers(signal, 'cloud').catch((err) => {
+                if (err instanceof GatewayError && err.statusCode === 401) {
+                  setCloudConnectionState('auth-required');
+                }
+                return null;
+              })
+            : Promise.resolve(null),
+        ]);
+        if (epoch !== epochRef.current) return false;
+        setResources((prev) => ({
+          ...prev,
+          searchEngines,
+          localMcpServers,
+          mcpServers: localMcpServers,
+          cloudMcpServers: cloudMcpServers ?? prev.cloudMcpServers,
+          loading: { ...prev.loading, plugins: false },
+        }));
+        return true;
+      } catch (err) {
+        if (epoch !== epochRef.current) return false;
+        if (err instanceof DOMException && err.name === 'AbortError') return false;
+        if (err instanceof Error && err.name === 'AbortError') return false;
+        handleAuthFailureIf401(err, epoch);
+        const message = errorMessageOf(err);
+        lastRefreshErrorRef.current = message;
+        setResources((prev) => ({
+          ...prev,
+          loading: { ...prev.loading, plugins: false },
+          error: { ...prev.error, plugins: message },
+        }));
+        return false;
+      } finally {
+        cleanup();
+      }
+    },
+    [gateway, handleAuthFailureIf401, isDesktop, trackSignal],
+  );
 
   const refreshPreferences = useCallback(async (): Promise<boolean> => {
     const connectionGateway = settingsRef.current.gatewayBaseUrl;
@@ -670,16 +831,55 @@ export function AppProvider({
     }
   }, [applyConfirmedPreferences, gateway, handleAuthFailureIf401, trackSignal]);
 
+  const refreshDesktopStatus = useCallback(async (): Promise<DesktopStatus | null> => {
+    if (!isDesktop) return null;
+    const { epoch, signal, cleanup } = trackSignal();
+    try {
+      const status = await gateway.getDesktopStatus(signal);
+      if (epoch !== epochRef.current) return null;
+      setDesktopStatus(status);
+      setCloudConnectionState(normalizeCloudState(status.cloudState));
+      setGatewayHealth({
+        status: 'ok',
+        version: status.version || desktopBootstrap?.version || '1.5.0',
+        authRequired: false,
+      });
+      return status;
+    } catch {
+      if (epoch !== epochRef.current) return null;
+      setCloudConnectionState('error');
+      return null;
+    } finally {
+      cleanup();
+    }
+  }, [desktopBootstrap?.version, gateway, isDesktop, trackSignal]);
+
   const refreshAll = useCallback(async () => {
-    await Promise.all([
+    if (!isDesktop) {
+      await Promise.all([
+        refreshProviders(),
+        refreshAssistants(),
+        refreshConversations(),
+        refreshPlugins(),
+      ]);
+      return;
+    }
+    const status = await refreshDesktopStatus();
+    const tasks: Promise<unknown>[] = [
       refreshProviders(),
       refreshAssistants(),
-      refreshConversations(),
+      refreshConversations('local'),
       refreshPlugins(),
-    ]);
+    ];
+    if (status?.cloudState === 'connected') {
+      tasks.push(refreshConversations('cloud'));
+    }
+    await Promise.all(tasks);
   }, [
+    isDesktop,
     refreshAssistants,
     refreshConversations,
+    refreshDesktopStatus,
     refreshPlugins,
     refreshProviders,
   ]);
@@ -697,6 +897,34 @@ export function AppProvider({
     lastRefreshErrorRef.current = null;
     const startEpoch = epochRef.current;
     try {
+      if (isDesktop) {
+        const status = await refreshDesktopStatus();
+        const activeScopeNow = topicScopeRef.current;
+        const [provOk, asstOk, localConvs, cloudConvs, pluginsOk, prefsOk] =
+          await Promise.all([
+            refreshProviders(),
+            refreshAssistants(),
+            refreshConversations('local'),
+            status?.cloudState === 'connected'
+              ? refreshConversations('cloud')
+              : Promise.resolve(null),
+            refreshPlugins(),
+            refreshPreferences(),
+          ]);
+        if (startEpoch !== epochRef.current) {
+          return { ok: false, error: '连接已切换' };
+        }
+        const activeConvs = activeScopeNow === 'local' ? localConvs : cloudConvs;
+        if (!provOk || !asstOk || localConvs === null || !pluginsOk || !prefsOk) {
+          return {
+            ok: false,
+            error: lastRefreshErrorRef.current || '同步数据失败',
+          };
+        }
+        setLastSyncedAt(new Date().toISOString());
+        return { ok: true, conversations: activeConvs ?? localConvs };
+      }
+
       const [provOk, asstOk, convs, pluginsOk, prefsOk] = await Promise.all([
         refreshProviders(),
         refreshAssistants(),
@@ -720,8 +948,10 @@ export function AppProvider({
       setSyncingServer(false);
     }
   }, [
+    isDesktop,
     refreshAssistants,
     refreshConversations,
+    refreshDesktopStatus,
     refreshPlugins,
     refreshPreferences,
     refreshProviders,
@@ -737,6 +967,63 @@ export function AppProvider({
       const nextEpoch = epochRef.current + 1;
       epochRef.current = nextEpoch;
       setConnectionEpoch(nextEpoch);
+
+      if (desktopBootstrap) {
+        gateway.baseUrl = desktopBootstrap.apiBaseUrl;
+        gateway.accessToken = desktopBootstrap.sessionToken;
+
+        setResources(emptyResources());
+        setConnectionState('connected');
+        setConnectionError(null);
+        setCloudConnectionState('checking');
+        setLastSyncedAt(null);
+
+        const { signal, cleanup } = trackSignal();
+        try {
+          const [status] = await Promise.all([
+            gateway.getDesktopStatus(signal).catch(() => null),
+            hydratePreferences(signal, nextEpoch).catch(() => {}),
+          ]);
+          if (nextEpoch !== epochRef.current) return;
+          if (status) {
+            setDesktopStatus(status);
+            setCloudConnectionState(normalizeCloudState(status.cloudState));
+            setGatewayHealth({
+              status: 'ok',
+              version: status.version || desktopBootstrap.version,
+              authRequired: false,
+            });
+          } else {
+            setCloudConnectionState('disconnected');
+            setGatewayHealth({
+              status: 'ok',
+              version: desktopBootstrap.version,
+              authRequired: false,
+            });
+          }
+
+          const cloudReady = status?.cloudState === 'connected';
+          const [provOk, asstOk, localConvs, , pluginsOk] = await Promise.all([
+            refreshProviders(),
+            refreshAssistants(),
+            refreshConversations('local'),
+            cloudReady ? refreshConversations('cloud') : Promise.resolve(null),
+            refreshPlugins(cloudReady ? 'cloud' : 'local'),
+          ]);
+          if (
+            nextEpoch === epochRef.current &&
+            provOk &&
+            asstOk &&
+            localConvs !== null &&
+            pluginsOk
+          ) {
+            setLastSyncedAt(new Date().toISOString());
+          }
+        } finally {
+          cleanup();
+        }
+        return;
+      }
 
       gateway.baseUrl = baseUrl;
       gateway.accessToken = accessToken;
@@ -793,6 +1080,7 @@ export function AppProvider({
       }
     },
     [
+      desktopBootstrap,
       gateway,
       handleAuthFailureIf401,
       hydratePreferences,
@@ -813,6 +1101,37 @@ export function AppProvider({
 
   const saveConnection = useCallback(
     async (input: { gatewayBaseUrl: string; accessToken: string }) => {
+      if (isDesktop) {
+        const trimmedUrl = input.gatewayBaseUrl.trim();
+        if (!trimmedUrl || trimmedUrl === '/') {
+          return { ok: false, error: '请输入完整的云端网关地址（如 https://example.com）' };
+        }
+        const urlErr = validateGatewayUrl(trimmedUrl);
+        if (urlErr) {
+          return { ok: false, error: urlErr };
+        }
+        try {
+          const saved = await gateway.saveDesktopConnection({
+            gatewayBaseUrl: trimmedUrl,
+            accessToken: input.accessToken.trim(),
+          });
+          setDesktopStatus(saved.status);
+          const nextCloudState = normalizeCloudState(saved.status.cloudState);
+          setCloudConnectionState(nextCloudState);
+          const epoch = epochRef.current;
+          void refreshAll();
+          if (nextCloudState === 'connected') {
+            const { signal, cleanup } = trackSignal();
+            void hydratePreferences(signal, epoch)
+              .catch(() => {})
+              .finally(cleanup);
+          }
+          return { ok: true };
+        } catch (err) {
+          return { ok: false, error: errorMessageOf(err) };
+        }
+      }
+
       const normalizedUrl = input.gatewayBaseUrl.trim() || '/';
       const urlErr = validateGatewayUrl(normalizedUrl);
       if (urlErr) {
@@ -826,11 +1145,45 @@ export function AppProvider({
       await bootstrapConnection(normalizedUrl, nextToken);
       return { ok: true };
     },
-    [bootstrapConnection, updateSettings],
+    [
+      bootstrapConnection,
+      gateway,
+      hydratePreferences,
+      isDesktop,
+      refreshAll,
+      trackSignal,
+      updateSettings,
+    ],
   );
 
   const testGatewayConnection = useCallback(
     async (input?: { gatewayBaseUrl?: string; accessToken?: string }) => {
+      if (isDesktop) {
+        const rawUrl = (input?.gatewayBaseUrl ?? desktopStatus?.gatewayBaseUrl ?? '').trim();
+        if (!rawUrl || rawUrl === '/') {
+          return { ok: false, error: '请输入完整的云端网关地址（如 https://example.com）' };
+        }
+        const urlErr = validateGatewayUrl(rawUrl);
+        if (urlErr) {
+          return { ok: false, error: urlErr };
+        }
+        try {
+          const res = await gateway.testDesktopConnection({
+            gatewayBaseUrl: rawUrl,
+            accessToken: (input?.accessToken ?? '').trim(),
+          });
+          if (!res.ok) {
+            return {
+              ok: false,
+              error: res.message || (res.authRequired ? '网关需要访问令牌' : '连接失败'),
+            };
+          }
+          return { ok: true, latencyMs: res.latencyMs };
+        } catch (err) {
+          return { ok: false, error: errorMessageOf(err) };
+        }
+      }
+
       const url = (input?.gatewayBaseUrl ?? settings.gatewayBaseUrl).trim() || '/';
       const urlErr = validateGatewayUrl(url);
       if (urlErr) {
@@ -861,70 +1214,227 @@ export function AppProvider({
         return { ok: false, error: errorMessageOf(err) };
       }
     },
-    [fetchImpl, settings.accessToken, settings.gatewayBaseUrl],
+    [
+      desktopStatus?.gatewayBaseUrl,
+      fetchImpl,
+      gateway,
+      isDesktop,
+      settings.accessToken,
+      settings.gatewayBaseUrl,
+    ],
   );
+
+  const disconnectDesktopCloud = useCallback(async (): Promise<DesktopStatus | null> => {
+    if (!isDesktop) return null;
+    const status = await gateway.disconnectDesktopCloud();
+    setDesktopStatus(status);
+    setCloudConnectionState(normalizeCloudState(status.cloudState));
+    setResources((prev) => {
+      const nextActiveConvs =
+        topicScopeRef.current === 'local' ? prev.localConversations : [];
+      const nextActiveGroups =
+        topicScopeRef.current === 'local' ? prev.localConversationGroups : [];
+      return {
+        ...prev,
+        cloudConversations: [],
+        cloudConversationGroups: [],
+        cloudMcpServers: [],
+        conversations: nextActiveConvs,
+        conversationGroups: nextActiveGroups,
+      };
+    });
+    return status;
+  }, [gateway, isDesktop]);
 
   const retryConnection = useCallback(() => {
     void bootstrapConnection(settings.gatewayBaseUrl, settings.accessToken);
   }, [bootstrapConnection, settings.accessToken, settings.gatewayBaseUrl]);
 
-  const upsertLocalConversation = useCallback((conv: Conversation) => {
-    if (conv.ephemeral) return;
-    setResources((prev) => {
-      const idx = prev.conversations.findIndex((c) => c.id === conv.id);
-      const next =
-        idx >= 0
-          ? prev.conversations.map((c, i) => (i === idx ? conv : c))
-          : [conv, ...prev.conversations];
-      return {
+  const setTopicScope = useCallback(
+    (nextScope: TopicScope) => {
+      if (!isDesktop) return;
+      topicScopeRef.current = nextScope;
+      setTopicScopeState(nextScope);
+      setResources((prev) => ({
         ...prev,
-        conversations: sortConversationsByOrg(next, prev.conversationGroups),
-      };
-    });
-  }, []);
+        conversations:
+          nextScope === 'local'
+            ? prev.localConversations
+            : prev.cloudConversations,
+        conversationGroups:
+          nextScope === 'local'
+            ? prev.localConversationGroups
+            : prev.cloudConversationGroups,
+      }));
+      if (nextScope === 'cloud' && cloudStateRef.current === 'connected') {
+        void refreshConversations('cloud');
+      }
+    },
+    [isDesktop, refreshConversations],
+  );
 
-  const removeLocalConversation = useCallback((id: string) => {
-    setResources((prev) => ({
-      ...prev,
-      conversations: prev.conversations.filter((c) => c.id !== id),
-    }));
-  }, []);
+  const upsertLocalConversation = useCallback(
+    (conv: Conversation, explicitScope?: TopicScope) => {
+      if (conv.ephemeral) return;
+      const targetBucket: TopicScope = isDesktop
+        ? (explicitScope ?? conv.scope ?? topicScopeRef.current)
+        : 'cloud';
+      setResources((prev) => {
+        const currentList =
+          targetBucket === 'local'
+            ? prev.localConversations
+            : prev.cloudConversations;
+        const currentGroups =
+          targetBucket === 'local'
+            ? prev.localConversationGroups
+            : prev.cloudConversationGroups;
+        const idx = currentList.findIndex((c) => c.id === conv.id);
+        const nextList = sortConversationsByOrg(
+          idx >= 0
+            ? currentList.map((c, i) => (i === idx ? conv : c))
+            : [conv, ...currentList],
+          currentGroups,
+        );
+        const nextLocalConvs =
+          targetBucket === 'local' ? nextList : prev.localConversations;
+        const nextCloudConvs =
+          targetBucket === 'cloud' ? nextList : prev.cloudConversations;
+        const activeScopeNow = isDesktop ? topicScopeRef.current : 'cloud';
+        return {
+          ...prev,
+          localConversations: nextLocalConvs,
+          cloudConversations: nextCloudConvs,
+          conversations:
+            activeScopeNow === 'local' ? nextLocalConvs : nextCloudConvs,
+        };
+      });
+    },
+    [isDesktop],
+  );
 
-  const cleanupUngroupedConversations = useCallback(async () => {
+  const removeLocalConversation = useCallback(
+    (id: string, explicitScope?: TopicScope) => {
+      const targetBucket: TopicScope = isDesktop
+        ? (explicitScope ?? topicScopeRef.current)
+        : 'cloud';
+      setResources((prev) => {
+        const nextLocalConvs =
+          targetBucket === 'local'
+            ? prev.localConversations.filter((c) => c.id !== id)
+            : prev.localConversations;
+        const nextCloudConvs =
+          targetBucket === 'cloud'
+            ? prev.cloudConversations.filter((c) => c.id !== id)
+            : prev.cloudConversations;
+        const activeScopeNow = isDesktop ? topicScopeRef.current : 'cloud';
+        return {
+          ...prev,
+          localConversations: nextLocalConvs,
+          cloudConversations: nextCloudConvs,
+          conversations:
+            activeScopeNow === 'local' ? nextLocalConvs : nextCloudConvs,
+        };
+      });
+    },
+    [isDesktop],
+  );
+
+  const cleanupUngroupedConversations = useCallback(
+    async (explicitScope?: TopicScope) => {
+      const effectiveScope = isDesktop ? (explicitScope ?? 'cloud') : undefined;
+      const targetBucket: TopicScope = effectiveScope ?? 'cloud';
+      const { epoch, signal, cleanup } = trackSignal();
+      try {
+        const deleted = await gateway.cleanupUngroupedConversations(
+          signal,
+          effectiveScope,
+        );
+        if (epoch !== epochRef.current) return null;
+        if (deleted.length > 0) {
+          conversationCleanupRevision.current++;
+          const ids = new Set(deleted.map((item) => item.id));
+          setResources((prev) => {
+            const nextLocalConvs =
+              targetBucket === 'local'
+                ? prev.localConversations.filter((c) => !ids.has(c.id))
+                : prev.localConversations;
+            const nextCloudConvs =
+              targetBucket === 'cloud'
+                ? prev.cloudConversations.filter((c) => !ids.has(c.id))
+                : prev.cloudConversations;
+            const activeScopeNow = isDesktop ? topicScopeRef.current : 'cloud';
+            return {
+              ...prev,
+              localConversations: nextLocalConvs,
+              cloudConversations: nextCloudConvs,
+              conversations:
+                activeScopeNow === 'local' ? nextLocalConvs : nextCloudConvs,
+            };
+          });
+        }
+        return deleted;
+      } catch (err) {
+        if (epoch !== epochRef.current) return null;
+        handleAuthFailureIf401(err, epoch);
+        throw err;
+      } finally {
+        cleanup();
+      }
+    },
+    [gateway, handleAuthFailureIf401, isDesktop, trackSignal],
+  );
+
+  const cleanupLocalUngrouped = useCallback(async () => {
     const { epoch, signal, cleanup } = trackSignal();
     try {
-      const deleted = await gateway.cleanupUngroupedConversations(signal);
+      const deleted = await gateway.cleanupLocalUngrouped(signal);
       if (epoch !== epochRef.current) return null;
       if (deleted.length > 0) {
         conversationCleanupRevision.current++;
         const ids = new Set(deleted.map((item) => item.id));
-        setResources((prev) => ({
-          ...prev,
-          conversations: prev.conversations.filter((c) => !ids.has(c.id)),
-        }));
+        setResources((prev) => {
+          const nextLocalConvs = prev.localConversations.filter(
+            (c) => !ids.has(c.id),
+          );
+          const activeScopeNow = isDesktop ? topicScopeRef.current : 'cloud';
+          return {
+            ...prev,
+            localConversations: nextLocalConvs,
+            conversations:
+              activeScopeNow === 'local' ? nextLocalConvs : prev.cloudConversations,
+          };
+        });
       }
       return deleted;
-    } catch (err) {
-      if (epoch !== epochRef.current) return null;
-      handleAuthFailureIf401(err, epoch);
-      throw err;
     } finally {
       cleanup();
     }
-  }, [gateway, handleAuthFailureIf401, trackSignal]);
+  }, [gateway, isDesktop, trackSignal]);
 
   const applyConversationOrganizationSnapshot = useCallback(
     (
       assistantId: string,
       snapshot: { conversations: Conversation[]; groups: ConversationGroup[] },
       expectedEpoch?: number,
+      explicitScope?: TopicScope,
     ) => {
       if (expectedEpoch !== undefined && expectedEpoch !== epochRef.current) return;
+      const targetBucket: TopicScope = isDesktop
+        ? (explicitScope ?? topicScopeRef.current)
+        : 'cloud';
       setResources((prev) => {
-        const otherConvs = prev.conversations.filter(
+        const curConvs =
+          targetBucket === 'local'
+            ? prev.localConversations
+            : prev.cloudConversations;
+        const curGroups =
+          targetBucket === 'local'
+            ? prev.localConversationGroups
+            : prev.cloudConversationGroups;
+        const otherConvs = curConvs.filter(
           (c) => (c.assistantId || 'default') !== assistantId,
         );
-        const otherGroups = prev.conversationGroups.filter(
+        const otherGroups = curGroups.filter(
           (g) => g.assistantId !== assistantId,
         );
         const nextGroups = [...otherGroups, ...snapshot.groups];
@@ -932,14 +1442,97 @@ export function AppProvider({
           [...otherConvs, ...snapshot.conversations],
           nextGroups,
         );
+        const nextLocalConvs =
+          targetBucket === 'local' ? nextConvs : prev.localConversations;
+        const nextLocalGroups =
+          targetBucket === 'local' ? nextGroups : prev.localConversationGroups;
+        const nextCloudConvs =
+          targetBucket === 'cloud' ? nextConvs : prev.cloudConversations;
+        const nextCloudGroups =
+          targetBucket === 'cloud' ? nextGroups : prev.cloudConversationGroups;
+        const activeScopeNow = isDesktop ? topicScopeRef.current : 'cloud';
         return {
           ...prev,
-          conversations: nextConvs,
-          conversationGroups: nextGroups,
+          localConversations: nextLocalConvs,
+          localConversationGroups: nextLocalGroups,
+          cloudConversations: nextCloudConvs,
+          cloudConversationGroups: nextCloudGroups,
+          conversations:
+            activeScopeNow === 'local' ? nextLocalConvs : nextCloudConvs,
+          conversationGroups:
+            activeScopeNow === 'local' ? nextLocalGroups : nextCloudGroups,
         };
       });
     },
-    [],
+    [isDesktop],
+  );
+
+  const uploadConversations = useCallback(
+    async (
+      ids: string[],
+      force = false,
+    ): Promise<ConversationTransferResult | BatchTransferResult> => {
+      if (ids.length === 1) {
+        const targetId = ids[0];
+        const res = await gateway.uploadConversation(targetId, { force });
+        upsertLocalConversation(res.conversation, 'cloud');
+        setResources((prev) => {
+          const syncedAt =
+            res.conversation.lastSyncedAt ?? new Date().toISOString();
+          const nextLocalConvs = prev.localConversations.map((c) =>
+            c.id === targetId
+              ? {
+                  ...c,
+                  syncState: 'synced',
+                  syncVersion: res.conversation.syncVersion,
+                  lastSyncedAt: syncedAt,
+                }
+              : c,
+          );
+          return {
+            ...prev,
+            localConversations: nextLocalConvs,
+            conversations:
+              topicScopeRef.current === 'local'
+                ? nextLocalConvs
+                : prev.cloudConversations,
+          };
+        });
+        return res;
+      }
+      const res = await gateway.batchTransferConversations('upload', ids, {
+        force,
+      });
+      if (res.succeeded.length > 0) {
+        await Promise.all([
+          refreshConversations('local'),
+          refreshConversations('cloud'),
+        ]);
+      }
+      return res;
+    },
+    [gateway, refreshConversations, upsertLocalConversation],
+  );
+
+  const pullConversations = useCallback(
+    async (
+      ids: string[],
+      force = false,
+    ): Promise<ConversationTransferResult | BatchTransferResult> => {
+      if (ids.length === 1) {
+        const res = await gateway.pullConversation(ids[0], { force });
+        upsertLocalConversation(res.conversation, 'local');
+        return res;
+      }
+      const res = await gateway.batchTransferConversations('pull', ids, {
+        force,
+      });
+      if (res.succeeded.length > 0) {
+        await refreshConversations('local');
+      }
+      return res;
+    },
+    [gateway, refreshConversations, upsertLocalConversation],
   );
 
   const upsertLocalAssistant = useCallback((assistant: Assistant) => {
@@ -1024,24 +1617,61 @@ export function AppProvider({
     });
   }, []);
 
-  const upsertLocalMcpServer = useCallback((server: MCPServerConfig) => {
-    setResources((prev) => {
-      const exists = prev.mcpServers.some((s) => s.id === server.id);
-      return {
-        ...prev,
-        mcpServers: exists
-          ? prev.mcpServers.map((s) => (s.id === server.id ? server : s))
-          : [...prev.mcpServers, server],
-      };
-    });
-  }, []);
+  const upsertLocalMcpServer = useCallback(
+    (server: MCPServerConfig, explicitScope?: TopicScope) => {
+      const targetBucket: TopicScope = isDesktop
+        ? (explicitScope ?? 'local')
+        : 'cloud';
+      setResources((prev) => {
+        const upsertList = (list: MCPServerConfig[]) => {
+          const exists = list.some((s) => s.id === server.id);
+          return exists
+            ? list.map((s) => (s.id === server.id ? server : s))
+            : [...list, server];
+        };
+        if (targetBucket === 'local') {
+          const nextLocal = upsertList(prev.localMcpServers);
+          return {
+            ...prev,
+            localMcpServers: nextLocal,
+            mcpServers: isDesktop ? nextLocal : prev.mcpServers,
+          };
+        }
+        const nextCloud = upsertList(prev.cloudMcpServers);
+        return {
+          ...prev,
+          cloudMcpServers: nextCloud,
+          mcpServers: !isDesktop ? nextCloud : prev.mcpServers,
+        };
+      });
+    },
+    [isDesktop],
+  );
 
-  const removeLocalMcpServer = useCallback((id: string) => {
-    setResources((prev) => ({
-      ...prev,
-      mcpServers: prev.mcpServers.filter((s) => s.id !== id),
-    }));
-  }, []);
+  const removeLocalMcpServer = useCallback(
+    (id: string, explicitScope?: TopicScope) => {
+      const targetBucket: TopicScope = isDesktop
+        ? (explicitScope ?? 'local')
+        : 'cloud';
+      setResources((prev) => {
+        if (targetBucket === 'local') {
+          const nextLocal = prev.localMcpServers.filter((s) => s.id !== id);
+          return {
+            ...prev,
+            localMcpServers: nextLocal,
+            mcpServers: isDesktop ? nextLocal : prev.mcpServers,
+          };
+        }
+        const nextCloud = prev.cloudMcpServers.filter((s) => s.id !== id);
+        return {
+          ...prev,
+          cloudMcpServers: nextCloud,
+          mcpServers: !isDesktop ? nextCloud : prev.mcpServers,
+        };
+      });
+    },
+    [isDesktop],
+  );
 
   const registerDirtyGuard = useCallback((guard: (() => boolean) | null) => {
     dirtyGuardRef.current = guard;
@@ -1060,6 +1690,16 @@ export function AppProvider({
   const value: AppContextValue = useMemo(
     () => ({
       gateway,
+      isDesktop,
+      desktopStatus,
+      cloudConnectionState,
+      topicScope,
+      setTopicScope,
+      refreshDesktopStatus,
+      disconnectDesktopCloud,
+      uploadConversations,
+      pullConversations,
+      cleanupLocalUngrouped,
       connectionEpoch,
       settings,
       resolvedTheme,
@@ -1101,6 +1741,16 @@ export function AppProvider({
     }),
     [
       gateway,
+      isDesktop,
+      desktopStatus,
+      cloudConnectionState,
+      topicScope,
+      setTopicScope,
+      refreshDesktopStatus,
+      disconnectDesktopCloud,
+      uploadConversations,
+      pullConversations,
+      cleanupLocalUngrouped,
       connectionEpoch,
       settings,
       resolvedTheme,

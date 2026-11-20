@@ -593,6 +593,7 @@ func TestGatewayClientCancelAbortsUpstreamAndPersistsPartial(t *testing.T) {
 	cResp.Body.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	reqBody, _ := json.Marshal(map[string]any{"text": "Stream until aborted"})
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, gw.URL+"/api/v1/conversations/"+convWrap.Conversation.ID+"/messages/stream", bytes.NewReader(reqBody))
 	req.Header.Set("Authorization", "Bearer "+gwToken)

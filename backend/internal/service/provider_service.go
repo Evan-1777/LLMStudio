@@ -95,6 +95,35 @@ func (s *ProviderService) Get(ctx context.Context, id string) (domain.ProviderCo
 	return s.store.Get(ctx, id)
 }
 
+// ProviderRuntimeCredential holds unmasked upstream provider credentials returned
+// on explicit authenticated runtime fetches with no-store cache headers.
+type ProviderRuntimeCredential struct {
+	ProviderID string            `json:"providerId"`
+	Adapter    string            `json:"adapter"`
+	BaseURL    string            `json:"baseURL"`
+	AuthType   string            `json:"authType"`
+	APIKey     string            `json:"apiKey"`
+	Headers    map[string]string `json:"headers,omitempty"`
+	UpdatedAt  time.Time         `json:"updatedAt"`
+}
+
+// GetRuntimeCredential returns the raw credential payload for a configured provider.
+func (s *ProviderService) GetRuntimeCredential(ctx context.Context, id string) (ProviderRuntimeCredential, error) {
+	cfg, err := s.store.Get(ctx, id)
+	if err != nil {
+		return ProviderRuntimeCredential{}, err
+	}
+	return ProviderRuntimeCredential{
+		ProviderID: cfg.ID,
+		Adapter:    cfg.Adapter,
+		BaseURL:    cfg.BaseURL,
+		AuthType:   cfg.AuthType,
+		APIKey:     cfg.APIKey,
+		Headers:    cfg.Headers,
+		UpdatedAt:  cfg.UpdatedAt,
+	}, nil
+}
+
 // Create validates and persists a new provider configuration.
 func (s *ProviderService) Create(ctx context.Context, in ProviderInput) (domain.ProviderConfig, error) {
 	cfg := domain.ProviderConfig{

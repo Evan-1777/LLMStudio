@@ -11,6 +11,7 @@ import {
   type SettingsSection,
 } from '../../app/routes';
 import { Icon, IconButton, type IconName } from '../../components/ui';
+import type { CloudConnectionState } from '../../core/types';
 import { AboutPage } from './AboutPage';
 import { AppearancePage } from './AppearancePage';
 import { ConnectionPage } from './ConnectionPage';
@@ -49,6 +50,21 @@ function statusLabel(state: ConnectionState): string {
   }
 }
 
+function cloudStatusLabel(state: CloudConnectionState): string {
+  switch (state) {
+    case 'connected':
+      return '云端已连接';
+    case 'checking':
+      return '正在连接云端';
+    case 'auth-required':
+      return '云端需要令牌';
+    case 'error':
+      return '云端连接失败';
+    case 'disconnected':
+      return '云端未连接';
+  }
+}
+
 function renderSectionContent(section: SettingsSection): ReactNode {
   switch (section) {
     case 'providers':
@@ -84,7 +100,12 @@ export function SettingsLayout({
   const { section: routeSection } = useParams<{ section?: string }>();
   const navigate = useNavigate();
   const location = useLocation();
-  const { connectionState, confirmLeaveIfDirty } = useApp();
+  const {
+    isDesktop,
+    cloudConnectionState,
+    connectionState,
+    confirmLeaveIfDirty,
+  } = useApp();
 
   const [drawerOpen, setDrawerOpen] = useState(false);
   const drawerToggleRef = useRef<HTMLButtonElement | null>(null);
@@ -148,12 +169,18 @@ export function SettingsLayout({
     navigate(`/settings/${next}`, { state: location.state });
   };
 
+  const effectiveState = isDesktop ? cloudConnectionState : connectionState;
   const dotClass =
-    connectionState === 'connected'
+    effectiveState === 'connected'
       ? ''
-      : connectionState === 'error'
+      : effectiveState === 'error'
         ? 'st-status-dot--error'
-        : 'st-status-dot--warn';
+        : effectiveState === 'disconnected'
+          ? 'st-status-dot--muted'
+          : 'st-status-dot--warn';
+  const footerStatusText = isDesktop
+    ? cloudStatusLabel(cloudConnectionState)
+    : statusLabel(connectionState);
 
   return (
     <div className="st-shell">
@@ -198,7 +225,7 @@ export function SettingsLayout({
 
         <div className="st-rail-foot">
           <span className={`st-status-dot ${dotClass}`.trim()} aria-hidden="true" />
-          <span>{statusLabel(connectionState)}</span>
+          <span>{footerStatusText}</span>
         </div>
       </aside>
 

@@ -471,3 +471,158 @@ func TestExecuteToolsAndLocalContinuationRoutes(t *testing.T) {
 		t.Fatalf("prepare-local continuation must not mutate SQLite messages")
 	}
 }
+
+func TestStatelessMCPToolsExecuteEndpoint(t *testing.T) {
+	ctx := t.Context()
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	defer db.Close()
+
+	mcpRuntime := mcp.NewRuntime()
+	defer mcpRuntime.Close()
+
+	var executed []string
+	mcpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		var req struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params struct {
+				Name string `json:"name"`
+			} `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "application/json")
+		if len(req.ID) == 0 {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		switch req.Method {
+		case "initialize":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(req.ID),
+				"result":  map[string]any{"protocolVersion": "2025-11-25", "capabilities": map[string]any{"tools": map[string]any{}}},
+			})
+		case "tools/list":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(req.ID),
+				"result": map[string]any{
+					"tools": []plugin.MCPToolDescriptor{
+						{Name: "get_note", Description: "Get note", InputSchema: json.RawMessage(`{"type":"object"}`)},
+						{Name: "blocked_tool", Description: "Blocked", InputSchema: json.RawMessage(`{"type":"object"}`)},
+					},
+				},
+			})
+		case "tools/call":
+			executed = append(executed, req.Params.Name)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"jsonrpc": "2.0",
+				"id":      json.RawMessage(req.ID),
+				"result": map[string]any{
+					"content": []map[string]any{{"type": "text", "text": "stateless-" + req.Params.Name}},
+				},
+			})
+		}
+	}))
+	defer mcpSrv.Close()
+
+	mcpStore := store.NewMCPServerStore(db)
+	_, _ = mcpStore.Create(ctx, domain.MCPServerConfig{
+		ID:            "cloud-srv",
+		Name:          "cloud-srv",
+		Transport:     domain.MCPTransportStreamableHTTP,
+		Endpoint:      mcpSrv.URL,
+		Enabled:       true,
+		DisabledTools: []string{"blocked_tool"},
+	})
+	_, _ = mcpStore.Create(ctx, domain.MCPServerConfig{
+		ID:        "disabled-srv",
+		Name:      "disabled-srv",
+		Transport: domain.MCPTransportStreamableHTTP,
+		Endpoint:  mcpSrv.URL,
+		Enabled:   false,
+	})
+
+	searchReg := plugin.NewSearchRegistry()
+	pluginSvc := service.NewPluginService(searchReg, store.NewSearchConfigStore(db), mcpStore).WithMCPClient(mcpRuntime)
+	router := httpapi.NewRouter(httpapi.RouterDeps{
+		Config:        config.Config{AccessToken: "stateless-tok", DevMode: false},
+		PluginService: pluginSvc,
+	})
+	gw := httptest.NewServer(router)
+	defer gw.Close()
+
+	post := func(accept string, payload any) *http.Response {
+		var buf bytes.Buffer
+		_ = json.NewEncoder(&buf).Encode(payload)
+		req, _ := http.NewRequest(http.MethodPost, gw.URL+"/api/v1/mcp/tools/execute", &buf)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer stateless-tok")
+		if accept != "" {
+			req.Header.Set("Accept", accept)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST /mcp/tools/execute: %v", err)
+		}
+		return resp
+	}
+
+	// 1. Direct serverId + toolName call (no conversationId), including disabled tool and disabled server checks.
+	resp := post("", map[string]any{
+		"calls": []map[string]any{
+			{"id": "c1", "serverId": "cloud-srv", "toolName": "get_note", "arguments": map[string]any{}},
+			{"id": "c2", "serverId": "cloud-srv", "toolName": "blocked_tool", "arguments": map[string]any{}},
+			{"id": "c3", "serverId": "disabled-srv", "toolName": "get_note", "arguments": map[string]any{}},
+		},
+	})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stateless execute status=%d", resp.StatusCode)
+	}
+	var jsonOut struct {
+		ToolResults []domain.ContentBlock `json:"toolResults"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jsonOut); err != nil {
+		t.Fatalf("decode jsonOut: %v", err)
+	}
+	if len(jsonOut.ToolResults) != 3 {
+		t.Fatalf("expected 3 toolResults, got %+v", jsonOut.ToolResults)
+	}
+	if jsonOut.ToolResults[0].IsError || jsonOut.ToolResults[0].Content != "stateless-get_note" {
+		t.Fatalf("unexpected enabled tool result: %+v", jsonOut.ToolResults[0])
+	}
+	if !jsonOut.ToolResults[1].IsError || !strings.Contains(jsonOut.ToolResults[1].Content, "disabled") {
+		t.Fatalf("expected disabled tool error, got %+v", jsonOut.ToolResults[1])
+	}
+	if !jsonOut.ToolResults[2].IsError || !strings.Contains(jsonOut.ToolResults[2].Content, "disabled") {
+		t.Fatalf("expected disabled server error, got %+v", jsonOut.ToolResults[2])
+	}
+
+	// 2. Alias fallback over SSE.
+	alias := plugin.BuildChatToolAlias("cloud-srv", "get_note", nil)
+	sseResp := post("text/event-stream", map[string]any{
+		"calls": []map[string]any{
+			{"id": "c4", "name": alias, "arguments": map[string]any{}},
+		},
+	})
+	defer sseResp.Body.Close()
+	if sseResp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE execute status=%d", sseResp.StatusCode)
+	}
+	var sseBuf bytes.Buffer
+	_, _ = sseBuf.ReadFrom(sseResp.Body)
+	if !strings.Contains(sseBuf.String(), "stateless-get_note") || !strings.Contains(sseBuf.String(), "event: block_end") {
+		t.Fatalf("unexpected SSE output: %s", sseBuf.String())
+	}
+	if len(executed) != 2 {
+		t.Fatalf("expected exactly 2 actual MCP calls, got %v", executed)
+	}
+}

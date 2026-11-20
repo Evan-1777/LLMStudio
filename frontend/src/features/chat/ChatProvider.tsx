@@ -29,6 +29,7 @@ import type {
   StreamEvent,
   TokenUsage,
   ToolCallBlock,
+  TopicScope,
 } from '../../core/types';
 import {
   bufferToBlock,
@@ -43,6 +44,7 @@ import { estimateCompactionAfterTokens } from '../workbench/contextUsage';
 export interface SendMessageOptions {
   conversationId?: string;
   conversation?: Conversation;
+  scope?: TopicScope;
   ensureConversation?: (signal: AbortSignal) => Promise<Conversation | null>;
   blocks: ContentBlock[];
   text?: string;
@@ -60,6 +62,7 @@ export interface RegenerateOptions {
   targetMessageId: string;
   providerId: string;
   modelId: string;
+  scope?: TopicScope;
   params?: GenerationParams;
   webSearch?: boolean;
   searchEngineId?: string;
@@ -78,18 +81,29 @@ export interface ChatContextValue {
   isCompacting: boolean;
   updateConversationMeta: (conversation: Conversation) => void;
   clearSession: () => void;
-  loadConversation: (conversationId: string) => Promise<ConversationDetail | null>;
+  loadConversation: (
+    conversationId: string,
+    scope?: TopicScope,
+  ) => Promise<ConversationDetail | null>;
   reloadCurrentConversation: () => Promise<void>;
   sendMessage: (opts: SendMessageOptions) => Promise<boolean>;
   regenerateMessage: (opts: RegenerateOptions) => Promise<boolean>;
   compactConversation: (opts: {
     providerId: string;
     modelId: string;
+    scope?: TopicScope;
   }) => Promise<CompactConversationResult>;
-  updateMessage: (messageId: string, blocks: ContentBlock[]) => Promise<boolean>;
-  deleteMessage: (messageId: string) => Promise<boolean>;
-  branchFromMessage: (messageId: string) => Promise<ConversationDetail | null>;
-  applyBranchedDetail: (detail: ConversationDetail) => void;
+  updateMessage: (
+    messageId: string,
+    blocks: ContentBlock[],
+    scope?: TopicScope,
+  ) => Promise<boolean>;
+  deleteMessage: (messageId: string, scope?: TopicScope) => Promise<boolean>;
+  branchFromMessage: (
+    messageId: string,
+    scope?: TopicScope,
+  ) => Promise<ConversationDetail | null>;
+  applyBranchedDetail: (detail: ConversationDetail, scope?: TopicScope) => void;
   stopStreaming: () => void;
 }
 
@@ -160,6 +174,8 @@ function extractSafeCacheResult(
 export function ChatProvider({ children }: { children: ReactNode }) {
   const {
     gateway,
+    isDesktop,
+    topicScope,
     resources,
     settings: { mcpMaxToolRounds },
     connectionEpoch,
@@ -177,6 +193,19 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const activeAbortRef = useRef<AbortController | null>(null);
   const manualAbortRef = useRef(false);
   const sendingRef = useRef(false);
+  const topicScopeRef = useRef(topicScope);
+  topicScopeRef.current = topicScope;
+  const sessionScopeRef = useRef<TopicScope | undefined>(
+    isDesktop ? topicScope : undefined,
+  );
+
+  const resolveScope = useCallback(
+    (explicit?: TopicScope): TopicScope | undefined => {
+      if (!isDesktop) return undefined;
+      return explicit ?? sessionScopeRef.current ?? topicScopeRef.current;
+    },
+    [isDesktop],
+  );
 
   const cancelActiveStream = useCallback((quiet: boolean) => {
     epochRef.current += 1;
@@ -217,8 +246,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, [cancelActiveStream]);
 
   const loadConversation = useCallback(
-    async (conversationId: string): Promise<ConversationDetail | null> => {
+    async (
+      conversationId: string,
+      explicitScope?: TopicScope,
+    ): Promise<ConversationDetail | null> => {
       cancelActiveStream(true);
+      const reqScope = isDesktop ? (explicitScope ?? topicScopeRef.current) : undefined;
+      sessionScopeRef.current = reqScope;
       const epoch = ++epochRef.current;
       const ctrl = new AbortController();
       activeAbortRef.current = ctrl;
@@ -227,6 +261,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         const detail = await gateway.getConversationDetail(
           conversationId,
           ctrl.signal,
+          reqScope,
         );
         if (epoch !== epochRef.current) return null;
         dispatch({
@@ -234,7 +269,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           conversation: detail.conversation,
           messages: detail.messages,
         });
-        upsertLocalConversation(detail.conversation);
+        upsertLocalConversation(detail.conversation, reqScope);
         return detail;
       } catch (err) {
         if (epoch !== epochRef.current || isAbortError(err)) return null;
@@ -247,7 +282,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
       }
     },
-    [cancelActiveStream, gateway, upsertLocalConversation],
+    [cancelActiveStream, gateway, isDesktop, upsertLocalConversation],
   );
 
   const reconcileAfterStream = useCallback(
@@ -258,9 +293,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         isAbort: boolean;
         minExpectedMessages: number;
       },
+      reqScope?: TopicScope,
     ) => {
       const fetchDetail = async () => {
-        const detail = await gateway.getConversationDetail(conversationId);
+        const detail = await gateway.getConversationDetail(
+          conversationId,
+          undefined,
+          reqScope,
+        );
         if (epoch !== epochRef.current) return null;
         return detail;
       };
@@ -292,7 +332,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           conversation: detail.conversation,
           messages: detail.messages,
         });
-        upsertLocalConversation(detail.conversation);
+        upsertLocalConversation(detail.conversation, reqScope);
       } catch {
         if (epoch !== epochRef.current) return;
         if (opts.isAbort) {
@@ -306,6 +346,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const executeStream = useCallback(
     async (opts: {
       conversationId: string;
+      scope?: TopicScope;
       input: {
         blocks?: ContentBlock[];
         text?: string;
@@ -326,6 +367,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       onStreamAccepted?: () => void;
     }): Promise<boolean> => {
       const { epoch, ctrl } = opts;
+      const reqScope = opts.scope;
 
       let response: Response;
       try {
@@ -333,6 +375,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           opts.conversationId,
           opts.input,
           ctrl.signal,
+          reqScope,
         );
       } catch (err) {
         sendingRef.current = false;
@@ -428,10 +471,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
         if (manualAbortRef.current) {
           dispatch({ type: 'ABORT_LOCAL' });
-          await reconcileAfterStream(opts.conversationId, epoch, {
-            isAbort: true,
-            minExpectedMessages: opts.expectedCountOnAbort,
-          });
+          await reconcileAfterStream(
+            opts.conversationId,
+            epoch,
+            {
+              isAbort: true,
+              minExpectedMessages: opts.expectedCountOnAbort,
+            },
+            reqScope,
+          );
           return false;
         }
 
@@ -445,19 +493,29 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
 
         // Sync real server IDs (user + assistant) & updated title/timestamps.
-        await reconcileAfterStream(opts.conversationId, epoch, {
-          isAbort: false,
-          minExpectedMessages: opts.expectedCountOnAbort,
-        });
+        await reconcileAfterStream(
+          opts.conversationId,
+          epoch,
+          {
+            isAbort: false,
+            minExpectedMessages: opts.expectedCountOnAbort,
+          },
+          reqScope,
+        );
         return true;
       } catch (err) {
         if (epoch !== epochRef.current) return false;
         if (isAbortError(err) || manualAbortRef.current) {
           dispatch({ type: 'ABORT_LOCAL' });
-          await reconcileAfterStream(opts.conversationId, epoch, {
-            isAbort: true,
-            minExpectedMessages: opts.expectedCountOnAbort,
-          });
+          await reconcileAfterStream(
+            opts.conversationId,
+            epoch,
+            {
+              isAbort: true,
+              minExpectedMessages: opts.expectedCountOnAbort,
+            },
+            reqScope,
+          );
           return false;
         }
         const e = formatError(err);
@@ -1315,12 +1373,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      const isLocal = Boolean(
-        resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
-      );
-      const streamRunner = isLocal ? executeLocalStream : executeStream;
+      const reqScope = resolveScope(opts.scope);
+      sessionScopeRef.current = reqScope;
+      const useBrowserLocalRequest =
+        !isDesktop &&
+        Boolean(
+          resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
+        );
+      const streamRunner = useBrowserLocalRequest ? executeLocalStream : executeStream;
       return streamRunner({
         conversationId: targetConvId,
+        scope: reqScope,
         input: {
           blocks: opts.blocks,
           text: opts.text,
@@ -1339,7 +1402,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         onStreamAccepted: opts.onStreamAccepted,
       });
     },
-    [executeLocalStream, executeStream, resources.providers],
+    [
+      executeLocalStream,
+      executeStream,
+      isDesktop,
+      resolveScope,
+      resources.providers,
+    ],
   );
 
   const regenerateMessage = useCallback(
@@ -1377,12 +1446,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         placeholderAssistantId,
       });
 
-      const isLocal = Boolean(
-        resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
-      );
-      const streamRunner = isLocal ? executeLocalStream : executeStream;
+      const reqScope = resolveScope(opts.scope);
+      sessionScopeRef.current = reqScope;
+      const useBrowserLocalRequest =
+        !isDesktop &&
+        Boolean(
+          resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
+        );
+      const streamRunner = useBrowserLocalRequest ? executeLocalStream : executeStream;
       return streamRunner({
         conversationId: conv.id,
+        scope: reqScope,
         input: {
           providerId: opts.providerId,
           modelId: opts.modelId,
@@ -1398,7 +1472,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         placeholderAssistantId,
       });
     },
-    [executeLocalStream, executeStream, resources.providers, toast],
+    [
+      executeLocalStream,
+      executeStream,
+      isDesktop,
+      resolveScope,
+      resources.providers,
+      toast,
+    ],
   );
 
   const stopStreaming = useCallback(() => {
@@ -1415,11 +1496,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const reloadCurrentConversation = useCallback(async () => {
     const convId = stateRef.current.conversation?.id;
     if (!convId || isBusy) return;
-    await loadConversation(convId);
-  }, [isBusy, loadConversation]);
+    await loadConversation(convId, resolveScope());
+  }, [isBusy, loadConversation, resolveScope]);
 
   const updateMessage = useCallback(
-    async (messageId: string, blocks: ContentBlock[]): Promise<boolean> => {
+    async (
+      messageId: string,
+      blocks: ContentBlock[],
+      scope?: TopicScope,
+    ): Promise<boolean> => {
       const conv = stateRef.current.conversation;
       if (!conv || sendingRef.current) return false;
       if (isLocalMessageId(messageId)) {
@@ -1427,7 +1512,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return false;
       }
       try {
-        const updated = await gateway.updateMessage(conv.id, messageId, blocks);
+        const updated = await gateway.updateMessage(
+          conv.id,
+          messageId,
+          blocks,
+          undefined,
+          resolveScope(scope),
+        );
         dispatch({ type: 'UPDATE_MESSAGE', message: updated });
         return true;
       } catch (err) {
@@ -1435,11 +1526,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return false;
       }
     },
-    [gateway, toast],
+    [gateway, resolveScope, toast],
   );
 
   const deleteMessage = useCallback(
-    async (messageId: string): Promise<boolean> => {
+    async (messageId: string, scope?: TopicScope): Promise<boolean> => {
       const conv = stateRef.current.conversation;
       if (!conv || sendingRef.current) return false;
       if (isLocalMessageId(messageId)) {
@@ -1447,7 +1538,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return false;
       }
       try {
-        await gateway.deleteMessage(conv.id, messageId);
+        await gateway.deleteMessage(
+          conv.id,
+          messageId,
+          undefined,
+          resolveScope(scope),
+        );
         dispatch({ type: 'REMOVE_MESSAGE', messageId });
         return true;
       } catch (err) {
@@ -1455,20 +1551,26 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return false;
       }
     },
-    [gateway, toast],
+    [gateway, resolveScope, toast],
   );
 
   const branchFromMessage = useCallback(
-    async (messageId: string) => {
+    async (messageId: string, scope?: TopicScope) => {
       const conv = stateRef.current.conversation;
       if (!conv || sendingRef.current) return null;
       if (isLocalMessageId(messageId)) {
         toast('该消息尚未确认落盘，请先重新加载', 'error');
         return null;
       }
+      const reqScope = resolveScope(scope);
       try {
-        const detail = await gateway.branchConversation(conv.id, messageId);
-        upsertLocalConversation(detail.conversation);
+        const detail = await gateway.branchConversation(
+          conv.id,
+          messageId,
+          undefined,
+          reqScope,
+        );
+        upsertLocalConversation(detail.conversation, reqScope);
         dispatch({
           type: 'LOAD_SUCCESS',
           conversation: detail.conversation,
@@ -1480,13 +1582,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return null;
       }
     },
-    [gateway, toast, upsertLocalConversation],
+    [gateway, resolveScope, toast, upsertLocalConversation],
   );
 
   const compactConversation = useCallback(
     async (opts: {
       providerId: string;
       modelId: string;
+      scope?: TopicScope;
     }): Promise<CompactConversationResult> => {
       const conv = stateRef.current.conversation;
       const runState = stateRef.current.runState;
@@ -1502,6 +1605,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const provider = resources.providers.find(
         (p) => p.id === opts.providerId,
       );
+      const reqScope = resolveScope(opts.scope);
       const epoch = epochRef.current;
       const ctrl = new AbortController();
       sendingRef.current = true;
@@ -1510,7 +1614,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setIsCompacting(true);
 
       try {
-        if (!provider?.localRequest) {
+        if (isDesktop || !provider?.localRequest) {
           const res = await gateway.compactConversation(
             conv.id,
             {
@@ -1518,6 +1622,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
               modelId: opts.modelId,
             },
             ctrl.signal,
+            reqScope,
           );
           if (epoch !== epochRef.current || ctrl.signal.aborted) {
             return { ok: false, error: '压缩已取消' };
@@ -1527,7 +1632,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             conversation: res.conversation,
             messages: res.messages,
           });
-          upsertLocalConversation(res.conversation);
+          upsertLocalConversation(res.conversation, reqScope);
           return {
             ok: true,
             beforeTokens: res.meta.beforeTokens,
@@ -1729,20 +1834,27 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
       }
     },
-    [gateway, resources.providers, sendLocalHttpFetch, upsertLocalConversation],
+    [
+      gateway,
+      isDesktop,
+      resolveScope,
+      resources.providers,
+      sendLocalHttpFetch,
+      upsertLocalConversation,
+    ],
   );
 
   const applyBranchedDetail = useCallback(
-    (detail: ConversationDetail) => {
+    (detail: ConversationDetail, scope?: TopicScope) => {
       cancelActiveStream(true);
-      upsertLocalConversation(detail.conversation);
+      upsertLocalConversation(detail.conversation, resolveScope(scope));
       dispatch({
         type: 'LOAD_SUCCESS',
         conversation: detail.conversation,
         messages: detail.messages,
       });
     },
-    [cancelActiveStream, upsertLocalConversation],
+    [cancelActiveStream, resolveScope, upsertLocalConversation],
   );
 
   const value = useMemo<ChatContextValue>(

@@ -11,7 +11,11 @@ import (
 )
 
 func decodeJSONBody(r *http.Request, dst any) error {
-	dec := json.NewDecoder(io.LimitReader(r.Body, 16*1024*1024))
+	return decodeJSONBodyWithLimit(r, dst, 16*1024*1024)
+}
+
+func decodeJSONBodyWithLimit(r *http.Request, dst any, maxBytes int64) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, maxBytes))
 	if err := dec.Decode(dst); err != nil {
 		return domain.NewError(domain.ErrCodeInvalidArgument, "invalid JSON request body", err)
 	}

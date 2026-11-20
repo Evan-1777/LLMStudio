@@ -3,16 +3,22 @@ import {
   type Assistant,
   type AssistantUpsertPayload,
   type BatchConversationsInput,
+  type BatchTransferResult,
   type CompactConversationResponse,
   type ContentBlock,
   type Conversation,
   type ConversationDetail,
   type ConversationGroup,
   type ConversationOrganizationSnapshot,
+  type ConversationTransferResult,
   type CreateConversationInput,
   type CreateMessageInput,
   type CreateMessageResult,
   type DeletedConversation,
+  type DesktopConnectionConfig,
+  type DesktopConnectionTestResult,
+  type DesktopStatus,
+  type DesktopStorageUsage,
   type DiscoveredModel,
   type FormatInfo,
   type GroupDeleteResult,
@@ -45,7 +51,14 @@ import {
   type StorageUsage,
   type StreamChatInput,
   type ToolCallExecutionInput,
+  type TopicScope,
 } from './types';
+
+function withScopeQuery(path: string, scope?: TopicScope): string {
+  if (!scope) return path;
+  const sep = path.includes('?') ? '&' : '?';
+  return `${path}${sep}scope=${encodeURIComponent(scope)}`;
+}
 
 export class GatewayError extends Error {
   readonly code: string;
@@ -621,10 +634,10 @@ export class GatewayClient {
     );
   }
 
-  listConversations(signal?: AbortSignal): Promise<Conversation[]> {
+  listConversations(signal?: AbortSignal, scope?: TopicScope): Promise<Conversation[]> {
     return this.requestJson<{ conversations?: Conversation[] }>(
       'GET',
-      '/api/v1/conversations',
+      withScopeQuery('/api/v1/conversations', scope),
       { signal },
     ).then((res) => res.conversations ?? []);
   }
@@ -632,10 +645,11 @@ export class GatewayClient {
   createConversation(
     input: CreateConversationInput = {},
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<Conversation> {
     return this.requestJson<{ conversation: Conversation }>(
       'POST',
-      '/api/v1/conversations',
+      withScopeQuery('/api/v1/conversations', scope),
       { body: input, signal },
     ).then((res) => res.conversation);
   }
@@ -643,10 +657,11 @@ export class GatewayClient {
   getConversationDetail(
     id: string,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<ConversationDetail> {
     return this.requestJson<ConversationDetail>(
       'GET',
-      `/api/v1/conversations/${encodeURIComponent(id)}`,
+      withScopeQuery(`/api/v1/conversations/${encodeURIComponent(id)}`, scope),
       { signal },
     );
   }
@@ -655,26 +670,31 @@ export class GatewayClient {
     id: string,
     input: PatchConversationInput,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<Conversation> {
     return this.requestJson<{ conversation: Conversation }>(
       'PATCH',
-      `/api/v1/conversations/${encodeURIComponent(id)}`,
+      withScopeQuery(`/api/v1/conversations/${encodeURIComponent(id)}`, scope),
       { body: input, signal },
     ).then((res) => res.conversation);
   }
 
-  deleteConversation(id: string, signal?: AbortSignal): Promise<void> {
+  deleteConversation(
+    id: string,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<void> {
     return this.requestJson<void>(
       'DELETE',
-      `/api/v1/conversations/${encodeURIComponent(id)}`,
+      withScopeQuery(`/api/v1/conversations/${encodeURIComponent(id)}`, scope),
       { signal },
     );
   }
 
-  deleteConversationKeepalive(id: string): void {
+  deleteConversationKeepalive(id: string, scope?: TopicScope): void {
     const url = resolveGatewayUrl(
       this.baseUrl,
-      `/api/v1/conversations/${encodeURIComponent(id)}`,
+      withScopeQuery(`/api/v1/conversations/${encodeURIComponent(id)}`, scope),
     );
     void this.fetchImpl(url, {
       method: 'DELETE',
@@ -683,22 +703,28 @@ export class GatewayClient {
     }).catch(() => {});
   }
 
-  cleanupUngroupedConversations(signal?: AbortSignal): Promise<DeletedConversation[]> {
+  cleanupUngroupedConversations(
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<DeletedConversation[]> {
     return this.requestJson<{ deleted: DeletedConversation[] }>(
-      'POST', '/api/v1/conversations/cleanup-ungrouped', { signal },
+      'POST',
+      withScopeQuery('/api/v1/conversations/cleanup-ungrouped', scope),
+      { signal },
     ).then((res) => res.deleted);
   }
 
   listConversationGroups(
     assistantId?: string,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<ConversationGroup[]> {
     const query = assistantId
       ? `?assistantId=${encodeURIComponent(assistantId)}`
       : '';
     return this.requestJson<{ groups?: ConversationGroup[] }>(
       'GET',
-      `/api/v1/conversation-groups${query}`,
+      withScopeQuery(`/api/v1/conversation-groups${query}`, scope),
       { signal },
     ).then((res) => res.groups ?? []);
   }
@@ -706,10 +732,11 @@ export class GatewayClient {
   createConversationGroup(
     input: { assistantId: string; name: string },
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<GroupMutationResult> {
     return this.requestJson<GroupMutationResult>(
       'POST',
-      '/api/v1/conversation-groups',
+      withScopeQuery('/api/v1/conversation-groups', scope),
       { body: input, signal },
     );
   }
@@ -717,9 +744,12 @@ export class GatewayClient {
   reorderConversationGroup(
     input: { assistantId: string; id: string; beforeId: string | null },
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<ConversationOrganizationSnapshot> {
     return this.requestJson<ConversationOrganizationSnapshot>(
-      'POST', '/api/v1/conversation-groups/reorder', { body: input, signal },
+      'POST',
+      withScopeQuery('/api/v1/conversation-groups/reorder', scope),
+      { body: input, signal },
     );
   }
 
@@ -727,10 +757,11 @@ export class GatewayClient {
     id: string,
     input: { name: string },
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<GroupMutationResult> {
     return this.requestJson<GroupMutationResult>(
       'PATCH',
-      `/api/v1/conversation-groups/${encodeURIComponent(id)}`,
+      withScopeQuery(`/api/v1/conversation-groups/${encodeURIComponent(id)}`, scope),
       { body: input, signal },
     );
   }
@@ -738,10 +769,11 @@ export class GatewayClient {
   deleteConversationGroup(
     id: string,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<GroupDeleteResult> {
     return this.requestJson<GroupDeleteResult>(
       'DELETE',
-      `/api/v1/conversation-groups/${encodeURIComponent(id)}`,
+      withScopeQuery(`/api/v1/conversation-groups/${encodeURIComponent(id)}`, scope),
       { signal },
     );
   }
@@ -749,6 +781,7 @@ export class GatewayClient {
   batchConversations(
     input: BatchConversationsInput,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<ConversationOrganizationSnapshot> {
     const body: Record<string, unknown> = {
       assistantId: input.assistantId,
@@ -762,7 +795,7 @@ export class GatewayClient {
     }
     return this.requestJson<ConversationOrganizationSnapshot>(
       'POST',
-      '/api/v1/conversations/batch',
+      withScopeQuery('/api/v1/conversations/batch', scope),
       { body, signal },
     );
   }
@@ -770,6 +803,7 @@ export class GatewayClient {
   reorderConversations(
     input: ReorderConversationsInput,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<ConversationOrganizationSnapshot> {
     const body: Record<string, unknown> = {
       assistantId: input.assistantId,
@@ -784,7 +818,7 @@ export class GatewayClient {
     }
     return this.requestJson<ConversationOrganizationSnapshot>(
       'POST',
-      '/api/v1/conversations/reorder',
+      withScopeQuery('/api/v1/conversations/reorder', scope),
       { body, signal },
     );
   }
@@ -793,10 +827,14 @@ export class GatewayClient {
     conversationId: string,
     messageId: string,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<void> {
     return this.requestJson<void>(
       'DELETE',
-      `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+        scope,
+      ),
       { signal },
     );
   }
@@ -806,10 +844,14 @@ export class GatewayClient {
     messageId: string,
     blocks: ContentBlock[],
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<Message> {
     return this.requestJson<{ message: Message }>(
       'PATCH',
-      `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}`,
+        scope,
+      ),
       { body: { blocks }, signal },
     ).then((res) => res.message);
   }
@@ -818,10 +860,14 @@ export class GatewayClient {
     conversationId: string,
     input: CreateMessageInput,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<CreateMessageResult> {
     return this.requestJson<CreateMessageResult>(
       'POST',
-      `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages`,
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages`,
+        scope,
+      ),
       { body: input, signal },
     );
   }
@@ -842,10 +888,14 @@ export class GatewayClient {
     conversationId: string,
     body: { providerId?: string; modelId?: string },
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<CompactConversationResponse> {
     return this.requestJson<CompactConversationResponse>(
       'POST',
-      `/api/v1/conversations/${encodeURIComponent(conversationId)}/compact`,
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/compact`,
+        scope,
+      ),
       { body, signal },
     );
   }
@@ -866,10 +916,14 @@ export class GatewayClient {
     conversationId: string,
     messageId: string,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<ConversationDetail> {
     return this.requestJson<ConversationDetail>(
       'POST',
-      `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/branch`,
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/${encodeURIComponent(messageId)}/branch`,
+        scope,
+      ),
       { body: {}, signal },
     );
   }
@@ -906,10 +960,13 @@ export class GatewayClient {
     );
   }
 
-  listMcpServers(signal?: AbortSignal): Promise<MCPServerConfig[]> {
+  listMcpServers(
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<MCPServerConfig[]> {
     return this.requestJson<{ servers?: MCPServerConfig[] }>(
       'GET',
-      '/api/v1/mcp/servers',
+      withScopeQuery('/api/v1/mcp/servers', scope),
       { signal },
     ).then((res) => res.servers ?? []);
   }
@@ -917,10 +974,11 @@ export class GatewayClient {
   createMcpServer(
     input: MCPServerInput,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<MCPServerConfig> {
     return this.requestJson<{ server: MCPServerConfig }>(
       'POST',
-      '/api/v1/mcp/servers',
+      withScopeQuery('/api/v1/mcp/servers', scope),
       { body: input, signal },
     ).then((res) => res.server);
   }
@@ -929,18 +987,23 @@ export class GatewayClient {
     id: string,
     input: Partial<MCPServerInput>,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<MCPServerConfig> {
     return this.requestJson<{ server: MCPServerConfig }>(
       'PUT',
-      `/api/v1/mcp/servers/${encodeURIComponent(id)}`,
+      withScopeQuery(`/api/v1/mcp/servers/${encodeURIComponent(id)}`, scope),
       { body: input, signal },
     ).then((res) => res.server);
   }
 
-  deleteMcpServer(id: string, signal?: AbortSignal): Promise<void> {
+  deleteMcpServer(
+    id: string,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<void> {
     return this.requestJson<void>(
       'DELETE',
-      `/api/v1/mcp/servers/${encodeURIComponent(id)}`,
+      withScopeQuery(`/api/v1/mcp/servers/${encodeURIComponent(id)}`, scope),
       { signal },
     );
   }
@@ -948,10 +1011,11 @@ export class GatewayClient {
   listMcpServerTools(
     id: string,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<MCPToolDescriptor[]> {
     return this.requestJson<{ tools?: MCPToolDescriptor[] }>(
       'GET',
-      `/api/v1/mcp/servers/${encodeURIComponent(id)}/tools`,
+      withScopeQuery(`/api/v1/mcp/servers/${encodeURIComponent(id)}/tools`, scope),
       { signal },
     ).then((res) => res.tools ?? []);
   }
@@ -959,11 +1023,122 @@ export class GatewayClient {
   testMcpServer(
     id: string,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<MCPServerTestResult> {
     return this.requestJson<MCPServerTestResult>(
       'POST',
-      `/api/v1/mcp/servers/${encodeURIComponent(id)}/test`,
+      withScopeQuery(`/api/v1/mcp/servers/${encodeURIComponent(id)}/test`, scope),
       { body: {}, signal },
+    );
+  }
+
+  getDesktopStatus(signal?: AbortSignal): Promise<DesktopStatus> {
+    return this.requestJson<DesktopStatus>('GET', '/api/v1/desktop/status', { signal });
+  }
+
+  getDesktopConnection(signal?: AbortSignal): Promise<DesktopConnectionConfig> {
+    return this.requestJson<DesktopConnectionConfig>(
+      'GET',
+      '/api/v1/desktop/connection',
+      { signal },
+    );
+  }
+
+  saveDesktopConnection(
+    input: { gatewayBaseUrl: string; accessToken: string; clearToken?: boolean },
+    signal?: AbortSignal,
+  ): Promise<{ connection: DesktopConnectionConfig; status: DesktopStatus }> {
+    return this.requestJson<{
+      connection: DesktopConnectionConfig;
+      status: DesktopStatus;
+    }>('PUT', '/api/v1/desktop/connection', { body: input, signal });
+  }
+
+  disconnectDesktopCloud(signal?: AbortSignal): Promise<DesktopStatus> {
+    return this.requestJson<DesktopStatus>(
+      'DELETE',
+      '/api/v1/desktop/connection',
+      { signal },
+    );
+  }
+
+  testDesktopConnection(
+    input: { gatewayBaseUrl: string; accessToken?: string },
+    signal?: AbortSignal,
+  ): Promise<DesktopConnectionTestResult> {
+    return this.requestJson<DesktopConnectionTestResult>(
+      'POST',
+      '/api/v1/desktop/connection/test',
+      { body: input, signal },
+    );
+  }
+
+  uploadConversation(
+    id: string,
+    opts?: { force?: boolean; signal?: AbortSignal },
+  ): Promise<ConversationTransferResult> {
+    return this.requestJson<ConversationTransferResult>(
+      'POST',
+      `/api/v1/desktop/conversations/${encodeURIComponent(id)}/upload`,
+      { body: { force: Boolean(opts?.force) }, signal: opts?.signal },
+    );
+  }
+
+  pullConversation(
+    id: string,
+    opts?: { force?: boolean; signal?: AbortSignal },
+  ): Promise<ConversationTransferResult> {
+    return this.requestJson<ConversationTransferResult>(
+      'POST',
+      `/api/v1/desktop/conversations/${encodeURIComponent(id)}/pull`,
+      { body: { force: Boolean(opts?.force) }, signal: opts?.signal },
+    );
+  }
+
+  batchTransferConversations(
+    direction: 'upload' | 'pull',
+    ids: string[],
+    opts?: { force?: boolean; signal?: AbortSignal },
+  ): Promise<BatchTransferResult> {
+    return this.requestJson<BatchTransferResult>(
+      'POST',
+      '/api/v1/desktop/conversations/batch-transfer',
+      {
+        body: { direction, ids, force: Boolean(opts?.force) },
+        signal: opts?.signal,
+      },
+    );
+  }
+
+  getDesktopStorage(signal?: AbortSignal): Promise<DesktopStorageUsage> {
+    return this.requestJson<DesktopStorageUsage>(
+      'GET',
+      '/api/v1/desktop/storage',
+      { signal },
+    );
+  }
+
+  compactLocalStorage(signal?: AbortSignal): Promise<StorageCompactResult> {
+    return this.requestJson<StorageCompactResult>(
+      'POST',
+      '/api/v1/desktop/storage/compact',
+      { signal },
+    );
+  }
+
+  cleanupLocalUngrouped(signal?: AbortSignal): Promise<DeletedConversation[]> {
+    return this.requestJson<{ deleted: DeletedConversation[] }>(
+      'POST',
+      '/api/v1/desktop/storage/cleanup-ungrouped',
+      { signal },
+    ).then((res) => res.deleted ?? []);
+  }
+
+  clearDesktopCache(signal?: AbortSignal): Promise<void> {
+    return this.requestJson<void>(
+      'POST',
+      '/api/v1/desktop/storage/clear-cache',
+      { signal },
     );
   }
 
@@ -971,11 +1146,15 @@ export class GatewayClient {
     conversationId: string,
     calls: ToolCallExecutionInput[],
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<Response> {
     const serialized = this.serializeBody({ calls });
     const url = resolveGatewayUrl(
       this.baseUrl,
-      `/api/v1/conversations/${encodeURIComponent(conversationId)}/tools/execute`,
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/tools/execute`,
+        scope,
+      ),
     );
 
     let response: Response;
@@ -1011,11 +1190,15 @@ export class GatewayClient {
     conversationId: string,
     input: StreamChatInput,
     signal?: AbortSignal,
+    scope?: TopicScope,
   ): Promise<Response> {
     const serialized = this.serializeBody(buildStreamChatPayload(input));
     const url = resolveGatewayUrl(
       this.baseUrl,
-      `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/stream`,
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/stream`,
+        scope,
+      ),
     );
 
     let response: Response;

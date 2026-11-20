@@ -2,7 +2,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useState } from 'react';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { AppProvider, useApp } from './AppProvider';
 import { ConnectionGate } from './ConnectionGate';
 import { AppRoutes } from './routes';
@@ -736,5 +736,142 @@ describe('AppProvider, ConnectionGate, and Routing', () => {
     expect(
       screen.getByRole('button', { name: /^保持选中话题/ }),
     ).toHaveAttribute('aria-current', 'true');
+  });
+
+  it('desktop mode bypasses ConnectionGate offline, persists cloud connection in SQLite facade, and reflects cloud status in SettingsLayout', async () => {
+    window.__LLMSTUDIO_DESKTOP__ = {
+      apiBaseUrl: 'http://127.0.0.1:43211',
+      sessionToken: 'desktop-tok-app',
+      platform: 'windows',
+      dataMode: 'portable',
+      version: '1.5.0',
+    };
+
+    try {
+      let conn = { gatewayBaseUrl: '', tokenSet: false };
+      let cloudState = 'disconnected';
+      const user = userEvent.setup();
+
+      const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const method = (init?.method ?? 'GET').toUpperCase();
+        expect((init?.headers as Record<string, string>)?.Authorization).toBe(
+          'Bearer desktop-tok-app',
+        );
+        if (url.endsWith('/api/v1/desktop/status')) {
+          return new Response(
+            JSON.stringify({
+              mode: 'portable',
+              dataDir: 'D:\\LLMStudio\\data',
+              dbPath: 'D:\\LLMStudio\\data\\llmstudio.db',
+              cloudConfigured: Boolean(conn.gatewayBaseUrl),
+              cloudState,
+              gatewayBaseUrl: conn.gatewayBaseUrl,
+              tokenSet: conn.tokenSet,
+              authRequired: conn.tokenSet,
+              version: '1.5.0',
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/desktop/connection') && method === 'GET') {
+          return new Response(JSON.stringify(conn), { status: 200 });
+        }
+        if (url.endsWith('/api/v1/desktop/connection/test') && method === 'POST') {
+          return new Response(
+            JSON.stringify({ ok: true, authRequired: true, latencyMs: 14, message: 'ok' }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/desktop/connection') && method === 'PUT') {
+          const body = JSON.parse(String(init?.body ?? '{}')) as {
+            gatewayBaseUrl: string;
+            accessToken: string;
+          };
+          conn = { gatewayBaseUrl: body.gatewayBaseUrl, tokenSet: Boolean(body.accessToken) };
+          cloudState = 'connected';
+          return new Response(
+            JSON.stringify({
+              connection: conn,
+              status: {
+                mode: 'portable',
+                dataDir: 'D:\\LLMStudio\\data',
+                dbPath: 'D:\\LLMStudio\\data\\llmstudio.db',
+                cloudConfigured: true,
+                cloudState: 'connected',
+                gatewayBaseUrl: conn.gatewayBaseUrl,
+                tokenSet: conn.tokenSet,
+                authRequired: true,
+                version: '1.5.0',
+              },
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/desktop/connection') && method === 'DELETE') {
+          conn = { gatewayBaseUrl: '', tokenSet: false };
+          cloudState = 'disconnected';
+          return new Response(
+            JSON.stringify({
+              mode: 'portable',
+              dataDir: 'D:\\LLMStudio\\data',
+              dbPath: 'D:\\LLMStudio\\data\\llmstudio.db',
+              cloudConfigured: false,
+              cloudState: 'disconnected',
+              gatewayBaseUrl: '',
+              tokenSet: false,
+              authRequired: false,
+              version: '1.5.0',
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/settings')) {
+          return new Response(
+            JSON.stringify(settingsEnvelope({ themeMode: 'dark' })),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/formats')) return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
+        if (url.endsWith('/api/v1/providers')) return new Response(JSON.stringify({ providers: [] }), { status: 200 });
+        if (url.endsWith('/api/v1/assistants')) return new Response(JSON.stringify({ assistants: [] }), { status: 200 });
+        if (url.includes('/api/v1/conversations')) return new Response(JSON.stringify({ conversations: [] }), { status: 200 });
+        if (url.includes('/api/v1/conversation-groups')) return new Response(JSON.stringify({ groups: [] }), { status: 200 });
+        if (url.endsWith('/api/v1/plugins/search')) return new Response(JSON.stringify({ engines: [] }), { status: 200 });
+        if (url.includes('/api/v1/mcp/servers')) return new Response(JSON.stringify({ servers: [] }), { status: 200 });
+        return new Response('{}', { status: 200 });
+      });
+
+      render(
+        <AppProvider fetchImpl={fetchMock}>
+          <MemoryRouter initialEntries={['/settings/connection']}>
+            <ConnectionGate>
+              <Routes>
+                <Route path="/settings/:section" element={<SettingsLayout />} />
+              </Routes>
+            </ConnectionGate>
+          </MemoryRouter>
+        </AppProvider>,
+      );
+
+      await waitFor(() => expect(screen.getByText('云端未连接')).toBeInTheDocument());
+      expect(document.documentElement.dataset.desktop).toBe('true');
+
+      await user.type(screen.getByLabelText('网关地址'), 'https://vps.example.com');
+      await user.type(screen.getByLabelText('访问令牌'), 'cloud-secret');
+      await user.click(screen.getByRole('button', { name: '测试连接' }));
+      await waitFor(() => expect(screen.getByText(/连接成功/)).toBeInTheDocument());
+
+      await user.click(screen.getByRole('button', { name: '保存连接' }));
+      await waitFor(() => expect(screen.getByText('云端已连接')).toBeInTheDocument());
+      expect(screen.getByRole('button', { name: '断开云端' })).toBeInTheDocument();
+
+      await user.click(screen.getByRole('button', { name: '断开云端' }));
+      await waitFor(() => expect(screen.getByText('云端未连接')).toBeInTheDocument());
+      expect(screen.queryByRole('button', { name: '断开云端' })).toBeNull();
+    } finally {
+      delete window.__LLMSTUDIO_DESKTOP__;
+      delete document.documentElement.dataset.desktop;
+    }
   });
 });

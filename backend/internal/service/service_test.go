@@ -69,10 +69,11 @@ func setupServiceTestEnv(t *testing.T) (
 // setAutoCache flips the gateway-managed automatic caching preference for tests.
 func setAutoCache(t *testing.T, chatSvc *ChatService, enabled bool) {
 	t.Helper()
-	if chatSvc.preferences == nil {
-		t.Fatal("chat service has no preference store")
+	prefSvc, ok := chatSvc.preferences.(*PreferenceService)
+	if !ok || prefSvc == nil {
+		t.Fatal("chat service has no preference service")
 	}
-	if _, _, err := chatSvc.preferences.store.Update(
+	if _, _, err := prefSvc.store.Update(
 		context.Background(),
 		domain.PreferencesPatch{AutoCreateCache: domain.BoolPtr(enabled)},
 		false,
@@ -554,7 +555,11 @@ func TestPreferenceImportLegacyIgnoresMissingWidthAndEphemeralCreate(t *testing.
 	legacy.ThemeMode = domain.ThemeModeDark
 	legacy.ChatWidthMode = ""
 	legacy.ChatManualWidth = 0
-	imported, initialized, err := chatSvc.preferences.ImportLegacy(ctx, legacy)
+	prefSvc, ok := chatSvc.preferences.(*PreferenceService)
+	if !ok || prefSvc == nil {
+		t.Fatal("chat service has no preference service")
+	}
+	imported, initialized, err := prefSvc.ImportLegacy(ctx, legacy)
 	if err != nil || !initialized {
 		t.Fatalf("import legacy without width fields: err=%v initialized=%v", err, initialized)
 	}

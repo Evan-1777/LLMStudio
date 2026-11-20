@@ -16,7 +16,7 @@ import {
 import { useApp } from '../../app/AppProvider';
 import { Icon, IconButton } from '../../components/ui';
 import { CHAT_WIDTH_MAX, CHAT_WIDTH_MIN } from '../../core/settings';
-import { isReasoningEffort, type Assistant, type ContentBlock, type Message, type ReasoningEffort } from '../../core/types';
+import { isReasoningEffort, type Assistant, type ContentBlock, type Message, type ReasoningEffort, type TopicScope } from '../../core/types';
 import { ChatProvider, useChat } from '../chat/ChatProvider';
 import { AssistantEditor } from './AssistantEditor';
 import { AssistantSidebar } from './AssistantSidebar';
@@ -82,6 +82,9 @@ function WorkbenchInner() {
 
   const {
     gateway,
+    isDesktop,
+    topicScope,
+    setTopicScope,
     connectionState,
     connectionEpoch,
     resources,
@@ -93,6 +96,27 @@ function WorkbenchInner() {
     syncingServer,
     toast,
   } = useApp();
+
+  const rawUrlScope = searchParams.get('scope');
+  const urlScope: TopicScope | null =
+    rawUrlScope === 'local' || rawUrlScope === 'cloud' ? rawUrlScope : null;
+  const activeScope: TopicScope = isDesktop ? (urlScope ?? topicScope) : 'cloud';
+  const reqScope: TopicScope | undefined = isDesktop ? activeScope : undefined;
+  const activeScopeRef = useRef<TopicScope | undefined>(reqScope);
+  activeScopeRef.current = reqScope;
+  const prevUrlScopeRef = useRef<TopicScope | null>(null);
+
+  useEffect(() => {
+    if (!isDesktop) return;
+    if (urlScope && urlScope !== prevUrlScopeRef.current) {
+      prevUrlScopeRef.current = urlScope;
+      if (urlScope !== topicScope) {
+        setTopicScope(urlScope);
+      }
+    } else if (!urlScope) {
+      prevUrlScopeRef.current = null;
+    }
+  }, [isDesktop, setTopicScope, topicScope, urlScope]);
 
   const {
     state: chatState,
@@ -157,10 +181,11 @@ function WorkbenchInner() {
       const tempId = temporaryConvIdRef.current;
       if (!tempId) return;
       temporaryConvIdRef.current = null;
+      const scopeForTemp = activeScopeRef.current;
       if (options?.keepalive) {
-        gateway.deleteConversationKeepalive(tempId);
+        gateway.deleteConversationKeepalive(tempId, scopeForTemp);
       } else {
-        void gateway.deleteConversation(tempId).catch(() => {});
+        void gateway.deleteConversation(tempId, undefined, scopeForTemp).catch(() => {});
       }
     },
     [gateway],
@@ -239,12 +264,13 @@ function WorkbenchInner() {
     if (connectionState !== 'connected') {
       return;
     }
-    if (skipNextLoadIdRef.current === conversationId) {
+    const loadKey = `${reqScope ?? 'cloud'}:${conversationId}`;
+    if (skipNextLoadIdRef.current === loadKey) {
       skipNextLoadIdRef.current = null;
       return;
     }
     let alive = true;
-    void loadConversation(conversationId).then((detail) => {
+    void loadConversation(conversationId, reqScope).then((detail) => {
       if (!alive || !detail) return;
       const aid = detail.conversation.assistantId || 'default';
       setSelectedAssistantId(aid);
@@ -258,6 +284,7 @@ function WorkbenchInner() {
     connectionState,
     conversationId,
     loadConversation,
+    reqScope,
   ]);
 
   const activeAssistant = useMemo(
@@ -363,6 +390,59 @@ function WorkbenchInner() {
   const selectedProviderId = targetModel?.provider.id ?? '';
   const selectedModelId = targetModel?.model.id ?? '';
 
+  const buildChatUrl = useCallback(
+    (
+      targetConvId?: string,
+      opts?: { assistantId?: string; scope?: TopicScope },
+    ) => {
+      const scopeVal = opts?.scope ?? activeScope;
+      if (targetConvId) {
+        return isDesktop
+          ? `/chat/${encodeURIComponent(targetConvId)}?scope=${scopeVal}`
+          : `/chat/${encodeURIComponent(targetConvId)}`;
+      }
+      const aid = opts?.assistantId ?? activeAssistant.id;
+      return isDesktop
+        ? `/chat?assistant=${encodeURIComponent(aid)}&scope=${scopeVal}`
+        : `/chat?assistant=${encodeURIComponent(aid)}`;
+    },
+    [activeAssistant.id, activeScope, isDesktop],
+  );
+
+  const handleChangeScope = useCallback(
+    (nextScope: TopicScope) => {
+      if (!isDesktop || nextScope === activeScope) return;
+      stopStreaming();
+      discardRef.current();
+      setIsTemporaryMode(false);
+      clearSession();
+      setDraftSessionParams({ systemPrompt: '', params: {} });
+      setInspectorOpen(false);
+      prevUrlScopeRef.current = nextScope;
+      setTopicScope(nextScope);
+      if (conversationId) {
+        navigate(buildChatUrl(undefined, { scope: nextScope }), { replace: true });
+      } else {
+        setSearchParams(
+          { assistant: activeAssistant.id, scope: nextScope },
+          { replace: true },
+        );
+      }
+    },
+    [
+      activeAssistant.id,
+      activeScope,
+      buildChatUrl,
+      clearSession,
+      conversationId,
+      isDesktop,
+      navigate,
+      setSearchParams,
+      setTopicScope,
+      stopStreaming,
+    ],
+  );
+
   const closeDrawers = useCallback((restoreFocusTo?: 'left' | 'right') => {
     setLeftDrawerOpen(false);
     setRightDrawerOpen(false);
@@ -382,9 +462,9 @@ function WorkbenchInner() {
     setDraftSessionParams({ systemPrompt: '', params: {} });
     setInspectorOpen(false);
     closeDrawers();
-    navigate(`/chat?assistant=${encodeURIComponent(activeAssistant.id)}`);
+    navigate(buildChatUrl());
   }, [
-    activeAssistant.id,
+    buildChatUrl,
     clearSession,
     closeDrawers,
     discardTemporarySession,
@@ -403,10 +483,10 @@ function WorkbenchInner() {
     }
     setIsTemporaryMode(true);
     if (conversationId) {
-      navigate(`/chat?assistant=${encodeURIComponent(activeAssistant.id)}`);
+      navigate(buildChatUrl());
     }
   }, [
-    activeAssistant.id,
+    buildChatUrl,
     clearSession,
     conversationId,
     discardTemporarySession,
@@ -477,10 +557,10 @@ function WorkbenchInner() {
         (c) => (c.assistantId || 'default') === assistantId,
       );
       if (firstForAssistant) {
-        navigate(`/chat/${encodeURIComponent(firstForAssistant.id)}`);
+        navigate(buildChatUrl(firstForAssistant.id));
       } else {
         clearSession();
-        navigate(`/chat?assistant=${encodeURIComponent(assistantId)}`);
+        navigate(buildChatUrl(undefined, { assistantId }));
       }
     }
     if (window.innerWidth < 768) {
@@ -493,7 +573,7 @@ function WorkbenchInner() {
       stopStreaming();
       discardTemporarySession();
       setIsTemporaryMode(false);
-      navigate(`/chat/${encodeURIComponent(id)}`);
+      navigate(buildChatUrl(id));
     }
     if (window.innerWidth < 1200) {
       closeDrawers('right');
@@ -513,23 +593,30 @@ function WorkbenchInner() {
     }
     const targetConvId = currentConversation.id;
     const startEpoch = connectionEpoch;
+    const targetScope = activeScopeRef.current;
     const scopeKey = `${startEpoch}:${targetConvId}`;
     if (isBusy || modelSaveLockRef.current === scopeKey) return;
 
     modelSaveLockRef.current = scopeKey;
     setSavingModelKey(scopeKey);
     try {
-      const updated = await gateway.patchConversation(targetConvId, {
-        providerId,
-        modelId,
-      });
+      const updated = await gateway.patchConversation(
+        targetConvId,
+        {
+          providerId,
+          modelId,
+        },
+        undefined,
+        targetScope,
+      );
       if (
         activeConnEpochRef.current !== startEpoch ||
-        activeConvIdRef.current !== targetConvId
+        activeConvIdRef.current !== targetConvId ||
+        activeScopeRef.current !== targetScope
       ) {
         return;
       }
-      upsertLocalConversation(updated);
+      upsertLocalConversation(updated, targetScope);
       updateConversationMeta(updated);
     } catch {
       if (
@@ -565,8 +652,10 @@ function WorkbenchInner() {
       currentConversation?.id ??
       (isTemporaryMode ? temporaryConvIdRef.current ?? '' : conversationId ?? '');
     const tempModeAtSend = isTemporaryMode;
+    const scopeAtSend = activeScopeRef.current;
     return sendMessage({
       conversationId: existingConvId || undefined,
+      scope: scopeAtSend,
       ensureConversation: existingConvId
         ? undefined
         : async (signal) => {
@@ -574,6 +663,7 @@ function WorkbenchInner() {
               const created = await gateway.getConversationDetail(
                 temporaryConvIdRef.current,
                 signal,
+                scopeAtSend,
               );
               return created.conversation;
             }
@@ -590,10 +680,11 @@ function WorkbenchInner() {
                 ...(tempModeAtSend ? { ephemeral: true } : {}),
               },
               signal,
+              scopeAtSend,
             );
             if (signal.aborted) {
               if (tempModeAtSend) {
-                void gateway.deleteConversation(created.id).catch(() => {});
+                void gateway.deleteConversation(created.id, undefined, scopeAtSend).catch(() => {});
               }
               return null;
             }
@@ -601,9 +692,9 @@ function WorkbenchInner() {
               temporaryConvIdRef.current = created.id;
               return created;
             }
-            upsertLocalConversation(created);
-            skipNextLoadIdRef.current = created.id;
-            navigate(`/chat/${encodeURIComponent(created.id)}`, { replace: true });
+            upsertLocalConversation(created, scopeAtSend);
+            skipNextLoadIdRef.current = `${scopeAtSend ?? 'cloud'}:${created.id}`;
+            navigate(buildChatUrl(created.id, { scope: scopeAtSend }), { replace: true });
             return created;
           },
       blocks: opts.blocks,
@@ -625,9 +716,11 @@ function WorkbenchInner() {
       providerId: selectedProviderId,
       modelId: selectedModelId,
       params: { reasoningEffort },
+      scope: activeScopeRef.current,
     });
 
-  const handleDeleteMessage = (message: Message) => deleteMessage(message.id);
+  const handleDeleteMessage = (message: Message) =>
+    deleteMessage(message.id, activeScopeRef.current);
 
   const handleCompact = useCallback(async () => {
     if (!currentConversation?.id || !selectedProviderId || !selectedModelId) {
@@ -636,6 +729,7 @@ function WorkbenchInner() {
     const res = await compactConversation({
       providerId: selectedProviderId,
       modelId: selectedModelId,
+      scope: activeScopeRef.current,
     });
     if (res.ok) {
       toast('上下文已压缩');
@@ -651,12 +745,12 @@ function WorkbenchInner() {
   ]);
 
   const handleUpdateMessage = (messageId: string, blocks: ContentBlock[]) =>
-    updateMessage(messageId, blocks);
+    updateMessage(messageId, blocks, activeScopeRef.current);
 
   const handleBranchMessage = async (message: Message) => {
-    const detail = await branchFromMessage(message.id);
+    const detail = await branchFromMessage(message.id, activeScopeRef.current);
     if (detail) {
-      navigate(`/chat/${encodeURIComponent(detail.conversation.id)}`);
+      navigate(buildChatUrl(detail.conversation.id));
       toast('已创建分支话题');
     }
   };
@@ -715,7 +809,7 @@ function WorkbenchInner() {
         stopStreaming();
         clearSession();
         setDraftSessionParams({ systemPrompt: '', params: {} });
-        navigate(`/chat?assistant=${encodeURIComponent(activeAssistant.id)}`, {
+        navigate(buildChatUrl(), {
           replace: true,
         });
         toast('当前话题已在其他端删除');
@@ -724,7 +818,7 @@ function WorkbenchInner() {
       await reloadCurrentConversation();
     }
   }, [
-    activeAssistant.id,
+    buildChatUrl,
     clearSession,
     conversationId,
     isBusy,
@@ -1027,6 +1121,8 @@ function WorkbenchInner() {
         drawerOpen={rightDrawerOpen}
         manageMode={sidebarManageMode}
         isBusy={isBusy}
+        scope={activeScope}
+        onScopeChange={handleChangeScope}
         onManageModeChange={setSidebarManageMode}
         onSelectConversation={handleSelectConversation}
         onNewConversation={handleStartNewTopic}
@@ -1047,15 +1143,12 @@ function WorkbenchInner() {
             stopStreaming();
             const next = remaining[0];
             if (next) {
-              navigate(`/chat/${encodeURIComponent(next.id)}`, {
+              navigate(buildChatUrl(next.id), {
                 replace: true,
               });
             } else {
               clearSession();
-              navigate(
-                `/chat?assistant=${encodeURIComponent(activeAssistant.id)}`,
-                { replace: true },
-              );
+              navigate(buildChatUrl(), { replace: true });
             }
           }
         }}
@@ -1083,7 +1176,12 @@ function WorkbenchInner() {
         onSaved={(saved) => {
           setSelectedAssistantId(saved.id);
           if (!conversationId) {
-            setSearchParams({ assistant: saved.id }, { replace: true });
+            setSearchParams(
+              isDesktop
+                ? { assistant: saved.id, scope: activeScope }
+                : { assistant: saved.id },
+              { replace: true },
+            );
           }
         }}
         onDeleted={(deletedId) => {
@@ -1092,7 +1190,7 @@ function WorkbenchInner() {
               assistants.find((a) => a.id !== deletedId)?.id ?? 'default';
             setSelectedAssistantId(fallback);
             clearSession();
-            navigate(`/chat?assistant=${encodeURIComponent(fallback)}`, {
+            navigate(buildChatUrl(undefined, { assistantId: fallback }), {
               replace: true,
             });
           }

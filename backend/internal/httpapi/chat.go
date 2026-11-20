@@ -121,7 +121,16 @@ func (h *ChatHandler) ExecuteTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.ConversationID = r.PathValue("id")
+	streamSSEToolEvents(w, in.ConversationID, func(emit func(domain.StreamEvent) error) error {
+		return h.svc.ExecuteTools(r.Context(), in, emit)
+	})
+}
 
+func streamSSEToolEvents(
+	w http.ResponseWriter,
+	conversationID string,
+	run func(emit func(domain.StreamEvent) error) error,
+) {
 	rc := http.NewResponseController(w)
 	headersSent := false
 	sendEvent := func(ev domain.StreamEvent) error {
@@ -144,14 +153,14 @@ func (h *ChatHandler) ExecuteTools(w http.ResponseWriter, r *http.Request) {
 		return rc.Flush()
 	}
 
-	if err := h.svc.ExecuteTools(r.Context(), in, sendEvent); err != nil {
+	if err := run(sendEvent); err != nil {
 		if !headersSent {
 			writeServiceError(w, err)
 			return
 		}
 		_ = sendEvent(domain.StreamEvent{
 			Type:           domain.StreamEventError,
-			ConversationID: in.ConversationID,
+			ConversationID: conversationID,
 			Error: &domain.StreamError{
 				Code:    domain.ErrCodeInternalError,
 				Message: err.Error(),

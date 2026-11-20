@@ -709,3 +709,101 @@ func TestMigration011EphemeralConversationsLifecycleAndCleanup(t *testing.T) {
 		t.Fatalf("expected pinned regular conversation preserved: %v", err)
 	}
 }
+
+func TestImportConversationAtomicAndConflict(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("OpenSQLite failed: %v", err)
+	}
+	defer db.Close()
+
+	convs := NewConversationStore(db)
+	msgs := NewMessageStore(db)
+
+	if _, _, err := convs.ImportConversation(ctx, domain.Conversation{
+		ID:        "ephemeral-conv",
+		Title:     "Temp",
+		Ephemeral: true,
+	}, nil, false); err == nil {
+		t.Fatal("expected ephemeral import to fail")
+	}
+
+	t0 := time.Now().UTC().Add(-time.Hour)
+	missingGroup := "non-existent-group"
+	importedConv, importedMsgs, err := convs.ImportConversation(ctx, domain.Conversation{
+		ID:          "sync-conv-1",
+		AssistantID: domain.DefaultAssistantID,
+		Title:       "Desktop Topic",
+		ProviderID:  "prov-1",
+		ModelID:     "gpt-4o",
+		GroupID:     &missingGroup,
+		Pinned:      true,
+		CreatedAt:   t0,
+		UpdatedAt:   t0.Add(time.Minute),
+	}, []domain.Message{
+		{
+			ID:        "m-user-1",
+			Role:      domain.RoleUser,
+			Blocks:    []domain.ContentBlock{{Type: domain.BlockTypeImage, MimeType: "image/png", Data: "iVBORw0KGgo="}, {Type: domain.BlockTypeText, Text: "inspect image"}},
+			CreatedAt: t0,
+		},
+		{
+			ID:         "m-asst-1",
+			Role:       domain.RoleAssistant,
+			Blocks:     []domain.ContentBlock{{Type: domain.BlockTypeToolCall, ID: "tc1", Name: "read", Arguments: []byte(`{"path":"a.txt"}`)}, {Type: domain.BlockTypeText, Text: "done"}},
+			ProviderID: "prov-1",
+			ModelID:    "gpt-4o",
+			Usage:      &domain.Usage{InputTokens: 10, OutputTokens: 5, TotalTokens: 15, ContextTokens: 15},
+			StopReason: domain.StopReasonStop,
+			CreatedAt:  t0.Add(time.Second),
+		},
+		{
+			ID:        "m-comp-1",
+			Role:      domain.RoleCompaction,
+			Blocks:    []domain.ContentBlock{{Type: domain.BlockTypeCompaction, Text: "summary"}},
+			CreatedAt: t0.Add(2 * time.Second),
+		},
+	}, false)
+	if err != nil {
+		t.Fatalf("first ImportConversation failed: %v", err)
+	}
+	if importedConv.GroupID != nil || !importedConv.Pinned || importedConv.SyncState != domain.SyncStateSynced || importedConv.LastSyncedAt == nil {
+		t.Fatalf("unexpected imported conversation metadata: %+v", importedConv)
+	}
+	if len(importedMsgs) != 3 || importedMsgs[0].ID != "m-user-1" || importedMsgs[0].Blocks[0].Type != domain.BlockTypeImage || importedMsgs[1].Usage == nil || importedMsgs[1].Usage.ContextTokens != 15 || importedMsgs[2].Role != domain.RoleCompaction {
+		t.Fatalf("unexpected imported messages fidelity: %+v", importedMsgs)
+	}
+
+	// Idempotent re-import without target edits succeeds without duplicating messages.
+	reImportedConv, reImportedMsgs, err := convs.ImportConversation(ctx, importedConv, importedMsgs, false)
+	if err != nil {
+		t.Fatalf("idempotent re-import failed: %v", err)
+	}
+	if reImportedConv.SortOrder != importedConv.SortOrder || len(reImportedMsgs) != 3 {
+		t.Fatalf("expected sort order %d and 3 messages, got sort=%d count=%d", importedConv.SortOrder, reImportedConv.SortOrder, len(reImportedMsgs))
+	}
+
+	// Simulate target edit after last sync -> conflict unless force=true.
+	if err := convs.TouchUpdatedAt(ctx, importedConv.ID, time.Now().UTC().Add(2*time.Minute)); err != nil {
+		t.Fatalf("TouchUpdatedAt failed: %v", err)
+	}
+	if _, _, err := convs.ImportConversation(ctx, importedConv, importedMsgs, false); err == nil {
+		t.Fatal("expected conflict error when target has newer unsynced changes")
+	} else if appErr, ok := domain.AsAppError(err); !ok || appErr.Code != domain.ErrCodeConflict {
+		t.Fatalf("expected ErrCodeConflict, got %v", err)
+	}
+
+	// Force overwrite succeeds and replaces messages cleanly.
+	importedConv.Title = "Forced Title"
+	forcedConv, forcedMsgs, err := convs.ImportConversation(ctx, importedConv, importedMsgs[:1], true)
+	if err != nil {
+		t.Fatalf("forced import failed: %v", err)
+	}
+	if forcedConv.Title != "Forced Title" || forcedConv.SortOrder != importedConv.SortOrder || len(forcedMsgs) != 1 {
+		t.Fatalf("unexpected forced import result: conv=%+v msgs=%+v", forcedConv, forcedMsgs)
+	}
+	if _, err := msgs.Get(ctx, "m-asst-1"); err == nil {
+		t.Fatal("expected replaced old message to be removed")
+	}
+}

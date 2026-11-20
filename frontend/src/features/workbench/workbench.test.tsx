@@ -1641,5 +1641,272 @@ describe('Workbench flows and attachments', () => {
     await user.click(screen.getByRole('button', { name: '删除' }));
 
     await waitFor(() => expect(screen.queryByLabelText('压缩检查点')).not.toBeInTheDocument());
+    expect(screen.queryByRole('radio', { name: '本地话题' })).toBeNull();
+    expect(screen.queryByRole('radio', { name: '云端话题' })).toBeNull();
+  });
+
+  it('desktop mode switches local/cloud scopes, handles upload/pull conflicts with ConfirmDialog, and routes streaming through loopback', async () => {
+    window.__LLMSTUDIO_DESKTOP__ = {
+      apiBaseUrl: 'http://127.0.0.1:45125',
+      sessionToken: 'desktop-wb-tok',
+      platform: 'windows',
+      dataMode: 'portable',
+      version: '1.5.0',
+    };
+
+    try {
+      const localConvs = [
+        {
+          id: 'loc-1',
+          assistantId: 'default',
+          title: '本地研究笔记',
+          providerId: 'openai',
+          modelId: 'gpt-4.1',
+          params: {},
+          syncEnabled: false,
+          syncState: 'local_only',
+          syncVersion: 0,
+          createdAt: '2026-11-20T08:00:00Z',
+          updatedAt: '2026-11-20T08:00:00Z',
+        },
+        {
+          id: 'loc-2',
+          assistantId: 'default',
+          title: '本地草稿二',
+          providerId: 'openai',
+          modelId: 'gpt-4.1',
+          params: {},
+          syncEnabled: false,
+          syncState: 'local_only',
+          syncVersion: 0,
+          createdAt: '2026-11-20T08:05:00Z',
+          updatedAt: '2026-11-20T08:05:00Z',
+        },
+      ];
+      let cloudConvs = [
+        {
+          id: 'cld-1',
+          assistantId: 'default',
+          title: '云端架构讨论',
+          providerId: 'openai',
+          modelId: 'gpt-4.1',
+          params: {},
+          syncEnabled: true,
+          syncState: 'synced',
+          syncVersion: 1,
+          createdAt: '2026-11-20T07:00:00Z',
+          updatedAt: '2026-11-20T07:00:00Z',
+        },
+      ];
+      const calls: Array<{ method: string; url: string; body?: Record<string, unknown> }> = [];
+      let prepareLocalCalled = false;
+
+      const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const method = (init?.method ?? 'GET').toUpperCase();
+        const parsed =
+          typeof init?.body === 'string' && init.body
+            ? (JSON.parse(init.body) as Record<string, unknown>)
+            : undefined;
+        calls.push({ method, url, body: parsed });
+
+        if (url.includes('/prepare-local')) {
+          prepareLocalCalled = true;
+        }
+        if (url.endsWith('/api/v1/desktop/status')) {
+          return Response.json({
+            mode: 'portable',
+            dataDir: 'D:\\LLMStudio\\data',
+            dbPath: 'D:\\LLMStudio\\data\\llmstudio.db',
+            cloudConfigured: true,
+            cloudState: 'connected',
+            gatewayBaseUrl: 'https://cloud.example.com',
+            tokenSet: true,
+            authRequired: true,
+            version: '1.5.0',
+          });
+        }
+        if (url.endsWith('/api/v1/settings')) {
+          return Response.json({ preferences: defaultAppPreferences(), initialized: true });
+        }
+        if (url.endsWith('/api/v1/formats')) return Response.json({ formats: [], adapters: [] });
+        if (url.endsWith('/api/v1/providers')) {
+          return Response.json({
+            providers: [
+              {
+                id: 'openai',
+                name: 'OpenAI',
+                adapter: 'generic-http',
+                baseURL: 'https://api.openai.com/v1',
+                authType: 'bearer',
+                apiKeyMasked: 'sk-1...89',
+                apiKeySet: true,
+                enabled: true,
+                builtIn: true,
+                localRequest: true,
+                models: [{ id: 'gpt-4.1', name: 'GPT-4.1', apiFormat: 'openai-responses' }],
+              },
+            ],
+          });
+        }
+        if (url.endsWith('/api/v1/assistants')) {
+          return Response.json({
+            assistants: [{ id: 'default', name: '默认助手', params: {}, isDefault: true }],
+          });
+        }
+        if (url.includes('/api/v1/conversations?') || url.endsWith('/api/v1/conversations')) {
+          const isCloud = url.includes('scope=cloud');
+          return Response.json({ conversations: isCloud ? cloudConvs : localConvs });
+        }
+        if (url.includes('/api/v1/conversation-groups')) {
+          return Response.json({ groups: [] });
+        }
+        if (url.endsWith('/api/v1/plugins/search')) return Response.json({ engines: [] });
+        if (url.includes('/api/v1/mcp/servers')) return Response.json({ servers: [] });
+
+        if (url.includes('/api/v1/desktop/conversations/loc-1/upload') && method === 'POST') {
+          if (!parsed?.force) {
+            return Response.json(
+              { code: 'CONFLICT', message: '云端存在较新版本' },
+              { status: 409 },
+            );
+          }
+          const uploaded = {
+            ...localConvs[0],
+            groupId: null,
+            syncEnabled: true,
+            syncState: 'synced',
+            syncVersion: 2,
+          };
+          cloudConvs = [...cloudConvs, uploaded];
+          return Response.json({ conversation: uploaded, messages: [] });
+        }
+
+        if (url.endsWith('/api/v1/desktop/conversations/batch-transfer') && method === 'POST') {
+          return Response.json({
+            direction: 'upload',
+            succeeded: (parsed?.ids as string[]) ?? [],
+            failed: [],
+          });
+        }
+
+        if (url.includes('/api/v1/desktop/conversations/cld-1/pull') && method === 'POST') {
+          return Response.json({
+            conversation: { ...cloudConvs[0], groupId: null, syncState: 'synced' },
+            messages: [],
+          });
+        }
+
+        if (url.includes('/api/v1/conversations/loc-1/messages/stream') && method === 'POST') {
+          const sse = [
+            'event: message_start\ndata: {"type":"message_start","messageId":"m-u1","conversationId":"loc-1"}\n\n',
+            'event: block_start\ndata: {"type":"block_start","index":0,"blockType":"text"}\n\n',
+            'event: block_delta\ndata: {"type":"block_delta","index":0,"delta":"回环响应"}\n\n',
+            'event: message_end\ndata: {"type":"message_end","messageId":"m-a1","stopReason":"stop"}\n\n',
+          ].join('');
+          return new Response(sse, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          });
+        }
+
+        if (url.includes('/api/v1/conversations/loc-1') && method === 'GET') {
+          return Response.json({
+            conversation: localConvs[0],
+            messages: [
+              {
+                id: 'm-u1',
+                conversationId: 'loc-1',
+                role: 'user',
+                blocks: [{ type: 'text', text: '本地测试' }],
+                createdAt: '2026-11-20T08:00:01Z',
+              },
+              {
+                id: 'm-a1',
+                conversationId: 'loc-1',
+                role: 'assistant',
+                blocks: [{ type: 'text', text: '回环响应' }],
+                createdAt: '2026-11-20T08:00:02Z',
+              },
+            ],
+          });
+        }
+
+        return Response.json({});
+      });
+
+      const user = userEvent.setup();
+      render(
+        <AppProvider fetchImpl={fetchMock}>
+          <MemoryRouter initialEntries={['/chat/loc-1?scope=local']}>
+            <Routes>
+              <Route path="/chat" element={<WorkbenchPage />} />
+              <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+              <Route path="/settings/connection" element={<div>conn-page</div>} />
+            </Routes>
+          </MemoryRouter>
+        </AppProvider>,
+      );
+
+      await waitFor(() => expect(screen.getByText('本地研究笔记')).toBeInTheDocument());
+      await user.click(screen.getByRole('button', { name: '切换话题栏' }));
+      expect(screen.getByRole('radio', { name: '本地话题' })).toBeChecked();
+      expect(screen.queryByText('云端架构讨论')).toBeNull();
+
+      // Send a message with provider.localRequest=true: desktop still uses loopback stream, never prepare-local.
+      const composer = screen.getByLabelText('消息输入框');
+      await user.type(composer, '桌面回环消息');
+      await user.click(screen.getByRole('button', { name: '发送消息' }));
+      await waitFor(() =>
+        expect(
+          calls.some((c) =>
+            c.url.includes('/api/v1/conversations/loc-1/messages/stream?scope=local'),
+          ),
+        ).toBe(true),
+      );
+      await waitFor(() => expect(screen.getByText('回环响应')).toBeInTheDocument());
+      expect(prepareLocalCalled).toBe(false);
+
+      // Single upload triggers 409 conflict dialog -> confirm retries with force=true.
+      const locRow = screen.getByText('本地研究笔记').closest('.wb-topic-row') as HTMLElement;
+      await user.click(within(locRow).getByRole('button', { name: '上传至云端' }));
+      const conflictDlg = await screen.findByRole('dialog', { name: '覆盖云端话题？' });
+      expect(conflictDlg).toHaveTextContent(/分组不跨端迁移/);
+      await user.click(within(conflictDlg).getByRole('button', { name: '覆盖' }));
+      await waitFor(() =>
+        expect(
+          calls.some(
+            (c) =>
+              c.url.includes('/api/v1/desktop/conversations/loc-1/upload') &&
+              c.body?.force === true,
+          ),
+        ).toBe(true),
+      );
+
+      // Batch upload in manage mode (select both items to trigger batch-transfer endpoint).
+      await user.click(screen.getByRole('button', { name: '管理话题' }));
+      await user.click(screen.getByLabelText('选择 本地研究笔记'));
+      await user.click(screen.getByLabelText('选择 本地草稿二'));
+      await user.click(screen.getByRole('button', { name: '批量上传至云端' }));
+      await waitFor(() =>
+        expect(
+          calls.some((c) => c.url.endsWith('/api/v1/desktop/conversations/batch-transfer')),
+        ).toBe(true),
+      );
+
+      // Switch to cloud scope and pull cloud conversation to local.
+      await user.click(screen.getByRole('radio', { name: '云端话题' }));
+      await waitFor(() => expect(screen.getByText('云端架构讨论')).toBeInTheDocument());
+      const cldRow = screen.getByText('云端架构讨论').closest('.wb-topic-row') as HTMLElement;
+      await user.click(within(cldRow).getByRole('button', { name: '拉取至本地' }));
+      await waitFor(() =>
+        expect(
+          calls.some((c) => c.url.endsWith('/api/v1/desktop/conversations/cld-1/pull')),
+        ).toBe(true),
+      );
+    } finally {
+      delete window.__LLMSTUDIO_DESKTOP__;
+      delete document.documentElement.dataset.desktop;
+    }
   });
 });

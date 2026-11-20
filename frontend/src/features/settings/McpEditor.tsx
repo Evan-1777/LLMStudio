@@ -14,6 +14,7 @@ import type {
   MCPServerConfig,
   MCPServerInput,
   MCPTransport,
+  TopicScope,
 } from '../../core/types';
 import {
   errorMessageOf,
@@ -41,10 +42,12 @@ export interface McpEditorProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   existing: MCPServerConfig | null;
+  scope?: TopicScope;
 }
 
-export function McpEditor({ open, onOpenChange, existing }: McpEditorProps) {
-  const { gateway, upsertLocalMcpServer, toast } = useApp();
+export function McpEditor({ open, onOpenChange, existing, scope }: McpEditorProps) {
+  const { gateway, isDesktop, upsertLocalMcpServer, toast } = useApp();
+  const reqScope = isDesktop ? (scope ?? 'local') : undefined;
 
   const [name, setName] = useState('');
   const [transport, setTransport] = useState<MCPTransport>('stdio');
@@ -161,9 +164,9 @@ export function McpEditor({ open, onOpenChange, existing }: McpEditorProps) {
     setSaving(true);
     try {
       const saved = existing
-        ? await gateway.updateMcpServer(existing.id, payload)
-        : await gateway.createMcpServer(payload);
-      upsertLocalMcpServer(saved);
+        ? await gateway.updateMcpServer(existing.id, payload, undefined, reqScope)
+        : await gateway.createMcpServer(payload, undefined, reqScope);
+      upsertLocalMcpServer(saved, reqScope);
       onOpenChange(false);
       toast(existing ? 'MCP 配置已更新' : 'MCP 配置已添加');
     } catch (err) {

@@ -1970,3 +1970,114 @@
   flex: 1;
   min-width: 0;
 }
+
+/* Desktop Native Titlebar & Dual-Domain Topic UI */
+:root[data-desktop='true'] .wb-history__head {
+  padding-right: max(12px, var(--mygo-titlebar-inset-right, 0px));
+}
+
+:root[data-desktop='true'] .wb-shell--no-right .wb-toolbar {
+  padding-right: max(12px, var(--mygo-titlebar-inset-right, 0px));
+}
+
+@media (max-width: 1199px) {
+  :root[data-desktop='true'] .wb-toolbar {
+    padding-right: max(12px, var(--mygo-titlebar-inset-right, 0px));
+  }
+}
+
+.wb-scope-switch {
+  display: flex;
+  padding: 0 2px 6px;
+  flex: none;
+}
+
+.wb-scope-switch .ui-segmented {
+  width: 100%;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.wb-scope-switch .ui-segmented__item {
+  width: 100%;
+  padding: 4px 6px;
+  gap: 5px;
+}
+
+.wb-scope-count {
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+
+.wb-scope-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px 8px;
+}
+
+.wb-topic-sync-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--success);
+  opacity: 0.78;
+  flex: none;
+}
+
+.wb-foot-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.wb-foot-status__cloud {
+  flex: 1;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--wb-panel-muted);
+  text-align: left;
+  transition: background-color var(--duration-fast) var(--ease-apple),
+    color var(--duration-fast) var(--ease-apple);
+}
+
+.wb-foot-status__cloud:hover,
+.wb-foot-status__cloud:focus-visible {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.wb-foot-status__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-foot-status .wb-status-dot {
+  margin-right: 0;
+}
+
+.wb-status-dot--warn {
+  background: var(--warning);
+  box-shadow: 0 0 0 3px var(--warning-bg);
+}
+
+.wb-status-dot--error {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-bg);
+}
+
+.wb-status-dot--muted {
+  background: var(--text-tertiary);
+  box-shadow: 0 0 0 3px var(--bg-subtle);
+}

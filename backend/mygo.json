@@ -1,0 +1,16 @@
+{
+  "name": "LLMStudio",
+  "slug": "llmstudio",
+  "identifier": "io.llmstudio.desktop",
+  "version": "1.5.0",
+  "main": "./cmd/desktop",
+  "out": "../build/desktop",
+  "frontendDist": "../frontend/dist",
+  "buildCommand": "npm --prefix ../frontend run build",
+  "icon": "../frontend/public/favicon.png",
+  "bindings": "../build/desktop/mygo.ts",
+  "windows": {
+    "displayName": "LLMStudio",
+    "installDirName": "LLMStudio"
+  }
+}

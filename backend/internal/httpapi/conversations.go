@@ -56,6 +56,20 @@ func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *ConversationHandler) Import(w http.ResponseWriter, r *http.Request) {
+	var in service.ImportConversationInput
+	if err := decodeJSONBodyWithLimit(r, &in, 64*1024*1024); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	detail, err := h.svc.Import(r.Context(), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, detail)
+}
+
 func (h *ConversationHandler) GetDetail(w http.ResponseWriter, r *http.Request) {
 	detail, err := h.svc.GetDetail(r.Context(), r.PathValue("id"))
 	if err != nil {

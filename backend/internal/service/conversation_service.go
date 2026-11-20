@@ -132,6 +132,57 @@ func (s *ConversationService) Create(ctx context.Context, in CreateConversationI
 	})
 }
 
+// ImportConversationInput supplies a complete conversation snapshot for conflict-aware import.
+type ImportConversationInput struct {
+	Conversation domain.Conversation `json:"conversation"`
+	Messages     []domain.Message    `json:"messages"`
+	Force        bool                `json:"force,omitempty"`
+}
+
+// Import atomically persists an imported conversation and its messages with conflict checks.
+func (s *ConversationService) Import(ctx context.Context, in ImportConversationInput) (ConversationDetail, error) {
+	if in.Conversation.Ephemeral {
+		return ConversationDetail{}, domain.NewError(domain.ErrCodeInvalidArgument, "ephemeral conversations cannot be imported", nil)
+	}
+	conv := in.Conversation
+	aid := strings.TrimSpace(conv.AssistantID)
+	if aid == "" {
+		aid = domain.DefaultAssistantID
+	} else if s.assistants != nil && aid != domain.DefaultAssistantID {
+		if _, err := s.assistants.Get(ctx, aid); err != nil {
+			if appErr, ok := domain.AsAppError(err); ok && appErr.Code == domain.ErrCodeNotFound {
+				aid = domain.DefaultAssistantID
+			} else {
+				return ConversationDetail{}, err
+			}
+		}
+	}
+	conv.AssistantID = aid
+	if strings.TrimSpace(conv.Title) == "" {
+		conv.Title = "New Chat"
+	}
+
+	msgs := make([]domain.Message, len(in.Messages))
+	for i, m := range in.Messages {
+		role, blocks, err := validateMessagePayload(m.Role, m.Blocks)
+		if err != nil {
+			return ConversationDetail{}, err
+		}
+		m.Role = role
+		m.Blocks = blocks
+		msgs[i] = m
+	}
+
+	savedConv, savedMsgs, err := s.convs.ImportConversation(ctx, conv, msgs, in.Force)
+	if err != nil {
+		return ConversationDetail{}, err
+	}
+	return ConversationDetail{
+		Conversation: savedConv,
+		Messages:     savedMsgs,
+	}, nil
+}
+
 // GetDetail returns the conversation and its ordered message list.
 func (s *ConversationService) GetDetail(ctx context.Context, id string) (ConversationDetail, error) {
 	conv, err := s.convs.Get(ctx, id)
@@ -300,26 +351,9 @@ func (s *ConversationService) CreateMessage(ctx context.Context, conversationID 
 	if err != nil {
 		return CreateMessageResult{}, err
 	}
-	role := strings.TrimSpace(in.Role)
-	switch role {
-	case domain.RoleUser, domain.RoleAssistant, domain.RoleToolResult, domain.RoleCompaction:
-	default:
-		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "invalid message role", nil)
-	}
-	blocks := in.Blocks
-	if blocks == nil {
-		blocks = []domain.ContentBlock{}
-	}
-	if role == domain.RoleUser && len(blocks) == 0 {
-		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "message blocks are required for user message", nil)
-	}
-	if role == domain.RoleCompaction && !hasValidCompactionBlock(blocks) {
-		return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "compaction block with non-empty text is required for compaction message", nil)
-	}
-	for _, b := range blocks {
-		if strings.TrimSpace(b.Type) == "" {
-			return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "content block type is required", nil)
-		}
+	role, blocks, err := validateMessagePayload(in.Role, in.Blocks)
+	if err != nil {
+		return CreateMessageResult{}, err
 	}
 	replaceID := strings.TrimSpace(in.ReplaceMessageID)
 	afterID := strings.TrimSpace(in.AfterMessageID)
@@ -377,6 +411,31 @@ func (s *ConversationService) CreateMessage(ctx context.Context, conversationID 
 		Message:      saved,
 		Conversation: conv,
 	}, nil
+}
+
+func validateMessagePayload(rawRole string, rawBlocks []domain.ContentBlock) (string, []domain.ContentBlock, error) {
+	role := strings.TrimSpace(rawRole)
+	switch role {
+	case domain.RoleUser, domain.RoleAssistant, domain.RoleToolResult, domain.RoleCompaction:
+	default:
+		return "", nil, domain.NewError(domain.ErrCodeInvalidArgument, "invalid message role", nil)
+	}
+	blocks := rawBlocks
+	if blocks == nil {
+		blocks = []domain.ContentBlock{}
+	}
+	if role == domain.RoleUser && len(blocks) == 0 {
+		return "", nil, domain.NewError(domain.ErrCodeInvalidArgument, "message blocks are required for user message", nil)
+	}
+	if role == domain.RoleCompaction && !hasValidCompactionBlock(blocks) {
+		return "", nil, domain.NewError(domain.ErrCodeInvalidArgument, "compaction block with non-empty text is required for compaction message", nil)
+	}
+	for _, b := range blocks {
+		if strings.TrimSpace(b.Type) == "" {
+			return "", nil, domain.NewError(domain.ErrCodeInvalidArgument, "content block type is required", nil)
+		}
+	}
+	return role, blocks, nil
 }
 
 func countRoleMessages(msgs []domain.Message, role string) int {

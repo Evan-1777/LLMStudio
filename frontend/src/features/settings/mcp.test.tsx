@@ -415,5 +415,120 @@ describe('McpPage and McpEditor', () => {
     await user.click(pull);
     expect(await screen.findByText(/服务器未声明工具/)).toBeVisible();
     expect(screen.queryByText('read_doc')).not.toBeInTheDocument();
+    expect(screen.queryByRole('radiogroup', { name: 'MCP 作用域' })).toBeNull();
+  });
+
+  it('isolates local and cloud MCP servers with scoped API calls in desktop mode', async () => {
+    window.__LLMSTUDIO_DESKTOP__ = {
+      apiBaseUrl: 'http://127.0.0.1:45124',
+      sessionToken: 'desktop-mcp-tok',
+      platform: 'windows',
+      dataMode: 'installed',
+      version: '1.5.0',
+    };
+    try {
+      const localServers: MCPServerConfig[] = [
+        {
+          id: 'loc-mcp-1',
+          name: 'local-fs',
+          transport: 'stdio',
+          command: 'npx',
+          args: ['-y', 'fs-server'],
+          enabled: true,
+        },
+      ];
+      let cloudServers: MCPServerConfig[] = [
+        {
+          id: 'cld-mcp-1',
+          name: 'cloud-docs',
+          transport: 'streamable-http',
+          endpoint: 'https://mcp.cloud.example',
+          args: [],
+          enabled: true,
+        },
+      ];
+      const requestedUrls: string[] = [];
+
+      const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const method = (init?.method ?? 'GET').toUpperCase();
+        requestedUrls.push(`${method} ${url}`);
+        if (url.endsWith('/api/v1/desktop/status')) {
+          return Response.json({
+            mode: 'installed',
+            dataDir: 'C:\\Users\\dev\\AppData\\Roaming\\LLMStudio',
+            dbPath: 'C:\\Users\\dev\\AppData\\Roaming\\LLMStudio\\llmstudio.db',
+            cloudConfigured: true,
+            cloudState: 'connected',
+            gatewayBaseUrl: 'https://cloud.example',
+            tokenSet: true,
+            authRequired: true,
+            version: '1.5.0',
+          });
+        }
+        if (url.endsWith('/api/v1/settings')) {
+          return Response.json({ initialized: true, preferences: { mcpMaxToolRounds: 20 } });
+        }
+        if (url.endsWith('/api/v1/formats')) return Response.json({ formats: [], adapters: [] });
+        if (url.endsWith('/api/v1/providers')) return Response.json({ providers: [] });
+        if (url.endsWith('/api/v1/assistants')) return Response.json({ assistants: [] });
+        if (url.includes('/api/v1/conversations')) return Response.json({ conversations: [] });
+        if (url.includes('/api/v1/conversation-groups')) return Response.json({ groups: [] });
+        if (url.endsWith('/api/v1/plugins/search')) return Response.json({ engines: [] });
+        if (url.includes('/api/v1/mcp/servers') && method === 'GET') {
+          const isCloud = url.includes('scope=cloud');
+          return Response.json({ servers: isCloud ? cloudServers : localServers });
+        }
+        if (url.includes('/api/v1/mcp/servers') && method === 'POST') {
+          const body = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
+          const created: MCPServerConfig = {
+            id: 'cld-mcp-2',
+            name: String(body.name ?? ''),
+            transport: String(body.transport ?? 'sse'),
+            endpoint: String(body.endpoint ?? ''),
+            args: [],
+            enabled: true,
+          };
+          cloudServers = [...cloudServers, created];
+          return Response.json({ server: created }, { status: 201 });
+        }
+        return Response.json({});
+      });
+
+      const user = userEvent.setup();
+      render(
+        <AppProvider fetchImpl={fetchMock}>
+          <MemoryRouter>
+            <McpPage />
+          </MemoryRouter>
+        </AppProvider>,
+      );
+
+      await waitFor(() => expect(screen.getByText('local-fs')).toBeInTheDocument());
+      expect(screen.queryByText('cloud-docs')).toBeNull();
+
+      await user.click(screen.getByRole('radio', { name: '云端 MCP' }));
+      await waitFor(() => expect(screen.getByText('cloud-docs')).toBeInTheDocument());
+      expect(screen.queryByText('local-fs')).toBeNull();
+
+      await user.click(screen.getByRole('button', { name: '添加配置' }));
+      const dlg = screen.getByRole('dialog');
+      await user.type(within(dlg).getByLabelText('名称'), 'remote-sse');
+      await user.selectOptions(within(dlg).getByLabelText('传输方式'), 'sse');
+      await user.type(within(dlg).getByLabelText('服务地址'), 'https://sse.cloud.example/events');
+      await user.click(within(dlg).getByRole('button', { name: '保存' }));
+
+      await waitFor(() => expect(screen.getByText('remote-sse')).toBeInTheDocument());
+      expect(
+        requestedUrls.some((u) => u.includes('POST') && u.includes('/api/v1/mcp/servers?scope=cloud')),
+      ).toBe(true);
+
+      await user.click(screen.getByRole('radio', { name: '本地 MCP' }));
+      await waitFor(() => expect(screen.getByText('local-fs')).toBeInTheDocument());
+      expect(screen.queryByText('remote-sse')).toBeNull();
+    } finally {
+      delete window.__LLMSTUDIO_DESKTOP__;
+      delete document.documentElement.dataset.desktop;
+    }
   });
 });

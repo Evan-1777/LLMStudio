@@ -2,18 +2,27 @@ package httpapi
 
 import (
 	"net/http"
+	"strings"
 
+	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/service"
 )
 
 // PluginHandler serves search plugin and MCP server configuration endpoints.
 type PluginHandler struct {
-	svc *service.PluginService
+	svc     *service.PluginService
+	chatSvc *service.ChatService
 }
 
 // NewPluginHandler constructs a PluginHandler.
 func NewPluginHandler(svc *service.PluginService) *PluginHandler {
 	return &PluginHandler{svc: svc}
+}
+
+// WithChatService attaches ChatService so stateless MCP execution can reuse its runtime.
+func (h *PluginHandler) WithChatService(chatSvc *service.ChatService) *PluginHandler {
+	h.chatSvc = chatSvc
+	return h
 }
 
 func (h *PluginHandler) ListSearchEngines(w http.ResponseWriter, r *http.Request) {
@@ -25,6 +34,17 @@ func (h *PluginHandler) ListSearchEngines(w http.ResponseWriter, r *http.Request
 	WriteJSON(w, http.StatusOK, map[string]any{
 		"engines": engines,
 	})
+}
+
+func (h *PluginHandler) GetSearchEngineCredential(w http.ResponseWriter, r *http.Request) {
+	cred, err := h.svc.GetSearchEngineRuntimeCredential(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	WriteJSON(w, http.StatusOK, cred)
 }
 
 func (h *PluginHandler) UpdateSearchEngine(w http.ResponseWriter, r *http.Request) {
@@ -128,4 +148,40 @@ func (h *PluginHandler) TestMCPServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, res)
+}
+
+func (h *PluginHandler) ExecuteMCPTools(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Calls []service.StatelessToolCallInput `json:"calls"`
+	}
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+
+	run := func(emit func(domain.StreamEvent) error) error {
+		if h.chatSvc != nil {
+			return h.chatSvc.ExecuteToolsStateless(r.Context(), in.Calls, emit)
+		}
+		return h.svc.ExecuteMCPTools(r.Context(), in.Calls, emit)
+	}
+
+	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") || r.URL.Query().Get("stream") == "true" {
+		streamSSEToolEvents(w, "", run)
+		return
+	}
+
+	results := make([]domain.ContentBlock, 0, len(in.Calls))
+	if err := run(func(ev domain.StreamEvent) error {
+		if ev.Type == domain.StreamEventBlockEnd && ev.Block != nil {
+			results = append(results, *ev.Block)
+		}
+		return nil
+	}); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"toolResults": results,
+	})
 }

@@ -6,13 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/format"
 	"llmstudio/backend/internal/plugin"
-	"llmstudio/backend/internal/store"
 )
 
 // LocalContinuationInput supplies the saved anchor turn and in-progress assistant blocks
@@ -74,32 +74,97 @@ type StreamChatInput struct {
 	CredentialEnvelope bool `json:"credentialEnvelope,omitempty"`
 }
 
+// ProviderLookup fetches provider configurations needed to encode and route a chat turn.
+type ProviderLookup interface {
+	Get(ctx context.Context, id string) (domain.ProviderConfig, error)
+}
+
+// ConversationRepo reads and updates conversation metadata during a chat turn.
+type ConversationRepo interface {
+	Get(ctx context.Context, id string) (domain.Conversation, error)
+	Update(ctx context.Context, c domain.Conversation) (domain.Conversation, error)
+	TouchUpdatedAt(ctx context.Context, id string, updatedAt time.Time) error
+}
+
+// MessageRepo reads and persists conversation messages.
+type MessageRepo interface {
+	Get(ctx context.Context, id string) (domain.Message, error)
+	ListByConversation(ctx context.Context, conversationID string) ([]domain.Message, error)
+	Create(ctx context.Context, m domain.Message) (domain.Message, error)
+	ReplaceByID(ctx context.Context, conversationID, targetMessageID string, next domain.Message) (domain.Message, error)
+	InsertAfter(ctx context.Context, conversationID, afterMessageID string, next domain.Message) (domain.Message, error)
+}
+
+// AssistantLookup loads assistant presets for system prompts and sampling overrides.
+type AssistantLookup interface {
+	Get(ctx context.Context, id string) (domain.Assistant, error)
+}
+
+// SearchConfigLookup reads configured search engine settings.
+type SearchConfigLookup interface {
+	Get(ctx context.Context, engineID string) (domain.SearchEngineConfig, error)
+	List(ctx context.Context) ([]domain.SearchEngineConfig, error)
+}
+
+// PreferenceLookup reads runtime generation preferences.
+type PreferenceLookup interface {
+	Get(ctx context.Context) (domain.Preferences, bool, error)
+}
+
+// MCPCatalog lists and fetches configured MCP servers.
+type MCPCatalog interface {
+	List(ctx context.Context) ([]domain.MCPServerConfig, error)
+	Get(ctx context.Context, id string) (domain.MCPServerConfig, error)
+}
+
+func isNilDependency(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Map, reflect.Func:
+		return rv.IsNil()
+	default:
+		return false
+	}
+}
+
 // ChatService orchestrates upstream LLM requests, SSE normalization, cancellation, and persistence.
 type ChatService struct {
-	providers   *store.ProviderStore
-	convs       *store.ConversationStore
-	msgs        *store.MessageStore
+	providers   ProviderLookup
+	convs       ConversationRepo
+	msgs        MessageRepo
 	formats     *plugin.FormatRegistry
 	adapters    *plugin.ProviderRegistry
 	httpClient  *http.Client
-	assistants  *store.AssistantStore
+	assistants  AssistantLookup
 	searchReg   *plugin.SearchRegistry
-	searchStore *store.SearchConfigStore
-	mcpStore    *store.MCPServerStore
+	searchStore SearchConfigLookup
+	mcpStore    MCPCatalog
 	mcpClient   plugin.MCPClientBoundary
 	cacheStore  *promptCacheStore
-	preferences *PreferenceService
+	preferences PreferenceLookup
 }
 
 // NewChatService constructs a ChatService. If httpClient is nil, a default client with no overall request timeout is used.
 func NewChatService(
-	providers *store.ProviderStore,
-	convs *store.ConversationStore,
-	msgs *store.MessageStore,
+	providers ProviderLookup,
+	convs ConversationRepo,
+	msgs MessageRepo,
 	formats *plugin.FormatRegistry,
 	adapters *plugin.ProviderRegistry,
 	httpClient *http.Client,
 ) *ChatService {
+	if isNilDependency(providers) {
+		providers = nil
+	}
+	if isNilDependency(convs) {
+		convs = nil
+	}
+	if isNilDependency(msgs) {
+		msgs = nil
+	}
 	if httpClient == nil {
 		httpClient = &http.Client{}
 	}
@@ -114,22 +179,31 @@ func NewChatService(
 	}
 }
 
-// WithAssistants injects an AssistantStore so chat requests inherit assistant presets.
-func (s *ChatService) WithAssistants(assistants *store.AssistantStore) *ChatService {
+// WithAssistants injects an AssistantLookup so chat requests inherit assistant presets.
+func (s *ChatService) WithAssistants(assistants AssistantLookup) *ChatService {
+	if isNilDependency(assistants) {
+		assistants = nil
+	}
 	s.assistants = assistants
 	return s
 }
 
-// WithSearch injects the orthogonal SearchRegistry and SearchConfigStore for web search augmentation.
-func (s *ChatService) WithSearch(searchReg *plugin.SearchRegistry, searchStore *store.SearchConfigStore) *ChatService {
+// WithSearch injects the orthogonal SearchRegistry and SearchConfigLookup for web search augmentation.
+func (s *ChatService) WithSearch(searchReg *plugin.SearchRegistry, searchStore SearchConfigLookup) *ChatService {
 	s.searchReg = searchReg
+	if isNilDependency(searchStore) {
+		searchStore = nil
+	}
 	s.searchStore = searchStore
 	return s
 }
 
 // WithPreferences injects the gateway-managed preferences used to resolve the
 // automatic caching policy and tool round limit for each generation.
-func (s *ChatService) WithPreferences(preferences *PreferenceService) *ChatService {
+func (s *ChatService) WithPreferences(preferences PreferenceLookup) *ChatService {
+	if isNilDependency(preferences) {
+		preferences = nil
+	}
 	s.preferences = preferences
 	return s
 }
@@ -156,7 +230,13 @@ func (s *ChatService) mcpMaxToolRoundsPreference(ctx context.Context) int {
 }
 
 // WithMCP injects MCP server metadata and runtime boundary for tool discovery and execution.
-func (s *ChatService) WithMCP(mcpStore *store.MCPServerStore, mcpClient plugin.MCPClientBoundary) *ChatService {
+func (s *ChatService) WithMCP(mcpStore MCPCatalog, mcpClient plugin.MCPClientBoundary) *ChatService {
+	if isNilDependency(mcpStore) {
+		mcpStore = nil
+	}
+	if isNilDependency(mcpClient) {
+		mcpClient = nil
+	}
 	s.mcpStore = mcpStore
 	s.mcpClient = mcpClient
 	return s
@@ -1160,7 +1240,7 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 			ProviderID:     p.provider.ID,
 			ModelID:        p.model.ID,
 		}
-		activeTools := p.service.filterEnabledTools(ctx, p.tools)
+		activeTools := p.service.filterEnabledToolsWithBindings(ctx, p.tools, p.toolBindings)
 		nextInput := plugin.ChatInput{
 			ConversationID:  p.conversation.ID,
 			Provider:        p.provider,
