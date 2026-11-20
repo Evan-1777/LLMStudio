@@ -1,4 +1,5 @@
 import { Navigate, Route, Routes, useParams } from 'react-router-dom';
+import { isDesktopApp } from '../core/desktop';
 import { SettingsLayout } from '../features/settings';
 import { WorkbenchPage } from '../features/workbench/WorkbenchPage';
 
@@ -7,6 +8,7 @@ export const SETTINGS_SECTIONS = [
   'plugins',
   'connection',
   'appearance',
+  'client',
   'mcp',
   'storage',
   'about',
@@ -22,7 +24,7 @@ export function isSettingsSection(value: string | undefined): value is SettingsS
 
 function SettingsRoute() {
   const { section } = useParams();
-  if (!isSettingsSection(section)) {
+  if (!isSettingsSection(section) || (section === 'client' && !isDesktopApp())) {
     return <Navigate to="/settings/providers" replace />;
   }
   return <SettingsLayout />;

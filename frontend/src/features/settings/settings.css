@@ -10,6 +10,10 @@
   background: var(--bg-base);
 }
 
+:root[data-desktop='true'] .st-shell {
+  height: 100%;
+}
+
 /* Left Navigation Rail (Layer 2) */
 .st-rail {
   display: flex;
@@ -303,17 +307,68 @@
   font-size: 12px;
 }
 
+.st-custom-font {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex: 1 1 260px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.st-custom-font__name {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+.st-custom-font__input {
+  display: none;
+}
+
+.st-client-control {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
 .st-font-size-controls {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
+  flex: 1 1 240px;
   flex-wrap: wrap;
+  min-width: 0;
   max-width: 100%;
+}
+
+.st-font-size-controls .st-range {
+  flex: 1 1 140px;
+  min-width: 0;
+  width: auto;
+}
+
+.st-font-size-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  white-space: nowrap;
+}
+
+.st-font-size-reset {
+  flex: none;
 }
 
 .st-font-size-value {
   min-width: 44px;
-  text-align: right;
+  text-align: center;
   font-family: var(--font-mono);
   font-size: 12.5px;
   font-variant-numeric: tabular-nums;
@@ -917,6 +972,20 @@
     flex-wrap: wrap;
   }
 
+  .st-client-control {
+    align-items: stretch;
+    width: 100%;
+  }
+
+  .st-custom-font {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .st-custom-font__name {
+    max-width: 100%;
+  }
+
   .st-model-row {
     flex-wrap: wrap;
   }
@@ -1038,8 +1107,12 @@
   overflow: auto;
 }
 
-:root[data-desktop='true'] .st-toolbar {
-  padding-right: max(20px, var(--mygo-titlebar-inset-right, 0px));
+:root[data-desktop='true'] .st-rail {
+  top: calc(var(--app-titlebar-height) + max(var(--st-panel-gap), env(safe-area-inset-top)));
+}
+
+:root[data-desktop='true'] .st-scrim {
+  top: var(--app-titlebar-height);
 }
 
 .st-status-dot--muted {

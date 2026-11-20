@@ -17,9 +17,20 @@ export function App({
       skipInitialBootstrap={skipInitialBootstrap}
     >
       <BrowserRouter>
-        <ConnectionGate>
-          <AppRoutes />
-        </ConnectionGate>
+        <div className="app-frame">
+          <div
+            className="desktop-titlebar"
+            data-testid="desktop-titlebar"
+            aria-hidden="true"
+          >
+            <span className="desktop-titlebar__brand">LLMStudio</span>
+          </div>
+          <div className="app-frame__body">
+            <ConnectionGate>
+              <AppRoutes />
+            </ConnectionGate>
+          </div>
+        </div>
       </BrowserRouter>
     </AppProvider>
   );

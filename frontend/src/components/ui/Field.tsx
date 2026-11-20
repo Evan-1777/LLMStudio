@@ -66,6 +66,7 @@ export interface SegmentedOption<T extends string> {
   label: ReactNode;
   ariaLabel?: string;
   title?: string;
+  disabled?: boolean;
 }
 
 export function SegmentedControl<T extends string>({
@@ -73,11 +74,13 @@ export function SegmentedControl<T extends string>({
   options,
   onChange,
   ariaLabel,
+  disabled = false,
 }: {
   value: T;
   options: readonly SegmentedOption<T>[];
   onChange: (next: T) => void;
   ariaLabel: string;
+  disabled?: boolean;
 }) {
   return (
     <div className="ui-segmented" role="radiogroup" aria-label={ariaLabel}>
@@ -94,6 +97,7 @@ export function SegmentedControl<T extends string>({
             className={`ui-segmented__item ${
               active ? 'ui-segmented__item--active' : ''
             }`.trim()}
+            disabled={disabled || opt.disabled}
             onClick={() => onChange(opt.value)}
           >
             {opt.label}

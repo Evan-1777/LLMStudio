@@ -12,6 +12,10 @@
   background: var(--bg-base);
 }
 
+:root[data-desktop='true'] .wb-shell {
+  height: 100%;
+}
+
 @media (min-width: 768px) {
   .wb-shell--no-left {
     grid-template-columns: minmax(0, 1fr) var(--history-width);
@@ -1972,18 +1976,13 @@
 }
 
 /* Desktop Native Titlebar & Dual-Domain Topic UI */
-:root[data-desktop='true'] .wb-history__head {
-  padding-right: max(12px, var(--mygo-titlebar-inset-right, 0px));
+:root[data-desktop='true'] .wb-history,
+:root[data-desktop='true'] .wb-rail {
+  top: calc(var(--app-titlebar-height) + max(var(--wb-panel-gap), env(safe-area-inset-top)));
 }
 
-:root[data-desktop='true'] .wb-shell--no-right .wb-toolbar {
-  padding-right: max(12px, var(--mygo-titlebar-inset-right, 0px));
-}
-
-@media (max-width: 1199px) {
-  :root[data-desktop='true'] .wb-toolbar {
-    padding-right: max(12px, var(--mygo-titlebar-inset-right, 0px));
-  }
+:root[data-desktop='true'] .wb-scrim {
+  top: var(--app-titlebar-height);
 }
 
 .wb-scope-switch {

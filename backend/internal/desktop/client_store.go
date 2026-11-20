@@ -150,6 +150,10 @@ func ensureDesktopTables(ctx context.Context, db *sql.DB) error {
 			value_json TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS desktop_settings (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			close_to_tray INTEGER NOT NULL DEFAULT 0
+		);
 	`
 	if _, err := db.ExecContext(ctx, ddl); err != nil {
 		return fmt.Errorf("init desktop tables: %w", err)
@@ -221,6 +225,37 @@ func (s *DesktopStore) DisconnectCloud(ctx context.Context) error {
 	}
 	if s.onInvalidateMemoryCache != nil {
 		s.onInvalidateMemoryCache()
+	}
+	return nil
+}
+
+// GetCloseToTray reports whether the window close button hides to the tray.
+// Desktop settings live in their own single-row table, apart from cloud
+// connection and cached cloud metadata.
+func (s *DesktopStore) GetCloseToTray(ctx context.Context) (bool, error) {
+	var value int
+	err := s.DB.QueryRowContext(ctx, `SELECT close_to_tray FROM desktop_settings WHERE id = 1`).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("get close to tray: %w", err)
+	}
+	return value != 0, nil
+}
+
+// SetCloseToTray persists whether the window close button hides to the tray.
+func (s *DesktopStore) SetCloseToTray(ctx context.Context, value bool) error {
+	flag := 0
+	if value {
+		flag = 1
+	}
+	if _, err := s.DB.ExecContext(ctx, `
+		INSERT INTO desktop_settings (id, close_to_tray)
+		VALUES (1, ?)
+		ON CONFLICT(id) DO UPDATE SET close_to_tray = excluded.close_to_tray
+	`, flag); err != nil {
+		return fmt.Errorf("save close to tray: %w", err)
 	}
 	return nil
 }

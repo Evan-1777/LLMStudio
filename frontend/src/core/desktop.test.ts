@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getDesktopBootstrap, isDesktopApp, openDesktopDataDir } from './desktop';
+import {
+  getDesktopBootstrap,
+  getDesktopClientSettings,
+  isDesktopApp,
+  openDesktopDataDir,
+  setDesktopCloseToTray,
+} from './desktop';
 import { readThemeHint, themeHintKey, writeThemeHint } from './settings';
 
 function clearDesktopEnv() {
@@ -50,6 +56,23 @@ describe('desktop runtime detection and themeHint isolation', () => {
 
     await openDesktopDataDir();
     expect(callSpy).toHaveBeenCalledWith('DesktopBridge.OpenDataDir');
+
+    callSpy.mockResolvedValueOnce({ closeToTray: false, trayAvailable: true });
+    await expect(getDesktopClientSettings()).resolves.toEqual({
+      closeToTray: false,
+      trayAvailable: true,
+    });
+    expect(callSpy).toHaveBeenLastCalledWith('DesktopBridge.GetClientSettings');
+
+    callSpy.mockResolvedValueOnce({ closeToTray: true, trayAvailable: true });
+    await expect(setDesktopCloseToTray(true)).resolves.toEqual({
+      closeToTray: true,
+      trayAvailable: true,
+    });
+    expect(callSpy).toHaveBeenLastCalledWith(
+      'DesktopBridge.SetCloseToTray',
+      true,
+    );
   });
 
   it('ignores malformed desktop bootstrap payloads', () => {

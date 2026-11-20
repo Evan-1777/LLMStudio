@@ -8,6 +8,14 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import {
+  CUSTOM_FONT_FAMILY,
+  deleteCustomFont as deleteStoredCustomFont,
+  importCustomFont,
+  loadStoredCustomFontFace,
+  readCustomFont,
+  setStoredCustomFontEnabled,
+} from '../core/customFont';
 import { getDesktopBootstrap } from '../core/desktop';
 import { GatewayClient, GatewayError, validateGatewayUrl } from '../core/gateway';
 import {
@@ -48,6 +56,11 @@ import type {
 import { ConfirmDialog } from '../components/ui/Modal';
 
 export type ConnectionState = 'checking' | 'connected' | 'auth-required' | 'error';
+
+export interface CustomFontInfo {
+  name: string;
+  enabled: boolean;
+}
 
 export interface AppResources {
   providers: ProviderConfig[];
@@ -98,6 +111,11 @@ export interface AppContextValue {
   cleanupLocalUngrouped: () => Promise<DeletedConversation[] | null>;
   connectionEpoch: number;
   settings: AppSettings;
+  customFont: CustomFontInfo | null;
+  customFontBusy: boolean;
+  uploadCustomFont: (file: File) => Promise<{ ok: boolean; error?: string }>;
+  toggleCustomFont: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
+  removeCustomFont: () => Promise<{ ok: boolean; error?: string }>;
   resolvedTheme: 'light' | 'dark';
   settingsNotice: string | null;
   dismissSettingsNotice: () => void;
@@ -302,6 +320,10 @@ export function AppProvider({
   // snapshot. Each write applies and rolls back only the fields it patched, so a
   // slow avatar save cannot revert a newer theme change.
   const serverPreferencesRef = useRef<AppPreferences>(defaultAppPreferences());
+  const [customFont, setCustomFont] = useState<CustomFontInfo | null>(null);
+  const [customFontBusy, setCustomFontBusy] = useState(false);
+  const customFontFaceRef = useRef<FontFace | null>(null);
+  const customFontRevisionRef = useRef(0);
 
   const [connectionEpoch, setConnectionEpoch] = useState(1);
   const epochRef = useRef(1);
@@ -396,6 +418,119 @@ export function AppProvider({
     settings.fontSize,
     settings.seedColorValue,
   ]);
+
+  const detachCustomFontFace = useCallback(() => {
+    const face = customFontFaceRef.current;
+    if (face) {
+      document.fonts.delete(face);
+      customFontFaceRef.current = null;
+    }
+    document.documentElement.style.removeProperty('--font-custom');
+  }, []);
+
+  const attachCustomFontFace = useCallback(
+    (face: FontFace) => {
+      detachCustomFontFace();
+      document.fonts.add(face);
+      customFontFaceRef.current = face;
+      document.documentElement.style.setProperty(
+        '--font-custom',
+        `"${CUSTOM_FONT_FAMILY}", `,
+      );
+    },
+    [detachCustomFontFace],
+  );
+
+  useEffect(() => {
+    const revision = ++customFontRevisionRef.current;
+    void (async () => {
+      const stored = await readCustomFont();
+      if (!stored || revision !== customFontRevisionRef.current) return;
+      if (stored.enabled) {
+        try {
+          const face = await loadStoredCustomFontFace(stored);
+          if (revision !== customFontRevisionRef.current) return;
+          attachCustomFontFace(face);
+        } catch {
+          // Keep the built-in stack when a saved font can no longer be decoded.
+        }
+      }
+      if (revision === customFontRevisionRef.current) {
+        setCustomFont({ name: stored.name, enabled: stored.enabled });
+      }
+    })();
+    return () => {
+      customFontRevisionRef.current += 1;
+      detachCustomFontFace();
+    };
+  }, [attachCustomFontFace, detachCustomFontFace]);
+
+  const uploadCustomFont = useCallback(
+    async (file: File): Promise<{ ok: boolean; error?: string }> => {
+      const revision = ++customFontRevisionRef.current;
+      setCustomFontBusy(true);
+      try {
+        const { font, face } = await importCustomFont(file);
+        if (revision !== customFontRevisionRef.current) return { ok: true };
+        attachCustomFontFace(face);
+        setCustomFont({ name: font.name, enabled: true });
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: errorMessageOf(err) };
+      } finally {
+        if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
+      }
+    },
+    [attachCustomFontFace],
+  );
+
+  const toggleCustomFont = useCallback(
+    async (enabled: boolean): Promise<{ ok: boolean; error?: string }> => {
+      const revision = ++customFontRevisionRef.current;
+      setCustomFontBusy(true);
+      try {
+        if (enabled) {
+          const stored = await readCustomFont();
+          if (!stored) throw new Error('没有可用的自定义字体');
+          const face = await loadStoredCustomFontFace(stored);
+          const saved = await setStoredCustomFontEnabled(true);
+          if (revision !== customFontRevisionRef.current) return { ok: true };
+          attachCustomFontFace(face);
+          setCustomFont({ name: saved.name, enabled: true });
+        } else {
+          const saved = await setStoredCustomFontEnabled(false);
+          if (revision !== customFontRevisionRef.current) return { ok: true };
+          detachCustomFontFace();
+          setCustomFont({ name: saved.name, enabled: false });
+        }
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, error: errorMessageOf(err) };
+      } finally {
+        if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
+      }
+    },
+    [attachCustomFontFace, detachCustomFontFace],
+  );
+
+  const removeCustomFont = useCallback(async (): Promise<{
+    ok: boolean;
+    error?: string;
+  }> => {
+    const revision = ++customFontRevisionRef.current;
+    setCustomFontBusy(true);
+    try {
+      await deleteStoredCustomFont();
+      if (revision !== customFontRevisionRef.current) return { ok: true };
+      detachCustomFontFace();
+      setCustomFont(null);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: errorMessageOf(err) };
+    } finally {
+      if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
+    }
+  }, [detachCustomFontFace]);
 
   const toast = useCallback(
     (message: string, tone: 'default' | 'error' = 'default') => {
@@ -1702,6 +1837,11 @@ export function AppProvider({
       cleanupLocalUngrouped,
       connectionEpoch,
       settings,
+      customFont,
+      customFontBusy,
+      uploadCustomFont,
+      toggleCustomFont,
+      removeCustomFont,
       resolvedTheme,
       settingsNotice,
       dismissSettingsNotice: () => setSettingsNotice(null),
@@ -1753,6 +1893,11 @@ export function AppProvider({
       cleanupLocalUngrouped,
       connectionEpoch,
       settings,
+      customFont,
+      customFontBusy,
+      uploadCustomFont,
+      toggleCustomFont,
+      removeCustomFont,
       resolvedTheme,
       settingsNotice,
       updateSettings,

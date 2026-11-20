@@ -14,6 +14,7 @@ import { Icon, IconButton, type IconName } from '../../components/ui';
 import type { CloudConnectionState } from '../../core/types';
 import { AboutPage } from './AboutPage';
 import { AppearancePage } from './AppearancePage';
+import { ClientPage } from './ClientPage';
 import { ConnectionPage } from './ConnectionPage';
 import { McpPage } from './McpPage';
 import { PluginsPage } from './PluginsPage';
@@ -32,6 +33,7 @@ const NAV_ITEMS: readonly SettingsNavItem[] = [
   { id: 'plugins', label: '插件', icon: 'plugin' },
   { id: 'connection', label: '连接', icon: 'link' },
   { id: 'appearance', label: '外观与显示', icon: 'sun' },
+  { id: 'client', label: '客户端设置', icon: 'monitor' },
   { id: 'mcp', label: 'MCP 配置', icon: 'wrench' },
   { id: 'storage', label: '存储', icon: 'folder' },
   { id: 'about', label: '关于', icon: 'info' },
@@ -75,6 +77,8 @@ function renderSectionContent(section: SettingsSection): ReactNode {
       return <ConnectionPage />;
     case 'appearance':
       return <AppearancePage />;
+    case 'client':
+      return <ClientPage />;
     case 'mcp':
       return <McpPage />;
     case 'storage':
@@ -137,8 +141,11 @@ export function SettingsLayout({
 
   const activeSection: SettingsSection =
     propSection ?? (routeSection as SettingsSection);
+  const navItems = isDesktop
+    ? NAV_ITEMS
+    : NAV_ITEMS.filter((item) => item.id !== 'client');
   const activeItem =
-    NAV_ITEMS.find((item) => item.id === activeSection) ?? NAV_ITEMS[0];
+    navItems.find((item) => item.id === activeSection) ?? navItems[0];
 
   const handleBack = async () => {
     if (!(await confirmLeaveIfDirty())) return;
@@ -203,7 +210,7 @@ export function SettingsLayout({
 
         <div className="st-rail__body">
           <nav className="st-nav" aria-label="设置导航">
-            {NAV_ITEMS.map((item) => {
+            {navItems.map((item) => {
               const active = item.id === activeSection;
               return (
                 <button

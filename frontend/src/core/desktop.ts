@@ -38,9 +38,31 @@ export function isDesktopApp(): boolean {
   return getDesktopBootstrap() !== null;
 }
 
-export async function openDesktopDataDir(): Promise<void> {
+async function callDesktop<T>(method: string, ...args: unknown[]): Promise<T> {
   if (typeof window === 'undefined' || typeof window.mygo?.call !== 'function') {
     throw new Error('原生桌面桥接不可用');
   }
-  await window.mygo.call('DesktopBridge.OpenDataDir');
+  return window.mygo.call<T>(method, ...args);
+}
+
+export async function openDesktopDataDir(): Promise<void> {
+  await callDesktop('DesktopBridge.OpenDataDir');
+}
+
+export interface DesktopClientSettings {
+  closeToTray: boolean;
+  trayAvailable: boolean;
+}
+
+export async function getDesktopClientSettings(): Promise<DesktopClientSettings> {
+  return callDesktop<DesktopClientSettings>('DesktopBridge.GetClientSettings');
+}
+
+export async function setDesktopCloseToTray(
+  closeToTray: boolean,
+): Promise<DesktopClientSettings> {
+  return callDesktop<DesktopClientSettings>(
+    'DesktopBridge.SetCloseToTray',
+    closeToTray,
+  );
 }

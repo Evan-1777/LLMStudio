@@ -769,36 +769,49 @@ a {
   border: 0;
 }
 
-/* Native MyGo Desktop Titlebar Framing (strictly desktop-only via [data-desktop="true"]) */
+/* Native MyGo desktop title band (strictly desktop-only via [data-desktop='true']) */
+:root {
+  --app-titlebar-height: 0px;
+}
+
 :root[data-desktop='true'] {
   --history-width: 280px;
+  --app-titlebar-height: var(--mygo-titlebar-height, 32px);
 }
 
-:root[data-desktop='true'] .wb-shell,
-:root[data-desktop='true'] .st-shell {
-  --app-region: no-drag;
+.app-frame {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
 }
 
-:root[data-desktop='true'] .wb-rail__head,
-:root[data-desktop='true'] .wb-toolbar,
-:root[data-desktop='true'] .wb-history__head,
-:root[data-desktop='true'] .st-rail__head,
-:root[data-desktop='true'] .st-toolbar {
+.app-frame__body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+}
+
+.desktop-titlebar {
+  display: none;
+}
+
+:root[data-desktop='true'] .desktop-titlebar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  height: var(--app-titlebar-height);
+  padding: 0 max(12px, var(--mygo-titlebar-inset-right, 0px)) 0
+    max(12px, var(--mygo-titlebar-inset-left, 0px));
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--text-tertiary);
+  user-select: none;
   --app-region: drag;
 }
 
-:root[data-desktop='true'] .wb-rail__head button,
-:root[data-desktop='true'] .wb-rail__head a,
-:root[data-desktop='true'] .wb-toolbar button,
-:root[data-desktop='true'] .wb-toolbar a,
-:root[data-desktop='true'] .wb-toolbar input,
-:root[data-desktop='true'] .wb-toolbar select,
-:root[data-desktop='true'] .wb-toolbar .wb-crumb,
-:root[data-desktop='true'] .wb-history__head button,
-:root[data-desktop='true'] .wb-history__head a,
-:root[data-desktop='true'] .st-rail__head button,
-:root[data-desktop='true'] .st-rail__head a,
-:root[data-desktop='true'] .st-toolbar button,
-:root[data-desktop='true'] .st-toolbar a {
-  --app-region: no-drag;
+.desktop-titlebar__brand {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
 }

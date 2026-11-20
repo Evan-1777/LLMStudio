@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
   AvatarField,
+  Button,
   ErrorBanner,
   Icon,
   IconButton,
@@ -26,7 +27,13 @@ export function AppearancePage() {
     settingsNotice,
     dismissSettingsNotice,
     updatePreferences,
+    customFont,
+    customFontBusy,
+    uploadCustomFont,
+    toggleCustomFont,
+    removeCustomFont,
   } = useApp();
+  const fontInputRef = useRef<HTMLInputElement | null>(null);
 
   const [lineInput, setLineInput] = useState(
     String(settings.collapseLineThreshold),
@@ -38,6 +45,7 @@ export function AppearancePage() {
   const [charError, setCharError] = useState<string | null>(null);
   const [avatarError, setAvatarError] = useState<string | null>(null);
   const [savingAvatar, setSavingAvatar] = useState(false);
+  const [customFontError, setCustomFontError] = useState<string | null>(null);
 
   useEffect(() => {
     setLineInput(String(settings.collapseLineThreshold));
@@ -56,6 +64,33 @@ export function AppearancePage() {
     setSavingAvatar(false);
     if (!result.ok) {
       setAvatarError(result.error ?? '保存头像失败');
+    }
+  };
+
+  const handleFontFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setCustomFontError(null);
+    const result = await uploadCustomFont(file);
+    if (!result.ok) {
+      setCustomFontError(result.error ?? '上传字体失败');
+    }
+  };
+
+  const handleCustomFontToggle = async (enabled: boolean) => {
+    setCustomFontError(null);
+    const result = await toggleCustomFont(enabled);
+    if (!result.ok) {
+      setCustomFontError(result.error ?? '切换字体失败');
+    }
+  };
+
+  const handleCustomFontRemove = async () => {
+    setCustomFontError(null);
+    const result = await removeCustomFont();
+    if (!result.ok) {
+      setCustomFontError(result.error ?? '移除字体失败');
     }
   };
 
@@ -215,22 +250,75 @@ export function AppearancePage() {
             </div>
 
             <div className="st-row--inline">
+              <span className="st-row__label--plain">自定义字体</span>
+              <div className="st-custom-font">
+                {customFont ? (
+                  <>
+                    <span
+                      className="st-custom-font__name"
+                      title={customFont.name}
+                    >
+                      {customFont.name}
+                    </span>
+                    <Switch
+                      checked={customFont.enabled}
+                      label="使用自定义字体"
+                      disabled={customFontBusy}
+                      onCheckedChange={(enabled) =>
+                        void handleCustomFontToggle(enabled)
+                      }
+                    />
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={customFontBusy}
+                      onClick={() => fontInputRef.current?.click()}
+                    >
+                      替换
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="danger-ghost"
+                      disabled={customFontBusy}
+                      onClick={() => void handleCustomFontRemove()}
+                    >
+                      移除
+                    </Button>
+                  </>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    loading={customFontBusy}
+                    onClick={() => fontInputRef.current?.click()}
+                  >
+                    上传字体
+                  </Button>
+                )}
+                <input
+                  ref={fontInputRef}
+                  type="file"
+                  accept=".ttf"
+                  className="st-custom-font__input"
+                  aria-label="选择 TTF 字体文件"
+                  onChange={(e) => void handleFontFileChange(e)}
+                />
+              </div>
+            </div>
+            {customFontError ? (
+              <div className="st-row">
+                <span className="ui-field__error" role="alert">
+                  {customFontError}
+                </span>
+              </div>
+            ) : null}
+
+            <div className="st-row--inline">
               <span className="st-row__label--plain">字体大小</span>
               <div className="st-font-size-controls">
-                <IconButton
-                  size="sm"
-                  icon="minus"
-                  label="减小字号"
-                  disabled={settings.fontSize <= FONT_SIZE_MIN}
-                  onClick={() =>
-                    void updatePreferences({
-                      fontSize: Math.max(FONT_SIZE_MIN, settings.fontSize - 1),
-                    })
-                  }
-                />
                 <input
                   type="range"
-                  className="st-range"
+                  className="st-range st-font-size-range"
                   aria-label="字体大小"
                   min={FONT_SIZE_MIN}
                   max={FONT_SIZE_MAX}
@@ -243,31 +331,44 @@ export function AppearancePage() {
                     }
                   }}
                 />
-                <IconButton
-                  size="sm"
-                  icon="plus"
-                  label="增大字号"
-                  disabled={settings.fontSize >= FONT_SIZE_MAX}
-                  onClick={() =>
-                    void updatePreferences({
-                      fontSize: Math.min(FONT_SIZE_MAX, settings.fontSize + 1),
-                    })
-                  }
-                />
-                <span className="st-font-size-value">
-                  {settings.fontSize} px
-                </span>
-                {settings.fontSize !== FONT_SIZE_DEFAULT ? (
-                  <button
-                    type="button"
-                    className="ui-btn ui-btn--ghost ui-btn--sm"
+                <div className="st-font-size-stepper">
+                  <IconButton
+                    size="sm"
+                    icon="minus"
+                    label="减小字号"
+                    disabled={settings.fontSize <= FONT_SIZE_MIN}
                     onClick={() =>
-                      void updatePreferences({ fontSize: FONT_SIZE_DEFAULT })
+                      void updatePreferences({
+                        fontSize: Math.max(FONT_SIZE_MIN, settings.fontSize - 1),
+                      })
                     }
-                  >
-                    重置
-                  </button>
-                ) : null}
+                  />
+                  <span className="st-font-size-value">
+                    {settings.fontSize} px
+                  </span>
+                  <IconButton
+                    size="sm"
+                    icon="plus"
+                    label="增大字号"
+                    disabled={settings.fontSize >= FONT_SIZE_MAX}
+                    onClick={() =>
+                      void updatePreferences({
+                        fontSize: Math.min(FONT_SIZE_MAX, settings.fontSize + 1),
+                      })
+                    }
+                  />
+                </div>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="st-font-size-reset"
+                  disabled={settings.fontSize === FONT_SIZE_DEFAULT}
+                  onClick={() =>
+                    void updatePreferences({ fontSize: FONT_SIZE_DEFAULT })
+                  }
+                >
+                  重置
+                </Button>
               </div>
             </div>
           </div>
