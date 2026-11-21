@@ -64,6 +64,7 @@ describe('settings storage and migration', () => {
       fontFamily: 'system',
       fontSize: 14,
       builtinTimeToolEnabled: false,
+      mathRenderEnabled: true,
     });
 
     expect(defaultSettings()).toMatchObject({
@@ -278,5 +279,28 @@ describe('settings storage and migration', () => {
     const legacy = readLegacyPreferences(storage);
     expect(legacy).not.toBeNull();
     expect('builtinTimeToolEnabled' in (legacy as Record<string, unknown>)).toBe(false);
+  });
+
+  it('defaults mathRenderEnabled to true even when omitted by an older gateway, normalizes booleans, and excludes it from legacy import', () => {
+    expect(defaultSettings().mathRenderEnabled).toBe(true);
+    expect(normalizeSettings({ mathRenderEnabled: false }).mathRenderEnabled).toBe(false);
+    expect(normalizeSettings({ mathRenderEnabled: 'no' }).mathRenderEnabled).toBe(true);
+    expect(normalizeServerPreferences({}).mathRenderEnabled).toBe(true);
+    expect(normalizeServerPreferences({ mathRenderEnabled: false }).mathRenderEnabled).toBe(false);
+
+    const storeMap = new Map<string, string>([
+      ['llmstudio.settings.v2', JSON.stringify({ themeMode: 'dark', mathRenderEnabled: false })],
+    ]);
+    const storage: Storage = {
+      length: 1,
+      clear: () => storeMap.clear(),
+      key: () => null,
+      removeItem: (k) => { storeMap.delete(k); },
+      getItem: (k) => storeMap.get(k) ?? null,
+      setItem: (k, v) => { storeMap.set(k, v); },
+    };
+    const legacy = readLegacyPreferences(storage);
+    expect(legacy).not.toBeNull();
+    expect('mathRenderEnabled' in (legacy as Record<string, unknown>)).toBe(false);
   });
 });

@@ -14,7 +14,7 @@ import {
   useSearchParams,
 } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
-import { Icon, IconButton } from '../../components/ui';
+import { IconButton } from '../../components/ui';
 import { CHAT_WIDTH_MAX, CHAT_WIDTH_MIN } from '../../core/settings';
 import { isReasoningEffort, type Assistant, type ContentBlock, type Message, type ReasoningEffort, type TopicScope } from '../../core/types';
 import { ChatProvider, useChat } from '../chat/ChatProvider';
@@ -24,7 +24,6 @@ import { ChatCanvas } from './ChatCanvas';
 import { Composer } from './Composer';
 import { ConversationSidebar } from './ConversationSidebar';
 import {
-  ModelPicker,
   getDefaultModelOption,
   resolveModelOption,
 } from './ModelPicker';
@@ -121,6 +120,7 @@ function WorkbenchInner() {
   const {
     state: chatState,
     isBusy,
+    isGenerating,
     isCompacting,
     updateConversationMeta,
     clearSession,
@@ -332,8 +332,9 @@ function WorkbenchInner() {
   const previousEffort = currentConversation?.params?.reasoningEffort;
   const reasoningEffort = settings.composerReasoningEffort || (isReasoningEffort(previousEffort) ? previousEffort : 'none');
 
-  const saveReasoningEffort = async (effort: ReasoningEffort) => {
-    if (effortSaveLock.current === connectionEpoch || effort === settings.composerReasoningEffort) return;
+  const saveReasoningEffort = async (effort: ReasoningEffort): Promise<boolean> => {
+    if (effortSaveLock.current === connectionEpoch) return false;
+    if (effort === settings.composerReasoningEffort) return true;
     effortSaveLock.current = connectionEpoch;
     setEffortSaveEpoch(connectionEpoch);
     try {
@@ -341,6 +342,7 @@ function WorkbenchInner() {
       if (activeConnEpochRef.current === connectionEpoch && !result.ok) {
         toast('思考强度保存失败：' + result.error, 'error');
       }
+      return result.ok;
     } finally {
       if (effortSaveLock.current === connectionEpoch) {
         effortSaveLock.current = null;
@@ -526,7 +528,7 @@ function WorkbenchInner() {
           setInspectorOpen(false);
           return;
         }
-        if (isBusy) {
+        if (isGenerating) {
           e.preventDefault();
           stopStreaming();
         }
@@ -538,7 +540,7 @@ function WorkbenchInner() {
     closeDrawers,
     handleStartNewTopic,
     inspectorOpen,
-    isBusy,
+    isGenerating,
     leftDrawerOpen,
     rightDrawerOpen,
     sidebarManageMode,
@@ -642,7 +644,7 @@ function WorkbenchInner() {
     onPrepareRollback: () => void;
     onAccepted: () => void;
   }): Promise<boolean> => {
-    if (effortSaveLock.current === connectionEpoch) return false;
+    if (effortSaveLock.current === connectionEpoch || isSavingModel) return false;
     if (!selectedProviderId || !selectedModelId) {
       toast('请先配置可用模型', 'error');
       return false;
@@ -960,7 +962,6 @@ function WorkbenchInner() {
       <AssistantSidebar
         assistants={assistants}
         activeAssistantId={activeAssistant.id}
-        connected={connectionState === 'connected'}
         drawerOpen={leftDrawerOpen}
         onSelectAssistant={handleSelectAssistant}
         onAddAssistant={() => {
@@ -998,17 +999,6 @@ function WorkbenchInner() {
                 {activeAssistant.name}
               </span>
             </button>
-
-            <Icon name="chevronRight" size={14} className="wb-crumb-sep" />
-
-            <ModelPicker
-              providers={resources.providers}
-              selectedProviderId={selectedProviderId}
-              selectedModelId={selectedModelId}
-              disabled={isBusy}
-              busy={isSavingModel}
-              onSelect={(pId, mId) => void handleSelectModel(pId, mId)}
-            />
           </div>
 
           <div className="wb-toolbar__spacer" />
@@ -1089,13 +1079,16 @@ function WorkbenchInner() {
             selectedProviderId={selectedProviderId}
             selectedModelId={selectedModelId}
             reasoningEffort={reasoningEffort}
+            savingModel={isSavingModel}
             savingEffort={savingEffort}
             isBusy={isBusy || isCompacting}
+            canStop={isGenerating}
             messages={chatState.messages}
             streaming={chatState.streaming}
             systemPrompt={currentConversation?.systemPrompt || activeAssistant.systemPrompt || ''}
             contextWindow={targetModel?.model.contextWindow}
-            onChangeReasoningEffort={(effort) => void saveReasoningEffort(effort)}
+            onSelectModel={(pId, mId) => void handleSelectModel(pId, mId)}
+            onChangeReasoningEffort={saveReasoningEffort}
             onStop={stopStreaming}
             onSend={handleSend}
             onCompact={handleCompact}

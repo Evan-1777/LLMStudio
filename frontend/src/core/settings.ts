@@ -161,6 +161,7 @@ export interface AppSettings {
   fontFamily: FontFamily;
   fontSize: number;
   builtinTimeToolEnabled: boolean;
+  mathRenderEnabled: boolean;
 }
 
 export interface SettingsLoadResult {
@@ -198,6 +199,7 @@ export const APP_PREFERENCE_KEYS = [
   'fontFamily',
   'fontSize',
   'builtinTimeToolEnabled',
+  'mathRenderEnabled',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -226,6 +228,7 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     fontFamily: settings.fontFamily,
     fontSize: settings.fontSize,
     builtinTimeToolEnabled: settings.builtinTimeToolEnabled,
+    mathRenderEnabled: settings.mathRenderEnabled,
   };
 }
 
@@ -258,6 +261,7 @@ export function defaultSettings(): AppSettings {
     fontFamily: 'system',
     fontSize: FONT_SIZE_DEFAULT,
     builtinTimeToolEnabled: false,
+    mathRenderEnabled: true,
   };
 }
 
@@ -374,6 +378,10 @@ export function normalizeSettings(raw: unknown): AppSettings {
       typeof obj.builtinTimeToolEnabled === 'boolean'
         ? obj.builtinTimeToolEnabled
         : defaults.builtinTimeToolEnabled,
+    mathRenderEnabled:
+      typeof obj.mathRenderEnabled === 'boolean'
+        ? obj.mathRenderEnabled
+        : defaults.mathRenderEnabled,
   };
 }
 
@@ -570,6 +578,7 @@ export function readLegacyPreferences(
         fontFamily: _ff,
         fontSize: _fs,
         builtinTimeToolEnabled: _bt,
+        mathRenderEnabled: _mr,
         ...legacy
       } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
       return legacy;
@@ -584,6 +593,7 @@ export function readLegacyPreferences(
         fontFamily: _ff,
         fontSize: _fs,
         builtinTimeToolEnabled: _bt,
+        mathRenderEnabled: _mr,
         ...legacy
       } = pickAppPreferences(
         normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),

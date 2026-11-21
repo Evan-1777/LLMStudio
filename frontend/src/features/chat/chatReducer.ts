@@ -173,6 +173,7 @@ export type ChatAction =
       placeholderAssistantId: string;
     }
   | { type: 'SEND_PREPARE_FAILED'; optimisticUserId: string; code: string; message: string }
+  | { type: 'SEND_PREPARE_ABORTED'; optimisticUserId: string }
   | {
       type: 'REGEN_PREPARE_START';
       targetMessageId: string;
@@ -278,6 +279,23 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         runState: 'error',
         errorCode: action.code,
         errorMessage: action.message,
+        pendingInsertIndex: null,
+        pendingRollback: null,
+        streaming: null,
+      };
+    }
+
+    case 'SEND_PREPARE_ABORTED': {
+      const nextMsgs = state.messages.filter(
+        (m) => m.id !== action.optimisticUserId,
+      );
+      const rest = deriveRestState(nextMsgs);
+      return {
+        ...state,
+        messages: nextMsgs,
+        runState: rest.runState,
+        errorCode: rest.errorCode,
+        errorMessage: rest.errorMessage,
         pendingInsertIndex: null,
         pendingRollback: null,
         streaming: null,

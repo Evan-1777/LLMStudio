@@ -1,4 +1,6 @@
-import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { isValidElement, memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useApp } from '../app/AppProvider';
@@ -7,7 +9,8 @@ import type { ContentBlock, ToolCallBlock, ToolResultBlock, WebSearchExtra } fro
 import { CodeBlock } from './CodeBlock';
 import { CollapsibleBlock } from './CollapsibleBlock';
 import { SandboxedIframe } from './HtmlPreview';
-import { parseAssistantContent, shouldAutoCollapseText } from './segments';
+import { buildRemarkPlugins } from './markdownPlugins';
+import { shouldAutoCollapseText, splitMarkdownAndRawHtml } from './segments';
 import './rendering.css';
 
 function RawHtmlCodeCard({
@@ -75,13 +78,138 @@ export function imageBlockSource(image: Extract<ContentBlock, { type: 'image' }>
     : sanitizeLinkUrl(image.url);
 }
 
-const MarkdownProse = memo(function MarkdownProse({ markdown }: { markdown: string }) {
+const KatexMath = memo(function KatexMath({
+  latex,
+  raw,
+  displayMode,
+}: {
+  latex: string;
+  raw: string;
+  displayMode: boolean;
+}) {
+  const renderedHtml = useMemo(() => {
+    try {
+      return katex.renderToString(latex, {
+        displayMode,
+        output: 'htmlAndMathml',
+        trust: false,
+        throwOnError: true,
+        strict: 'ignore',
+      });
+    } catch {
+      return null;
+    }
+  }, [displayMode, latex]);
+
+  if (renderedHtml === null) {
+    return displayMode ? (
+      <div className="math-raw math-raw--block">{raw}</div>
+    ) : (
+      <span className="math-raw">{raw}</span>
+    );
+  }
+
+  if (displayMode) {
+    return (
+      <div
+        className="math-block-scroll"
+        // KaTeX runs with trust:false and throwOnError:true on parsed math tokens only.
+        dangerouslySetInnerHTML={{ __html: renderedHtml }}
+      />
+    );
+  }
+
+  return (
+    <span
+      className="math-inline"
+      dangerouslySetInnerHTML={{ __html: renderedHtml }}
+    />
+  );
+});
+
+const MarkdownProse = memo(function MarkdownProse({
+  markdown,
+  isStreaming = false,
+  collapsePrefix = 'prose',
+}: {
+  markdown: string;
+  isStreaming?: boolean;
+  collapsePrefix?: string;
+}) {
+  const { settings } = useApp();
+  const normalized = useMemo(
+    () => markdown.replace(/\r\n/g, '\n').replace(/\r/g, '\n'),
+    [markdown],
+  );
+  const plugins = useMemo(
+    () => [
+      remarkGfm,
+      ...buildRemarkPlugins({
+        source: normalized,
+        isStreaming,
+        collapsePrefix,
+        mathRenderEnabled: settings.mathRenderEnabled,
+      }),
+    ],
+    [collapsePrefix, isStreaming, normalized, settings.mathRenderEnabled],
+  );
+
   return (
     <div className="prose">
       <Markdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={plugins}
         urlTransform={(url) => sanitizeLinkUrl(url) ?? ''}
         components={{
+          pre({ children }) {
+            if (
+              isValidElement(children) &&
+              (children.props as Record<string, unknown>)['data-code-block'] === 'true'
+            ) {
+              return <>{children}</>;
+            }
+            return <pre>{children}</pre>;
+          },
+          code({ className, children, ...props }) {
+            const p = props as Record<string, unknown>;
+            if (p['data-code-block'] === 'true') {
+              return (
+                <CodeBlock
+                  language={String(p['data-lang'] ?? '')}
+                  code={String(p['data-code-raw'] ?? '')}
+                  isClosed={p['data-closed'] === 'true'}
+                  collapseKey={String(p['data-collapse-key'] ?? `${collapsePrefix}:code`)}
+                />
+              );
+            }
+            return <code className={className}>{children}</code>;
+          },
+          div({ className, children, ...props }) {
+            const p = props as Record<string, unknown>;
+            if (p['data-math-node'] === 'block') {
+              return (
+                <KatexMath
+                  latex={String(p['data-math-latex'] ?? '')}
+                  raw={String(p['data-math-raw'] ?? '')}
+                  displayMode
+                />
+              );
+            }
+            return <div className={className}>{children}</div>;
+          },
+          span({ className, children, ...props }) {
+            const p = props as Record<string, unknown>;
+            const mathKind = p['data-math-node'];
+            if (mathKind === 'inline' || mathKind === 'inline-display') {
+              return (
+                <KatexMath
+                  latex={String(p['data-math-latex'] ?? '')}
+                  raw={String(p['data-math-raw'] ?? '')}
+                  displayMode={mathKind === 'inline-display'}
+                />
+              );
+            }
+            return <span className={className}>{children}</span>;
+          },
           table({ children }) {
             return (
               <div className="prose-table-wrap">
@@ -105,7 +233,7 @@ const MarkdownProse = memo(function MarkdownProse({ markdown }: { markdown: stri
           },
         }}
       >
-        {markdown}
+        {normalized}
       </Markdown>
     </div>
   );
@@ -335,16 +463,28 @@ export const ContentRenderer = memo(function ContentRenderer({
       }
 
       if (inTrace) {
-        nodes.push(<MarkdownProse key={baseKey} markdown={text} />);
+        nodes.push(
+          <MarkdownProse
+            key={baseKey}
+            markdown={text}
+            isStreaming={isStreaming}
+            collapsePrefix={baseKey}
+          />,
+        );
         return;
       }
 
-      const segments = parseAssistantContent(text, { isStreaming });
+      const segments = splitMarkdownAndRawHtml(text, { isStreaming });
       segments.forEach((seg, segIdx) => {
         const segKey = `${baseKey}:${segIdx}`;
         if (seg.kind === 'prose') {
           nodes.push(
-            <MarkdownProse key={segKey} markdown={seg.markdown} />,
+            <MarkdownProse
+              key={segKey}
+              markdown={seg.markdown}
+              isStreaming={isStreaming}
+              collapsePrefix={segKey}
+            />,
           );
         } else if (seg.kind === 'code') {
           nodes.push(

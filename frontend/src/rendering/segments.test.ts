@@ -102,4 +102,45 @@ Closing paragraph.
       }),
     ).toBe(false);
   });
+
+  it('keeps nested list/blockquote fences and reference links in a single prose stream when splitting only standalone raw HTML', async () => {
+    const mod = await import('./segments');
+    const fn = (mod as Record<string, unknown>).splitMarkdownAndRawHtml as
+      | ((input: string, opts?: { isStreaming?: boolean }) => ReturnType<typeof parseAssistantContent>)
+      | undefined;
+    expect(fn).toBeTypeOf('function');
+    if (!fn) return;
+
+    const md = [
+      '1. First step',
+      '',
+      '   ```ts',
+      '   const a = 1;',
+      '   ```',
+      '',
+      '2. Second [link][ref]',
+      '',
+      '```html',
+      '<div>inside fence must stay markdown code</div>',
+      '```',
+      '',
+      '<div class="raw-widget">',
+      '  <span>ok</span>',
+      '</div>',
+      '',
+      '[ref]: https://example.com/ref',
+    ].join('\n');
+
+    const segs = fn(md, { isStreaming: false });
+    expect(segs.filter((s) => s.kind === 'code')).toHaveLength(0);
+    expect(segs.filter((s) => s.kind === 'html')).toHaveLength(1);
+    const proseCombined = segs
+      .filter((s) => s.kind === 'prose')
+      .map((s) => s.markdown)
+      .join('\n');
+    expect(proseCombined).toContain('1. First step');
+    expect(proseCombined).toContain('2. Second [link][ref]');
+    expect(proseCombined).toContain('```ts');
+    expect(proseCombined).toContain('```html');
+  });
 });

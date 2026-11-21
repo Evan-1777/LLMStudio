@@ -604,4 +604,184 @@ describe('ContentRenderer and HTML sandbox', () => {
     );
     expect(frame.style.height).toBe('min(70dvh, 640px)');
   });
+
+  it('keeps CommonMark list/blockquote fence boundaries, reference links across code blocks, CJK bold punctuation, CRLF, and long fences intact', () => {
+    const md = [
+      '1. 第一步',
+      '   ```ts',
+      '   const step1 = 1;',
+      '   ```',
+      '2. 第二步查看 [规范文档][spec-ref]',
+      '> 引用说明',
+      '>',
+      '> ```js',
+      '> const quoted = true;',
+      '> ```',
+      '>',
+      '> 引用结尾',
+      '中文**（加粗）**与**“引号”**，还有 ~~删除线~~。',
+      '````md',
+      '```ts',
+      'const nested = 1;',
+      '```',
+      '````',
+      '[spec-ref]: https://example.com/spec',
+    ].join('\r\n');
+
+    const { container } = render(
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer
+            messageId="m-cm"
+            blocks={[{ type: 'text', text: md }]}
+          />
+        </CollapseStateProvider>
+      </AppProvider>,
+    );
+
+    const ols = container.querySelectorAll('ol');
+    expect(ols).toHaveLength(1);
+    expect(ols[0].querySelectorAll(':scope > li')).toHaveLength(2);
+    expect(ols[0].querySelector('.block-card')).not.toBeNull();
+
+    const quote = container.querySelector('blockquote');
+    expect(quote).not.toBeNull();
+    expect(quote!.querySelector('.block-card')).not.toBeNull();
+    expect(quote!.textContent).toContain('const quoted = true;');
+    expect(quote!.textContent).not.toContain('> const quoted');
+
+    const link = screen.getByRole('link', { name: '规范文档' });
+    expect(link).toHaveAttribute('href', 'https://example.com/spec');
+
+    const strongs = Array.from(container.querySelectorAll('strong')).map((s) => s.textContent);
+    expect(strongs).toContain('（加粗）');
+    expect(strongs).toContain('“引号”');
+    expect(container.querySelector('del')?.textContent).toBe('删除线');
+    expect(container.textContent).toContain('const nested = 1;');
+
+    // User messages stay plain text without Markdown or math rendering.
+    render(
+      <AppProvider skipInitialBootstrap>
+        <ContentRenderer
+          messageId="u-plain"
+          isUser
+          blocks={[{ type: 'text', text: '**bold** $x^2$ \\(y\\)' }]}
+        />
+      </AppProvider>,
+    );
+    expect(screen.getByText('**bold** $x^2$ \\(y\\)')).toBeInTheDocument();
+  });
+
+  it('renders four LaTeX delimiters via KaTeX, respects mathRenderEnabled toggle, protects code/URL/HTML/currency, and falls back on invalid/unclosed math', () => {
+    const md = [
+      '行内 $a^2 + b^2 = c^2$ 与 \\(e^{i\\pi}+1=0\\)。',
+      '',
+      '$$',
+      '\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}',
+      '$$',
+      '',
+      '\\[',
+      '\\int_0^1 x^2 \\, dx = \\frac{1}{3}',
+      '\\]',
+      '',
+      '价格是 $5 和 $10，转义 \\$x\\$，代码 `$z$` 与 `\\(w\\)`。',
+      '',
+      '链接 [url](https://example.com/$a$/$b$/(c)) 与不合法 $\\unknowncmd{1}$。',
+      '',
+      '```tex',
+      '$$not_math$$',
+      '\\[also_not_math\\]',
+      '```',
+    ].join('\n');
+
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...defaultSettings(), mathRenderEnabled: true }),
+    );
+    const { container, rerender } = render(
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer
+            messageId="m-math"
+            isStreaming
+            blocks={[{ type: 'text', text: '流式未闭合 $x + ' }]}
+          />
+        </CollapseStateProvider>
+      </AppProvider>,
+    );
+    expect(container.querySelector('.katex')).toBeNull();
+    expect(container.textContent).toContain('$x +');
+
+    rerender(
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer
+            messageId="m-math"
+            isStreaming={false}
+            blocks={[{ type: 'text', text: md }]}
+          />
+        </CollapseStateProvider>
+      </AppProvider>,
+    );
+
+    const katexNodes = container.querySelectorAll('.katex');
+    expect(katexNodes).toHaveLength(4);
+    expect(container.querySelectorAll('.katex-mathml math').length).toBe(4);
+    expect(container.querySelector('.math-block-scroll')).not.toBeNull();
+    expect(container.textContent).toContain('$5 和 $10');
+    expect(container.textContent).toContain('$x$');
+    expect(container.textContent).toContain('$z$');
+    expect(container.textContent).toContain('\\(w\\)');
+    expect(container.textContent).toContain('$\\unknowncmd{1}$');
+    expect(container.textContent).toContain('$$not_math$$');
+    expect(screen.getByRole('link', { name: 'url' })).toHaveAttribute(
+      'href',
+      'https://example.com/$a$/$b$/(c)',
+    );
+
+    // Disable math rendering: preserves original delimiters & backslashes verbatim.
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...defaultSettings(), mathRenderEnabled: false }),
+    );
+    const { container: offContainer } = render(
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer
+            messageId="m-math-off"
+            blocks={[{ type: 'text', text: '公式 \\(a_1\\) 与 \\[b_2\\] 与 $c_3$' }]}
+          />
+        </CollapseStateProvider>
+      </AppProvider>,
+    );
+    expect(offContainer.querySelector('.katex')).toBeNull();
+    expect(offContainer.querySelector('em')).toBeNull();
+    expect(offContainer.textContent).toContain('\\(a_1\\)');
+    expect(offContainer.textContent).toContain('\\[b_2\\]');
+    expect(offContainer.textContent).toContain('$c_3$');
+
+    // KaTeX trust:false blocks javascript: links from \href, and streaming unclosed code blocks report 输出中 until closed.
+    localStorage.setItem(
+      SETTINGS_STORAGE_KEY,
+      JSON.stringify({ ...defaultSettings(), mathRenderEnabled: true }),
+    );
+    const { container: secContainer } = render(
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer
+            messageId="m-sec"
+            isStreaming
+            blocks={[
+              {
+                type: 'text',
+                text: '$\\href{javascript:alert(1)}{click}$\n\n```html\n<div>streaming',
+              },
+            ]}
+          />
+        </CollapseStateProvider>
+      </AppProvider>,
+    );
+    expect(secContainer.querySelector('a[href^="javascript:"]')).toBeNull();
+    expect(screen.getByText('HTML · 输出中')).toBeInTheDocument();
+  });
 });

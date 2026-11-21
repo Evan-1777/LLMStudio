@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type PointerEvent } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import {
@@ -9,6 +9,7 @@ import {
   Icon,
   IconButton,
   LoadingSpinner,
+  Popover,
 } from '../../components/ui';
 import type {
   Assistant,
@@ -29,11 +30,16 @@ import {
   type ChatState,
 } from '../chat/chatReducer';
 
-function resolveMessageSource(
+interface MessageSourceMeta {
+  displayName: string;
+  providerName?: string;
+  modelId?: string;
+}
+
+function resolveMessageSourceMeta(
   msg: Message,
   providers: readonly ProviderConfig[],
-  assistantName: string,
-): string {
+): MessageSourceMeta | null {
   const provider = msg.providerId
     ? providers.find((p) => p.id === msg.providerId)
     : undefined;
@@ -41,16 +47,149 @@ function resolveMessageSource(
     provider && msg.modelId
       ? provider.models.find((m) => m.id === msg.modelId)
       : undefined;
-  if (model && provider) {
-    return `${model.name || msg.modelId} | ${provider.name}`;
+  if (model) {
+    return {
+      displayName: model.name || msg.modelId || '模型详情',
+      providerName: provider?.name,
+      modelId: msg.modelId || model.id,
+    };
   }
-  if (msg.modelId && provider) {
-    return `${msg.modelId} | ${provider.name}`;
+  if (msg.providerId || msg.modelId) {
+    return {
+      displayName: '模型详情',
+      providerName: provider?.name ?? (msg.providerId || undefined),
+      modelId: msg.modelId || undefined,
+    };
   }
-  if (msg.modelId) {
-    return msg.modelId;
-  }
-  return assistantName;
+  return null;
+}
+
+function ModelDetailPopover({ meta }: { meta: MessageSourceMeta }) {
+  const [hoverOpen, setHoverOpen] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const closeTimer = useRef<number | undefined>(undefined);
+  const lastPointerType = useRef('');
+  const open = pinned || hoverOpen;
+
+  const cancelClose = () => {
+    if (closeTimer.current !== undefined) {
+      window.clearTimeout(closeTimer.current);
+      closeTimer.current = undefined;
+    }
+  };
+
+  useEffect(() => () => cancelClose(), []);
+
+  const handlePointerEnter = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') return;
+    cancelClose();
+    setHoverOpen(true);
+  };
+
+  const handlePointerLeave = (event: PointerEvent) => {
+    if (event.pointerType === 'touch') return;
+    cancelClose();
+    closeTimer.current = window.setTimeout(() => {
+      setHoverOpen(false);
+    }, 120);
+  };
+
+  return (
+    <Popover
+      side="top"
+      align="start"
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) {
+          cancelClose();
+          setPinned(false);
+          setHoverOpen(false);
+        }
+      }}
+      contentProps={{
+        'aria-label': '模型信息',
+        onPointerEnter: handlePointerEnter,
+        onPointerLeave: handlePointerLeave,
+        onOpenAutoFocus: (event) => event.preventDefault(),
+        onCloseAutoFocus: (event) => event.preventDefault(),
+      }}
+      trigger={
+        <button
+          type="button"
+          className="wb-msg-detail-btn"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          onPointerEnter={handlePointerEnter}
+          onPointerLeave={handlePointerLeave}
+          onPointerDown={(event) => {
+            lastPointerType.current = event.pointerType;
+          }}
+          onPointerCancel={() => {
+            lastPointerType.current = '';
+          }}
+          onClick={(event) => {
+            event.preventDefault();
+            cancelClose();
+            setPinned((prev) => {
+              const next = !prev;
+              if (!next) setHoverOpen(false);
+              return next;
+            });
+            lastPointerType.current = '';
+          }}
+        >
+          {meta.displayName}
+        </button>
+      }
+    >
+      <dl className="wb-msg-detail-dl">
+        <dt>供应商</dt>
+        <dd>{meta.providerName || '未知'}</dd>
+        <dt>模型 ID</dt>
+        <dd>{meta.modelId ? <code>{meta.modelId}</code> : '未知'}</dd>
+      </dl>
+    </Popover>
+  );
+}
+
+function AssistantMetaHeader({
+  headClassName,
+  assistant,
+  sourceMeta,
+  createdAt,
+}: {
+  headClassName: 'wb-feed-head' | 'wb-asst-head';
+  assistant: Assistant;
+  sourceMeta: MessageSourceMeta | null;
+  createdAt?: string;
+}) {
+  const timestamp = formatFeedTimestamp(createdAt);
+  const nameClassName =
+    headClassName === 'wb-feed-head' ? 'wb-feed-author' : 'wb-asst-name';
+
+  return (
+    <div className={headClassName}>
+      <Avatar kind="assistant" src={assistant.avatarDataUrl} size={32} />
+      <div className="wb-feed-meta">
+        <span className={nameClassName}>{assistant.name}</span>
+        {sourceMeta || timestamp ? (
+          <div className="wb-msg-meta-row">
+            {sourceMeta ? <ModelDetailPopover meta={sourceMeta} /> : null}
+            {sourceMeta && timestamp ? (
+              <span className="wb-msg-meta-sep" aria-hidden="true">
+                ·
+              </span>
+            ) : null}
+            {timestamp ? (
+              <time dateTime={createdAt} className="wb-feed-time">
+                {timestamp}
+              </time>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function formatFeedTimestamp(iso?: string): string {
@@ -373,9 +512,9 @@ export function ChatCanvas({
 
               if (displayMode === 'feed') {
                 const isUser = msg.role === 'user';
-                const authorLabel = isUser
-                  ? '用户'
-                  : resolveMessageSource(msg, providers, assistant.name);
+                const sourceMeta = isUser
+                  ? null
+                  : resolveMessageSourceMeta(msg, providers);
                 const timestamp = formatFeedTimestamp(msg.createdAt);
 
                 return (
@@ -385,19 +524,30 @@ export function ChatCanvas({
                       isUser ? 'wb-feed-msg--user' : 'wb-feed-msg--asst'
                     }`.trim()}
                   >
-                    <div className="wb-feed-head">
-                      <Avatar
-                        kind={isUser ? 'user' : 'assistant'}
-                        src={isUser ? settings.userAvatarDataUrl : assistant.avatarDataUrl}
-                        size={32}
-                      />
-                      <div className="wb-feed-meta">
-                        <span className="wb-feed-author">{authorLabel}</span>
-                        {timestamp ? (
-                          <span className="wb-feed-time">{timestamp}</span>
-                        ) : null}
+                    {isUser ? (
+                      <div className="wb-feed-head">
+                        <Avatar
+                          kind="user"
+                          src={settings.userAvatarDataUrl}
+                          size={32}
+                        />
+                        <div className="wb-feed-meta">
+                          <span className="wb-feed-author">用户</span>
+                          {timestamp ? (
+                            <time dateTime={msg.createdAt} className="wb-feed-time">
+                              {timestamp}
+                            </time>
+                          ) : null}
+                        </div>
                       </div>
-                    </div>
+                    ) : (
+                      <AssistantMetaHeader
+                        headClassName="wb-feed-head"
+                        assistant={assistant}
+                        sourceMeta={sourceMeta}
+                        createdAt={msg.createdAt}
+                      />
+                    )}
 
                     <div className="wb-feed-body">
                       {isEditingThis ? (
@@ -492,19 +642,16 @@ export function ChatCanvas({
                 );
               }
 
+              const sourceMeta = resolveMessageSourceMeta(msg, providers);
+
               return (
                 <article key={uiKey} className="wb-asst-msg">
-                  <div className="wb-asst-head">
-                    <Avatar
-                      kind="assistant"
-                      src={assistant.avatarDataUrl}
-                      size={32}
-                    />
-                    <span className="wb-asst-name">{assistant.name}</span>
-                    {msg.modelId ? (
-                      <span className="wb-asst-tag">{msg.modelId}</span>
-                    ) : null}
-                  </div>
+                  <AssistantMetaHeader
+                    headClassName="wb-asst-head"
+                    assistant={assistant}
+                    sourceMeta={sourceMeta}
+                    createdAt={msg.createdAt}
+                  />
 
                   {isEditingThis ? (
                     inlineEditor

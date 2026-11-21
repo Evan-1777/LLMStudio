@@ -760,9 +760,10 @@ test.describe('MCP End-to-End Integration', () => {
       await page.getByRole('button', { name: '新建话题' }).click();
       await page.getByRole('button', { name: '选择模型' }).click();
       await page.getByRole('option', { name: 'Local Chat' }).click();
-      await page.getByRole('button', { name: /思考强度/ }).click();
-      await page.getByRole('radio', { name: '高', exact: true }).click();
-      await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeEnabled();
+      await page.getByRole('button', { name: '选择模型' }).click();
+      await page.getByRole('slider', { name: 'Reasoning' }).fill('3');
+      await page.keyboard.press('Escape');
+      await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/High/);
       mockSrv.resetTurns();
       await page.getByLabel('消息输入框').fill('[LOCAL_MULTI]');
       await page.getByLabel('发送消息').click();

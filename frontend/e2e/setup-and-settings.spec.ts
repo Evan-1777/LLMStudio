@@ -188,6 +188,14 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await directChatReqPromise;
     await expect(page.getByText(/to: Direct browser chat/)).toBeVisible();
 
+    // Bubble mode keeps unified assistant name + model detail button + time without raw IDs leaked.
+    const bubbleHead = page.locator('.wb-asst-head').first();
+    await expect(bubbleHead.locator('.wb-asst-name')).toBeVisible();
+    await expect(bubbleHead.getByRole('button', { name: 'Mock Chat' })).toBeVisible();
+    await expect(bubbleHead.locator('time')).toBeVisible();
+    await expect(bubbleHead).not.toContainText('Direct Local');
+    await expect(bubbleHead).not.toContainText('mock-chat');
+
     // Toolbar no longer exposes display mode toggle; switch to Feed mode via Settings -> Appearance.
     await expect(
       page.getByRole('button', { name: '切换消息显示模式' }),
@@ -197,9 +205,30 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await page.getByRole('radio', { name: '信息流模式' }).click();
     await page.getByRole('button', { name: '返回工作台' }).click();
     await expect(page.locator('.wb-feed-author', { hasText: '用户' })).toBeVisible();
-    await expect(
-      page.locator('.wb-feed-author', { hasText: 'Mock Chat | Direct Local' }),
-    ).toBeVisible();
+    await expect(page.locator('.wb-feed-msg--user .wb-msg-detail-btn')).toHaveCount(0);
+
+    // Feed mode renders assistant name first, followed by secondary model display name + time, with on-demand metadata popover.
+    const feedAsstHead = page.locator('.wb-feed-head').nth(1);
+    const modelDetailTrigger = feedAsstHead.getByRole('button', { name: 'Mock Chat' });
+    await expect(feedAsstHead.locator('.wb-feed-author')).toBeVisible();
+    await expect(modelDetailTrigger).toBeVisible();
+    await expect(feedAsstHead.locator('time')).toBeVisible();
+    await expect(feedAsstHead).not.toContainText('Direct Local');
+
+    await page.getByLabel('消息输入框').focus();
+    await modelDetailTrigger.hover();
+    const modelInfo = page.getByRole('dialog', { name: '模型信息' });
+    await expect(modelInfo).toContainText('Direct Local');
+    await expect(modelInfo).toContainText('mock-chat');
+    await expect(page.getByLabel('消息输入框')).toBeFocused();
+
+    // Clicking pins the disclosure; moving pointer away keeps it visible until Escape or second click.
+    await modelDetailTrigger.click();
+    await page.getByLabel('消息输入框').hover();
+    await expect(modelInfo).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(modelInfo).toBeHidden();
+
     const token = page.locator('article').filter({ hasText: 'Direct browser chat' }).getByRole('button', { name: 'Token 用量' });
     const usage = page.getByRole('dialog', { name: 'Token 用量明细' });
     await expect(page.getByText(/^Tokens:/)).toHaveCount(0);
@@ -215,7 +244,7 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     // Reload preserves persisted local chat history and Feed mode.
     await page.reload({ waitUntil: 'networkidle' });
     await expect(
-      page.locator('.wb-feed-author', { hasText: 'Mock Chat | Direct Local' }),
+      page.locator('.wb-feed-head').nth(1).getByRole('button', { name: 'Mock Chat' }),
     ).toBeVisible();
     await expect(page.getByText(/to: Direct browser chat/)).toBeVisible();
 

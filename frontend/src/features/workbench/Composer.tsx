@@ -16,17 +16,16 @@ import {
   ErrorBanner,
   Icon,
   IconButton,
-  Popover,
 } from '../../components/ui';
-import {
-  REASONING_EFFORT_LEVELS,
-  type ContentBlock,
-  type Message,
-  type ReasoningEffort,
+import type {
+  ContentBlock,
+  Message,
+  ReasoningEffort,
 } from '../../core/types';
 import type { StreamingDraft } from '../chat/chatReducer';
 import { AttachmentChips } from './AttachmentChips';
 import { ContextUsageRing } from './ContextUsageRing';
+import { ModelPicker } from './ModelPicker';
 import { computeContextUsage } from './contextUsage';
 import {
   FILE_INPUT_ACCEPT,
@@ -39,25 +38,19 @@ import {
   type PendingAttachment,
 } from './attachments';
 
-const EFFORT_LABELS: Record<ReasoningEffort, string> = {
-  none: '关闭',
-  low: '低',
-  medium: '中',
-  high: '高',
-  xhigh: '极高',
-  max: '最大',
-};
-
 export function Composer({
   selectedProviderId,
   selectedModelId,
   reasoningEffort,
+  savingModel = false,
   savingEffort,
   isBusy,
+  canStop,
   messages = [],
   streaming = null,
   systemPrompt = '',
   contextWindow,
+  onSelectModel,
   onChangeReasoningEffort,
   onStop,
   onSend,
@@ -68,13 +61,16 @@ export function Composer({
   selectedProviderId: string;
   selectedModelId: string;
   reasoningEffort: ReasoningEffort;
+  savingModel?: boolean;
   savingEffort: boolean;
   isBusy: boolean;
+  canStop?: boolean;
   messages?: readonly Message[];
   streaming?: StreamingDraft | null;
   systemPrompt?: string;
   contextWindow?: number;
-  onChangeReasoningEffort: (effort: ReasoningEffort) => void;
+  onSelectModel: (providerId: string, modelId: string) => void;
+  onChangeReasoningEffort: (effort: ReasoningEffort) => Promise<boolean> | void;
   onStop: () => void;
   onSend: (opts: {
     blocks: ContentBlock[];
@@ -96,7 +92,6 @@ export function Composer({
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [webSearch, setWebSearch] = useState(false);
   const [selectedEngineId, setSelectedEngineId] = useState<string>('');
-  const [effortOpen, setEffortOpen] = useState(false);
   const [bodyError, setBodyError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -154,6 +149,7 @@ export function Composer({
   const hasContent = draft.trim().length > 0 || readyAttachments.length > 0;
   const canSend =
     !isBusy &&
+    !savingModel &&
     !savingEffort &&
     !submitting &&
     !hasReading &&
@@ -288,12 +284,15 @@ export function Composer({
     }
   };
 
+  const stoppable = canStop ?? isBusy;
+
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    if (isBusy) {
+    if (stoppable) {
       onStop();
       return;
     }
+    if (isBusy) return;
     void submitCurrent();
   };
 
@@ -432,72 +431,18 @@ export function Composer({
             onClick={() => fileInputRef.current?.click()}
           />
 
-          {/* 3. Reasoning Effort (6 levels always selectable) */}
-          <Popover
-            open={effortOpen}
-            onOpenChange={setEffortOpen}
-            side="top"
-            align="start"
-            trigger={
-              <button
-                type="button"
-                className={`ui-icon-btn ui-icon-btn--sm ${
-                  reasoningEffort !== 'none' ? 'ui-icon-btn--active' : ''
-                }`.trim()}
-                style={
-                  reasoningEffort !== 'none'
-                    ? { width: 'auto', padding: '0 7px', gap: 4 }
-                    : undefined
-                }
-                aria-label={`思考强度 (${EFFORT_LABELS[reasoningEffort]})`}
-                title={savingEffort ? '正在保存思考强度' : `思考强度 (${EFFORT_LABELS[reasoningEffort]})`}
-                aria-busy={savingEffort}
-                disabled={isBusy || savingEffort}
-              >
-                <Icon name="lightbulb" size={15} />
-                {reasoningEffort !== 'none' ? (
-                  <span className="wb-effort-badge">
-                    {EFFORT_LABELS[reasoningEffort]}
-                  </span>
-                ) : null}
-              </button>
-            }
-          >
-            <div
-              role="radiogroup"
-              aria-label="思考强度"
-              style={{
-                display: 'flex',
-                flexDirection: 'column',
-                gap: 2,
-                minWidth: 136,
-              }}
-            >
-              {REASONING_EFFORT_LEVELS.map((level) => {
-                const active = reasoningEffort === level;
-                return (
-                  <button
-                    key={level}
-                    type="button"
-                    role="radio"
-                    aria-checked={active}
-                    className={`ui-menu-item ${
-                      active ? 'ui-menu-item--active' : ''
-                    }`.trim()}
-                    onClick={() => {
-                      onChangeReasoningEffort(level);
-                      setEffortOpen(false);
-                    }}
-                  >
-                    <span style={{ flex: 1, textAlign: 'left' }}>
-                      {EFFORT_LABELS[level]}
-                    </span>
-                    {active ? <Icon name="check" size={14} /> : null}
-                  </button>
-                );
-              })}
-            </div>
-          </Popover>
+          {/* 3. Unified Model Picker & Reasoning Effort */}
+          <ModelPicker
+            providers={resources.providers}
+            selectedProviderId={selectedProviderId}
+            selectedModelId={selectedModelId}
+            reasoningEffort={reasoningEffort}
+            disabled={isBusy}
+            busy={savingModel}
+            savingEffort={savingEffort}
+            onSelect={onSelectModel}
+            onChangeReasoningEffort={onChangeReasoningEffort}
+          />
 
           <input
             ref={fileInputRef}
@@ -517,8 +462,9 @@ export function Composer({
               )}
               isCompacting={isCompacting}
             />
-            {isBusy ? (
+            {stoppable ? (
               <button
+                key="stop-btn"
                 type="button"
                 className="wb-send-btn wb-send-btn--stop"
                 aria-label="停止生成"
@@ -529,6 +475,7 @@ export function Composer({
               </button>
             ) : (
               <button
+                key="send-btn"
                 type="submit"
                 className="wb-send-btn"
                 aria-label="发送消息"

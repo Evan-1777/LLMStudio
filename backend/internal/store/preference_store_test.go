@@ -177,6 +177,37 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if !timeUpdated.BuiltinTimeToolEnabled {
 		t.Fatal("expected builtinTimeToolEnabled persisted true")
 	}
+
+	if !stored.MathRenderEnabled {
+		t.Fatal("expected mathRenderEnabled default true")
+	}
+	disableMath := false
+	mathUpdated, _, err := prefs.Update(ctx, domain.PreferencesPatch{MathRenderEnabled: &disableMath}, false, validatePrefs)
+	if err != nil {
+		t.Fatalf("disable mathRenderEnabled: %v", err)
+	}
+	if mathUpdated.MathRenderEnabled {
+		t.Fatal("expected mathRenderEnabled persisted false")
+	}
+	// Unrelated partial update must not overwrite explicit false with default true.
+	nextSize := 16
+	afterOther, _, err := prefs.Update(ctx, domain.PreferencesPatch{FontSize: &nextSize}, false, validatePrefs)
+	if err != nil || afterOther.MathRenderEnabled {
+		t.Fatalf("expected mathRenderEnabled to stay false after unrelated patch, got %+v err=%v", afterOther, err)
+	}
+	// Reopening database preserves explicit false.
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	db, err = OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen sqlite for mathRenderEnabled: %v", err)
+	}
+	prefs = NewPreferenceStore(db)
+	reloaded, _, err := prefs.Get(ctx)
+	if err != nil || reloaded.MathRenderEnabled {
+		t.Fatalf("expected mathRenderEnabled false after reopen, got %+v err=%v", reloaded, err)
+	}
 }
 
 func TestMigration005BackfillsManagedAPIKeys(t *testing.T) {

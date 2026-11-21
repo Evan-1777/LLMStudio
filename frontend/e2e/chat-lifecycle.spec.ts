@@ -32,13 +32,16 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
 
     await connectWithToken(page, appUrl);
 
-    // Select Mock Chat explicitly via ModelPicker.
+    // 1. Select Mock Chat and set Reasoning High via unified composer ModelPicker.
     await page.getByRole('button', { name: '选择模型' }).click();
     await page.getByRole('option', { name: /Mock Chat/ }).click();
 
-    // 1. Send with reasoning effort high + web search enabled.
-    await page.getByRole('button', { name: /思考强度/ }).click();
-    await page.getByRole('radio', { name: '高', exact: true }).click();
+    await page.getByRole('button', { name: '选择模型' }).click();
+    const slider = page.getByRole('slider', { name: 'Reasoning' });
+    await slider.fill('3');
+    await expect(slider).toHaveAttribute('aria-valuetext', 'High');
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/High/);
     await page.getByRole('button', { name: '开启联网搜索' }).click();
 
     const composer = page.getByLabel('消息输入框');
@@ -59,16 +62,46 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     const convId = new URL(page.url()).pathname.split('/').pop()!;
     await page.reload({ waitUntil: 'networkidle' });
     await expect(page.getByText(/Reply #1 to:/)).toBeVisible();
-    await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeVisible();
+    await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/High/);
 
-    // 2. Abort streaming: receive partial content first, click stop, verify upstream disconnect & Go aborted record.
+    // 2. Abort before first byte (prepare gate) restores draft & does NOT persist user message;
+    //    abort after headers before first token persists user message & aborted assistant without releasing gate.
+    const preHeaderEntered = upstream.armFirstByteGate();
+    await composer.fill('Pre-header abort draft');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await preHeaderEntered;
+    await expect(page.getByRole('button', { name: '停止生成' })).toBeVisible();
+    await page.getByRole('button', { name: '停止生成' }).click();
+    await expect.poll(() => upstream.abortedCount, { timeout: 5000 }).toBeGreaterThanOrEqual(1);
+    await expect(composer).toHaveValue('Pre-header abort draft');
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    upstream.releaseFirstByteGate();
+
+    const beforePostHeaderDetail = (await (
+      await fetch(`${appUrl}/api/v1/conversations/${encodeURIComponent(convId)}`, {
+        headers: { Authorization: `Bearer ${E2E_TOKEN}` },
+      })
+    ).json()) as { messages: Array<{ id: string }> };
+    expect(beforePostHeaderDetail.messages).toHaveLength(2);
+
+    const postHeaderEntered = upstream.armFirstByteGate();
+    await composer.fill('[GATE_AFTER_HEADERS] wait before first token');
+    await page.getByRole('button', { name: '发送消息' }).click();
+    await postHeaderEntered;
+    await page.getByRole('button', { name: '停止生成' }).click();
+    await expect.poll(() => upstream.abortedCount, { timeout: 5000 }).toBeGreaterThanOrEqual(2);
+    await expect(page.getByText('已停止')).toBeVisible();
+    upstream.releaseFirstByteGate();
+
+    // 2b. Abort streaming: receive partial content first, click stop, verify upstream disconnect & Go aborted record.
     await composer.fill('[SLOW_ABORT] please stream slowly');
     await page.getByRole('button', { name: '发送消息' }).click();
     await expect(page.getByText(/Partial streamed answer/)).toBeVisible();
     await page.getByRole('button', { name: '停止生成' }).click();
 
     await expect.poll(() => upstream.abortedCount, { timeout: 5000 }).toBeGreaterThanOrEqual(1);
-    await expect(page.getByText('已停止')).toBeVisible();
+    await expect(page.getByText('已停止')).toHaveCount(2);
+    await expect(page.getByText('已停止').last()).toBeVisible();
 
     // Poll Go API directly (no fixed sleep) to verify Go persisted aborted stopReason.
     await expect
@@ -90,7 +123,8 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
 
     // Reload to get clean server IDs after abort.
     await page.reload({ waitUntil: 'networkidle' });
-    await expect(page.getByText('已停止')).toBeVisible();
+    await expect(page.getByText('已停止')).toHaveCount(2);
+    await expect(page.getByText('已停止').last()).toBeVisible();
 
     // 3. Prepare failure keeps history intact; incomplete EOF reports error instead of success.
     await composer.fill('[PREPARE_FAIL]');
@@ -112,7 +146,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
       conversation: { updatedAt: string };
       messages: Array<{ id: string; role: string }>;
     };
-    expect(beforeUserRetryDetail.messages).toHaveLength(6);
+    expect(beforeUserRetryDetail.messages).toHaveLength(8);
 
     const retryButtons = page.getByRole('button', { name: '重试消息' });
     await retryButtons.first().click();
@@ -142,14 +176,14 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         }
         return detail.messages.map((m) => m.role).join(',');
       })
-      .toBe('user,assistant,user,assistant,user,assistant');
+      .toBe('user,assistant,user,assistant,user,assistant,user,assistant');
 
     // Add a second turn so branch vs original divergence and single-message delete can be verified.
     await composer.fill('Second turn question');
     await page.getByRole('button', { name: '发送消息' }).click();
     await expect(page.getByText(/to: Second turn question/)).toBeVisible();
 
-    // Reload to ensure all 8 messages have final server IDs.
+    // Reload to ensure all 10 messages have final server IDs.
     await page.reload({ waitUntil: 'networkidle' });
     await expect(page.getByText(/to: Second turn question/)).toBeVisible();
 
@@ -158,7 +192,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         headers: { Authorization: `Bearer ${E2E_TOKEN}` },
       })
     ).json()) as { messages: Array<{ id: string }> };
-    expect(originalDetailBeforeBranch.messages).toHaveLength(8);
+    expect(originalDetailBeforeBranch.messages).toHaveLength(10);
     const originalIds = new Set(originalDetailBeforeBranch.messages.map((m) => m.id));
 
     // 5. Branch from the FIRST assistant message -> new URL, 2 messages with newly assigned IDs; original retains 8 messages.
@@ -238,7 +272,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         expect(detail.conversation.updatedAt >= beforeMidRetry.conversation.updatedAt).toBe(true);
         return detail.messages.map((m) => m.role).join(',');
       })
-      .toBe('user,assistant,user,assistant,user,assistant,user,assistant');
+      .toBe('user,assistant,user,assistant,user,assistant,user,assistant,user,assistant');
 
     // 8. Single-message delete removes ONLY the first user message; subsequent messages stay after reload.
     await page.getByRole('button', { name: '删除消息' }).first().click();
@@ -253,13 +287,13 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         const detail = (await res.json()) as { messages: Array<{ id: string }> };
         return detail.messages.length;
       })
-      .toBe(7);
+      .toBe(9);
 
     await page.reload({ waitUntil: 'networkidle' });
     await expect(page.getByText('Edited second reply')).toBeVisible();
 
     await page.getByRole('button', { name: '新建话题' }).click();
-    await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeVisible();
+    await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/High/);
     await composer.fill('New topic inherits effort');
     const created = page.waitForResponse((res) =>
       res.url().endsWith('/api/v1/conversations') && res.request().method() === 'POST');
@@ -276,18 +310,22 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
       await route.fulfill({ status: 500, json: { code: 'INTERNAL_ERROR', message: '写入失败' } });
     };
     await page.route('**/api/v1/settings', failSave);
-    await page.getByRole('button', { name: '思考强度 (高)' }).click();
-    await page.getByRole('radio', { name: '关闭', exact: true }).click();
+    await page.getByRole('button', { name: '选择模型' }).click();
+    const editSlider = page.getByRole('slider', { name: 'Reasoning' });
+    await editSlider.fill('0');
     await expect(page.getByText(/思考强度保存失败/)).toBeVisible();
-    await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/High/);
+    await expect(page.getByRole('button', { name: '选择模型' })).toBeEnabled();
     await expect(composer).toHaveValue('Keep draft when preference save fails');
     await page.unroute('**/api/v1/settings', failSave);
 
-    await page.getByRole('button', { name: '思考强度 (高)' }).click();
-    await page.getByRole('radio', { name: '关闭', exact: true }).click();
-    await expect(page.getByRole('button', { name: '思考强度 (关闭)' })).toBeEnabled();
+    await editSlider.fill('0');
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/Off/);
+    await expect(page.getByRole('button', { name: '选择模型' })).toBeEnabled();
     await page.reload({ waitUntil: 'networkidle' });
-    await expect(page.getByRole('button', { name: '思考强度 (关闭)' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/Off/);
+    await expect(page.getByRole('button', { name: '选择模型' })).toBeEnabled();
 
     const resetPreference = await fetch(appUrl + '/api/v1/settings', {
       method: 'PATCH', headers: { Authorization: 'Bearer ' + E2E_TOKEN, 'Content-Type': 'application/json' },
@@ -295,7 +333,8 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     });
     expect(resetPreference.ok).toBe(true);
     await page.reload({ waitUntil: 'networkidle' });
-    await expect(page.getByRole('button', { name: '思考强度 (高)' })).toBeEnabled();
+    await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/High/);
+    await expect(page.getByRole('button', { name: '选择模型' })).toBeEnabled();
   });
 });
 

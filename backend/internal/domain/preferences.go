@@ -76,6 +76,7 @@ type Preferences struct {
 	FontFamily                   string `json:"fontFamily"`
 	FontSize                     int    `json:"fontSize"`
 	BuiltinTimeToolEnabled       bool   `json:"builtinTimeToolEnabled"`
+	MathRenderEnabled            bool   `json:"mathRenderEnabled"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -98,6 +99,7 @@ func DefaultPreferences() Preferences {
 		ChatManualWidth:              DefaultChatManualWidth,
 		FontFamily:                   FontFamilySystem,
 		FontSize:                     DefaultFontSize,
+		MathRenderEnabled:            true,
 	}
 }
 
@@ -125,6 +127,7 @@ type PreferencesPatch struct {
 	FontFamily                   *string `json:"fontFamily"`
 	FontSize                     *int    `json:"fontSize"`
 	BuiltinTimeToolEnabled       *bool   `json:"builtinTimeToolEnabled"`
+	MathRenderEnabled            *bool   `json:"mathRenderEnabled"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -189,6 +192,9 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	}
 	if p.BuiltinTimeToolEnabled != nil {
 		out.BuiltinTimeToolEnabled = *p.BuiltinTimeToolEnabled
+	}
+	if p.MathRenderEnabled != nil {
+		out.MathRenderEnabled = *p.MathRenderEnabled
 	}
 	return out
 }

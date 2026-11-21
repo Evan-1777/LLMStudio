@@ -169,7 +169,8 @@ test.describe('Motion transitions, reduced-motion, 5s slow network feedback, and
     await page.getByRole('button', { name: '返回工作台' }).click();
 
     const modelBtn = page.getByRole('button', { name: '选择模型' });
-    expect(await modelBtn.locator('svg').count()).toBe(0);
+    expect(await modelBtn.locator('svg').count()).toBe(1);
+    expect(await modelBtn.locator('svg.wb-model-btn__chevron').count()).toBe(1);
     await modelBtn.click();
     const popoverContent = page.locator('.ui-popover-content');
     await expect(popoverContent).toBeVisible();

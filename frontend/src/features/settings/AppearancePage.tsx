@@ -443,6 +443,17 @@ export function AppearancePage() {
             </div>
 
             <div className="st-row--inline">
+              <span className="st-row__label--plain">数学公式渲染</span>
+              <Switch
+                checked={settings.mathRenderEnabled}
+                label="数学公式渲染"
+                onCheckedChange={(mathRenderEnabled) =>
+                  void updatePreferences({ mathRenderEnabled })
+                }
+              />
+            </div>
+
+            <div className="st-row--inline">
               <span className="st-row__label--plain">HTML 代码块预览</span>
               <Switch
                 checked={settings.defaultHtmlPreview}

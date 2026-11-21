@@ -40,17 +40,16 @@ function formatShortTime(iso: string): string {
   return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-function cloudDotClass(state: CloudConnectionState): string {
+function cloudIconClass(state: CloudConnectionState): string {
   switch (state) {
-    case 'connected':
-      return '';
-    case 'checking':
     case 'auth-required':
-      return 'wb-status-dot--warn';
+      return 'wb-foot-status__icon--warn';
     case 'error':
-      return 'wb-status-dot--error';
+      return 'wb-foot-status__icon--error';
+    case 'connected':
+    case 'checking':
     case 'disconnected':
-      return 'wb-status-dot--muted';
+      return '';
   }
 }
 
@@ -1463,9 +1462,10 @@ export function ConversationSidebar({
                         : '前往连接云端'
                     }
                   >
-                    <span
-                      className={`wb-status-dot ${cloudDotClass(cloudConnectionState)}`.trim()}
-                      aria-hidden="true"
+                    <Icon
+                      name="cloud"
+                      size={15}
+                      className={`wb-foot-status__icon ${cloudIconClass(cloudConnectionState)}`.trim()}
                     />
                     <span className="wb-foot-status__label">
                       {cloudStatusLabel(cloudConnectionState)}

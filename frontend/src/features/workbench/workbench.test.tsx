@@ -282,11 +282,18 @@ describe('Workbench flows and attachments', () => {
     });
     expect(draftBox).toHaveValue('保持这段草稿');
 
-    // Six effort levels are always selectable even though model.reasoning is false
-    await user.click(screen.getByRole('button', { name: /思考强度/ }));
-    expect(screen.getByRole('radio', { name: '极高' })).toBeInTheDocument();
-    await user.click(screen.getByRole('radio', { name: '极高' }));
-    expect(screen.getByRole('button', { name: /思考强度 \(极高\)/ })).toBeInTheDocument();
+    // Six effort levels are always selectable inside unified ModelPicker even though model.reasoning is false
+    const modelTrigger = screen.getByRole('button', { name: '选择模型' });
+    await user.click(modelTrigger);
+    const effortSlider = screen.getByRole('slider', { name: 'Reasoning' });
+    expect(effortSlider).toHaveAttribute('aria-valuetext', 'Off');
+    fireEvent.change(effortSlider, { target: { value: '4' } });
+    await waitFor(() => {
+      expect(effortSlider).toHaveAttribute('aria-valuetext', 'Extra High');
+      expect(modelTrigger).toHaveTextContent('Extra High');
+    });
+    await user.keyboard('{Escape}');
+    expect(modelTrigger).toHaveFocus();
   });
 
   it('validates attachments (types, size limits, XML attribute escaping, 16 MiB body cap)', () => {
@@ -908,8 +915,15 @@ describe('Workbench flows and attachments', () => {
     expect(getDetailCountA).toBe(1);
     expect(screen.getByText('History reply')).toBe(historyElBefore);
     expect(draftBox).toHaveValue('保持草稿不丢');
-    // Historical assistant message retains original modelId tag.
-    expect(screen.getByText('gpt-4.1')).toBeInTheDocument();
+    // Historical assistant message retains original model display name and discloses provider/modelId on demand.
+    const detailTrigger = screen.getByRole('button', { name: 'GPT-4.1' });
+    expect(detailTrigger).toBeInTheDocument();
+    expect(screen.queryByText('gpt-4.1')).not.toBeInTheDocument();
+    await user.click(detailTrigger);
+    const detailDialog = await screen.findByRole('dialog', { name: '模型信息' });
+    expect(detailDialog).toHaveTextContent('gpt-4.1');
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: '模型信息' })).not.toBeInTheDocument();
 
     // Order in sidebar remains Topic A, Topic B, Topic C.
     const titles = Array.from(document.querySelectorAll('.wb-topic-row__title')).map((el) => el.textContent);
@@ -1807,6 +1821,12 @@ describe('Workbench flows and attachments', () => {
             assistants: [{ id: 'default', name: '默认助手', params: {}, isDefault: true }],
           });
         }
+        if (url.includes('/api/v1/conversation-groups')) {
+          return Response.json({ groups: [] });
+        }
+        if (url.includes('/api/v1/mcp/servers')) {
+          return Response.json({ servers: [] });
+        }
         if (url.includes('/api/v1/conversations?') || url.endsWith('/api/v1/conversations')) {
           const isCloud = url.includes('scope=cloud');
           return Response.json({ conversations: isCloud ? cloudConvs : localConvs });
@@ -1957,6 +1977,189 @@ describe('Workbench flows and attachments', () => {
           calls.some((c) => c.url.endsWith('/api/v1/desktop/conversations/cld-1/pull')),
         ).toBe(true),
       );
+    } finally {
+      delete window.__LLMSTUDIO_DESKTOP__;
+      delete document.documentElement.dataset.desktop;
+    }
+  });
+
+  it('keeps single composer model+effort trigger, commits slider only on release, and rolls back failed save without touching draft', async () => {
+    localStorage.clear();
+    let patchCount = 0;
+    let failSettingsPatch = false;
+    const { fetchMock } = makeWorkbenchFetch();
+    const wrappedFetch: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith('/api/v1/settings') && init?.method === 'PATCH') {
+        patchCount += 1;
+        if (failSettingsPatch) {
+          return new Response(
+            JSON.stringify({ code: 'INTERNAL_ERROR', message: '偏好写入失败' }),
+            { status: 500 },
+          );
+        }
+      }
+      return fetchMock(input, init);
+    };
+    const user = userEvent.setup();
+
+    render(
+      <AppProvider fetchImpl={wrappedFetch}>
+        <MemoryRouter initialEntries={['/chat']}>
+          <Routes>
+            <Route path="/chat" element={<WorkbenchPage />} />
+            <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    const modelBtn = await screen.findByRole('button', { name: '选择模型' });
+    await waitFor(() => expect(modelBtn).toHaveTextContent('GPT-4.1'));
+
+    // Web mode omits desktop-only cloud footer and left-rail gateway status dot.
+    expect(document.querySelectorAll('.wb-status-dot')).toHaveLength(0);
+    expect(document.querySelectorAll('.wb-foot-status')).toHaveLength(0);
+
+    const draftBox = screen.getByLabelText('消息输入框');
+    await user.type(draftBox, '保留草稿内容');
+
+    await user.click(modelBtn);
+    const slider = screen.getByRole('slider', { name: 'Reasoning' });
+
+    // Pointer drag only previews until pointerup, committing once on release.
+    fireEvent.pointerDown(slider);
+    fireEvent.change(slider, { target: { value: '2' } });
+    fireEvent.change(slider, { target: { value: '3' } });
+    expect(patchCount).toBe(0);
+    expect(modelBtn).toHaveTextContent('High');
+    fireEvent.pointerUp(slider);
+
+    await waitFor(() => expect(patchCount).toBe(1));
+    await waitFor(() => expect(modelBtn).toHaveTextContent('High'));
+
+    // Failed PATCH rolls back effort display to last confirmed value ('High') while keeping draft.
+    failSettingsPatch = true;
+    fireEvent.change(slider, { target: { value: '0' } });
+    await waitFor(() => {
+      expect(screen.getByText(/思考强度保存失败/)).toBeInTheDocument();
+    });
+    expect(modelBtn).toHaveTextContent('High');
+    expect(slider).toHaveAttribute('aria-valuetext', 'High');
+    expect(draftBox).toHaveValue('保留草稿内容');
+  });
+
+  it('shows unknown historical model fallback via 「模型详情」 and desktop single cloud status', async () => {
+    localStorage.clear();
+    window.__LLMSTUDIO_DESKTOP__ = {
+      apiBaseUrl: 'http://127.0.0.1:45125',
+      sessionToken: 'desktop-wb-tok',
+      platform: 'windows',
+      dataMode: 'portable',
+      version: '1.5.0',
+    };
+    document.documentElement.dataset.desktop = 'true';
+    try {
+      const unknownConv = {
+        id: 'c1',
+        assistantId: 'default',
+        title: '旧模型会话',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        params: {},
+        pinned: false,
+        sortOrder: 1,
+        createdAt: '2026-10-01T00:00:00Z',
+        updatedAt: '2026-10-01T00:00:00Z',
+      };
+      const { fetchMock } = makeWorkbenchFetch(true);
+      const wrappedFetch: typeof fetch = async (input, init) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.endsWith('/api/v1/desktop/status')) {
+          return Response.json({
+            mode: 'portable',
+            dataDir: 'D:\\LLMStudio\\data',
+            dbPath: 'D:\\LLMStudio\\data\\llmstudio.db',
+            cloudConfigured: true,
+            cloudState: 'connected',
+            gatewayBaseUrl: 'https://cloud.example.com',
+            tokenSet: true,
+            authRequired: true,
+            version: '1.5.0',
+          });
+        }
+        if (url.includes('/api/v1/conversation-groups')) {
+          return Response.json({ groups: [] });
+        }
+        if (url.includes('/api/v1/mcp/servers')) {
+          return Response.json({ servers: [] });
+        }
+        if (url.includes('/api/v1/conversations?') || url.endsWith('/api/v1/conversations')) {
+          return Response.json({ conversations: [unknownConv] });
+        }
+        if (url.includes('/api/v1/conversations/c1')) {
+          return Response.json({
+            conversation: unknownConv,
+            messages: [
+              {
+                id: 'm-user',
+                conversationId: 'c1',
+                role: 'user',
+                blocks: [{ type: 'text', text: '问题' }],
+                createdAt: '2026-10-01T10:00:00Z',
+              },
+              {
+                id: 'm-unknown',
+                conversationId: 'c1',
+                role: 'assistant',
+                providerId: 'retired-prov',
+                modelId: 'retired-model-x',
+                blocks: [{ type: 'text', text: '历史回复' }],
+                createdAt: '2026-10-01T10:01:00Z',
+              },
+            ],
+          });
+        }
+        return fetchMock(input, init);
+      };
+      const user = userEvent.setup();
+
+      render(
+        <AppProvider fetchImpl={wrappedFetch}>
+          <MemoryRouter initialEntries={['/chat/c1?scope=local']}>
+            <Routes>
+              <Route path="/chat" element={<WorkbenchPage />} />
+              <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+            </Routes>
+          </MemoryRouter>
+        </AppProvider>,
+      );
+
+      await waitFor(() => expect(screen.getByText('历史回复')).toBeInTheDocument());
+
+      // Desktop workbench shows single cloud status footer in Topic rail and none in Assistant rail.
+      expect(document.querySelectorAll('.wb-status-dot')).toHaveLength(0);
+      expect(document.querySelectorAll('.wb-foot-status')).toHaveLength(1);
+      const cloudBtn = document.querySelector('.wb-foot-status__cloud');
+      expect(cloudBtn).not.toBeNull();
+      expect(cloudBtn).toHaveTextContent('云端在线');
+      expect(cloudBtn?.closest('.wb-history')).not.toBeNull();
+      expect(document.querySelector('.wb-rail .wb-foot-status')).toBeNull();
+
+      // Unknown historical model shows 「模型详情」 without substituting current active model 'GPT-4.1'.
+      const fallbackTrigger = screen.getByRole('button', { name: '模型详情' });
+      expect(screen.queryByText('retired-model-x')).not.toBeInTheDocument();
+      await user.hover(fallbackTrigger);
+      const popover = await screen.findByRole('dialog', { name: '模型信息' });
+      expect(popover).toHaveTextContent('retired-prov');
+      expect(popover).toHaveTextContent('retired-model-x');
+      await user.click(fallbackTrigger); // pin open
+      await user.unhover(fallbackTrigger);
+      expect(screen.getByRole('dialog', { name: '模型信息' })).toBeVisible();
+      await user.click(fallbackTrigger); // click again closes
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog', { name: '模型信息' })).not.toBeInTheDocument();
+      });
     } finally {
       delete window.__LLMSTUDIO_DESKTOP__;
       delete document.documentElement.dataset.desktop;

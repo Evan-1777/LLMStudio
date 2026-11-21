@@ -744,6 +744,7 @@ export interface ServerPreferences {
   fontFamily: FontFamily;
   fontSize: number;
   builtinTimeToolEnabled: boolean;
+  mathRenderEnabled: boolean;
 }
 
 export interface ServerPreferencesEnvelope {
@@ -761,6 +762,7 @@ export type ServerPreferencesImport = Omit<
   | 'fontFamily'
   | 'fontSize'
   | 'builtinTimeToolEnabled'
+  | 'mathRenderEnabled'
 >;
 
 export interface StorageUsage {

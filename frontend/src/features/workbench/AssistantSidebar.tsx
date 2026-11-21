@@ -5,7 +5,6 @@ import type { Assistant } from '../../core/types';
 export function AssistantSidebar({
   assistants,
   activeAssistantId,
-  connected,
   onSelectAssistant,
   onAddAssistant,
   onEditAssistant,
@@ -14,7 +13,6 @@ export function AssistantSidebar({
 }: {
   assistants: Assistant[];
   activeAssistantId: string;
-  connected: boolean;
   onSelectAssistant: (id: string) => void;
   onAddAssistant: () => void;
   onEditAssistant: (assistant: Assistant) => void;
@@ -89,11 +87,6 @@ export function AssistantSidebar({
         >
           <Icon name="settings" size={16} />
         </Link>
-        <span
-          className="wb-status-dot"
-          title={connected ? '网关已连接' : '网关未连接'}
-          aria-label={connected ? '网关已连接' : '网关未连接'}
-        />
       </div>
     </aside>
   );

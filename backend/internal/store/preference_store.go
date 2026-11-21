@@ -13,7 +13,7 @@ const preferencesSelect = "SELECT theme_mode, seed_color_value, enter_to_send, v
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
 	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, mcp_max_tool_rounds, " +
-	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, imported " +
+	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, math_render_enabled, imported " +
 	"FROM user_preferences WHERE id = 1"
 
 const preferencesUpsert = "INSERT INTO user_preferences (" +
@@ -21,8 +21,8 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
 	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, mcp_max_tool_rounds, " +
-	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, imported, updated_at" +
-	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
+	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, math_render_enabled, imported, updated_at" +
+	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
 	"ON CONFLICT(id) DO UPDATE SET " +
 	"theme_mode = excluded.theme_mode, " +
 	"seed_color_value = excluded.seed_color_value, " +
@@ -44,6 +44,7 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"font_family = excluded.font_family, " +
 	"font_size = excluded.font_size, " +
 	"builtin_time_tool_enabled = excluded.builtin_time_tool_enabled, " +
+	"math_render_enabled = excluded.math_render_enabled, " +
 	"imported = 1, " +
 	"updated_at = excluded.updated_at"
 
@@ -129,6 +130,7 @@ func (s *PreferenceStore) Update(
 		next.FontFamily,
 		next.FontSize,
 		boolToInt(next.BuiltinTimeToolEnabled),
+		boolToInt(next.MathRenderEnabled),
 		formatTime(time.Now().UTC()),
 	); err != nil {
 		return domain.Preferences{}, false, fmt.Errorf("write preferences: %w", err)
@@ -155,6 +157,7 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 		collapseTools int
 		autoCache     int
 		builtinTime   int
+		mathRender    int
 		initialized   int
 	)
 	err := q.QueryRowContext(ctx, preferencesSelect).Scan(
@@ -178,6 +181,7 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 		&prefs.FontFamily,
 		&prefs.FontSize,
 		&builtinTime,
+		&mathRender,
 		&initialized,
 	)
 	if err != nil {
@@ -192,5 +196,6 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 	prefs.AutoCollapseToolsComplete = collapseTools != 0
 	prefs.AutoCreateCache = autoCache != 0
 	prefs.BuiltinTimeToolEnabled = builtinTime != 0
+	prefs.MathRenderEnabled = mathRender != 0
 	return prefs, initialized != 0, nil
 }

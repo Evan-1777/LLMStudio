@@ -500,7 +500,9 @@ describe('chatReducer and ChatProvider', () => {
     );
 
     expect(screen.getAllByText('用户').length).toBe(2);
-    expect(screen.getAllByText('Friendly Model | MyProvider').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('默认助手').length).toBeGreaterThan(0);
+    expect(screen.getAllByRole('button', { name: 'Friendly Model' }).length).toBeGreaterThan(0);
+    expect(screen.queryByText('MyProvider')).not.toBeInTheDocument();
     const usageTrigger = screen.getByRole('button', { name: 'Token 用量' });
     expect(screen.queryByText(/^Tokens:/)).not.toBeInTheDocument();
     expect(screen.queryByText('总计')).not.toBeInTheDocument();
@@ -1772,5 +1774,312 @@ describe('chatReducer and ChatProvider', () => {
     expect(aborted.pendingRollback).toBeNull();
     expect(aborted.streaming).toBeNull();
     expect(aborted.messages.map((m) => m.id)).toEqual(['u1', 'a1']);
+  });
+
+  it('aborts pre-first-byte waits immediately across new topic prep, localRequest user save, and regen without leaving error banners or blocking the next send', async () => {
+    const encoder = new TextEncoder();
+    function deferred<T>() {
+      let resolve!: (v: T) => void;
+      let reject!: (err: unknown) => void;
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      return { promise, resolve, reject };
+    }
+
+    let ensureSignals: AbortSignal[] = [];
+    let ensureGate = deferred<Conversation | null>();
+    let userSaveSignals: Array<AbortSignal | undefined> = [];
+    let userSaveGate = deferred<Response>();
+    let streamSignals: Array<AbortSignal | undefined> = [];
+    let streamGate = deferred<Response>();
+    let detailCalls = 0;
+    let detailGate = deferred<Response>();
+    let useSlowDetail = false;
+    let rollbackCount = 0;
+    let acceptedCount = 0;
+    const persisted: Message[] = [
+      { id: 'u1', conversationId: 'c-abort', role: 'user', blocks: [{ type: 'text', text: 'Q1' }], createdAt: '2026-11-21T00:00:00Z' },
+      { id: 'a1', conversationId: 'c-abort', role: 'assistant', blocks: [{ type: 'text', text: 'A1' }], stopReason: 'stop', createdAt: '2026-11-21T00:00:01Z' },
+    ];
+
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.5.0', authRequired: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/formats') || url.endsWith('/api/v1/assistants') || url.endsWith('/api/v1/plugins/search') || url.endsWith('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [], assistants: [], engines: [], servers: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(
+          JSON.stringify({
+            providers: [
+              {
+                id: 'local-p',
+                name: 'Local',
+                adapter: 'generic-http',
+                baseURL: 'http://127.0.0.1:11434/v1',
+                authType: 'bearer',
+                apiKeySet: true,
+                localRequest: true,
+                models: [{ id: 'qwen', name: 'Qwen', apiFormat: 'openai-completions' }],
+                enabled: true,
+                builtIn: false,
+              },
+              {
+                id: 'gw-p',
+                name: 'Gateway',
+                adapter: 'generic-http',
+                baseURL: 'http://127.0.0.1:11435/v1',
+                authType: 'bearer',
+                apiKeySet: true,
+                localRequest: false,
+                models: [{ id: 'gw-model', name: 'GW', apiFormat: 'openai-completions' }],
+                enabled: true,
+                builtIn: false,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations')) {
+        return new Response(JSON.stringify({ conversations: [makeConv('c-abort')] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-abort') && method === 'GET') {
+        detailCalls += 1;
+        if (useSlowDetail && detailCalls === 2) {
+          return detailGate.promise;
+        }
+        return new Response(JSON.stringify({ conversation: makeConv('c-abort'), messages: persisted }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-abort/messages/prepare-local')) {
+        return new Response(
+          JSON.stringify({
+            method: 'POST',
+            url: 'http://127.0.0.1:11434/v1/chat/completions',
+            headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sk-local' },
+            body: { model: 'qwen', messages: [], stream: true },
+            authType: 'bearer',
+          }),
+          { status: 200 },
+        );
+      }
+      if (url === 'http://127.0.0.1:11434/v1/chat/completions') {
+        const sse = 'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(encoder.encode(sse));
+              c.close();
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/c-abort/messages') && method === 'POST') {
+        userSaveSignals.push(init?.signal ?? undefined);
+        init?.signal?.addEventListener('abort', () => {
+          userSaveGate.reject(new DOMException('Aborted', 'AbortError'));
+        });
+        return userSaveGate.promise;
+      }
+      if (url.endsWith('/api/v1/conversations/c-abort/messages/stream')) {
+        streamSignals.push(init?.signal ?? undefined);
+        if (streamSignals.length === 1) {
+          init?.signal?.addEventListener('abort', () => {
+            streamGate.reject(new DOMException('Aborted', 'AbortError'));
+          });
+          return streamGate.promise;
+        }
+        const turnIdx = streamSignals.length;
+        const msgId = `a-next-${turnIdx}`;
+        persisted.push(
+          { id: `u-next-${turnIdx}`, conversationId: 'c-abort', role: 'user', blocks: [{ type: 'text', text: `Q-${turnIdx}` }], createdAt: '2026-11-21T00:00:02Z' },
+          { id: msgId, conversationId: 'c-abort', role: 'assistant', blocks: [{ type: 'text', text: 'fresh' }], stopReason: 'stop', createdAt: '2026-11-21T00:00:03Z' },
+        );
+        const sse =
+          `data: {"type":"message_start","messageId":"${msgId}"}\n\n` +
+          'data: {"type":"block_start","index":0,"blockType":"text"}\n\n' +
+          'data: {"type":"block_delta","index":0,"blockType":"text","deltaType":"text_delta","delta":"fresh"}\n\n' +
+          'data: {"type":"block_end","index":0,"blockType":"text","block":{"type":"text","text":"fresh"}}\n\n' +
+          `data: {"type":"message_end","messageId":"${msgId}"}\n\n`;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(encoder.encode(sse));
+              c.close();
+            },
+          }),
+          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
+        );
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    function AbortHarness() {
+      const { state, isGenerating, loadConversation, sendMessage, regenerateMessage, stopStreaming } = useChat();
+      return (
+        <div>
+          <span data-testid="run-state">{state.runState}</span>
+          <span data-testid="err-msg">{state.errorMessage ?? ''}</span>
+          <span data-testid="can-stop">{String(isGenerating)}</span>
+          <span data-testid="msg-ids">{state.messages.map((m) => m.id).join(',')}</span>
+          <span data-testid="has-streaming">{String(Boolean(state.streaming))}</span>
+          <button type="button" onClick={() => void loadConversation('c-abort')}>
+            load
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void sendMessage({
+                ensureConversation: (sig) => {
+                  ensureSignals.push(sig);
+                  sig.addEventListener('abort', () => {
+                    ensureGate.reject(new DOMException('Aborted', 'AbortError'));
+                  });
+                  return ensureGate.promise;
+                },
+                blocks: [{ type: 'text', text: 'New Topic Q' }],
+                text: 'New Topic Q',
+                providerId: 'gw-p',
+                modelId: 'gw-model',
+                onPrepareRollback: () => {
+                  rollbackCount += 1;
+                },
+                onStreamAccepted: () => {
+                  acceptedCount += 1;
+                },
+              })
+            }
+          >
+            send-new
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void sendMessage({
+                conversationId: 'c-abort',
+                blocks: [{ type: 'text', text: 'Local Save Q' }],
+                text: 'Local Save Q',
+                providerId: 'local-p',
+                modelId: 'qwen',
+                onPrepareRollback: () => {
+                  rollbackCount += 1;
+                },
+                onStreamAccepted: () => {
+                  acceptedCount += 1;
+                },
+              })
+            }
+          >
+            send-local
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void regenerateMessage({
+                targetMessageId: 'a1',
+                providerId: 'gw-p',
+                modelId: 'gw-model',
+              })
+            }
+          >
+            regen
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void sendMessage({
+                conversationId: 'c-abort',
+                blocks: [{ type: 'text', text: 'Immediate Next' }],
+                text: 'Immediate Next',
+                providerId: 'gw-p',
+                modelId: 'gw-model',
+              })
+            }
+          >
+            send-gw
+          </button>
+          <button type="button" onClick={stopStreaming}>
+            stop
+          </button>
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    await render(
+      <AppProvider fetchImpl={fetchMock}>
+        <MemoryRouter>
+          <ChatProvider>
+            <AbortHarness />
+          </ChatProvider>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/v1/providers'), expect.anything()));
+
+    // 1. Stuck new-topic preparation: stop available, signal aborts without waiting for gate, placeholder exits, no error banner.
+    await user.click(screen.getByRole('button', { name: 'send-new' }));
+    expect(screen.getByTestId('can-stop')).toHaveTextContent('true');
+    expect(screen.getByTestId('has-streaming')).toHaveTextContent('true');
+    await user.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(screen.getByTestId('can-stop')).toHaveTextContent('false'));
+    expect(ensureSignals[0]?.aborted).toBe(true);
+    expect(screen.getByTestId('has-streaming')).toHaveTextContent('false');
+    expect(screen.getByTestId('msg-ids')).toHaveTextContent('');
+    expect(screen.getByTestId('err-msg')).toHaveTextContent('');
+    expect(screen.getByTestId('run-state')).toHaveTextContent('empty');
+    expect(rollbackCount).toBe(1);
+    expect(acceptedCount).toBe(0);
+
+    // 2. Load conversation; localRequest user createMessage must receive AbortSignal and abort immediately.
+    await user.click(screen.getByRole('button', { name: 'load' }));
+    await waitFor(() => expect(screen.getByTestId('msg-ids')).toHaveTextContent('u1,a1'));
+    expect(screen.getByTestId('can-stop')).toHaveTextContent('false');
+
+    await user.click(screen.getByRole('button', { name: 'send-local' }));
+    await waitFor(() => expect(userSaveSignals).toHaveLength(1));
+    expect(userSaveSignals[0]).toBeInstanceOf(AbortSignal);
+    await user.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(screen.getByTestId('can-stop')).toHaveTextContent('false'));
+    expect(userSaveSignals[0]?.aborted).toBe(true);
+    expect(screen.getByTestId('has-streaming')).toHaveTextContent('false');
+    expect(screen.getByTestId('msg-ids')).toHaveTextContent('u1,a1');
+    expect(screen.getByTestId('err-msg')).toHaveTextContent('');
+    expect(rollbackCount).toBe(2);
+    expect(acceptedCount).toBe(0);
+
+    // 3. Stuck regen openChatStream: abort restores original reply cleanly.
+    await user.click(screen.getByRole('button', { name: 'regen' }));
+    await waitFor(() => expect(streamSignals).toHaveLength(1));
+    expect(screen.getByTestId('msg-ids')).toHaveTextContent('u1');
+    await user.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(screen.getByTestId('can-stop')).toHaveTextContent('false'));
+    expect(streamSignals[0]?.aborted).toBe(true);
+    expect(screen.getByTestId('msg-ids')).toHaveTextContent('u1,a1');
+    expect(screen.getByTestId('run-state')).toHaveTextContent('idle');
+
+    // 4. Slow background reconcile from previous run must NOT block immediate next send or overwrite its state.
+    const snapshotBeforeNext = [...persisted];
+    useSlowDetail = true;
+    await user.click(screen.getByRole('button', { name: 'send-gw' }));
+    await waitFor(() => expect(screen.getByTestId('run-state')).toHaveTextContent('idle'));
+    expect(detailCalls).toBe(2);
+    expect(screen.getByTestId('can-stop')).toHaveTextContent('false');
+    // Trigger another send while first reconcile GET is still pending!
+    await user.click(screen.getByRole('button', { name: 'send-gw' }));
+    await waitFor(() => expect(streamSignals).toHaveLength(3));
+    await waitFor(() => expect(screen.getByTestId('msg-ids')).toHaveTextContent('u-next-3'));
+    // Resolve stale reconcile with old 2-message list; it MUST NOT overwrite the newer state.
+    detailGate.resolve(new Response(JSON.stringify({ conversation: makeConv('c-abort'), messages: snapshotBeforeNext }), { status: 200 }));
+    await Promise.resolve();
+    expect(screen.getByTestId('msg-ids')).toHaveTextContent('u-next-3');
+    expect(screen.getByTestId('msg-ids')).toHaveTextContent('a-next-3');
   });
 });

@@ -445,7 +445,7 @@ func (s *DesktopStore) LoadCachedPreferences(ctx context.Context) (domain.Prefer
 
 // LoadCachedPreferencesWithTime loads cached preferences along with the cache write timestamp.
 func (s *DesktopStore) LoadCachedPreferencesWithTime(ctx context.Context) (domain.Preferences, bool, time.Time, error) {
-	var out domain.Preferences
+	out := domain.DefaultPreferences()
 	found, updatedAt, err := s.getCacheEntryJSON(ctx, cacheKeyPreferences, &out)
 	if err != nil || !found {
 		return domain.DefaultPreferences(), false, time.Time{}, err

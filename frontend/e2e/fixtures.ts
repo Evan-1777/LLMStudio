@@ -53,6 +53,8 @@ export interface MockUpstreamControl {
   lastChatBodies: Array<Record<string, unknown>>;
   abortedCount: number;
   firstByteDelayMs: number;
+  armFirstByteGate: () => Promise<void>;
+  releaseFirstByteGate: () => void;
   reset: () => void;
 }
 
@@ -111,6 +113,10 @@ async function startMockUpstream(): Promise<{
   control: MockUpstreamControl;
   close: () => Promise<void>;
 }> {
+  let gateActive = false;
+  let gateEnteredResolve: (() => void) | null = null;
+  let gateReleaseWaiters: Array<(aborted: boolean) => void> = [];
+
   const control: MockUpstreamControl = {
     url: '',
     models: DEFAULT_UPSTREAM_MODELS.map((m) => ({ ...m })),
@@ -118,12 +124,29 @@ async function startMockUpstream(): Promise<{
     lastChatBodies: [],
     abortedCount: 0,
     firstByteDelayMs: 0,
+    armFirstByteGate() {
+      gateActive = true;
+      return new Promise<void>((resolve) => {
+        gateEnteredResolve = resolve;
+      });
+    },
+    releaseFirstByteGate() {
+      gateActive = false;
+      const waiters = gateReleaseWaiters;
+      gateReleaseWaiters = [];
+      for (const w of waiters) w(false);
+    },
     reset() {
       this.models = DEFAULT_UPSTREAM_MODELS.map((m) => ({ ...m }));
       this.lastAuthHeaders = [];
       this.lastChatBodies = [];
       this.abortedCount = 0;
       this.firstByteDelayMs = 0;
+      gateActive = false;
+      gateEnteredResolve = null;
+      const waiters = gateReleaseWaiters;
+      gateReleaseWaiters = [];
+      for (const w of waiters) w(true);
     },
   };
 
@@ -193,6 +216,32 @@ async function startMockUpstream(): Promise<{
         return;
       }
 
+      const waitOnGate = () =>
+        new Promise<boolean>((resolve) => {
+          let settled = false;
+          const finish = (aborted: boolean) => {
+            if (settled) return;
+            settled = true;
+            req.off('close', onClose);
+            res.off('close', onClose);
+            resolve(aborted);
+          };
+          const onClose = () => {
+            control.abortedCount += 1;
+            finish(true);
+          };
+          gateReleaseWaiters.push(finish);
+          req.on('close', onClose);
+          res.on('close', onClose);
+          gateEnteredResolve?.();
+          gateEnteredResolve = null;
+        });
+
+      if (gateActive && !prompt.includes('[GATE_AFTER_HEADERS]')) {
+        const aborted = await waitOnGate();
+        if (aborted || res.writableEnded) return;
+      }
+
       if (control.firstByteDelayMs > 0) {
         const abortedEarly = await new Promise<boolean>((resolve) => {
           let settled = false;
@@ -220,6 +269,12 @@ async function startMockUpstream(): Promise<{
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
       });
+
+      if (gateActive && prompt.includes('[GATE_AFTER_HEADERS]')) {
+        res.flushHeaders();
+        const aborted = await waitOnGate();
+        if (aborted || res.writableEnded) return;
+      }
 
       const writeChunk = (obj: unknown) => {
         res.write(`data: ${JSON.stringify(obj)}\n\n`);

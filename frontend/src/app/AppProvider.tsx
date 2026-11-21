@@ -623,6 +623,7 @@ export function AppProvider({
         fontFamily: _ff,
         fontSize: _fs,
         builtinTimeToolEnabled: _bt,
+        mathRenderEnabled: _mr,
         ...fallback
       } = pickAppPreferences(settingsRef.current);
       const seed = legacy ?? fallback;

@@ -40,6 +40,9 @@ const HTML_OPEN_LINE_RE = /^\s*<([a-zA-Z][a-zA-Z0-9]*)(?=[\s>/]|$)/;
 const TAG_TOKEN_RE = /<(\/?)([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?(\/?)>/g;
 
 function matchHtmlBlockStart(line: string): string | null {
+  if (/^(?:\t| {4})/.test(line)) {
+    return null;
+  }
   if (DOCTYPE_START_RE.test(line)) {
     return 'html';
   }
@@ -111,13 +114,15 @@ function consumeRawHtmlBlock(
 
 /**
  * Splits assistant Markdown text into prose, fenced code blocks, and standalone raw HTML blocks.
+ * Set `extractCode: false` to keep Markdown fences in prose so CommonMark preserves list, quote, and link boundaries.
  */
 export function parseAssistantContent(
   input: string,
-  options?: { isStreaming?: boolean },
+  options?: { isStreaming?: boolean; extractCode?: boolean },
 ): ContentSegment[] {
   if (!input) return [];
   const isStreaming = options?.isStreaming ?? false;
+  const extractCode = options?.extractCode ?? true;
 
   const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
   const lines = normalized.split('\n');
@@ -146,7 +151,6 @@ export function parseAssistantContent(
       const language = info === '' ? '' : info.split(/\s+/)[0].toLowerCase();
 
       if (!(fenceChar === '`' && info.includes('`'))) {
-        flushProse();
         const codeLines: string[] = [];
         let closed = false;
         let j = i + 1;
@@ -166,13 +170,21 @@ export function parseAssistantContent(
           j++;
         }
 
-        segments.push({
-          kind: 'code',
-          language,
-          code: codeLines.join('\n'),
-          isClosed: closed,
-        });
-        i = closed ? j + 1 : lines.length;
+        const nextIdx = closed ? j + 1 : lines.length;
+        if (extractCode) {
+          flushProse();
+          segments.push({
+            kind: 'code',
+            language,
+            code: codeLines.join('\n'),
+            isClosed: closed,
+          });
+        } else {
+          for (let k = i; k < nextIdx; k++) {
+            proseLines.push(lines[k]);
+          }
+        }
+        i = nextIdx;
         continue;
       }
     }
@@ -194,6 +206,13 @@ export function parseAssistantContent(
 
   flushProse();
   return segments;
+}
+
+export function splitMarkdownAndRawHtml(
+  input: string,
+  options?: { isStreaming?: boolean },
+): ContentSegment[] {
+  return parseAssistantContent(input, { ...options, extractCode: false });
 }
 
 export function isFencedHtmlCodeBlock(seg: {
