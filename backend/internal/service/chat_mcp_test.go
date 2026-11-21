@@ -547,3 +547,106 @@ func TestChatServiceFinalPersistFailureEmitsErrorNotMessageEnd(t *testing.T) {
 		t.Fatalf("expected PERSIST_FAILED error and no fake message_end: events=%+v", events)
 	}
 }
+
+type countingPreferenceLookup struct {
+	calls int
+	mu    sync.Mutex
+	prefs domain.Preferences
+}
+
+func (c *countingPreferenceLookup) Get(context.Context) (domain.Preferences, bool, error) {
+	c.mu.Lock()
+	c.calls++
+	c.mu.Unlock()
+	return c.prefs, true, nil
+}
+
+type delayedMCPClient struct {
+	stubMCPClient
+	delay time.Duration
+}
+
+func (d *delayedMCPClient) ListTools(ctx context.Context, server domain.MCPServerConfig) ([]plugin.MCPToolDescriptor, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(d.delay):
+	}
+	return d.stubMCPClient.ListTools(ctx, server)
+}
+
+func TestChatServicePrepareReadsPreferencesOnceAndDiscoversToolsConcurrently(t *testing.T) {
+	ctx := context.Background()
+
+	var capturedTools []any
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		capturedTools, _ = body["tools"].([]any)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer llmSrv.Close()
+
+	mcpClient := &delayedMCPClient{
+		delay: 80 * time.Millisecond,
+		stubMCPClient: stubMCPClient{
+			toolsBySrv: map[string][]plugin.MCPToolDescriptor{
+				"srv-1": {{Name: "tool_one", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+				"srv-2": {{Name: "tool_two", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+				"srv-3": {{Name: "tool_three", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+			},
+		},
+	}
+
+	svc, _, _, mcpStore, conv, _ := setupChatMCPFixture(t, llmSrv.URL, &mcpClient.stubMCPClient)
+	svc.WithMCP(mcpStore, mcpClient)
+	prefLookup := &countingPreferenceLookup{prefs: domain.DefaultPreferences()}
+	svc.WithPreferences(prefLookup)
+
+	for _, id := range []string{"srv-3", "srv-1", "srv-2"} {
+		if _, err := mcpStore.Create(ctx, domain.MCPServerConfig{
+			ID: id, Name: id, Transport: domain.MCPTransportStdio, Command: "mock", Enabled: true,
+		}); err != nil {
+			t.Fatalf("create mcp %s: %v", id, err)
+		}
+	}
+
+	start := time.Now()
+	prep, err := svc.Prepare(ctx, service.StreamChatInput{
+		ConversationID: conv.ID,
+		Text:           "hello",
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	_ = prep.Stream(ctx, func(domain.StreamEvent) error { return nil })
+
+	prefLookup.mu.Lock()
+	prefCalls := prefLookup.calls
+	prefLookup.mu.Unlock()
+	if prefCalls != 1 {
+		t.Fatalf("expected PreferenceLookup.Get called exactly once during Prepare, got %d", prefCalls)
+	}
+	// 3 servers x 80ms each concurrently should complete well below serial 240ms.
+	if elapsed >= 200*time.Millisecond {
+		t.Fatalf("expected concurrent MCP discovery < 200ms, took %v", elapsed)
+	}
+	if len(capturedTools) != 3 {
+		t.Fatalf("expected 3 tools, got %d", len(capturedTools))
+	}
+	// Deterministic ordering by sorted server ID: srv-1, srv-2, srv-3.
+	var names []string
+	for _, raw := range capturedTools {
+		fn := raw.(map[string]any)["function"].(map[string]any)
+		names = append(names, fn["name"].(string))
+	}
+	for i, wantSuffix := range []string{"tool_one", "tool_two", "tool_three"} {
+		if !strings.Contains(names[i], wantSuffix) {
+			t.Fatalf("expected deterministic tool order [%s] at index %d, got %v", wantSuffix, i, names)
+		}
+	}
+}

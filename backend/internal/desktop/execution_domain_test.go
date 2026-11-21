@@ -11,7 +11,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"llmstudio/backend/internal/config"
 	"llmstudio/backend/internal/domain"
@@ -231,5 +233,118 @@ func TestDualDomainMCPAliasStabilityAndRouting(t *testing.T) {
 	}
 	if len(results) != 2 || len(localMCPStub.calls) != 1 || len(cloudMCPStub.calls) != 1 || len(cloudCalled) != 1 {
 		t.Fatalf("unexpected routing results: results=%v localCalls=%v cloudCalls=%v cloudHTTP=%v", results, localMCPStub.calls, cloudMCPStub.calls, cloudCalled)
+	}
+}
+
+func TestCompositeToolRuntimeCloudCacheAndInvalidation(t *testing.T) {
+	ctx := context.Background()
+
+	cloudDB, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open cloud db: %v", err)
+	}
+	defer cloudDB.Close()
+
+	cloudMCPStore := store.NewMCPServerStore(cloudDB)
+	srvCfg, err := cloudMCPStore.Create(ctx, domain.MCPServerConfig{
+		ID:        "cloud-srv-1",
+		Name:      "Cloud Cached",
+		Transport: domain.MCPTransportStreamableHTTP,
+		Endpoint:  "http://unused.local/mcp",
+		Enabled:   true,
+	})
+	if err != nil {
+		t.Fatalf("create cloud mcp server: %v", err)
+	}
+
+	cloudMCPStub := &stubLocalMCPClient{
+		toolsBy: map[string][]plugin.MCPToolDescriptor{
+			"cloud-srv-1": {{Name: "ping", Description: "Ping", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+		},
+	}
+
+	var listServersHits, listToolsHits atomic.Int32
+	cloudRouter := httpapi.NewRouter(httpapi.RouterDeps{
+		Config:        config.Config{AccessToken: "mcp-tok", DevMode: false},
+		PluginService: service.NewPluginService(plugin.NewSearchRegistry(), store.NewSearchConfigStore(cloudDB), cloudMCPStore).WithMCPClient(cloudMCPStub),
+	})
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/mcp/servers":
+			listServersHits.Add(1)
+		case "/api/v1/mcp/servers/cloud-srv-1/tools":
+			listToolsHits.Add(1)
+		}
+		cloudRouter.ServeHTTP(w, r)
+	}))
+	defer cloudSrv.Close()
+
+	localStore, err := OpenDesktopStore(ctx, filepath.Join(t.TempDir(), "local.db"))
+	if err != nil {
+		t.Fatalf("OpenDesktopStore: %v", err)
+	}
+	defer localStore.Close()
+
+	cloud := NewCloudClient(cloudSrv.URL, "mcp-tok")
+	composite := NewCompositeToolRuntime(localStore.MCPs, &stubLocalMCPClient{}, cloud)
+
+	now := time.Now()
+	composite.nowFn = func() time.Time { return now }
+
+	// First discovery hits cloud once for servers and once for tools.
+	entries, err := composite.ListScoped(ctx)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("ListScoped: entries=%+v err=%v", entries, err)
+	}
+	if _, err := composite.ListScopedTools(ctx, plugin.ExecutionScopeCloud, entries[0].Server); err != nil {
+		t.Fatalf("ListScopedTools: %v", err)
+	}
+	if listServersHits.Load() != 1 || listToolsHits.Load() != 1 {
+		t.Fatalf("expected 1/1 initial cloud hits, got servers=%d tools=%d", listServersHits.Load(), listToolsHits.Load())
+	}
+
+	// Subsequent calls within TTL hit cache with 0 cloud requests.
+	if _, err := composite.ListScoped(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := composite.GetScoped(ctx, plugin.ExecutionScopeCloud, srvCfg.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := composite.ListScopedTools(ctx, plugin.ExecutionScopeCloud, entries[0].Server); err != nil {
+		t.Fatal(err)
+	}
+	if listServersHits.Load() != 1 || listToolsHits.Load() != 1 {
+		t.Fatalf("expected zero additional cloud hits within TTL, got servers=%d tools=%d", listServersHits.Load(), listToolsHits.Load())
+	}
+
+	// UpdatedAt change forces tool catalog re-fetch even inside TTL.
+	updatedSrv := entries[0].Server
+	updatedSrv.UpdatedAt = updatedSrv.UpdatedAt.Add(time.Second)
+	if _, err := composite.ListScopedTools(ctx, plugin.ExecutionScopeCloud, updatedSrv); err != nil {
+		t.Fatal(err)
+	}
+	if listToolsHits.Load() != 2 {
+		t.Fatalf("expected UpdatedAt change to invalidate tools cache, got tools=%d", listToolsHits.Load())
+	}
+
+	// InvalidateCloudCache or connection change invalidates both server list and tools.
+	composite.InvalidateCloudCache()
+	if _, err := composite.ListScoped(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := composite.ListScopedTools(ctx, plugin.ExecutionScopeCloud, updatedSrv); err != nil {
+		t.Fatal(err)
+	}
+	if listServersHits.Load() != 2 || listToolsHits.Load() != 3 {
+		t.Fatalf("expected re-fetch after InvalidateCloudCache, got servers=%d tools=%d", listServersHits.Load(), listToolsHits.Load())
+	}
+
+	// Connection switch isolates cache to the new connection.
+	cloud.SetCredentials(cloudSrv.URL, "mcp-tok-2")
+	if _, err := composite.ListScoped(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if listServersHits.Load() != 3 {
+		t.Fatalf("expected SetCredentials to isolate cache, got servers=%d", listServersHits.Load())
 	}
 }

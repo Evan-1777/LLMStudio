@@ -726,6 +726,9 @@ func (s *Server) handleListMCPServers(w http.ResponseWriter, r *http.Request) {
 		writeDesktopError(w, err)
 		return
 	}
+	if s.cfg.CompositeTools != nil {
+		s.cfg.CompositeTools.SetCloudServers(s.cfg.Cloud.currentConnection(), servers)
+	}
 	httpapi.WriteJSON(w, http.StatusOK, map[string]any{"servers": servers})
 }
 
@@ -752,6 +755,9 @@ func (s *Server) handleCreateMCPServer(w http.ResponseWriter, r *http.Request) {
 		writeDesktopError(w, err)
 		return
 	}
+	if s.cfg.CompositeTools != nil {
+		s.cfg.CompositeTools.InvalidateCloudCache()
+	}
 	writeRawJSON(w, http.StatusCreated, raw)
 }
 
@@ -773,10 +779,14 @@ func (s *Server) handleUpdateMCPServer(w http.ResponseWriter, r *http.Request) {
 		writeDesktopError(w, err)
 		return
 	}
-	raw, err := s.cfg.Cloud.UpdateMCPServer(r.Context(), r.PathValue("id"), body)
+	id := r.PathValue("id")
+	raw, err := s.cfg.Cloud.UpdateMCPServer(r.Context(), id, body)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
+	}
+	if s.cfg.CompositeTools != nil {
+		s.cfg.CompositeTools.InvalidateCloudServer(id)
 	}
 	writeRawJSON(w, http.StatusOK, raw)
 }
@@ -794,9 +804,13 @@ func (s *Server) handleDeleteMCPServer(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCloud(w) {
 		return
 	}
-	if err := s.cfg.Cloud.DeleteMCPServer(r.Context(), r.PathValue("id")); err != nil {
+	id := r.PathValue("id")
+	if err := s.cfg.Cloud.DeleteMCPServer(r.Context(), id); err != nil {
 		writeDesktopError(w, err)
 		return
+	}
+	if s.cfg.CompositeTools != nil {
+		s.cfg.CompositeTools.InvalidateCloudServer(id)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -820,6 +834,11 @@ func (s *Server) handleListMCPServerTools(w http.ResponseWriter, r *http.Request
 		writeDesktopError(w, err)
 		return
 	}
+	if s.cfg.CompositeTools != nil {
+		if srv, sErr := s.cfg.CompositeTools.GetScoped(r.Context(), plugin.ExecutionScopeCloud, id); sErr == nil {
+			s.cfg.CompositeTools.SetCloudServerTools(s.cfg.Cloud.currentConnection(), id, srv.UpdatedAt, tools)
+		}
+	}
 	httpapi.WriteJSON(w, http.StatusOK, map[string]any{
 		"serverId": id,
 		"tools":    tools,
@@ -839,10 +858,14 @@ func (s *Server) handleTestMCPServer(w http.ResponseWriter, r *http.Request) {
 	if !s.requireCloud(w) {
 		return
 	}
-	raw, err := s.cfg.Cloud.TestMCPServer(r.Context(), r.PathValue("id"))
+	id := r.PathValue("id")
+	raw, err := s.cfg.Cloud.TestMCPServer(r.Context(), id)
 	if err != nil {
 		writeDesktopError(w, err)
 		return
+	}
+	if s.cfg.CompositeTools != nil {
+		s.cfg.CompositeTools.InvalidateCloudServer(id)
 	}
 	writeRawJSON(w, http.StatusOK, raw)
 }
@@ -1416,6 +1439,11 @@ func (s *Server) handleCloudStorageCompact(w http.ResponseWriter, r *http.Reques
 	httpapi.WriteJSON(w, http.StatusOK, res)
 }
 
+const (
+	desktopStatusProbeTimeout = 8 * time.Second
+	desktopStatusRetryDelay   = 400 * time.Millisecond
+)
+
 func (s *Server) computeDesktopStatus(ctx context.Context) DesktopStatus {
 	conn, _ := s.cfg.Store.GetConnection(ctx)
 	status := DesktopStatus{
@@ -1428,29 +1456,55 @@ func (s *Server) computeDesktopStatus(ctx context.Context) DesktopStatus {
 		TokenSet:        conn.TokenSet,
 		Version:         s.cfg.Version,
 	}
-	if !status.CloudConfigured {
+	if !status.CloudConfigured || s.cfg.Cloud == nil {
 		return status
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	defer cancel()
-	authRequired, err := s.cfg.Cloud.HealthCheck(probeCtx)
-	status.AuthRequired = authRequired
+
+	probeCtx, release := s.cfg.Cloud.bind(ctx)
+	defer release()
+
+	probeOnce := func() (domain.Preferences, error) {
+		attemptCtx, cancel := context.WithTimeout(probeCtx, desktopStatusProbeTimeout)
+		defer cancel()
+		prefs, _, err := s.cfg.Cloud.GetSettings(attemptCtx)
+		return prefs, err
+	}
+
+	prefs, err := probeOnce()
 	if err != nil {
 		if appErr, ok := domain.AsAppError(err); ok && appErr.Code == domain.ErrCodeUnauthorized {
+			status.AuthRequired = true
 			status.CloudState = "auth-required"
-		} else {
-			status.CloudState = "error"
+			return status
 		}
-		return status
-	}
-	if _, _, err := s.cfg.Cloud.GetSettings(probeCtx); err != nil {
-		if appErr, ok := domain.AsAppError(err); ok && appErr.Code == domain.ErrCodeUnauthorized {
-			status.CloudState = "auth-required"
-		} else {
+		if probeCtx.Err() != nil {
 			status.CloudState = "error"
+			return status
 		}
-		return status
+		timer := time.NewTimer(desktopStatusRetryDelay)
+		select {
+		case <-probeCtx.Done():
+			timer.Stop()
+			status.CloudState = "error"
+			return status
+		case <-timer.C:
+		}
+		prefs, err = probeOnce()
+		if err != nil {
+			if appErr, ok := domain.AsAppError(err); ok && appErr.Code == domain.ErrCodeUnauthorized {
+				status.AuthRequired = true
+				status.CloudState = "auth-required"
+			} else {
+				status.CloudState = "error"
+			}
+			return status
+		}
 	}
+
+	if s.cfg.Store != nil {
+		_ = s.cfg.Store.SaveCachedPreferences(probeCtx, prefs)
+	}
+	status.AuthRequired = status.TokenSet
 	status.CloudState = "connected"
 	return status
 }
@@ -1500,7 +1554,10 @@ func (s *Server) handleSaveDesktopConnection(w http.ResponseWriter, r *http.Requ
 		writeDesktopError(w, err)
 		return
 	}
-	// Best-effort initial warm sync of assistants, providers, search, and preferences.
+	if s.cfg.CompositeTools != nil {
+		s.cfg.CompositeTools.InvalidateCloudCache()
+	}
+	// Best-effort initial warm sync of assistants, providers, search, preferences, and MCP.
 	s.warmSyncFromCloud(r.Context())
 	saved.AccessToken = ""
 	httpapi.WriteJSON(w, http.StatusOK, map[string]any{
@@ -1515,7 +1572,7 @@ func (s *Server) warmSyncFromCloud(ctx context.Context) {
 	}
 	ctx, release := s.cfg.Cloud.bind(ctx)
 	defer release()
-	syncCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	syncCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	if assistants, err := s.cfg.Cloud.ListAssistants(syncCtx); err == nil {
 		_ = s.cfg.Store.SyncCloudAssistants(syncCtx, assistants)
@@ -1526,6 +1583,26 @@ func (s *Server) warmSyncFromCloud(ctx context.Context) {
 	}
 	if prefs, _, err := s.cfg.Cloud.GetSettings(syncCtx); err == nil {
 		_ = s.cfg.Store.SaveCachedPreferences(syncCtx, prefs)
+	}
+	if s.cfg.CompositeTools != nil {
+		conn := s.cfg.Cloud.currentConnection()
+		if servers, err := s.cfg.Cloud.ListMCPServers(syncCtx); err == nil {
+			s.cfg.CompositeTools.SetCloudServers(conn, servers)
+			var wg sync.WaitGroup
+			for _, srv := range servers {
+				if !srv.Enabled {
+					continue
+				}
+				wg.Add(1)
+				go func(srv domain.MCPServerConfig) {
+					defer wg.Done()
+					if tools, tErr := s.cfg.Cloud.ListMCPServerTools(syncCtx, srv.ID); tErr == nil {
+						s.cfg.CompositeTools.SetCloudServerTools(conn, srv.ID, srv.UpdatedAt, tools)
+					}
+				}(srv)
+			}
+			wg.Wait()
+		}
 	}
 }
 
@@ -1539,6 +1616,9 @@ func (s *Server) handleDeleteDesktopConnection(w http.ResponseWriter, r *http.Re
 	if err != nil {
 		writeDesktopError(w, err)
 		return
+	}
+	if s.cfg.CompositeTools != nil {
+		s.cfg.CompositeTools.InvalidateCloudCache()
 	}
 	httpapi.WriteJSON(w, http.StatusOK, s.computeDesktopStatus(r.Context()))
 }
@@ -1656,6 +1736,9 @@ func (s *Server) handleClearLocalCache(w http.ResponseWriter, r *http.Request) {
 	if err := s.cfg.Store.ClearLocalCache(r.Context()); err != nil {
 		writeDesktopError(w, err)
 		return
+	}
+	if s.cfg.CompositeTools != nil {
+		s.cfg.CompositeTools.InvalidateCloudCache()
 	}
 	httpapi.WriteJSON(w, http.StatusOK, map[string]any{"cleared": true})
 }

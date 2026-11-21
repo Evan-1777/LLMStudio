@@ -165,6 +165,18 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if typoUpdated.FontFamily != domain.FontFamilyKai || typoUpdated.FontSize != 18 {
 		t.Fatalf("unexpected persisted typography prefs: %+v", typoUpdated)
 	}
+
+	if stored.BuiltinTimeToolEnabled {
+		t.Fatal("expected builtinTimeToolEnabled default false")
+	}
+	enableTime := true
+	timeUpdated, _, err := prefs.Update(ctx, domain.PreferencesPatch{BuiltinTimeToolEnabled: &enableTime}, false, validatePrefs)
+	if err != nil {
+		t.Fatalf("enable builtinTimeToolEnabled: %v", err)
+	}
+	if !timeUpdated.BuiltinTimeToolEnabled {
+		t.Fatal("expected builtinTimeToolEnabled persisted true")
+	}
 }
 
 func TestMigration005BackfillsManagedAPIKeys(t *testing.T) {

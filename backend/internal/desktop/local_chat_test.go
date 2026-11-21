@@ -1,6 +1,8 @@
 package desktop
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,8 +21,10 @@ import (
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/format"
 	"llmstudio/backend/internal/httpapi"
+	"llmstudio/backend/internal/mcp"
 	"llmstudio/backend/internal/plugin"
 	"llmstudio/backend/internal/provider"
+	"llmstudio/backend/internal/search"
 	"llmstudio/backend/internal/service"
 	"llmstudio/backend/internal/store"
 )
@@ -459,5 +463,328 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 	llmMu.Unlock()
 	if sent != 0 || bRequests.Load() != 0 {
 		t.Fatalf("obsolete request reached upstream=%d or gateway B=%d", sent, bRequests.Load())
+	}
+}
+
+func TestDesktopHotPathZeroCloudCallsTTLAndTTFTComparison(t *testing.T) {
+	ctx := context.Background()
+
+	cloudDB, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatalf("open cloud sqlite: %v", err)
+	}
+	defer cloudDB.Close()
+
+	formats := plugin.NewFormatRegistry()
+	formats.MustRegister(format.NewOpenAICompletionsFormat())
+	adapters := plugin.NewProviderRegistry()
+	adapters.MustRegister(provider.NewGenericHTTPAdapter())
+	searchReg := plugin.NewSearchRegistry()
+	searchReg.MustRegister(search.NewTavilyEngine(nil))
+
+	const upstreamFirstByteDelay = 40 * time.Millisecond
+	const cloudRTT = 60 * time.Millisecond
+
+	var lastSystemPrompt atomic.Value
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if msgs, ok := body["messages"].([]any); ok && len(msgs) > 0 {
+			if first, ok := msgs[0].(map[string]any); ok && (first["role"] == "system" || first["role"] == "developer") {
+				lastSystemPrompt.Store(fmt.Sprint(first["content"]))
+			}
+		}
+		time.Sleep(upstreamFirstByteDelay)
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+		flusher.Flush()
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+	}))
+	defer llmSrv.Close()
+
+	cloudProvStore := store.NewProviderStore(cloudDB)
+	cloudAssistStore := store.NewAssistantStore(cloudDB)
+	cloudConvStore := store.NewConversationStore(cloudDB)
+	cloudMsgStore := store.NewMessageStore(cloudDB)
+	cloudSearchStore := store.NewSearchConfigStore(cloudDB)
+	cloudMCPStore := store.NewMCPServerStore(cloudDB)
+	cloudPrefStore := store.NewPreferenceStore(cloudDB)
+
+	_, err = cloudProvStore.Create(ctx, domain.ProviderConfig{
+		ID:       "prov-ttft",
+		Name:     "Fast Mock",
+		Adapter:  provider.AdapterGenericHTTP,
+		BaseURL:  llmSrv.URL,
+		AuthType: domain.AuthTypeBearer,
+		APIKey:   "sk-ttft",
+		Enabled:  true,
+		Models: []domain.ModelConfig{
+			{ID: "gpt-4o", Name: "GPT-4o", APIFormat: format.FormatIDOpenAICompletions},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asst, err := cloudAssistStore.Create(ctx, domain.Assistant{
+		ID:                "asst-ttft",
+		Name:              "Prompt V1",
+		SystemPrompt:      "prompt-v1",
+		DefaultProviderID: "prov-ttft",
+		DefaultModelID:    "gpt-4o",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"cloud-mcp-1", "cloud-mcp-2"} {
+		if _, err := cloudMCPStore.Create(ctx, domain.MCPServerConfig{
+			ID: id, Name: id, Transport: domain.MCPTransportStreamableHTTP, Endpoint: "http://unused.local/mcp", Enabled: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cloudMCPStub := &stubLocalMCPClient{
+		toolsBy: map[string][]plugin.MCPToolDescriptor{
+			"cloud-mcp-1": {{Name: "alpha", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+			"cloud-mcp-2": {{Name: "beta", InputSchema: json.RawMessage(`{"type":"object"}`)}},
+		},
+	}
+
+	cloudWebConv, err := cloudConvStore.Create(ctx, domain.Conversation{
+		ID: "web-ttft-conv", AssistantID: asst.ID, Title: "Web TTFT", ProviderID: "prov-ttft", ModelID: "gpt-4o",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloudTopicConv, err := cloudConvStore.Create(ctx, domain.Conversation{
+		ID: "cloud-ttft-conv", AssistantID: asst.ID, Title: "Cloud TTFT", ProviderID: "prov-ttft", ModelID: "gpt-4o",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	chatSvc := service.NewChatService(cloudProvStore, cloudConvStore, cloudMsgStore, formats, adapters, &http.Client{}).
+		WithAssistants(cloudAssistStore).
+		WithSearch(searchReg, cloudSearchStore).
+		WithPreferences(service.NewPreferenceService(cloudPrefStore)).
+		WithMCP(cloudMCPStore, cloudMCPStub)
+	cloudRouter := httpapi.NewRouter(httpapi.RouterDeps{
+		Config:              config.Config{AccessToken: "ttft-tok", DevMode: false},
+		Formats:             formats,
+		Adapters:            adapters,
+		ProviderService:     service.NewProviderService(cloudProvStore, formats, adapters),
+		AssistantService:    service.NewAssistantService(cloudAssistStore),
+		ConversationService: service.NewConversationService(cloudConvStore, cloudMsgStore).WithAssistants(cloudAssistStore),
+		PluginService:       service.NewPluginService(searchReg, cloudSearchStore, cloudMCPStore).WithMCPClient(cloudMCPStub),
+		ChatService:         chatSvc,
+		PreferenceService:   service.NewPreferenceService(cloudPrefStore),
+	})
+
+	var (
+		injectCloudRTT atomic.Bool
+		cloudOffline   atomic.Bool
+		settingsHits   atomic.Int32
+		assistantsHits atomic.Int32
+		searchHits     atomic.Int32
+		mcpListHits    atomic.Int32
+		mcpToolsHits   atomic.Int32
+		totalCloudHits atomic.Int32
+	)
+	resetCounters := func() {
+		settingsHits.Store(0)
+		assistantsHits.Store(0)
+		searchHits.Store(0)
+		mcpListHits.Store(0)
+		mcpToolsHits.Store(0)
+		totalCloudHits.Store(0)
+	}
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if injectCloudRTT.Load() {
+			time.Sleep(cloudRTT)
+		}
+		if cloudOffline.Load() {
+			http.Error(w, "cloud offline", http.StatusServiceUnavailable)
+			return
+		}
+		totalCloudHits.Add(1)
+		switch {
+		case r.URL.Path == "/api/v1/settings":
+			settingsHits.Add(1)
+		case r.URL.Path == "/api/v1/assistants":
+			assistantsHits.Add(1)
+		case r.URL.Path == "/api/v1/plugins/search":
+			searchHits.Add(1)
+		case r.URL.Path == "/api/v1/mcp/servers":
+			mcpListHits.Add(1)
+		case strings.HasPrefix(r.URL.Path, "/api/v1/mcp/servers/") && strings.HasSuffix(r.URL.Path, "/tools"):
+			mcpToolsHits.Add(1)
+		}
+		cloudRouter.ServeHTTP(w, r)
+	}))
+	defer cloudSrv.Close()
+
+	// Desktop runtime server.
+	tmpDir := t.TempDir()
+	paths := StoragePaths{Mode: DataModePortable, DataDir: tmpDir, DBPath: filepath.Join(tmpDir, "local.db")}
+	localStore, err := OpenDesktopStore(ctx, paths.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localStore.Close()
+	localStore.SetCredentialProtector(newTestProtector(t, 1))
+	cloud := NewCloudClient(cloudSrv.URL, "")
+	credCache := NewMemoryCredentialCache(cloud)
+	localStore.SetMemoryCacheInvalidator(credCache.ClearAll)
+	mcpRuntime := mcp.NewRuntime()
+	defer mcpRuntime.Close()
+	composite := NewCompositeToolRuntime(localStore.MCPs, mcpRuntime, cloud)
+	now := time.Now()
+	var nowMu sync.Mutex
+	nowFn := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	composite.nowFn = nowFn
+	engine := NewDesktopChatEngine(localStore, cloud, credCache, formats, adapters, searchReg, composite, &http.Client{})
+	engine.nowFn = nowFn
+
+	srv, err := NewServer(ServerConfig{
+		Paths:          paths,
+		Store:          localStore,
+		Cloud:          cloud,
+		CredCache:      credCache,
+		Formats:        formats,
+		Adapters:       adapters,
+		SearchReg:      searchReg,
+		LocalMCPClient: mcpRuntime,
+		CompositeTools: composite,
+		ChatEngine:     engine,
+		SyncService:    NewSyncService(localStore, cloud),
+		Version:        "1.5.0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desktopHTTP := httptest.NewServer(srv.Handler())
+	defer desktopHTTP.Close()
+
+	// Save connection -> triggers warmSyncFromCloud (assistants, providers, search, preferences, MCP servers+tools).
+	saveBody, _ := json.Marshal(map[string]any{"gatewayBaseUrl": cloudSrv.URL, "accessToken": "ttft-tok"})
+	saveReq, _ := http.NewRequest(http.MethodPut, desktopHTTP.URL+"/api/v1/desktop/connection", bytes.NewReader(saveBody))
+	saveReq.Header.Set("Authorization", "Bearer "+srv.Token())
+	saveReq.Header.Set("Content-Type", "application/json")
+	saveResp, err := (&http.Client{}).Do(saveReq)
+	if err != nil || saveResp.StatusCode != http.StatusOK {
+		t.Fatalf("save connection failed: resp=%v err=%v", saveResp, err)
+	}
+	saveResp.Body.Close()
+
+	// Pre-populate DPAPI-encrypted provider credential via one un-timed warm call or first local topic turn.
+	localConv, err := localStore.Conversations.Create(ctx, domain.Conversation{
+		ID: "local-ttft-conv", AssistantID: asst.ID, Title: "Local TTFT", ProviderID: "prov-ttft", ModelID: "gpt-4o",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	measureStreamTTFT := func(baseURL, token, path string) time.Duration {
+		req, _ := http.NewRequest(http.MethodPost, baseURL+path, strings.NewReader(`{"text":"hello"}`))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		started := time.Now()
+		resp, err := (&http.Client{}).Do(req)
+		if err != nil {
+			t.Fatalf("stream request %s failed: %v", path, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			raw, _ := io.ReadAll(resp.Body)
+			t.Fatalf("stream %s status=%d body=%s", path, resp.StatusCode, string(raw))
+		}
+		scanner := bufio.NewScanner(resp.Body)
+		var ttft time.Duration
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.Contains(line, `"text_delta"`) && ttft == 0 {
+				ttft = time.Since(started)
+			}
+		}
+		if ttft == 0 {
+			t.Fatalf("never received text_delta from %s", path)
+		}
+		return ttft
+	}
+
+	// Warm provider credential once before timing steady-state hot path.
+	_ = measureStreamTTFT(desktopHTTP.URL, srv.Token(), "/api/v1/conversations/"+localConv.ID+"/messages/stream?scope=local")
+
+	// Enable 60ms simulated cloud RTT and compare Web vs Desktop Local vs Desktop Cloud.
+	injectCloudRTT.Store(true)
+	resetCounters()
+
+	desktopLocalTTFT := measureStreamTTFT(desktopHTTP.URL, srv.Token(), "/api/v1/conversations/"+localConv.ID+"/messages/stream?scope=local")
+	if totalCloudHits.Load() != 0 {
+		t.Fatalf("expected 0 total cloud calls on warmed desktop local topic, got %d (settings=%d asst=%d search=%d mcp=%d tools=%d)",
+			totalCloudHits.Load(), settingsHits.Load(), assistantsHits.Load(), searchHits.Load(), mcpListHits.Load(), mcpToolsHits.Load())
+	}
+
+	resetCounters()
+	desktopCloudTTFT := measureStreamTTFT(desktopHTTP.URL, srv.Token(), "/api/v1/conversations/"+cloudTopicConv.ID+"/messages/stream?scope=cloud")
+	if settingsHits.Load() != 0 || assistantsHits.Load() != 0 || searchHits.Load() != 0 || mcpListHits.Load() != 0 || mcpToolsHits.Load() != 0 {
+		t.Fatalf("expected 0 metadata/MCP cloud calls on warmed desktop cloud topic, got settings=%d asst=%d search=%d mcp=%d tools=%d",
+			settingsHits.Load(), assistantsHits.Load(), searchHits.Load(), mcpListHits.Load(), mcpToolsHits.Load())
+	}
+
+	// Measure Web gateway streaming directly (no cloud proxy hop).
+	injectCloudRTT.Store(false)
+	webTTFT := measureStreamTTFT(cloudSrv.URL, "ttft-tok", "/api/v1/conversations/"+cloudWebConv.ID+"/messages/stream")
+
+	t.Logf("TTFT comparison (60ms simulated cloud RTT, 2 MCP servers, 40ms upstream): web=%v desktopLocal=%v desktopCloud=%v",
+		webTTFT, desktopLocalTTFT, desktopCloudTTFT)
+
+	if desktopLocalTTFT >= upstreamFirstByteDelay+cloudRTT {
+		t.Fatalf("desktop local TTFT=%v unexpectedly suffered cloud RTT penalty (upstream=%v cloudRTT=%v)", desktopLocalTTFT, upstreamFirstByteDelay, cloudRTT)
+	}
+	if desktopCloudTTFT >= upstreamFirstByteDelay+3*cloudRTT {
+		t.Fatalf("desktop cloud TTFT=%v exceeded 3x cloudRTT bound (pre-fix serial round trips would exceed 6x cloudRTT)", desktopCloudTTFT)
+	}
+
+	// Verify TTL expiration refreshes remote assistant prompt, and offline error falls back to stale cache.
+	asst.SystemPrompt = "prompt-v2"
+	if _, err := cloudAssistStore.Update(ctx, asst); err != nil {
+		t.Fatal(err)
+	}
+	nowMu.Lock()
+	now = now.Add(defaultMetadataCacheTTL + time.Second)
+	nowMu.Unlock()
+
+	resetCounters()
+	_ = measureStreamTTFT(desktopHTTP.URL, srv.Token(), "/api/v1/conversations/"+cloudTopicConv.ID+"/messages/stream?scope=cloud")
+	if got := fmt.Sprint(lastSystemPrompt.Load()); got != "prompt-v2" {
+		t.Fatalf("expected refreshed system prompt 'prompt-v2' after TTL expiry, got %q", got)
+	}
+	if assistantsHits.Load() != 1 || settingsHits.Load() != 1 {
+		t.Fatalf("expected 1 assistant and 1 settings refresh after TTL expiry, got asst=%d settings=%d", assistantsHits.Load(), settingsHits.Load())
+	}
+
+	// Advance TTL again while cloud is offline: local topic must still succeed via stale cache fallback.
+	cloudOffline.Store(true)
+	nowMu.Lock()
+	now = now.Add(defaultMetadataCacheTTL + time.Second)
+	nowMu.Unlock()
+	_ = measureStreamTTFT(desktopHTTP.URL, srv.Token(), "/api/v1/conversations/"+localConv.ID+"/messages/stream?scope=local")
+
+	// Switching connection clears cached preferences, search engines, and assistants sync timestamp.
+	if _, err := localStore.SaveConnection(ctx, cloudSrv.URL, "rotated-token"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := localStore.LoadCachedPreferences(ctx); ok {
+		t.Fatal("expected preferences cache cleared on connection change")
+	}
+	if _, ok, _ := localStore.AssistantsSyncedAt(ctx); ok {
+		t.Fatal("expected assistants_synced_at cleared on connection change")
 	}
 }

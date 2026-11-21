@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"sync/atomic"
 	"testing"
 
 	"llmstudio/backend/internal/config"
@@ -258,5 +259,117 @@ func TestDesktopLoopbackServerAuthCORSAndRoutes(t *testing.T) {
 	cleanupRec := doReq(http.MethodPost, "/api/v1/desktop/storage/cleanup-ungrouped", tok, "", nil)
 	if cleanupRec.Code != http.StatusOK || !bytes.Contains(cleanupRec.Body.Bytes(), []byte(locOut.Conversation.ID)) {
 		t.Fatalf("POST /desktop/storage/cleanup-ungrouped status=%d body=%s", cleanupRec.Code, cleanupRec.Body.String())
+	}
+}
+
+func TestDesktopStatusProbeSingleRequestRetryAndUnauthorized(t *testing.T) {
+	ctx := context.Background()
+
+	var mode atomic.Int32 // 0=ok, 1=transient-then-ok, 2=401
+	var healthHits, settingsHits atomic.Int32
+	cloudSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			healthHits.Add(1)
+			httpapi.WriteJSON(w, http.StatusOK, map[string]any{"status": "ok", "authRequired": true})
+		case "/api/v1/settings":
+			hit := settingsHits.Add(1)
+			switch mode.Load() {
+			case 1:
+				if hit == 1 {
+					http.Error(w, "bad gateway", http.StatusBadGateway)
+					return
+				}
+			case 2:
+				httpapi.WriteJSON(w, http.StatusUnauthorized, map[string]any{"code": "UNAUTHORIZED", "message": "bad token"})
+				return
+			}
+			prefs := domain.DefaultPreferences()
+			prefs.ThemeMode = domain.ThemeModeDark
+			httpapi.WriteJSON(w, http.StatusOK, map[string]any{"preferences": prefs, "initialized": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cloudSrv.Close()
+
+	tmpDir := t.TempDir()
+	paths := StoragePaths{Mode: DataModePortable, DataDir: tmpDir, DBPath: filepath.Join(tmpDir, "local.db")}
+	localStore, err := OpenDesktopStore(ctx, paths.DBPath)
+	if err != nil {
+		t.Fatalf("OpenDesktopStore: %v", err)
+	}
+	defer localStore.Close()
+	if _, err := localStore.SaveConnection(ctx, cloudSrv.URL, "secret-tok"); err != nil {
+		t.Fatalf("SaveConnection: %v", err)
+	}
+
+	formats := plugin.NewFormatRegistry()
+	adapters := plugin.NewProviderRegistry()
+	searchReg := plugin.NewSearchRegistry()
+	mcpRuntime := mcp.NewRuntime()
+	defer mcpRuntime.Close()
+	cloud := NewCloudClient(cloudSrv.URL, "secret-tok")
+	credCache := NewMemoryCredentialCache(cloud)
+	composite := NewCompositeToolRuntime(localStore.MCPs, mcpRuntime, cloud)
+	chatEngine := NewDesktopChatEngine(localStore, cloud, credCache, formats, adapters, searchReg, composite, &http.Client{})
+
+	srv, err := NewServer(ServerConfig{
+		Paths:          paths,
+		Store:          localStore,
+		Cloud:          cloud,
+		CredCache:      credCache,
+		Formats:        formats,
+		Adapters:       adapters,
+		SearchReg:      searchReg,
+		LocalMCPClient: mcpRuntime,
+		CompositeTools: composite,
+		ChatEngine:     chatEngine,
+		SyncService:    NewSyncService(localStore, cloud),
+		Version:        "1.5.0",
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	getStatus := func() DesktopStatus {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/desktop/status", nil)
+		req.Header.Set("Authorization", "Bearer "+srv.Token())
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET /desktop/status code=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var out DesktopStatus
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode status: %v", err)
+		}
+		return out
+	}
+
+	// 1. Healthy cloud: single /api/v1/settings probe, zero /healthz calls, warms preference cache.
+	mode.Store(0)
+	st := getStatus()
+	if st.CloudState != "connected" || !st.AuthRequired || healthHits.Load() != 0 || settingsHits.Load() != 1 {
+		t.Fatalf("unexpected connected status=%+v healthHits=%d settingsHits=%d", st, healthHits.Load(), settingsHits.Load())
+	}
+	cachedPrefs, ok, err := localStore.LoadCachedPreferences(ctx)
+	if err != nil || !ok || cachedPrefs.ThemeMode != domain.ThemeModeDark {
+		t.Fatalf("expected cached dark theme preference, ok=%v prefs=%+v err=%v", ok, cachedPrefs, err)
+	}
+
+	// 2. Transient 502 on first probe automatically retries once and recovers to connected.
+	settingsHits.Store(0)
+	mode.Store(1)
+	st = getStatus()
+	if st.CloudState != "connected" || settingsHits.Load() != 2 {
+		t.Fatalf("expected retry recovery to connected with 2 attempts, got status=%+v settingsHits=%d", st, settingsHits.Load())
+	}
+
+	// 3. 401 unauthorized fails fast without retry.
+	settingsHits.Store(0)
+	mode.Store(2)
+	st = getStatus()
+	if st.CloudState != "auth-required" || !st.AuthRequired || settingsHits.Load() != 1 {
+		t.Fatalf("expected auth-required without retry, got status=%+v settingsHits=%d", st, settingsHits.Load())
 	}
 }

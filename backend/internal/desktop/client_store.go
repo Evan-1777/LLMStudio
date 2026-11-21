@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	cacheKeyProviders     = "providers"
-	cacheKeySearchEngines = "search_engines"
-	cacheKeyPreferences   = "preferences"
+	cacheKeyProviders          = "providers"
+	cacheKeySearchEngines      = "search_engines"
+	cacheKeyPreferences        = "preferences"
+	cacheKeyAssistantsSyncedAt = "assistants_synced_at"
 )
 
 // DesktopConnection stores the persisted remote cloud gateway connection info.
@@ -228,7 +229,8 @@ func (s *DesktopStore) SaveConnection(ctx context.Context, gatewayBaseURL, acces
 		return DesktopConnection{}, err
 	}
 	if changed != 0 {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM desktop_cache WHERE key = ?`, cacheKeyProviders); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM desktop_cache WHERE key IN (?, ?, ?, ?)`,
+			cacheKeyProviders, cacheKeyPreferences, cacheKeySearchEngines, cacheKeyAssistantsSyncedAt); err != nil {
 			return DesktopConnection{}, err
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM desktop_provider_credentials`); err != nil {
@@ -290,9 +292,6 @@ func (s *DesktopStore) SetCloseToTray(ctx context.Context, value bool) error {
 // SyncCloudAssistants idempotently upserts cloud assistant presets into the local assistants table,
 // preserving the built-in default assistant seed so local topics can use cloud assistants offline.
 func (s *DesktopStore) SyncCloudAssistants(ctx context.Context, assistants []domain.Assistant) error {
-	if len(assistants) == 0 {
-		return nil
-	}
 	tx, err := s.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin sync cloud assistants tx: %w", err)
@@ -339,10 +338,29 @@ func (s *DesktopStore) SyncCloudAssistants(ctx context.Context, assistants []dom
 			return fmt.Errorf("upsert assistant %s: %w", id, err)
 		}
 	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO desktop_cache (key, value_json, updated_at)
+		VALUES (?, 'true', ?)
+		ON CONFLICT(key) DO UPDATE SET
+			value_json = excluded.value_json,
+			updated_at = excluded.updated_at
+	`, cacheKeyAssistantsSyncedAt, now.Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("record assistants sync timestamp: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit sync cloud assistants tx: %w", err)
 	}
 	return nil
+}
+
+// AssistantsSyncedAt reports when cloud assistants were last synced to the local mirror.
+func (s *DesktopStore) AssistantsSyncedAt(ctx context.Context) (time.Time, bool, error) {
+	var synced bool
+	found, updatedAt, err := s.getCacheEntryJSON(ctx, cacheKeyAssistantsSyncedAt, &synced)
+	if err != nil || !found {
+		return time.Time{}, false, err
+	}
+	return updatedAt, !updatedAt.IsZero(), nil
 }
 
 // SaveCachedProviders stores redacted provider metadata (stripping all plaintext API keys).
@@ -397,15 +415,21 @@ func (s *DesktopStore) SaveCachedSearchEngines(ctx context.Context, engines []se
 
 // LoadCachedSearchEngines loads masked search engine views from desktop_cache.
 func (s *DesktopStore) LoadCachedSearchEngines(ctx context.Context) ([]service.SearchEngineView, error) {
+	out, _, err := s.LoadCachedSearchEnginesWithTime(ctx)
+	return out, err
+}
+
+// LoadCachedSearchEnginesWithTime loads cached search engines along with the cache write timestamp.
+func (s *DesktopStore) LoadCachedSearchEnginesWithTime(ctx context.Context) ([]service.SearchEngineView, time.Time, error) {
 	var out []service.SearchEngineView
-	found, err := s.getCacheJSON(ctx, cacheKeySearchEngines, &out)
+	found, updatedAt, err := s.getCacheEntryJSON(ctx, cacheKeySearchEngines, &out)
 	if err != nil || !found {
-		return []service.SearchEngineView{}, err
+		return []service.SearchEngineView{}, time.Time{}, err
 	}
 	if out == nil {
-		return []service.SearchEngineView{}, nil
+		return []service.SearchEngineView{}, updatedAt, nil
 	}
-	return out, nil
+	return out, updatedAt, nil
 }
 
 // SaveCachedPreferences stores synced cloud user preferences in desktop_cache.
@@ -415,12 +439,18 @@ func (s *DesktopStore) SaveCachedPreferences(ctx context.Context, prefs domain.P
 
 // LoadCachedPreferences loads cached user preferences from desktop_cache.
 func (s *DesktopStore) LoadCachedPreferences(ctx context.Context) (domain.Preferences, bool, error) {
+	prefs, ok, _, err := s.LoadCachedPreferencesWithTime(ctx)
+	return prefs, ok, err
+}
+
+// LoadCachedPreferencesWithTime loads cached preferences along with the cache write timestamp.
+func (s *DesktopStore) LoadCachedPreferencesWithTime(ctx context.Context) (domain.Preferences, bool, time.Time, error) {
 	var out domain.Preferences
-	found, err := s.getCacheJSON(ctx, cacheKeyPreferences, &out)
+	found, updatedAt, err := s.getCacheEntryJSON(ctx, cacheKeyPreferences, &out)
 	if err != nil || !found {
-		return domain.DefaultPreferences(), false, err
+		return domain.DefaultPreferences(), false, time.Time{}, err
 	}
-	return out.Normalize(), true, nil
+	return out.Normalize(), true, updatedAt, nil
 }
 
 func (s *DesktopStore) putCacheJSON(ctx context.Context, key string, val any) error {
@@ -442,18 +472,27 @@ func (s *DesktopStore) putCacheJSON(ctx context.Context, key string, val any) er
 }
 
 func (s *DesktopStore) getCacheJSON(ctx context.Context, key string, dst any) (bool, error) {
-	var raw string
-	err := s.DB.QueryRowContext(ctx, `SELECT value_json FROM desktop_cache WHERE key = ?`, key).Scan(&raw)
+	found, _, err := s.getCacheEntryJSON(ctx, key, dst)
+	return found, err
+}
+
+func (s *DesktopStore) getCacheEntryJSON(ctx context.Context, key string, dst any) (bool, time.Time, error) {
+	var raw, updatedRaw string
+	err := s.DB.QueryRowContext(ctx, `SELECT value_json, updated_at FROM desktop_cache WHERE key = ?`, key).Scan(&raw, &updatedRaw)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return false, time.Time{}, nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("read desktop_cache %s: %w", key, err)
+		return false, time.Time{}, fmt.Errorf("read desktop_cache %s: %w", key, err)
 	}
 	if err := json.Unmarshal([]byte(raw), dst); err != nil {
-		return false, fmt.Errorf("decode desktop_cache %s: %w", key, err)
+		return false, time.Time{}, fmt.Errorf("decode desktop_cache %s: %w", key, err)
 	}
-	return true, nil
+	var updatedAt time.Time
+	if updatedRaw != "" {
+		updatedAt, _ = time.Parse(time.RFC3339Nano, updatedRaw)
+	}
+	return true, updatedAt, nil
 }
 
 // MarkConversationPending transitions a synced local conversation to pending after local edits.

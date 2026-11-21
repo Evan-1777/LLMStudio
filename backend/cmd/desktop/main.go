@@ -187,13 +187,18 @@ func startDesktopRuntime(paths desktop.StoragePaths) (*desktopRuntime, error) {
 	adapters := plugin.NewProviderRegistry()
 	adapters.MustRegister(provider.NewGenericHTTPAdapter())
 
-	searchEngines := plugin.NewSearchRegistry()
-	searchEngines.MustRegister(search.NewTavilyEngine(nil))
-	searchEngines.MustRegister(search.NewSearXNGEngine(nil))
+	desktopTransport := desktop.NewDesktopHTTPTransport()
 
-	mcpRuntime := mcp.NewRuntime()
+	searchEngines := plugin.NewSearchRegistry()
+	searchEngines.MustRegister(search.NewTavilyEngine(&http.Client{Transport: desktopTransport}))
+	searchEngines.MustRegister(search.NewSearXNGEngine(&http.Client{Transport: desktopTransport}))
+
+	mcpRuntime := mcp.NewRuntime(mcp.WithHTTPClient(&http.Client{
+		Timeout:   5 * time.Minute,
+		Transport: desktopTransport,
+	}))
 	compositeTools := desktop.NewCompositeToolRuntime(store.MCPs, mcpRuntime, cloud)
-	httpClient := &http.Client{}
+	httpClient := &http.Client{Transport: desktopTransport}
 	chatEngine := desktop.NewDesktopChatEngine(store, cloud, credCache, formats, adapters, searchEngines, compositeTools, httpClient)
 	syncSvc := desktop.NewSyncService(store, cloud)
 

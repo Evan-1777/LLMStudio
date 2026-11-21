@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"llmstudio/backend/internal/domain"
@@ -19,6 +20,7 @@ const (
 )
 
 type mcpToolBinding struct {
+	BuiltIn    bool
 	Scope      plugin.ExecutionScope
 	ServerID   string
 	ServerName string
@@ -122,33 +124,83 @@ func closeMCPServer(client plugin.MCPClientBoundary, scope plugin.ExecutionScope
 	_ = client.CloseServer(serverID)
 }
 
-func (s *ChatService) discoverActiveTools(ctx context.Context) ([]plugin.ChatTool, map[string]mcpToolBinding, error) {
+type serverDiscoveryResult struct {
+	descriptors []plugin.MCPToolDescriptor
+	err         error
+}
+
+func discoverToolsConcurrent(ctx context.Context, mcpClient plugin.MCPClientBoundary, entries []ScopedMCPServer) []serverDiscoveryResult {
+	results := make([]serverDiscoveryResult, len(entries))
+	if len(entries) == 0 {
+		return results
+	}
+	const maxDiscoveryConcurrency = 8
+	sem := make(chan struct{}, min(maxDiscoveryConcurrency, len(entries)))
+	var wg sync.WaitGroup
+	for i, entry := range entries {
+		wg.Add(1)
+		go func(idx int, e ScopedMCPServer) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				results[idx].err = ctx.Err()
+				return
+			}
+			discCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
+			descriptors, listErr := listServerTools(discCtx, mcpClient, e)
+			cancel()
+			results[idx] = serverDiscoveryResult{
+				descriptors: descriptors,
+				err:         listErr,
+			}
+		}(i, entry)
+	}
+	wg.Wait()
+	return results
+}
+
+func (s *ChatService) discoverActiveTools(ctx context.Context, builtinTimeEnabled bool) ([]plugin.ChatTool, map[string]mcpToolBinding, error) {
+	usedAliases := make(map[string]struct{})
+	var tools []plugin.ChatTool
+	var bindings map[string]mcpToolBinding
+
+	if builtinTimeEnabled {
+		usedAliases[BuiltinTimeToolName] = struct{}{}
+		bindings = map[string]mcpToolBinding{
+			BuiltinTimeToolName: {
+				BuiltIn:    true,
+				ServerID:   BuiltinServerID,
+				ServerName: BuiltinServerName,
+				ToolName:   BuiltinTimeToolName,
+			},
+		}
+		tools = append(tools, BuiltinTimeChatTool())
+	}
+
 	if s.mcpStore == nil || s.mcpClient == nil {
-		return nil, nil, nil
+		return tools, bindings, nil
 	}
 	entries, _, err := listNormalizedScopedServers(ctx, s.mcpStore)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	usedAliases := make(map[string]struct{})
-	var tools []plugin.ChatTool
-	var bindings map[string]mcpToolBinding
+	results := discoverToolsConcurrent(ctx, s.mcpClient, entries)
 
-	// Upstream servers may report the same tool set in any order; sorting by (scope, server
-	// ID) and tool name keeps aliases and the encoded tool block byte-stable.
-	for _, entry := range entries {
+	// Upstream servers may report the same tool set in any order; iterating in sorted
+	// (scope, server ID) and tool name order keeps aliases and encoded tool blocks byte-stable.
+	for i, entry := range entries {
 		srv := entry.Server
-		discCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
-		descriptors, listErr := listServerTools(discCtx, s.mcpClient, entry)
-		cancel()
-		if listErr != nil {
+		res := results[i]
+		if res.err != nil {
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()
 			}
-			return nil, nil, listErr
+			return nil, nil, res.err
 		}
-		for _, desc := range normalizedDescriptors(descriptors) {
+		for _, desc := range normalizedDescriptors(res.descriptors) {
 			alias := plugin.BuildChatToolAlias(mcpServerAliasKey(entry), desc.Name, usedAliases)
 			if !srv.ToolEnabled(desc.Name) {
 				continue
@@ -195,8 +247,29 @@ func normalizedDescriptors(descriptors []plugin.MCPToolDescriptor) []plugin.MCPT
 }
 
 func (s *ChatService) filterEnabledToolsWithBindings(ctx context.Context, tools []plugin.ChatTool, bindings map[string]mcpToolBinding) []plugin.ChatTool {
-	if len(tools) == 0 || s.mcpStore == nil {
+	if len(tools) == 0 {
 		return tools
+	}
+	var hasBuiltin, hasExternal bool
+	for _, t := range tools {
+		if b, ok := bindings[t.Alias]; ok && b.BuiltIn {
+			hasBuiltin = true
+		} else {
+			hasExternal = true
+		}
+	}
+	builtinEnabled := false
+	if hasBuiltin {
+		builtinEnabled = s.resolvePreferencesSnapshot(ctx).BuiltinTimeToolEnabled
+	}
+	if !hasExternal || s.mcpStore == nil {
+		filtered := make([]plugin.ChatTool, 0, len(tools))
+		for _, t := range tools {
+			if b, ok := bindings[t.Alias]; ok && b.BuiltIn && builtinEnabled {
+				filtered = append(filtered, t)
+			}
+		}
+		return filtered
 	}
 	entries, scoped, err := listNormalizedScopedServers(ctx, s.mcpStore)
 	if err != nil {
@@ -209,6 +282,12 @@ func (s *ChatService) filterEnabledToolsWithBindings(ctx context.Context, tools 
 		}
 		filtered := make([]plugin.ChatTool, 0, len(tools))
 		for _, t := range tools {
+			if b, ok := bindings[t.Alias]; ok && b.BuiltIn {
+				if builtinEnabled {
+					filtered = append(filtered, t)
+				}
+				continue
+			}
 			if byID[t.ServerID].ToolEnabled(t.ToolName) {
 				filtered = append(filtered, t)
 			}
@@ -225,8 +304,15 @@ func (s *ChatService) filterEnabledToolsWithBindings(ctx context.Context, tools 
 	}
 	filtered := make([]plugin.ChatTool, 0, len(tools))
 	for _, t := range tools {
+		b, hasB := bindings[t.Alias]
+		if hasB && b.BuiltIn {
+			if builtinEnabled {
+				filtered = append(filtered, t)
+			}
+			continue
+		}
 		var scope plugin.ExecutionScope
-		if b, ok := bindings[t.Alias]; ok {
+		if hasB {
 			scope = b.Scope
 		}
 		if byScoped[scopedKey{scope: scope, id: t.ServerID}].ToolEnabled(t.ToolName) {
@@ -241,7 +327,53 @@ func (s *ChatService) executeToolCall(
 	bindings map[string]mcpToolBinding,
 	call domain.ContentBlock,
 ) (domain.ContentBlock, error) {
+	if binding, ok := bindings[call.Name]; ok && binding.BuiltIn {
+		return executeBuiltinBindingCall(ctx, s.preferences, binding, call), nil
+	}
 	return executeToolCallWithRuntime(ctx, s.mcpStore, s.mcpClient, bindings, call)
+}
+
+func executeBuiltinBindingCall(
+	ctx context.Context,
+	prefsLookup PreferenceLookup,
+	binding mcpToolBinding,
+	call domain.ContentBlock,
+) domain.ContentBlock {
+	resultBlock := domain.ContentBlock{
+		Type:       domain.BlockTypeToolResult,
+		ToolCallID: call.ID,
+		ToolName:   call.Name,
+	}
+	enabled := false
+	if prefsLookup != nil {
+		if prefs, _, err := prefsLookup.Get(ctx); err == nil {
+			enabled = prefs.BuiltinTimeToolEnabled
+		}
+	}
+	if !enabled {
+		resultBlock.IsError = true
+		resultBlock.Content = fmt.Sprintf("builtin tool %q is disabled", binding.ToolName)
+		return resultBlock
+	}
+	argsJSON, argErr := normalizeCallArguments(call.Arguments)
+	if argErr != nil {
+		resultBlock.IsError = true
+		resultBlock.Content = argErr.Error()
+		return resultBlock
+	}
+	var res plugin.MCPCallToolResult
+	switch binding.ToolName {
+	case BuiltinTimeToolName:
+		res = executeBuiltinTimeTool(time.Now(), argsJSON)
+	default:
+		resultBlock.IsError = true
+		resultBlock.Content = fmt.Sprintf("unknown builtin tool %q", binding.ToolName)
+		return resultBlock
+	}
+	resultBlock.IsError = res.IsError
+	resultBlock.Content = summarizeMCPResultText(res)
+	resultBlock.Extra = encodeMCPResultExtra(res)
+	return resultBlock
 }
 
 func executeToolCallWithRuntime(
@@ -621,7 +753,22 @@ func emitToolResultEvents(emit func(domain.StreamEvent) error, conversationID st
 }
 
 func (s *ChatService) discoverActiveBindingsLenient(ctx context.Context) (map[string]mcpToolBinding, []string, error) {
-	return discoverActiveBindingsLenientWithRuntime(ctx, s.mcpStore, s.mcpClient)
+	bindings, serverErrs, err := discoverActiveBindingsLenientWithRuntime(ctx, s.mcpStore, s.mcpClient)
+	if err != nil {
+		return nil, nil, err
+	}
+	if s.resolvePreferencesSnapshot(ctx).BuiltinTimeToolEnabled {
+		if bindings == nil {
+			bindings = make(map[string]mcpToolBinding)
+		}
+		bindings[BuiltinTimeToolName] = mcpToolBinding{
+			BuiltIn:    true,
+			ServerID:   BuiltinServerID,
+			ServerName: BuiltinServerName,
+			ToolName:   BuiltinTimeToolName,
+		}
+	}
+	return bindings, serverErrs, nil
 }
 
 func discoverActiveBindingsLenientWithRuntime(
@@ -636,25 +783,24 @@ func discoverActiveBindingsLenientWithRuntime(
 	if err != nil {
 		return nil, nil, err
 	}
+	results := discoverToolsConcurrent(ctx, mcpClient, entries)
 	usedAliases := make(map[string]struct{})
 	bindings := make(map[string]mcpToolBinding)
 	var serverErrs []string
 
 	// Execute the same deterministic ordering as discoverActiveTools so aliases
 	// produced while encoding the request resolve back to the same tool here.
-	for _, entry := range entries {
+	for i, entry := range entries {
 		srv := entry.Server
-		discCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
-		descriptors, listErr := listServerTools(discCtx, mcpClient, entry)
-		cancel()
-		if listErr != nil {
+		res := results[i]
+		if res.err != nil {
 			if ctx.Err() != nil {
 				return nil, nil, ctx.Err()
 			}
-			serverErrs = append(serverErrs, fmt.Sprintf("%s: %v", srv.Name, listErr))
+			serverErrs = append(serverErrs, fmt.Sprintf("%s: %v", srv.Name, res.err))
 			continue
 		}
-		for _, desc := range normalizedDescriptors(descriptors) {
+		for _, desc := range normalizedDescriptors(res.descriptors) {
 			alias := plugin.BuildChatToolAlias(mcpServerAliasKey(entry), desc.Name, usedAliases)
 			if !srv.ToolEnabled(desc.Name) {
 				continue

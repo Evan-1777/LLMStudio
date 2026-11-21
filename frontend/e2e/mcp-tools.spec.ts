@@ -475,6 +475,7 @@ async function startE2EMcpAndLlmServer() {
     async close() {
       releaseRound?.();
       sseClientRes?.end();
+      server.closeAllConnections?.();
       await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
@@ -860,5 +861,34 @@ test.describe('MCP End-to-End Integration', () => {
     } finally {
       await mockSrv.close();
     }
+  });
+
+  test('内置时区时间工具开关持久化及无外部服务调用闭环', async ({
+    page,
+    appUrl,
+  }) => {
+    await connectWithToken(page, appUrl);
+    await page.getByRole('link', { name: '设置' }).click();
+    await page.getByRole('button', { name: 'MCP 配置' }).click();
+
+    await expect(page.getByRole('heading', { name: '内置工具' })).toBeVisible();
+    await expect(page.getByText('get_current_time')).toBeVisible();
+
+    const toggle = page.getByRole('switch', { name: '启用当前日期与时间工具' });
+    await expect(toggle).not.toBeChecked();
+
+    const patch = page.waitForResponse(
+      (res) => res.url().endsWith('/api/v1/settings') && res.request().method() === 'PATCH',
+    );
+    await toggle.click();
+    expect((await patch).ok()).toBe(true);
+    await expect(toggle).toBeChecked();
+    await expect(page.getByText('已启用')).toBeVisible();
+
+    await page.reload({ waitUntil: 'networkidle' });
+    await expect(page.getByRole('switch', { name: '启用当前日期与时间工具' })).toBeChecked();
+
+    await page.getByText('工具定义').click();
+    await expect(page.getByText(/"timezone"/)).toBeVisible();
   });
 });

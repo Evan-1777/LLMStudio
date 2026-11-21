@@ -874,4 +874,118 @@ describe('AppProvider, ConnectionGate, and Routing', () => {
       delete document.documentElement.dataset.desktop;
     }
   });
+
+  it('desktop startup awaits /desktop/status before /settings, maps status failure to error, and syncs cloudStateRef on recovery', async () => {
+    window.__LLMSTUDIO_DESKTOP__ = {
+      apiBaseUrl: 'http://127.0.0.1:43212',
+      sessionToken: 'desktop-tok-seq',
+      platform: 'windows',
+      dataMode: 'portable',
+      version: '1.5.0',
+    };
+
+    try {
+      const requestOrder: string[] = [];
+      let statusPhase: 'ok' | 'fail' = 'ok';
+      let resolveStatus!: (res: Response) => void;
+      const statusDeferred = new Promise<Response>((resolve) => {
+        resolveStatus = resolve;
+      });
+
+      const fetchMock = vi.fn<typeof fetch>(async (input) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const path = new URL(url, 'http://127.0.0.1').pathname + new URL(url, 'http://127.0.0.1').search;
+        requestOrder.push(path);
+        if (url.endsWith('/api/v1/desktop/status')) {
+          if (statusPhase === 'fail') {
+            return new Response(JSON.stringify({ code: 'UPSTREAM_ERROR', message: 'boom' }), { status: 502 });
+          }
+          await statusDeferred;
+          return new Response(
+            JSON.stringify({
+              mode: 'portable',
+              dataDir: 'D:\\LLMStudio\\data',
+              dbPath: 'D:\\LLMStudio\\data\\llmstudio.db',
+              cloudConfigured: true,
+              cloudState: 'connected',
+              gatewayBaseUrl: 'https://vps.example.com',
+              tokenSet: true,
+              authRequired: true,
+              version: '1.5.0',
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/settings')) {
+          return new Response(JSON.stringify(settingsEnvelope()), { status: 200 });
+        }
+        if (url.endsWith('/api/v1/formats')) return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
+        if (url.endsWith('/api/v1/providers')) return new Response(JSON.stringify({ providers: [] }), { status: 200 });
+        if (url.endsWith('/api/v1/assistants')) return new Response(JSON.stringify({ assistants: [] }), { status: 200 });
+        if (url.includes('/api/v1/conversations')) return new Response(JSON.stringify({ conversations: [] }), { status: 200 });
+        if (url.includes('/api/v1/conversation-groups')) return new Response(JSON.stringify({ groups: [] }), { status: 200 });
+        if (url.endsWith('/api/v1/plugins/search')) return new Response(JSON.stringify({ engines: [] }), { status: 200 });
+        if (url.includes('/api/v1/mcp/servers')) return new Response(JSON.stringify({ servers: [] }), { status: 200 });
+        return new Response('{}', { status: 200 });
+      });
+
+      function Probe() {
+        const { cloudConnectionState, refreshAll, syncFromServer } = useApp();
+        return (
+          <div>
+            <span data-testid="cloud-state">{cloudConnectionState}</span>
+            <button type="button" onClick={() => void refreshAll()}>refresh-all</button>
+            <button type="button" onClick={() => void syncFromServer()}>sync-server</button>
+          </div>
+        );
+      }
+
+      const user = userEvent.setup();
+      render(
+        <AppProvider fetchImpl={fetchMock}>
+          <Probe />
+        </AppProvider>,
+      );
+
+      // Before /desktop/status resolves, no /api/v1/settings or resource requests should be fired.
+      await waitFor(() => expect(requestOrder).toContain('/api/v1/desktop/status'));
+      expect(requestOrder).toEqual(['/api/v1/desktop/status']);
+
+      resolveStatus(
+        new Response(
+          JSON.stringify({
+            mode: 'portable',
+            dataDir: 'D:\\LLMStudio\\data',
+            dbPath: 'D:\\LLMStudio\\data\\llmstudio.db',
+            cloudConfigured: true,
+            cloudState: 'connected',
+            gatewayBaseUrl: 'https://vps.example.com',
+            tokenSet: true,
+            authRequired: true,
+            version: '1.5.0',
+          }),
+          { status: 200 },
+        ),
+      );
+
+      await waitFor(() => expect(screen.getByTestId('cloud-state')).toHaveTextContent('connected'));
+      expect(requestOrder).toContain('/api/v1/settings');
+      expect(requestOrder).toContain('/api/v1/mcp/servers?scope=cloud');
+
+      // Simulate status probe network failure -> transitions to 'error', NOT 'disconnected'.
+      statusPhase = 'fail';
+      await user.click(screen.getByRole('button', { name: 'refresh-all' }));
+      await waitFor(() => expect(screen.getByTestId('cloud-state')).toHaveTextContent('error'));
+
+      // Recover via syncFromServer -> cloudStateRef is updated synchronously so cloud MCP is fetched immediately.
+      requestOrder.length = 0;
+      statusPhase = 'ok';
+      await user.click(screen.getByRole('button', { name: 'sync-server' }));
+      await waitFor(() => expect(screen.getByTestId('cloud-state')).toHaveTextContent('connected'));
+      await waitFor(() => expect(requestOrder).toContain('/api/v1/mcp/servers?scope=cloud'));
+    } finally {
+      delete window.__LLMSTUDIO_DESKTOP__;
+      delete document.documentElement.dataset.desktop;
+    }
+  });
 });

@@ -74,6 +74,24 @@ type DesktopSearchLookup struct {
 	store     *DesktopStore
 	cloud     *CloudClient
 	credCache *MemoryCredentialCache
+	ttl       time.Duration
+	nowFn     func() time.Time
+}
+
+const defaultMetadataCacheTTL = 5 * time.Minute
+
+func resolveCachePolicy(ttl time.Duration, nowFn func() time.Time) (time.Duration, time.Time) {
+	if ttl <= 0 {
+		ttl = defaultMetadataCacheTTL
+	}
+	if nowFn == nil {
+		return ttl, time.Now()
+	}
+	return ttl, nowFn()
+}
+
+func isMetadataCacheFresh(updatedAt, now time.Time, ttl time.Duration) bool {
+	return !updatedAt.IsZero() && now.Sub(updatedAt) < ttl
 }
 
 func (l *DesktopSearchLookup) List(ctx context.Context) ([]domain.SearchEngineConfig, error) {
@@ -102,13 +120,25 @@ func (l *DesktopSearchLookup) Get(ctx context.Context, engineID string) (domain.
 }
 
 func (l *DesktopSearchLookup) loadViews(ctx context.Context) ([]service.SearchEngineView, error) {
-	if l.cloud != nil && l.cloud.IsConfigured() {
-		if list, err := l.cloud.ListSearchEngines(ctx); err == nil {
-			_ = l.store.SaveCachedSearchEngines(ctx, list)
-			return list, nil
+	ttl, now := resolveCachePolicy(l.ttl, l.nowFn)
+	cached, updatedAt, err := l.store.LoadCachedSearchEnginesWithTime(ctx)
+	cloudReady := l.cloud != nil && l.cloud.IsConfigured()
+	if err == nil && !updatedAt.IsZero() {
+		if !cloudReady || isMetadataCacheFresh(updatedAt, now, ttl) {
+			return cached, nil
 		}
 	}
-	return l.store.LoadCachedSearchEngines(ctx)
+	if cloudReady {
+		if list, cErr := l.cloud.ListSearchEngines(ctx); cErr == nil {
+			_ = l.store.SaveCachedSearchEngines(ctx, list)
+			return list, nil
+		} else if err == nil && !updatedAt.IsZero() {
+			return cached, nil
+		} else if err != nil {
+			return nil, cErr
+		}
+	}
+	return cached, err
 }
 
 func (l *DesktopSearchLookup) hydrateView(ctx context.Context, v service.SearchEngineView) domain.SearchEngineConfig {
@@ -134,21 +164,33 @@ func (l *DesktopSearchLookup) hydrateView(ctx context.Context, v service.SearchE
 	return cfg
 }
 
-// DesktopPreferenceLookup reads preferences from cloud when online and falls back to local cache.
+// DesktopPreferenceLookup reads local cached preferences within TTL and refreshes from cloud when stale/missing.
 type DesktopPreferenceLookup struct {
 	store *DesktopStore
 	cloud *CloudClient
+	ttl   time.Duration
+	nowFn func() time.Time
 }
 
 func (l *DesktopPreferenceLookup) Get(ctx context.Context) (domain.Preferences, bool, error) {
-	if l.cloud != nil && l.cloud.IsConfigured() {
-		if prefs, initialized, err := l.cloud.GetSettings(ctx); err == nil {
-			_ = l.store.SaveCachedPreferences(ctx, prefs)
-			return prefs, initialized, nil
+	ttl, now := resolveCachePolicy(l.ttl, l.nowFn)
+	cached, ok, updatedAt, err := l.store.LoadCachedPreferencesWithTime(ctx)
+	cloudReady := l.cloud != nil && l.cloud.IsConfigured()
+	if err == nil && ok {
+		if !cloudReady || isMetadataCacheFresh(updatedAt, now, ttl) {
+			return cached, true, nil
 		}
 	}
-	if prefs, ok, err := l.store.LoadCachedPreferences(ctx); err == nil && ok {
-		return prefs, true, nil
+	if cloudReady {
+		if prefs, initialized, cErr := l.cloud.GetSettings(ctx); cErr == nil {
+			_ = l.store.SaveCachedPreferences(ctx, prefs)
+			return prefs, initialized, nil
+		} else if err == nil && ok {
+			return cached, true, nil
+		}
+	}
+	if err == nil && ok {
+		return cached, true, nil
 	}
 	return l.store.Preferences.Get(ctx)
 }
@@ -348,20 +390,35 @@ type desktopAssistantLookup struct {
 	store *DesktopStore
 	cloud *CloudClient
 	live  bool
+	ttl   time.Duration
+	nowFn func() time.Time
 }
 
 func (l *desktopAssistantLookup) Get(ctx context.Context, id string) (domain.Assistant, error) {
-	if l.live && l.cloud != nil && l.cloud.IsConfigured() {
-		if list, err := l.cloud.ListAssistants(ctx); err == nil {
-			_ = l.store.SyncCloudAssistants(ctx, list)
-			for _, a := range list {
-				if a.ID == id {
-					return a, nil
-				}
-			}
+	ttl, now := resolveCachePolicy(l.ttl, l.nowFn)
+	localAsst, localErr := l.store.Assistants.Get(ctx, id)
+	cloudReady := l.live && l.cloud != nil && l.cloud.IsConfigured()
+	if !cloudReady {
+		return localAsst, localErr
+	}
+	if localErr == nil {
+		if syncedAt, ok, sErr := l.store.AssistantsSyncedAt(ctx); sErr == nil && ok && isMetadataCacheFresh(syncedAt, now, ttl) {
+			return localAsst, nil
 		}
 	}
-	return l.store.Assistants.Get(ctx, id)
+	if list, err := l.cloud.ListAssistants(ctx); err == nil {
+		_ = l.store.SyncCloudAssistants(ctx, list)
+		for _, a := range list {
+			if a.ID == id {
+				return a, nil
+			}
+		}
+		return l.store.Assistants.Get(ctx, id)
+	}
+	if localErr == nil {
+		return localAsst, nil
+	}
+	return domain.Assistant{}, localErr
 }
 
 // DesktopChatEngine provides local-first ChatService orchestration for both local and cloud topics.
@@ -374,6 +431,7 @@ type DesktopChatEngine struct {
 	searchReg      *plugin.SearchRegistry
 	compositeTools *CompositeToolRuntime
 	httpClient     *http.Client
+	nowFn          func() time.Time
 
 	localChat *service.ChatService
 }
@@ -392,24 +450,7 @@ func NewDesktopChatEngine(
 	if httpClient == nil {
 		httpClient = &http.Client{}
 	}
-	provLookup := &DesktopProviderLookup{store: store, cloud: cloud, credCache: credCache}
-	searchLookup := &DesktopSearchLookup{store: store, cloud: cloud, credCache: credCache}
-	prefLookup := &DesktopPreferenceLookup{store: store, cloud: cloud}
-
-	localChat := service.NewChatService(
-		provLookup,
-		&localConversationRepo{store: store},
-		&localMessageRepo{store: store},
-		formats,
-		adapters,
-		httpClient,
-	).
-		WithAssistants(&desktopAssistantLookup{store: store, cloud: cloud, live: false}).
-		WithSearch(searchReg, searchLookup).
-		WithPreferences(prefLookup).
-		WithMCP(compositeTools, compositeTools)
-
-	return &DesktopChatEngine{
+	engine := &DesktopChatEngine{
 		store:          store,
 		cloud:          cloud,
 		credCache:      credCache,
@@ -418,14 +459,38 @@ func NewDesktopChatEngine(
 		searchReg:      searchReg,
 		compositeTools: compositeTools,
 		httpClient:     httpClient,
-		localChat:      localChat,
 	}
+	provLookup := &DesktopProviderLookup{store: store, cloud: cloud, credCache: credCache}
+	searchLookup := &DesktopSearchLookup{store: store, cloud: cloud, credCache: credCache, nowFn: engine.now}
+	prefLookup := &DesktopPreferenceLookup{store: store, cloud: cloud, nowFn: engine.now}
+
+	engine.localChat = service.NewChatService(
+		provLookup,
+		&localConversationRepo{store: store},
+		&localMessageRepo{store: store},
+		formats,
+		adapters,
+		httpClient,
+	).
+		WithAssistants(&desktopAssistantLookup{store: store, cloud: cloud, live: false, nowFn: engine.now}).
+		WithSearch(searchReg, searchLookup).
+		WithPreferences(prefLookup).
+		WithMCP(compositeTools, compositeTools)
+
+	return engine
+}
+
+func (e *DesktopChatEngine) now() time.Time {
+	if e != nil && e.nowFn != nil {
+		return e.nowFn()
+	}
+	return time.Now()
 }
 
 func (e *DesktopChatEngine) newCloudChatService() *service.ChatService {
 	provLookup := &DesktopProviderLookup{store: e.store, cloud: e.cloud, credCache: e.credCache}
-	searchLookup := &DesktopSearchLookup{store: e.store, cloud: e.cloud, credCache: e.credCache}
-	prefLookup := &DesktopPreferenceLookup{store: e.store, cloud: e.cloud}
+	searchLookup := &DesktopSearchLookup{store: e.store, cloud: e.cloud, credCache: e.credCache, nowFn: e.now}
+	prefLookup := &DesktopPreferenceLookup{store: e.store, cloud: e.cloud, nowFn: e.now}
 	repo := newCloudChatRepo(e.cloud)
 
 	return service.NewChatService(
@@ -436,7 +501,7 @@ func (e *DesktopChatEngine) newCloudChatService() *service.ChatService {
 		e.adapters,
 		e.httpClient,
 	).
-		WithAssistants(&desktopAssistantLookup{store: e.store, cloud: e.cloud, live: true}).
+		WithAssistants(&desktopAssistantLookup{store: e.store, cloud: e.cloud, live: true, nowFn: e.now}).
 		WithSearch(e.searchReg, searchLookup).
 		WithPreferences(prefLookup).
 		WithMCP(e.compositeTools, e.compositeTools)

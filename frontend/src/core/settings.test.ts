@@ -63,6 +63,7 @@ describe('settings storage and migration', () => {
       chatManualWidth: 780,
       fontFamily: 'system',
       fontSize: 14,
+      builtinTimeToolEnabled: false,
     });
 
     expect(defaultSettings()).toMatchObject({
@@ -255,5 +256,27 @@ describe('settings storage and migration', () => {
       fontFamily: 'serif',
       fontSize: 18,
     });
+  });
+
+  it('defaults builtinTimeToolEnabled to false, normalizes booleans, and excludes it from legacy import', () => {
+    expect(defaultSettings().builtinTimeToolEnabled).toBe(false);
+    expect(normalizeSettings({ builtinTimeToolEnabled: true }).builtinTimeToolEnabled).toBe(true);
+    expect(normalizeSettings({ builtinTimeToolEnabled: 'yes' }).builtinTimeToolEnabled).toBe(false);
+    expect(normalizeServerPreferences({ builtinTimeToolEnabled: true }).builtinTimeToolEnabled).toBe(true);
+
+    const storeMap = new Map<string, string>([
+      ['llmstudio.settings.v2', JSON.stringify({ themeMode: 'dark', builtinTimeToolEnabled: true })],
+    ]);
+    const storage: Storage = {
+      length: 1,
+      clear: () => storeMap.clear(),
+      key: () => null,
+      removeItem: (k) => { storeMap.delete(k); },
+      getItem: (k) => storeMap.get(k) ?? null,
+      setItem: (k, v) => { storeMap.set(k, v); },
+    };
+    const legacy = readLegacyPreferences(storage);
+    expect(legacy).not.toBeNull();
+    expect('builtinTimeToolEnabled' in (legacy as Record<string, unknown>)).toBe(false);
   });
 });

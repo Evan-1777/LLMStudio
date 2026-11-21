@@ -39,6 +39,29 @@ function formatSchema(schema: unknown): string {
   }
 }
 
+const BUILTIN_TIME_INPUT_SCHEMA = {
+  type: 'object',
+  properties: {
+    timezone: {
+      type: 'string',
+      description: 'IANA timezone (e.g. Asia/Shanghai) or UTC offset (e.g. +08:00)',
+    },
+  },
+  additionalProperties: false,
+};
+
+function formatLocalTimeSnapshot(now: Date): { zone: string; timestamp: string } {
+  let zone = 'Local';
+  try {
+    zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
+  } catch {
+    zone = 'Local';
+  }
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const timestamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  return { zone, timestamp };
+}
+
 function summarizeTarget(server: MCPServerConfig): string {
   if (server.transport === 'stdio') {
     const args = server.args?.join(' ') ?? '';
@@ -55,7 +78,7 @@ export function McpPage() {
     cloudConnectionState,
     connectionEpoch,
     resources,
-    settings: { mcpMaxToolRounds },
+    settings: { mcpMaxToolRounds, builtinTimeToolEnabled },
     updatePreferences,
     refreshPlugins,
     upsertLocalMcpServer,
@@ -74,8 +97,28 @@ export function McpPage() {
   const [roundsInput, setRoundsInput] = useState(String(mcpMaxToolRounds));
   const [roundsError, setRoundsError] = useState<string | null>(null);
   const [savingRounds, setSavingRounds] = useState(false);
+  const [savingBuiltinTime, setSavingBuiltinTime] = useState(false);
+  const [clockSnapshot, setClockSnapshot] = useState(() => formatLocalTimeSnapshot(new Date()));
 
   useEffect(() => setRoundsInput(String(mcpMaxToolRounds)), [mcpMaxToolRounds]);
+
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      setClockSnapshot(formatLocalTimeSnapshot(new Date()));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const toggleBuiltinTime = async (checked: boolean) => {
+    if (savingBuiltinTime) return;
+    setSavingBuiltinTime(true);
+    setActionError(null);
+    const result = await updatePreferences({ builtinTimeToolEnabled: checked });
+    setSavingBuiltinTime(false);
+    if (!result.ok) {
+      setActionError(result.error ?? '保存内置工具设置失败');
+    }
+  };
 
   const saveRounds = async () => {
     const rounds = Number(roundsInput);
@@ -274,6 +317,66 @@ export function McpPage() {
           </div>
         </section>
 
+        <section aria-label="内置工具">
+          <h3 className="st-subhead">内置工具</h3>
+          <div className="st-group st-mcp-builtin">
+            <div className="st-mcp-builtin__row">
+              <span
+                className={
+                  builtinTimeToolEnabled
+                    ? 'st-mcp-builtin__icon st-mcp-builtin__icon--active'
+                    : 'st-mcp-builtin__icon'
+                }
+              >
+                <Icon name="clock" size={15} />
+              </span>
+              <div className="st-model-main">
+                <div className="st-mcp-builtin__title-row">
+                  <span className="st-model-name">当前日期与时间</span>
+                  <span className="st-badge st-mono">get_current_time</span>
+                  {builtinTimeToolEnabled ? (
+                    <span className="st-badge st-badge--accent">已启用</span>
+                  ) : null}
+                  <span className="st-badge">内置</span>
+                </div>
+                <div className="st-mcp-builtin__clock st-mono">
+                  {clockSnapshot.zone} · {clockSnapshot.timestamp}
+                </div>
+              </div>
+              <div className="st-model-meta">
+                <Switch
+                  checked={builtinTimeToolEnabled}
+                  disabled={savingBuiltinTime}
+                  label="启用当前日期与时间工具"
+                  onCheckedChange={(checked) => void toggleBuiltinTime(checked)}
+                />
+              </div>
+            </div>
+            <details className="st-mcp-builtin__details">
+              <summary className="st-mcp-builtin__summary">
+                <Icon name="chevronRight" size={13} className="st-mcp-builtin__chevron" />
+                <span>工具定义</span>
+              </summary>
+              <div className="st-mcp-builtin__schema">
+                <div className="st-mcp-tool-card__desc">
+                  输入参数
+                  <pre className="st-mcp-schema-pre">
+                    <code>{formatSchema(BUILTIN_TIME_INPUT_SCHEMA)}</code>
+                  </pre>
+                </div>
+                <div className="st-mcp-tool-card__desc">
+                  输出字段
+                  <pre className="st-mcp-schema-pre">
+                    <code>timezone / offset / datetime / date / time / weekday / unix</code>
+                  </pre>
+                </div>
+              </div>
+            </details>
+          </div>
+        </section>
+
+        <section aria-label="外部服务">
+          <h3 className="st-subhead">外部服务</h3>
         {cloudOffline ? (
           <div className="st-group">
             <EmptyState
@@ -424,6 +527,7 @@ export function McpPage() {
             })}
           </div>
         )}
+        </section>
       </div>
 
       <McpEditor

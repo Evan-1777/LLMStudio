@@ -333,18 +333,19 @@ func TestPreferenceEndpoints(t *testing.T) {
 	}
 
 	rec = doJSONReq(t, router, http.MethodPatch, "/api/v1/settings", tok, map[string]any{
-		"fontFamily": "serif",
-		"fontSize":   18,
+		"fontFamily":             "serif",
+		"fontSize":               18,
+		"builtinTimeToolEnabled": true,
 	})
 	if rec.Code != http.StatusOK {
-		t.Fatalf("PATCH typography status=%d body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("PATCH typography/builtin tool status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var typoEnv struct {
 		Preferences domain.Preferences `json:"preferences"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &typoEnv)
-	if typoEnv.Preferences.FontFamily != domain.FontFamilySerif || typoEnv.Preferences.FontSize != 18 {
-		t.Fatalf("unexpected typography patch result: %+v", typoEnv.Preferences)
+	if typoEnv.Preferences.FontFamily != domain.FontFamilySerif || typoEnv.Preferences.FontSize != 18 || !typoEnv.Preferences.BuiltinTimeToolEnabled {
+		t.Fatalf("unexpected patch result: %+v", typoEnv.Preferences)
 	}
 }
 

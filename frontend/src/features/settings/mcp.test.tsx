@@ -12,6 +12,7 @@ interface McpMockState {
   updateBodies: Array<{ id: string; body: Record<string, unknown> }>;
   requestedUrls: string[];
   rounds?: number;
+  builtinTimeToolEnabled?: boolean;
   failSettings?: boolean;
 }
 
@@ -34,9 +35,20 @@ function makeFetchMock(state: McpMockState) {
     if (url.endsWith('/api/v1/settings')) {
       if (method === 'PATCH') {
         if (state.failSettings) return Response.json({ message: '保存失败' }, { status: 500 });
-        state.rounds = Number(parsedBody.mcpMaxToolRounds);
+        if (typeof parsedBody.mcpMaxToolRounds === 'number') {
+          state.rounds = Number(parsedBody.mcpMaxToolRounds);
+        }
+        if (typeof parsedBody.builtinTimeToolEnabled === 'boolean') {
+          state.builtinTimeToolEnabled = parsedBody.builtinTimeToolEnabled;
+        }
       }
-      return Response.json({ initialized: true, preferences: { mcpMaxToolRounds: state.rounds ?? 20 } });
+      return Response.json({
+        initialized: true,
+        preferences: {
+          mcpMaxToolRounds: state.rounds ?? 20,
+          builtinTimeToolEnabled: state.builtinTimeToolEnabled ?? false,
+        },
+      });
     }
     if (url.endsWith('/api/v1/formats')) {
       return new Response(JSON.stringify({ formats: [], adapters: [] }), {
@@ -526,6 +538,118 @@ describe('McpPage and McpEditor', () => {
       await user.click(screen.getByRole('radio', { name: '本地 MCP' }));
       await waitFor(() => expect(screen.getByText('local-fs')).toBeInTheDocument());
       expect(screen.queryByText('remote-sse')).toBeNull();
+    } finally {
+      delete window.__LLMSTUDIO_DESKTOP__;
+      delete document.documentElement.dataset.desktop;
+    }
+  });
+
+  it('toggles built-in time tool, persists preference, rolls back on failure, and stays available offline on desktop', async () => {
+    const state: McpMockState = {
+      servers: [],
+      createBodies: [],
+      updateBodies: [],
+      requestedUrls: [],
+    };
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={makeFetchMock(state)}>
+        <MemoryRouter>
+          <McpPage />
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    const toggle = await screen.findByRole('switch', { name: '启用当前日期与时间工具' });
+    expect(toggle).not.toBeChecked();
+    expect(screen.getByText('get_current_time')).toBeInTheDocument();
+
+    // Expand tool definition details to inspect timezone schema.
+    const summary = screen.getByText('工具定义');
+    expect(summary.closest('details')).not.toHaveAttribute('open');
+    await user.click(summary);
+    expect(screen.getByText(/"timezone"/)).toBeVisible();
+    expect(screen.getByText(/timezone \/ offset \/ datetime/)).toBeVisible();
+
+    // Toggle on -> persists true via PATCH /api/v1/settings.
+    await user.click(toggle);
+    await waitFor(() => expect(state.builtinTimeToolEnabled).toBe(true));
+    expect(toggle).toBeChecked();
+    expect(screen.getByText('已启用')).toBeInTheDocument();
+
+    // Failure rolls back switch and displays error banner.
+    state.failSettings = true;
+    await user.click(toggle);
+    expect(await screen.findByRole('alert')).toHaveTextContent('保存失败');
+    expect(toggle).toBeChecked();
+  });
+
+  it('keeps built-in time tool visible and toggleable when desktop cloud scope is offline', async () => {
+    window.__LLMSTUDIO_DESKTOP__ = {
+      apiBaseUrl: 'http://127.0.0.1:45125',
+      sessionToken: 'desktop-builtin-tok',
+      platform: 'windows',
+      dataMode: 'portable',
+      version: '1.5.0',
+    };
+    try {
+      let builtinEnabled = false;
+      const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const method = (init?.method ?? 'GET').toUpperCase();
+        if (url.endsWith('/api/v1/desktop/status')) {
+          return Response.json({
+            mode: 'portable',
+            dataDir: 'D:\\LLMStudio\\data',
+            dbPath: 'D:\\LLMStudio\\data\\llmstudio.db',
+            cloudConfigured: false,
+            cloudState: 'disconnected',
+            gatewayBaseUrl: '',
+            tokenSet: false,
+            authRequired: false,
+            version: '1.5.0',
+          });
+        }
+        if (url.endsWith('/api/v1/settings')) {
+          if (method === 'PATCH') {
+            const body = JSON.parse(String(init?.body ?? '{}')) as { builtinTimeToolEnabled?: boolean };
+            if (typeof body.builtinTimeToolEnabled === 'boolean') {
+              builtinEnabled = body.builtinTimeToolEnabled;
+            }
+          }
+          return Response.json({
+            initialized: true,
+            preferences: { mcpMaxToolRounds: 20, builtinTimeToolEnabled: builtinEnabled },
+          });
+        }
+        if (url.endsWith('/api/v1/formats')) return Response.json({ formats: [], adapters: [] });
+        if (url.endsWith('/api/v1/providers')) return Response.json({ providers: [] });
+        if (url.endsWith('/api/v1/assistants')) return Response.json({ assistants: [] });
+        if (url.includes('/api/v1/conversations')) return Response.json({ conversations: [] });
+        if (url.includes('/api/v1/conversation-groups')) return Response.json({ groups: [] });
+        if (url.endsWith('/api/v1/plugins/search')) return Response.json({ engines: [] });
+        if (url.includes('/api/v1/mcp/servers')) return Response.json({ servers: [] });
+        return Response.json({});
+      });
+
+      const user = userEvent.setup();
+      render(
+        <AppProvider fetchImpl={fetchMock}>
+          <MemoryRouter>
+            <McpPage />
+          </MemoryRouter>
+        </AppProvider>,
+      );
+
+      await waitFor(() => expect(screen.getByRole('radio', { name: '云端 MCP' })).toBeInTheDocument());
+      await user.click(screen.getByRole('radio', { name: '云端 MCP' }));
+      expect(await screen.findByText('云端未连接')).toBeInTheDocument();
+
+      const toggle = screen.getByRole('switch', { name: '启用当前日期与时间工具' });
+      expect(toggle).toBeEnabled();
+      await user.click(toggle);
+      await waitFor(() => expect(builtinEnabled).toBe(true));
+      expect(toggle).toBeChecked();
     } finally {
       delete window.__LLMSTUDIO_DESKTOP__;
       delete document.documentElement.dataset.desktop;

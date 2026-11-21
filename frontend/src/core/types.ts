@@ -743,6 +743,7 @@ export interface ServerPreferences {
   chatManualWidth: number;
   fontFamily: FontFamily;
   fontSize: number;
+  builtinTimeToolEnabled: boolean;
 }
 
 export interface ServerPreferencesEnvelope {
@@ -759,6 +760,7 @@ export type ServerPreferencesImport = Omit<
   | 'chatManualWidth'
   | 'fontFamily'
   | 'fontSize'
+  | 'builtinTimeToolEnabled'
 >;
 
 export interface StorageUsage {

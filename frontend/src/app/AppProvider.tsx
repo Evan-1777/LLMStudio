@@ -340,6 +340,11 @@ export function AppProvider({
   );
   cloudStateRef.current = cloudConnectionState;
 
+  const updateCloudConnectionState = useCallback((next: CloudConnectionState) => {
+    cloudStateRef.current = next;
+    setCloudConnectionState(next);
+  }, []);
+
   const [topicScope, setTopicScopeState] = useState<TopicScope>(
     isDesktop ? 'local' : 'cloud',
   );
@@ -617,6 +622,7 @@ export function AppProvider({
         chatManualWidth: _mw,
         fontFamily: _ff,
         fontSize: _fs,
+        builtinTimeToolEnabled: _bt,
         ...fallback
       } = pickAppPreferences(settingsRef.current);
       const seed = legacy ?? fallback;
@@ -711,7 +717,7 @@ export function AppProvider({
       if (epoch !== epochRef.current) return false;
       if (err instanceof GatewayError && err.statusCode === 401) {
         if (isDesktop) {
-          setCloudConnectionState('auth-required');
+          updateCloudConnectionState('auth-required');
           return true;
         }
         setConnectionState('auth-required');
@@ -720,7 +726,7 @@ export function AppProvider({
       }
       return false;
     },
-    [isDesktop],
+    [isDesktop, updateCloudConnectionState],
   );
 
   const providerOrderRevision = useRef(0);
@@ -907,7 +913,7 @@ export function AppProvider({
           shouldFetchCloud
             ? gateway.listMcpServers(signal, 'cloud').catch((err) => {
                 if (err instanceof GatewayError && err.statusCode === 401) {
-                  setCloudConnectionState('auth-required');
+                  updateCloudConnectionState('auth-required');
                 }
                 return null;
               })
@@ -940,7 +946,7 @@ export function AppProvider({
         cleanup();
       }
     },
-    [gateway, handleAuthFailureIf401, isDesktop, trackSignal],
+    [gateway, handleAuthFailureIf401, isDesktop, trackSignal, updateCloudConnectionState],
   );
 
   const refreshPreferences = useCallback(async (): Promise<boolean> => {
@@ -973,7 +979,7 @@ export function AppProvider({
       const status = await gateway.getDesktopStatus(signal);
       if (epoch !== epochRef.current) return null;
       setDesktopStatus(status);
-      setCloudConnectionState(normalizeCloudState(status.cloudState));
+      updateCloudConnectionState(normalizeCloudState(status.cloudState));
       setGatewayHealth({
         status: 'ok',
         version: status.version || desktopBootstrap?.version || '1.5.0',
@@ -982,12 +988,12 @@ export function AppProvider({
       return status;
     } catch {
       if (epoch !== epochRef.current) return null;
-      setCloudConnectionState('error');
+      updateCloudConnectionState('error');
       return null;
     } finally {
       cleanup();
     }
-  }, [desktopBootstrap?.version, gateway, isDesktop, trackSignal]);
+  }, [desktopBootstrap?.version, gateway, isDesktop, trackSignal, updateCloudConnectionState]);
 
   const refreshAll = useCallback(async () => {
     if (!isDesktop) {
@@ -1110,26 +1116,32 @@ export function AppProvider({
         setResources(emptyResources());
         setConnectionState('connected');
         setConnectionError(null);
-        setCloudConnectionState('checking');
+        updateCloudConnectionState('checking');
         setLastSyncedAt(null);
 
         const { signal, cleanup } = trackSignal();
         try {
-          const [status] = await Promise.all([
-            gateway.getDesktopStatus(signal).catch(() => null),
-            hydratePreferences(signal, nextEpoch).catch(() => {}),
-          ]);
+          let status: DesktopStatus | null = null;
+          let statusFailed = false;
+          try {
+            status = await gateway.getDesktopStatus(signal);
+          } catch (err) {
+            if (nextEpoch !== epochRef.current) return;
+            if (err instanceof DOMException && err.name === 'AbortError') return;
+            if (err instanceof Error && err.name === 'AbortError') return;
+            statusFailed = true;
+          }
           if (nextEpoch !== epochRef.current) return;
           if (status) {
             setDesktopStatus(status);
-            setCloudConnectionState(normalizeCloudState(status.cloudState));
+            updateCloudConnectionState(normalizeCloudState(status.cloudState));
             setGatewayHealth({
               status: 'ok',
               version: status.version || desktopBootstrap.version,
               authRequired: false,
             });
           } else {
-            setCloudConnectionState('disconnected');
+            updateCloudConnectionState(statusFailed ? 'error' : 'disconnected');
             setGatewayHealth({
               status: 'ok',
               version: desktopBootstrap.version,
@@ -1138,7 +1150,8 @@ export function AppProvider({
           }
 
           const cloudReady = status?.cloudState === 'connected';
-          const [provOk, asstOk, localConvs, , pluginsOk] = await Promise.all([
+          const [, provOk, asstOk, localConvs, , pluginsOk] = await Promise.all([
+            hydratePreferences(signal, nextEpoch).catch(() => {}),
             refreshProviders(),
             refreshAssistants(),
             refreshConversations('local'),
@@ -1224,6 +1237,7 @@ export function AppProvider({
       refreshPlugins,
       refreshProviders,
       trackSignal,
+      updateCloudConnectionState,
     ],
   );
 
@@ -1252,7 +1266,7 @@ export function AppProvider({
           });
           setDesktopStatus(saved.status);
           const nextCloudState = normalizeCloudState(saved.status.cloudState);
-          setCloudConnectionState(nextCloudState);
+          updateCloudConnectionState(nextCloudState);
           const epoch = epochRef.current;
           void refreshAll();
           if (nextCloudState === 'connected') {
@@ -1287,6 +1301,7 @@ export function AppProvider({
       isDesktop,
       refreshAll,
       trackSignal,
+      updateCloudConnectionState,
       updateSettings,
     ],
   );
@@ -1363,7 +1378,7 @@ export function AppProvider({
     if (!isDesktop) return null;
     const status = await gateway.disconnectDesktopCloud();
     setDesktopStatus(status);
-    setCloudConnectionState(normalizeCloudState(status.cloudState));
+    updateCloudConnectionState(normalizeCloudState(status.cloudState));
     setResources((prev) => {
       const nextActiveConvs =
         topicScopeRef.current === 'local' ? prev.localConversations : [];
@@ -1379,7 +1394,7 @@ export function AppProvider({
       };
     });
     return status;
-  }, [gateway, isDesktop]);
+  }, [gateway, isDesktop, updateCloudConnectionState]);
 
   const retryConnection = useCallback(() => {
     void bootstrapConnection(settings.gatewayBaseUrl, settings.accessToken);

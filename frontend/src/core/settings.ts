@@ -160,6 +160,7 @@ export interface AppSettings {
   chatManualWidth: number;
   fontFamily: FontFamily;
   fontSize: number;
+  builtinTimeToolEnabled: boolean;
 }
 
 export interface SettingsLoadResult {
@@ -196,6 +197,7 @@ export const APP_PREFERENCE_KEYS = [
   'chatManualWidth',
   'fontFamily',
   'fontSize',
+  'builtinTimeToolEnabled',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -223,6 +225,7 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     chatManualWidth: settings.chatManualWidth,
     fontFamily: settings.fontFamily,
     fontSize: settings.fontSize,
+    builtinTimeToolEnabled: settings.builtinTimeToolEnabled,
   };
 }
 
@@ -254,6 +257,7 @@ export function defaultSettings(): AppSettings {
     chatManualWidth: CHAT_WIDTH_DEFAULT,
     fontFamily: 'system',
     fontSize: FONT_SIZE_DEFAULT,
+    builtinTimeToolEnabled: false,
   };
 }
 
@@ -366,6 +370,10 @@ export function normalizeSettings(raw: unknown): AppSettings {
       FONT_SIZE_MAX,
       defaults.fontSize,
     ),
+    builtinTimeToolEnabled:
+      typeof obj.builtinTimeToolEnabled === 'boolean'
+        ? obj.builtinTimeToolEnabled
+        : defaults.builtinTimeToolEnabled,
   };
 }
 
@@ -561,6 +569,7 @@ export function readLegacyPreferences(
         chatManualWidth: _mw,
         fontFamily: _ff,
         fontSize: _fs,
+        builtinTimeToolEnabled: _bt,
         ...legacy
       } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
       return legacy;
@@ -574,6 +583,7 @@ export function readLegacyPreferences(
         chatManualWidth: _mw,
         fontFamily: _ff,
         fontSize: _fs,
+        builtinTimeToolEnabled: _bt,
         ...legacy
       } = pickAppPreferences(
         normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),

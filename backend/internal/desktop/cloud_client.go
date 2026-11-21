@@ -35,10 +35,11 @@ type CloudClient struct {
 
 // NewCloudClient constructs a CloudClient targeting baseURL with optional Bearer accessToken.
 func NewCloudClient(baseURL, accessToken string) *CloudClient {
+	transport := NewDesktopHTTPTransport()
 	return &CloudClient{
 		connection:   newCloudConnection(baseURL, accessToken),
-		stdClient:    &http.Client{Timeout: 20 * time.Second},
-		streamClient: &http.Client{},
+		stdClient:    &http.Client{Timeout: 20 * time.Second, Transport: transport},
+		streamClient: &http.Client{Transport: transport},
 	}
 }
 
@@ -116,6 +117,15 @@ func (c *CloudClient) Credentials() (baseURL, accessToken string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.connection.baseURL, c.connection.token
+}
+
+func (c *CloudClient) currentConnection() *cloudConnection {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connection
 }
 
 // IsConfigured reports whether a remote gateway URL is currently configured.

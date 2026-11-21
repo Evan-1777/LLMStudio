@@ -208,25 +208,19 @@ func (s *ChatService) WithPreferences(preferences PreferenceLookup) *ChatService
 	return s
 }
 
-// autoCreateCachePreference reads the gateway-managed automatic caching preference.
-func (s *ChatService) autoCreateCachePreference(ctx context.Context) bool {
+// resolvePreferencesSnapshot loads runtime preferences once per generation, falling back to defaults.
+func (s *ChatService) resolvePreferencesSnapshot(ctx context.Context) domain.Preferences {
 	if s.preferences == nil {
-		return false
+		return domain.DefaultPreferences()
 	}
 	prefs, _, err := s.preferences.Get(ctx)
 	if err != nil {
-		return false
+		return domain.DefaultPreferences()
 	}
-	return prefs.AutoCreateCache
-}
-
-func (s *ChatService) mcpMaxToolRoundsPreference(ctx context.Context) int {
-	if s.preferences != nil {
-		if prefs, _, err := s.preferences.Get(ctx); err == nil {
-			return prefs.MCPMaxToolRounds
-		}
+	if prefs.MCPMaxToolRounds <= 0 {
+		prefs.MCPMaxToolRounds = domain.DefaultMCPMaxToolRounds
 	}
-	return domain.DefaultMCPMaxToolRounds
+	return prefs
 }
 
 // WithMCP injects MCP server metadata and runtime boundary for tool discovery and execution.
@@ -318,6 +312,7 @@ type preparedUpstream struct {
 	replaceMessageID     string
 	insertAfterMessageID string
 	autoCreateCache      bool
+	mcpMaxToolRounds     int
 	credentialEnvelope   bool
 	cacheScope           plugin.PromptCacheScope
 	chatInput            plugin.ChatInput
@@ -383,7 +378,7 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	}
 
 	return &PreparedStream{
-		maxToolRounds:        s.mcpMaxToolRoundsPreference(ctx),
+		maxToolRounds:        prep.mcpMaxToolRounds,
 		service:              s,
 		conversation:         conv,
 		provider:             prep.provider,
@@ -855,12 +850,14 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		history = appendSearchContext(history, searchPrompt)
 	}
 
-	tools, toolBindings, err := s.discoverActiveTools(ctx)
+	prefs := s.resolvePreferencesSnapshot(ctx)
+
+	tools, toolBindings, err := s.discoverActiveTools(ctx, prefs.BuiltinTimeToolEnabled)
 	if err != nil {
 		return preparedUpstream{}, err
 	}
 
-	autoCreateCache := s.autoCreateCachePreference(ctx)
+	autoCreateCache := prefs.AutoCreateCache
 	chatInput := plugin.ChatInput{
 		ConversationID:  conv.ID,
 		Provider:        prov,
@@ -895,6 +892,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		replaceMessageID:     replaceMessageID,
 		insertAfterMessageID: insertAfterMessageID,
 		autoCreateCache:      autoCreateCache,
+		mcpMaxToolRounds:     prefs.MCPMaxToolRounds,
 		credentialEnvelope:   in.CredentialEnvelope,
 		cacheScope:           cacheScope,
 		chatInput:            chatInput,

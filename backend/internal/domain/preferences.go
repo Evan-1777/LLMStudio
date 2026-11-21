@@ -75,6 +75,7 @@ type Preferences struct {
 	ChatManualWidth              int    `json:"chatManualWidth"`
 	FontFamily                   string `json:"fontFamily"`
 	FontSize                     int    `json:"fontSize"`
+	BuiltinTimeToolEnabled       bool   `json:"builtinTimeToolEnabled"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -123,6 +124,7 @@ type PreferencesPatch struct {
 	ChatManualWidth              *int    `json:"chatManualWidth"`
 	FontFamily                   *string `json:"fontFamily"`
 	FontSize                     *int    `json:"fontSize"`
+	BuiltinTimeToolEnabled       *bool   `json:"builtinTimeToolEnabled"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -184,6 +186,9 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	}
 	if p.FontSize != nil {
 		out.FontSize = *p.FontSize
+	}
+	if p.BuiltinTimeToolEnabled != nil {
+		out.BuiltinTimeToolEnabled = *p.BuiltinTimeToolEnabled
 	}
 	return out
 }
