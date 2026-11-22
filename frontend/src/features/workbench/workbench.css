@@ -1281,6 +1281,11 @@
   font-weight: 600;
 }
 
+.wb-history__head .ui-segmented__item {
+  min-width: 32px;
+  padding: 4px 8px;
+}
+
 .wb-history__body {
   flex: 1;
   min-height: 0;

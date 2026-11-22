@@ -332,11 +332,13 @@ export function HtmlPreview({
   isClosed,
   collapseKey,
   title = 'HTML',
+  defaultHtmlPreview,
 }: {
   html: string;
   isClosed: boolean;
   collapseKey: string;
   title?: string;
+  defaultHtmlPreview?: boolean;
 }) {
   const { settings, toast } = useApp();
   const [previewOverride, setPreviewOverride] = useState<boolean | null>(null);
@@ -345,7 +347,8 @@ export function HtmlPreview({
 
   const canPreview = isClosed;
   const showPreview =
-    canPreview && (previewOverride ?? settings.defaultHtmlPreview);
+    canPreview &&
+    (previewOverride ?? defaultHtmlPreview ?? settings.defaultHtmlPreview);
 
   const defaultCollapsed = shouldAutoCollapseText(html, settings);
 

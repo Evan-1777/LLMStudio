@@ -233,4 +233,32 @@ test.describe('Image attachments', () => {
     expect(encoded).toBeTruthy();
     expect(Buffer.from(encoded!, 'base64').byteLength).toBeLessThan(originalBytes / 4);
   });
+
+  test('deduplicates single clipboard image when items and files return separate File objects across millisecond boundaries', async ({ appUrl, upstream, page }) => {
+    await seedMockProviderViaApi(appUrl, upstream.url);
+    await connectWithToken(page, appUrl);
+    const box = page.getByLabel('消息输入框');
+
+    await box.evaluate((el) => {
+      const pngBytes = Uint8Array.from(
+        atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII='),
+        (c) => c.charCodeAt(0),
+      );
+      const itemFile = new File([pngBytes], '', { type: 'image/png', lastModified: 1700000000000 });
+      const filesCopy = new File([pngBytes], '', { type: 'image/png', lastModified: 1700000000001 });
+      const event = new Event('paste', { bubbles: true, cancelable: true });
+      Object.defineProperty(event, 'clipboardData', {
+        value: {
+          items: [{ kind: 'file', type: 'image/png', getAsFile: () => itemFile }],
+          files: [filesCopy],
+          types: ['Files'],
+          getData: () => '',
+        },
+      });
+      el.dispatchEvent(event);
+    });
+
+    await expect(page.getByRole('button', { name: /^移除 / })).toHaveCount(1);
+    await expect(page.getByRole('img', { name: 'pasted-image.png' })).toBeVisible();
+  });
 });

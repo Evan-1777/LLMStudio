@@ -294,6 +294,20 @@ async function startMockUpstream(): Promise<{
         return;
       }
 
+      if (prompt.includes('[AGENT_SKILL]')) {
+        const messages = Array.isArray(body.messages) ? body.messages : [];
+        const last = messages.at(-1);
+        if (last?.role === 'tool') {
+          writeChunk({ choices: [{ delta: { content: 'Skill verified: ' + last.content }, finish_reason: 'stop' }] });
+        } else {
+          writeChunk({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'agent-skill', function: {
+            name: 'skill', arguments: JSON.stringify({ name: 'demo-skill' }),
+          } }] }, finish_reason: 'tool_calls' }] });
+        }
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+
       if (prompt.includes('[SLOW_ABORT]')) {
         let closed = false;
         const onAbort = () => {
@@ -596,6 +610,7 @@ interface WorkerShared {
 interface GoInstance {
   baseUrl: string;
   dbPath: string;
+  workspaceDir: string;
 }
 
 export const test = base.extend<
@@ -604,6 +619,7 @@ export const test = base.extend<
     goInstance: GoInstance;
     appUrl: string;
     dbPath: string;
+    agentWorkspaceDir: string;
     upstream: MockUpstreamControl;
     context: BrowserContext;
     page: Page;
@@ -688,7 +704,7 @@ export const test = base.extend<
         throw new Error(`Go server failed to start on ${baseUrl}`);
       }
 
-      await use({ baseUrl, dbPath });
+      await use({ baseUrl, dbPath, workspaceDir: workspace });
     } finally {
       if (!proc.killed) {
         proc.kill('SIGTERM');
@@ -713,6 +729,10 @@ export const test = base.extend<
 
   dbPath: async ({ goInstance }, use) => {
     await use(goInstance.dbPath);
+  },
+
+  agentWorkspaceDir: async ({ goInstance }, use) => {
+    await use(goInstance.workspaceDir);
   },
 
   upstream: async ({ workerShared }, use) => {

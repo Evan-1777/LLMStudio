@@ -47,6 +47,27 @@ func RegisterAgentRoutes(mux *http.ServeMux, runtime *agent.Runtime, dispatch fu
 		data, err := runtime.UpdateTopic(r.Context(), r.PathValue("id"), in.Path)
 		writeAgent(w, data, err)
 	})
+	mount("GET /api/v1/agent/workspace/entries", func(w http.ResponseWriter, r *http.Request) {
+		data, err := runtime.ListWorkspaceEntries(r.Context(), r.URL.Query().Get("path"))
+		writeAgent(w, data, err)
+	})
+	mount("GET /api/v1/agent/workspace/file", func(w http.ResponseWriter, r *http.Request) {
+		data, err := runtime.ReadWorkspaceFile(r.Context(), r.URL.Query().Get("path"))
+		writeAgent(w, data, err)
+	})
+	mount("PUT /api/v1/agent/workspace/file", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Path         string `json:"path"`
+			Content      string `json:"content"`
+			ExpectedETag string `json:"expectedEtag"`
+		}
+		if err := decodeJSONBodyWithLimit(r, &in, 3<<20); err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		data, err := runtime.WriteWorkspaceFile(r.Context(), in.Path, in.Content, in.ExpectedETag)
+		writeAgent(w, data, err)
+	})
 }
 
 func writeAgent(w http.ResponseWriter, data any, err error) {

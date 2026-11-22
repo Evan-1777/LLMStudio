@@ -28,7 +28,10 @@ import type {
   Conversation,
   ConversationGroup,
   TopicScope,
+  WorkspaceEntry,
 } from '../../core/types';
+import { WorkspaceFileTree } from '../agent/WorkspaceFileTree';
+import { WorkspaceFileViewer } from '../agent/WorkspaceFileViewer';
 import {
   SessionInspector,
   type DraftSessionParams,
@@ -166,7 +169,11 @@ export function ConversationSidebar({
 
   const reqScope: TopicScope | undefined = isDesktop ? scope : undefined;
   const cloudOffline = isDesktop && scope === 'cloud' && cloudConnectionState !== 'connected';
+  const canBrowseWorkspace = !isDesktop || scope === 'cloud';
 
+  const [rightPanelTab, setRightPanelTab] = useState<'topics' | 'files'>('topics');
+  const [filesRefreshToken, setFilesRefreshToken] = useState(0);
+  const [viewingEntry, setViewingEntry] = useState<WorkspaceEntry | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [expandedGroupIds, setExpandedGroupIds] = useState<Set<string>>(
@@ -230,6 +237,24 @@ export function ConversationSidebar({
   useEffect(() => {
     setExpandedGroupIds(new Set());
   }, [connectionEpoch]);
+
+  useEffect(() => {
+    if (!canBrowseWorkspace) {
+      setRightPanelTab('topics');
+      setViewingEntry(null);
+    }
+  }, [canBrowseWorkspace]);
+
+  useEffect(() => {
+    setViewingEntry(null);
+    setFilesRefreshToken(0);
+  }, [connectionEpoch]);
+
+  useEffect(() => {
+    if (cloudOffline) {
+      setViewingEntry(null);
+    }
+  }, [cloudOffline]);
 
   useEffect(() => {
     if (!manageMode) {
@@ -843,7 +868,13 @@ export function ConversationSidebar({
     <>
       <aside
         className={`wb-history ${drawerOpen ? 'wb-history--drawer-open' : ''}`.trim()}
-        aria-label={inspectorOpen ? '话题参数' : '话题'}
+        aria-label={
+          inspectorOpen
+            ? '话题参数'
+            : rightPanelTab === 'files' && canBrowseWorkspace
+              ? '工作区文件'
+              : '话题'
+        }
       >
         {inspectorOpen ? (
           <SessionInspector
@@ -861,39 +892,82 @@ export function ConversationSidebar({
         ) : (
           <>
             <div className="wb-history__head">
-              <span>话题</span>
-              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
-                <IconButton
-                  size="sm"
-                  icon="folderPlus"
-                  label="新建分组"
-                  disabled={mutating || cloudOffline}
-                  onClick={() => {
-                    setGroupNameInput('');
-                    setGroupFormError(null);
-                    setGroupModalMode({ kind: 'create' });
+              {canBrowseWorkspace ? (
+                <SegmentedControl<'topics' | 'files'>
+                  ariaLabel="右侧面板"
+                  value={rightPanelTab}
+                  onChange={(next) => {
+                    setRightPanelTab(next);
+                    if (next === 'files' && manageMode) {
+                      onManageModeChange(false);
+                    }
                   }}
+                  options={[
+                    {
+                      value: 'topics',
+                      ariaLabel: '话题',
+                      title: '话题',
+                      label: <Icon name="history" size={14} />,
+                    },
+                    {
+                      value: 'files',
+                      ariaLabel: '工作区文件',
+                      title: '工作区文件',
+                      label: <Icon name="folder" size={14} />,
+                    },
+                  ]}
                 />
-                <IconButton
-                  size="sm"
-                  icon="checkSquare"
-                  label={manageMode ? '退出管理' : '管理话题'}
-                  active={manageMode}
-                  disabled={cloudOffline}
-                  onClick={() => onManageModeChange(!manageMode)}
-                />
-                <IconButton
-                  size="sm"
-                  icon="plus"
-                  label="新建话题"
-                  disabled={cloudOffline}
-                  onClick={onNewConversation}
-                />
+              ) : (
+                <span>话题</span>
+              )}
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
+                {rightPanelTab === 'files' && canBrowseWorkspace ? (
+                  <IconButton
+                    size="sm"
+                    icon="refresh"
+                    label="刷新工作区文件"
+                    disabled={cloudOffline}
+                    onClick={() => setFilesRefreshToken((n) => n + 1)}
+                  />
+                ) : (
+                  <>
+                    <IconButton
+                      size="sm"
+                      icon="folderPlus"
+                      label="新建分组"
+                      disabled={mutating || cloudOffline}
+                      onClick={() => {
+                        setGroupNameInput('');
+                        setGroupFormError(null);
+                        setGroupModalMode({ kind: 'create' });
+                      }}
+                    />
+                    <IconButton
+                      size="sm"
+                      icon="checkSquare"
+                      label={manageMode ? '退出管理' : '管理话题'}
+                      active={manageMode}
+                      disabled={cloudOffline}
+                      onClick={() => onManageModeChange(!manageMode)}
+                    />
+                    <IconButton
+                      size="sm"
+                      icon="plus"
+                      label="新建话题"
+                      disabled={cloudOffline}
+                      onClick={onNewConversation}
+                    />
+                  </>
+                )}
                 {drawerOpen ? (
                   <IconButton
                     size="sm"
                     icon="close"
-                    label="关闭话题栏"
+                    label={
+                      rightPanelTab === 'files' && canBrowseWorkspace
+                        ? '关闭工作区栏'
+                        : '关闭话题栏'
+                    }
                     className="wb-mobile-only"
                     onClick={onCloseDrawer}
                   />
@@ -945,21 +1019,36 @@ export function ConversationSidebar({
                 </div>
               ) : null}
 
-              {!cloudOffline ? (
-                <div className="wb-search-wrap">
-                  <Icon name="search" size={14} className="wb-search-icon" />
-                  <input
-                    type="search"
-                    className="wb-search-input"
-                    aria-label="搜索话题"
-                    placeholder="搜索话题"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
+              {rightPanelTab === 'files' && canBrowseWorkspace ? (
+                <div className="ws-tree-wrap">
+                  <WorkspaceFileTree
+                    gateway={gateway}
+                    scope={reqScope}
+                    isDesktop={isDesktop}
+                    cloudConnectionState={cloudConnectionState}
+                    connectionEpoch={connectionEpoch}
+                    selectedPath={viewingEntry?.path ?? null}
+                    refreshToken={filesRefreshToken}
+                    onSelectEntry={setViewingEntry}
                   />
                 </div>
-              ) : null}
+              ) : (
+                <>
+                  {!cloudOffline ? (
+                    <div className="wb-search-wrap">
+                      <Icon name="search" size={14} className="wb-search-icon" />
+                      <input
+                        type="search"
+                        className="wb-search-input"
+                        aria-label="搜索话题"
+                        placeholder="搜索话题"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                      />
+                    </div>
+                  ) : null}
 
-            {manageMode && !cloudOffline ? (
+                  {manageMode && !cloudOffline ? (
               <div className="wb-manage-bar" role="region" aria-label="批量管理">
                 <span className="wb-manage-bar__count">
                   <span aria-hidden="true">{selectedIds.size}</span>
@@ -1449,6 +1538,8 @@ export function ConversationSidebar({
                 })
               )}
               </div>
+                </>
+              )}
             </div>
             <div className="wb-history__foot">
               {isDesktop ? (
@@ -1717,6 +1808,13 @@ export function ConversationSidebar({
         danger={false}
         busy={forcingConflict}
         onConfirm={handleConfirmConflictForce}
+      />
+
+      <WorkspaceFileViewer
+        entry={viewingEntry}
+        gateway={gateway}
+        scope={reqScope}
+        onClose={() => setViewingEntry(null)}
       />
     </>
   );

@@ -1,0 +1,342 @@
+/* Workspace File Tree (Right Sidebar P1) */
+.ws-tree-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.ws-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 2px 0;
+}
+
+.ws-tree-state {
+  flex: 1;
+  min-height: 160px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px 8px;
+}
+
+.ws-tree-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 30px;
+  padding-right: 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  font-weight: 450;
+  color: var(--text-primary);
+  text-align: left;
+  transition: background-color var(--duration-fast) var(--ease-apple),
+    color var(--duration-fast) var(--ease-apple);
+}
+
+.ws-tree-row:hover {
+  background: var(--bg-hover);
+}
+
+.ws-tree-row--active,
+.ws-tree-row--active:hover {
+  background: var(--accent-soft);
+  font-weight: 600;
+}
+
+.ws-tree-row--active::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: calc(50% - 7px);
+  width: 2.5px;
+  height: 14px;
+  border-radius: 2px;
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.ws-tree-row--dot .ws-tree-label {
+  color: var(--text-secondary);
+}
+
+.ws-tree-row--muted {
+  color: var(--text-tertiary);
+}
+
+.ws-tree-row--muted .ws-tree-label {
+  color: var(--text-tertiary);
+}
+
+.ws-tree-chevron {
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  color: var(--text-tertiary);
+  transition: transform var(--duration-fast) var(--ease-apple);
+}
+
+.ws-tree-chevron--open {
+  transform: rotate(90deg);
+}
+
+.ws-tree-chevron-spacer {
+  width: 12px;
+  flex: none;
+}
+
+.ws-tree-icon {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.ws-tree-icon--dir {
+  color: var(--accent);
+}
+
+.ws-tree-row--muted .ws-tree-icon {
+  color: var(--text-tertiary);
+}
+
+.ws-tree-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-tree-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding-right: 8px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+
+.ws-tree-meta--error {
+  justify-content: space-between;
+  color: var(--danger);
+}
+
+.ws-tree-meta__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Workspace Document Viewer Modal (Apple HIG Layer 3) */
+.ui-dialog-content.ws-viewer-dialog {
+  width: min(920px, 90vw);
+  height: min(84dvh, 820px);
+  max-height: min(88dvh, 860px);
+  padding: 0;
+}
+
+.ui-dialog-content.ws-viewer-dialog--fullscreen {
+  width: 100vw;
+  height: 100dvh;
+  max-height: 100dvh;
+  border-radius: 0;
+  border-width: 0;
+}
+
+.ws-viewer__head {
+  height: var(--panel-head-height);
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 14px 0 16px;
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.ws-viewer__title-wrap {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ws-viewer__title-icon {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.ws-viewer__title {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ws-viewer__dirty-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+
+.ws-viewer__actions {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ws-viewer__actions .ui-segmented {
+  margin-right: 4px;
+}
+
+.ws-viewer__actions .ui-segmented__item {
+  padding: 4px 8px;
+}
+
+.ws-viewer__banner {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 16px 0;
+}
+
+.ws-viewer__conflict-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.ws-viewer__body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-surface);
+}
+
+.ws-viewer__center {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.ws-viewer__prose-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 22px 28px;
+}
+
+.ws-viewer__prose-inner {
+  max-width: var(--readable-max-width);
+  margin: 0 auto;
+}
+
+.ws-viewer__editor {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  border: 0;
+  outline: none;
+  resize: none;
+  padding: 18px 20px;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.62;
+  tab-size: 2;
+  overflow: auto;
+}
+
+.ws-viewer__foot {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  height: 28px;
+  padding: 0 16px;
+  border-top: 1px solid var(--border-hairline);
+  background: var(--bg-surface-secondary);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+}
+
+.ws-viewer__foot-dirty {
+  margin-left: auto;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.ws-viewer__unsupported-meta {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text-tertiary);
+}
+
+@media (max-width: 767px) {
+  .ui-dialog-content.ws-viewer-dialog {
+    width: 100vw;
+    height: 100dvh;
+    max-height: 100dvh;
+    border-radius: 0;
+    border-width: 0;
+  }
+
+  .ws-viewer__expand-btn {
+    display: none;
+  }
+
+  .ws-viewer__head {
+    padding: 0 10px 0 12px;
+    gap: 8px;
+  }
+
+  .ws-viewer__actions {
+    gap: 2px;
+  }
+
+  .ws-viewer__prose-scroll {
+    padding: 16px;
+  }
+
+  .ws-viewer__editor {
+    padding: 14px;
+    font-size: 14px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ws-tree-row,
+  .ws-tree-chevron {
+    transition: none;
+  }
+}

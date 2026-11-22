@@ -131,10 +131,12 @@ const MarkdownProse = memo(function MarkdownProse({
   markdown,
   isStreaming = false,
   collapsePrefix = 'prose',
+  defaultHtmlPreview,
 }: {
   markdown: string;
   isStreaming?: boolean;
   collapsePrefix?: string;
+  defaultHtmlPreview?: boolean;
 }) {
   const { settings } = useApp();
   const normalized = useMemo(
@@ -178,6 +180,7 @@ const MarkdownProse = memo(function MarkdownProse({
                   code={String(p['data-code-raw'] ?? '')}
                   isClosed={p['data-closed'] === 'true'}
                   collapseKey={String(p['data-collapse-key'] ?? `${collapsePrefix}:code`)}
+                  defaultHtmlPreview={defaultHtmlPreview}
                 />
               );
             }
@@ -236,6 +239,80 @@ const MarkdownProse = memo(function MarkdownProse({
         {normalized}
       </Markdown>
     </div>
+  );
+});
+
+export const MarkdownDocument = memo(function MarkdownDocument({
+  content,
+  collapsePrefix,
+  isStreaming = false,
+  visualHtmlRender,
+  defaultHtmlPreview,
+}: {
+  content: string;
+  collapsePrefix: string;
+  isStreaming?: boolean;
+  visualHtmlRender?: boolean;
+  defaultHtmlPreview?: boolean;
+}) {
+  const { settings } = useApp();
+  const enableVisualHtml = visualHtmlRender ?? settings.visualHtmlRender;
+  const segs = splitMarkdownAndRawHtml(content, { isStreaming });
+
+  return (
+    <>
+      {segs.map((seg, segIndex) => {
+        const segKey = `${collapsePrefix}:${segIndex}`;
+        if (seg.kind === 'prose') {
+          return (
+            <MarkdownProse
+              key={segKey}
+              markdown={seg.markdown}
+              isStreaming={isStreaming}
+              collapsePrefix={segKey}
+              defaultHtmlPreview={defaultHtmlPreview}
+            />
+          );
+        }
+        if (seg.kind === 'code') {
+          return (
+            <CodeBlock
+              key={segKey}
+              language={seg.language}
+              code={seg.code}
+              isClosed={seg.isClosed}
+              collapseKey={segKey}
+              defaultHtmlPreview={defaultHtmlPreview}
+            />
+          );
+        }
+        if (enableVisualHtml) {
+          if (seg.isClosed) {
+            return (
+              <SandboxedIframe
+                key={segKey}
+                html={seg.html}
+                seamless
+                minHeight={24}
+              />
+            );
+          }
+          return (
+            <pre key={segKey} className="code-pre code-pre--streaming">
+              <code>{seg.html}</code>
+            </pre>
+          );
+        }
+        return (
+          <RawHtmlCodeCard
+            key={segKey}
+            html={seg.html}
+            isClosed={seg.isClosed}
+            collapseKey={segKey}
+          />
+        );
+      })}
+    </>
   );
 });
 
@@ -474,56 +551,15 @@ export const ContentRenderer = memo(function ContentRenderer({
         return;
       }
 
-      const segments = splitMarkdownAndRawHtml(text, { isStreaming });
-      segments.forEach((seg, segIdx) => {
-        const segKey = `${baseKey}:${segIdx}`;
-        if (seg.kind === 'prose') {
-          nodes.push(
-            <MarkdownProse
-              key={segKey}
-              markdown={seg.markdown}
-              isStreaming={isStreaming}
-              collapsePrefix={segKey}
-            />,
-          );
-        } else if (seg.kind === 'code') {
-          nodes.push(
-            <CodeBlock
-              key={segKey}
-              language={seg.language}
-              code={seg.code}
-              isClosed={seg.isClosed}
-              collapseKey={segKey}
-            />,
-          );
-        } else if (settings.visualHtmlRender) {
-          if (seg.isClosed) {
-            nodes.push(
-              <SandboxedIframe
-                key={segKey}
-                html={seg.html}
-                seamless
-                minHeight={24}
-              />,
-            );
-          } else {
-            nodes.push(
-              <pre key={segKey} className="code-pre code-pre--streaming">
-                <code>{seg.html}</code>
-              </pre>,
-            );
-          }
-        } else {
-          nodes.push(
-            <RawHtmlCodeCard
-              key={segKey}
-              html={seg.html}
-              isClosed={seg.isClosed}
-              collapseKey={segKey}
-            />,
-          );
-        }
-      });
+      nodes.push(
+        <MarkdownDocument
+          key={baseKey}
+          content={text}
+          collapsePrefix={baseKey}
+          isStreaming={isStreaming}
+          visualHtmlRender={settings.visualHtmlRender}
+        />,
+      );
       return;
     }
 

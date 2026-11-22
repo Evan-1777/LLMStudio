@@ -15,6 +15,7 @@ const RAW_HTML_BLOCK_TAGS = new Set([
   'svg',
   'form',
   'style',
+  'details',
 ]);
 
 const VOID_HTML_TAGS = new Set([

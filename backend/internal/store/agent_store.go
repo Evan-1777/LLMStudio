@@ -13,32 +13,80 @@ type AgentStore struct{ db *sql.DB }
 
 func NewAgentStore(db *sql.DB) *AgentStore { return &AgentStore{db} }
 
-func (s *AgentStore) AgentSettings(ctx context.Context) (string, []string, error) {
-	var path, raw string
-	if err := s.db.QueryRowContext(ctx, "SELECT default_directory, allowed_tools_json FROM agent_settings WHERE id = 1").Scan(&path, &raw); err != nil {
-		return "", nil, err
+// AgentPolicyRecord represents the persisted execution-endpoint Agent policy.
+type AgentPolicyRecord struct {
+	DefaultDirectory     string
+	AllowedTools         []string
+	InjectAgentMD        bool
+	MarkdownVisualRender bool
+}
+
+// AgentPolicyPatch updates selected Agent policy fields while leaving nil fields unchanged.
+type AgentPolicyPatch struct {
+	DefaultDirectory     *string
+	AllowedTools         *[]string
+	InjectAgentMD        *bool
+	MarkdownVisualRender *bool
+}
+
+func (s *AgentStore) AgentSettings(ctx context.Context) (AgentPolicyRecord, error) {
+	var (
+		path, raw              string
+		injectInt, visualInt   int
+	)
+	if err := s.db.QueryRowContext(
+		ctx,
+		"SELECT default_directory, allowed_tools_json, inject_agent_md, markdown_visual_render FROM agent_settings WHERE id = 1",
+	).Scan(&path, &raw, &injectInt, &visualInt); err != nil {
+		return AgentPolicyRecord{}, err
 	}
 	tools := []string{}
 	if err := json.Unmarshal([]byte(raw), &tools); err != nil {
-		return "", nil, err
+		return AgentPolicyRecord{}, err
 	}
 	if tools == nil {
-		return "", nil, errors.New("invalid agent allowlist")
+		return AgentPolicyRecord{}, errors.New("invalid agent allowlist")
 	}
-	return path, tools, nil
+	return AgentPolicyRecord{
+		DefaultDirectory:     path,
+		AllowedTools:         tools,
+		InjectAgentMD:        injectInt != 0,
+		MarkdownVisualRender: visualInt != 0,
+	}, nil
 }
 
-func (s *AgentStore) UpdateAgentSettings(ctx context.Context, directory *string, tools *[]string) error {
+func (s *AgentStore) UpdateAgentSettings(ctx context.Context, patch AgentPolicyPatch) error {
 	var raw *string
-	if tools != nil {
-		data, err := json.Marshal(*tools)
+	if patch.AllowedTools != nil {
+		data, err := json.Marshal(*patch.AllowedTools)
 		if err != nil {
 			return err
 		}
 		text := string(data)
 		raw = &text
 	}
-	_, err := s.db.ExecContext(ctx, "UPDATE agent_settings SET default_directory = COALESCE(?, default_directory), allowed_tools_json = COALESCE(?, allowed_tools_json) WHERE id = 1", directory, raw)
+	var injectInt, visualInt *int
+	if patch.InjectAgentMD != nil {
+		v := boolToInt(*patch.InjectAgentMD)
+		injectInt = &v
+	}
+	if patch.MarkdownVisualRender != nil {
+		v := boolToInt(*patch.MarkdownVisualRender)
+		visualInt = &v
+	}
+	_, err := s.db.ExecContext(
+		ctx,
+		`UPDATE agent_settings SET
+			default_directory = COALESCE(?, default_directory),
+			allowed_tools_json = COALESCE(?, allowed_tools_json),
+			inject_agent_md = COALESCE(?, inject_agent_md),
+			markdown_visual_render = COALESCE(?, markdown_visual_render)
+		WHERE id = 1`,
+		patch.DefaultDirectory,
+		raw,
+		injectInt,
+		visualInt,
+	)
 	return err
 }
 

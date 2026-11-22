@@ -8,7 +8,7 @@ import { AgentDirectoryControl } from '../agent/AgentDirectoryControl';
 
 const TOOL_LABELS = {
   read: '读取文件', ls: '列出目录', find: '查找文件', grep: '搜索文本',
-  write: '写入文件', edit: '编辑文件', bash: '执行命令',
+  write: '写入文件', edit: '编辑文件', bash: '执行命令', skill: '调用技能',
 } as const;
 
 export function AgentPage() {
@@ -71,7 +71,7 @@ function AgentEndpointSettings({ gateway, scope }: { gateway: GatewayClient; sco
       if (!ctrl.signal.aborted) setSettings(next);
     } catch (err) {
       if (signal) throw err;
-      if (!ctrl.signal.aborted) setError('无法保存工具授权');
+      if (!ctrl.signal.aborted) setError('无法保存 Agent 设置');
     } finally {
       signal?.removeEventListener('abort', abort);
       mutation.current = null;
@@ -85,8 +85,11 @@ function AgentEndpointSettings({ gateway, scope }: { gateway: GatewayClient; sco
       : <LoadingSpinner label="读取 Agent 设置" />;
   }
 
+  const skills = settings.skills ?? [];
+
   return (
     <>
+      {error && <ErrorBanner message={error} />}
       <section>
         <h3 className="st-subhead">工作目录</h3>
         <div className="st-group">
@@ -99,8 +102,24 @@ function AgentEndpointSettings({ gateway, scope }: { gateway: GatewayClient; sco
         </div>
       </section>
       <section>
+        <h3 className="st-subhead">工作区与上下文</h3>
+        <div className="st-group" aria-busy={busy || undefined}>
+          <div className="st-row--inline">
+            <span className="st-row__label--plain">注入目录 AGENT.md</span>
+            <Switch label="注入目录 AGENT.md" checked={settings.injectAgentMd} disabled={busy}
+              onCheckedChange={(next) => void save({ injectAgentMd: next })} />
+          </div>
+          {scope !== 'local' && (
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">工作区 Markdown 可视化渲染</span>
+              <Switch label="工作区 Markdown 可视化渲染" checked={settings.markdownVisualRender} disabled={busy}
+                onCheckedChange={(next) => void save({ markdownVisualRender: next })} />
+            </div>
+          )}
+        </div>
+      </section>
+      <section>
         <h3 className="st-subhead">工具授权</h3>
-        {error && <ErrorBanner message={error} />}
         <div className="st-group" aria-busy={busy || undefined}>
           {Object.entries(TOOL_LABELS).map(([tool, label]) => {
             const allowed = settings.allowedTools.includes(tool);
@@ -118,6 +137,21 @@ function AgentEndpointSettings({ gateway, scope }: { gateway: GatewayClient; sco
           })}
         </div>
       </section>
+      {skills.length > 0 && (
+        <section>
+          <h3 className="st-subhead">目录技能</h3>
+          <div className="st-group">
+            {skills.map((skill) => (
+              <div className="st-row--inline st-agent-skill" key={skill.path}>
+                <span className="st-agent-skill__name" title={skill.path}>{skill.name}</span>
+                {skill.description && (
+                  <span className="st-agent-skill__desc" title={skill.description}>{skill.description}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
     </>
   );
 }

@@ -32,7 +32,11 @@ func (s *Server) dispatchAgent(local http.HandlerFunc) http.HandlerFunc {
 		if len(q) > 0 {
 			target += "?" + q.Encode()
 		}
-		resp, err := s.cfg.Cloud.proxyRequest(ctx, r.Method, target, r.Header, http.MaxBytesReader(w, r.Body, 64<<10), r.ContentLength)
+		maxBody := int64(64 << 10)
+		if r.Method == http.MethodPut && r.URL.Path == "/api/v1/agent/workspace/file" {
+			maxBody = 3 << 20
+		}
+		resp, err := s.cfg.Cloud.proxyRequest(ctx, r.Method, target, r.Header, http.MaxBytesReader(w, r.Body, maxBody), r.ContentLength)
 		if err != nil {
 			writeDesktopError(w, err)
 			return

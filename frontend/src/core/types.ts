@@ -366,15 +366,66 @@ export interface AgentDirectoryListing {
   directories: string[];
 }
 
+export interface AgentSkillSummary {
+  name: string;
+  description: string;
+  path: string;
+}
+
 export interface AgentSettings {
   directory: AgentDirectory;
   allowedTools: string[];
   availableTools: string[];
+  injectAgentMd: boolean;
+  markdownVisualRender: boolean;
+  skills: AgentSkillSummary[];
 }
 
 export interface AgentSettingsPatch {
   defaultDirectory?: string;
   allowedTools?: string[];
+  injectAgentMd?: boolean;
+  markdownVisualRender?: boolean;
+}
+
+export type WorkspacePreviewKind = 'markdown' | 'text' | 'unsupported';
+
+export interface WorkspaceEntry {
+  name: string;
+  path: string;
+  kind: 'dir' | 'file';
+  size: number;
+  modTime: string;
+  previewKind?: WorkspacePreviewKind;
+  editable: boolean;
+  unsupportedReason?: 'image' | 'binary' | string;
+}
+
+export interface WorkspaceEntriesResponse {
+  path: string;
+  entries: WorkspaceEntry[];
+  truncated: boolean;
+}
+
+export interface WorkspaceFileDocument {
+  path: string;
+  name: string;
+  size: number;
+  modTime: string;
+  previewKind: WorkspacePreviewKind;
+  editable: boolean;
+  etag: string;
+  content: string;
+}
+
+export interface WorkspaceFileWriteResult {
+  path: string;
+  name: string;
+  size: number;
+  modTime: string;
+  previewKind: WorkspacePreviewKind;
+  editable: boolean;
+  etag: string;
 }
 
 export type ConversationMode = 'chat' | 'agent';

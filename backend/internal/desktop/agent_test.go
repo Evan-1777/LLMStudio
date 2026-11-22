@@ -275,3 +275,107 @@ func TestAgentExecutionScopeAndTransfer(t *testing.T) {
 	}
 	read(stream(desktopSrv.URL, facade.Token(), "same", "?scope=cloud", "try-write"), 401)
 }
+
+func TestDesktopCloudWorkspaceFileBrowserAndLargeSaveProxy(t *testing.T) {
+	ctx := t.Context()
+	gatewayDir := t.TempDir()
+	largeText := strings.Repeat("line-of-text\n", 10000) // ~130 KiB > 64 KiB old limit
+	if err := os.WriteFile(filepath.Join(gatewayDir, "notes.md"), []byte("# Initial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gatewayDir, "pic.png"), []byte("png"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ls, err := OpenDesktopStore(ctx, filepath.Join(t.TempDir(), "desktop.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ls.Close()
+
+	cloudRuntime := agent.NewGateway(store.NewAgentStore(db), gatewayDir, true)
+	cloudSrv := httptest.NewServer(httpapi.NewRouter(httpapi.RouterDeps{
+		Config:       config.Config{AccessToken: "gw-tok"},
+		AgentRuntime: cloudRuntime,
+	}))
+	defer cloudSrv.Close()
+
+	cloud := NewCloudClient(cloudSrv.URL, "gw-tok")
+	facade, err := NewServer(ServerConfig{Store: ls, Cloud: cloud})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desktopSrv := httptest.NewServer(facade.Handler())
+	defer desktopSrv.Close()
+
+	doReq := func(method, path, body string) (int, []byte) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(ctx, method, desktopSrv.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+facade.Token())
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, data
+	}
+
+	// Local scope does not expose gateway workspace file browser.
+	if st, _ := doReq("GET", "/api/v1/agent/workspace/entries?scope=local", ""); st != http.StatusNotFound {
+		t.Fatalf("expected 404 for local workspace entries, got %d", st)
+	}
+
+	// Cloud scope lists entries and reads Markdown file.
+	if st, body := doReq("GET", "/api/v1/agent/workspace/entries?scope=cloud", ""); st != http.StatusOK || !strings.Contains(string(body), "notes.md") {
+		t.Fatalf("cloud entries status=%d body=%s", st, body)
+	}
+	st, fileBody := doReq("GET", "/api/v1/agent/workspace/file?scope=cloud&path=notes.md", "")
+	if st != http.StatusOK {
+		t.Fatalf("cloud file status=%d body=%s", st, fileBody)
+	}
+	var doc agent.WorkspaceFileDocument
+	if err := json.Unmarshal(fileBody, &doc); err != nil {
+		t.Fatal(err)
+	}
+
+	// Saving >64 KiB file through desktop cloud proxy succeeds.
+	payload, _ := json.Marshal(map[string]string{
+		"path":         "notes.md",
+		"content":      largeText,
+		"expectedEtag": doc.ETag,
+	})
+	if st, saveBody := doReq("PUT", "/api/v1/agent/workspace/file?scope=cloud", string(payload)); st != http.StatusOK {
+		t.Fatalf("large save status=%d body=%s", st, saveBody)
+	}
+	disk, err := os.ReadFile(filepath.Join(gatewayDir, "notes.md"))
+	if err != nil || string(disk) != largeText {
+		t.Fatalf("disk content mismatch len=%d want=%d err=%v", len(disk), len(largeText), err)
+	}
+
+	// Stale ETag returns 409 CONFLICT through desktop proxy.
+	conflictPayload, _ := json.Marshal(map[string]string{
+		"path":         "notes.md",
+		"content":      "stale",
+		"expectedEtag": doc.ETag,
+	})
+	if st, _ := doReq("PUT", "/api/v1/agent/workspace/file?scope=cloud", string(conflictPayload)); st != http.StatusConflict {
+		t.Fatalf("expected 409 conflict, got %d", st)
+	}
+
+	// Image preview returns 400.
+	if st, body := doReq("GET", "/api/v1/agent/workspace/file?scope=cloud&path=pic.png", ""); st != http.StatusBadRequest || !strings.Contains(string(body), "图片暂不支持预览") {
+		t.Fatalf("expected 400 image error, got %d %s", st, body)
+	}
+}

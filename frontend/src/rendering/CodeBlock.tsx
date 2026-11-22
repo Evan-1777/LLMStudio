@@ -10,11 +10,13 @@ export function CodeBlock({
   code,
   isClosed,
   collapseKey,
+  defaultHtmlPreview,
 }: {
   language: string;
   code: string;
   isClosed: boolean;
   collapseKey: string;
+  defaultHtmlPreview?: boolean;
 }) {
   const { settings, toast } = useApp();
   const [copied, setCopied] = useState(false);
@@ -26,6 +28,7 @@ export function CodeBlock({
         isClosed={isClosed}
         collapseKey={collapseKey}
         title="HTML"
+        defaultHtmlPreview={defaultHtmlPreview}
       />
     );
   }

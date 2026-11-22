@@ -97,12 +97,12 @@ export function defaultAttachmentName(file: Pick<File, 'name' | 'type'>): string
 }
 
 function clipboardFileKey(file: File): string {
-  return `${file.name}\u0000${file.size}\u0000${file.lastModified}\u0000${file.type}`;
+  return `${defaultAttachmentName(file)}\u0000${file.size}\u0000${file.type.toLowerCase()}`;
 }
 
 // collectClipboardImageFiles reads image files from one paste event, preferring
-// clipboardData.items and falling back to clipboardData.files without appending
-// the same file twice.
+// clipboardData.items (when any file item is present) and falling back to
+// clipboardData.files only when items carries no file entries.
 export function collectClipboardImageFiles(data: DataTransfer | null): File[] {
   if (!data) return [];
   const images: File[] = [];
@@ -114,9 +114,12 @@ export function collectClipboardImageFiles(data: DataTransfer | null): File[] {
     seen.add(key);
     images.push(file);
   };
-  for (const item of Array.from(data.items ?? [])) {
-    if (item.kind !== 'file') continue;
-    push(item.getAsFile());
+  const fileItems = Array.from(data.items ?? []).filter((item) => item.kind === 'file');
+  if (fileItems.length > 0) {
+    for (const item of fileItems) {
+      push(item.getAsFile());
+    }
+    return images;
   }
   for (const file of Array.from(data.files ?? [])) {
     push(file);

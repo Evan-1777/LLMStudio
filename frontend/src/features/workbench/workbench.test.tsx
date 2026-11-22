@@ -363,24 +363,55 @@ describe('Workbench flows and attachments', () => {
       }),
     ).toBe(false);
 
-    // Clipboard collection prefers items, falls back to files, and never stacks
-    // the same file twice within one paste.
-    const itemImage = new File(['a'], '', { type: 'image/png' });
-    const fileImage = new File(['b'], 'second.webp', { type: 'image/webp' });
+    // Clipboard collection strictly uses items when any file item is present
+    // (avoiding Chromium/WebView2 duplicate File instances across items/files
+    // with 1ms lastModified drift), falls back to files only when items has
+    // no file entries, deduplicates within items, and preserves multiple distinct images.
+    const itemImage = new File(['a'], '', { type: 'image/png', lastModified: 1000 });
+    const fileImage = new File(['b'], 'second.webp', { type: 'image/webp', lastModified: 1000 });
+    const driftedDupFile = new File(['a'], '', { type: 'image/png', lastModified: 1001 });
     const clipboard = {
       items: [
         { kind: 'file', type: 'image/png', getAsFile: () => itemImage },
         { kind: 'string', type: 'text/plain', getAsFile: () => null },
         new File(['t'], 'notes.txt', { type: 'text/plain' }),
       ],
-      files: [itemImage, fileImage],
+      files: [driftedDupFile, fileImage],
       types: ['Files'],
       getData: () => '',
     } as unknown as DataTransfer;
-    expect(collectClipboardImageFiles(clipboard)).toEqual([itemImage, fileImage]);
+    expect(collectClipboardImageFiles(clipboard)).toEqual([itemImage]);
+
+    const itemDupSameName = new File(['a'], '', { type: 'image/png', lastModified: 2001 });
+    expect(
+      collectClipboardImageFiles({
+        items: [
+          { kind: 'file', type: 'image/png', getAsFile: () => itemImage },
+          { kind: 'file', type: 'image/png', getAsFile: () => itemDupSameName },
+        ],
+        files: [],
+        types: ['Files'],
+        getData: () => '',
+      } as unknown as DataTransfer),
+    ).toEqual([itemImage]);
+
     expect(
       collectClipboardImageFiles({ ...clipboard, items: [] } as unknown as DataTransfer),
-    ).toEqual([itemImage, fileImage]);
+    ).toEqual([driftedDupFile, fileImage]);
+
+    const multiA = new File(['a'], 'a.png', { type: 'image/png', lastModified: 1000 });
+    const multiB = new File(['b'], 'b.webp', { type: 'image/webp', lastModified: 1000 });
+    expect(
+      collectClipboardImageFiles({
+        items: [
+          { kind: 'file', type: 'image/png', getAsFile: () => multiA },
+          { kind: 'file', type: 'image/webp', getAsFile: () => multiB },
+        ],
+        files: [multiA, multiB],
+        types: ['Files'],
+        getData: () => '',
+      } as unknown as DataTransfer),
+    ).toEqual([multiA, multiB]);
     expect(collectClipboardImageFiles(null)).toEqual([]);
     expect(clipboardHasPlainText(clipboard)).toBe(false);
     expect(

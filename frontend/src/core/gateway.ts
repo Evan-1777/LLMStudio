@@ -58,6 +58,9 @@ import {
   type StreamChatInput,
   type ToolCallExecutionInput,
   type TopicScope,
+  type WorkspaceEntriesResponse,
+  type WorkspaceFileDocument,
+  type WorkspaceFileWriteResult,
 } from './types';
 
 function withScopeQuery(path: string, scope?: TopicScope): string {
@@ -790,6 +793,22 @@ export class GatewayClient {
 
   setAgentTopicDirectory(id: string, path: string, scope?: TopicScope, signal?: AbortSignal): Promise<AgentDirectory> {
     return this.requestJson('PUT', withScopeQuery(`/api/v1/agent/conversations/${encodeURIComponent(id)}/directory`, scope), { body: { path }, signal });
+  }
+
+  listWorkspaceEntries(path = '', scope?: TopicScope, signal?: AbortSignal): Promise<WorkspaceEntriesResponse> {
+    return this.requestJson('GET', withScopeQuery(`/api/v1/agent/workspace/entries?path=${encodeURIComponent(path)}`, scope), { signal });
+  }
+
+  readWorkspaceFile(path: string, scope?: TopicScope, signal?: AbortSignal): Promise<WorkspaceFileDocument> {
+    return this.requestJson('GET', withScopeQuery(`/api/v1/agent/workspace/file?path=${encodeURIComponent(path)}`, scope), { signal });
+  }
+
+  writeWorkspaceFile(
+    input: { path: string; content: string; expectedEtag?: string },
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceFileWriteResult> {
+    return this.requestJson('PUT', withScopeQuery('/api/v1/agent/workspace/file', scope), { body: input, signal });
   }
 
   createConversation(

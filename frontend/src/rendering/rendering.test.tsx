@@ -5,7 +5,7 @@ import { AppProvider } from '../app/AppProvider';
 import { SETTINGS_STORAGE_KEY, defaultSettings } from '../core/settings';
 import type { ContentBlock } from '../core/types';
 import { CollapseStateProvider } from './CollapsibleBlock';
-import { ContentRenderer } from './ContentRenderer';
+import { ContentRenderer, MarkdownDocument } from './ContentRenderer';
 import { SandboxedIframe, buildSandboxedSrcDoc } from './HtmlPreview';
 
 describe('ContentRenderer and HTML sandbox', () => {
@@ -783,5 +783,58 @@ describe('ContentRenderer and HTML sandbox', () => {
     );
     expect(secContainer.querySelector('a[href^="javascript:"]')).toBeNull();
     expect(screen.getByText('HTML · 输出中')).toBeInTheDocument();
+  });
+
+  it('renders MarkdownDocument with explicit visualHtmlRender and defaultHtmlPreview overrides for div, svg, details, and fenced html', () => {
+    const doc = [
+      '# Workspace Doc',
+      '',
+      '<div>visual-div</div>',
+      '',
+      '<svg width="16" height="16"><circle cx="8" cy="8" r="6"/></svg>',
+      '',
+      '<details><summary>Expandable</summary><p>Hidden body</p></details>',
+      '',
+      '```html',
+      '<section>fenced-visual</section>',
+      '```',
+    ].join('\n');
+
+    const { rerender } = render(
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <MarkdownDocument
+            content={doc}
+            collapsePrefix="ws-doc"
+            visualHtmlRender={false}
+            defaultHtmlPreview={false}
+          />
+        </CollapseStateProvider>
+      </AppProvider>,
+    );
+
+    expect(screen.getByRole('heading', { name: 'Workspace Doc' })).toBeInTheDocument();
+    expect(screen.queryByTitle('HTML 预览')).not.toBeInTheDocument();
+    expect(screen.getByText('<div>visual-div</div>')).toBeInTheDocument();
+    expect(screen.getByText('<section>fenced-visual</section>')).toBeInTheDocument();
+
+    rerender(
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <MarkdownDocument
+            content={doc}
+            collapsePrefix="ws-doc-on"
+            visualHtmlRender
+            defaultHtmlPreview
+          />
+        </CollapseStateProvider>
+      </AppProvider>,
+    );
+
+    const frames = screen.getAllByTitle('HTML 预览');
+    expect(frames).toHaveLength(4);
+    for (const frame of frames) {
+      expect(frame).toHaveAttribute('sandbox', 'allow-scripts');
+    }
   });
 });

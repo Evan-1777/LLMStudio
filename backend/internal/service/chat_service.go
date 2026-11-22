@@ -735,9 +735,17 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	model := up.model
 	var nativeTools []plugin.ChatTool
 	if conv.Mode == domain.ConversationModeAgent {
-		nativeTools, err = s.agent.Tools(ctx, conv.ID)
+		var agentSuffix string
+		agentSuffix, nativeTools, err = s.agent.PrepareContext(ctx, conv.ID)
 		if err != nil {
 			return preparedUpstream{}, err
+		}
+		if agentSuffix != "" {
+			if strings.TrimSpace(up.systemPrompt) == "" {
+				up.systemPrompt = agentSuffix
+			} else {
+				up.systemPrompt = up.systemPrompt + "\n\n" + agentSuffix
+			}
 		}
 	}
 

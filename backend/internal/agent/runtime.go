@@ -11,6 +11,7 @@ import (
 
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/plugin"
+	"llmstudio/backend/internal/store"
 )
 
 const (
@@ -20,8 +21,8 @@ const (
 )
 
 type PolicyStore interface {
-	AgentSettings(context.Context) (string, []string, error)
-	UpdateAgentSettings(context.Context, *string, *[]string) error
+	AgentSettings(context.Context) (store.AgentPolicyRecord, error)
+	UpdateAgentSettings(context.Context, store.AgentPolicyPatch) error
 	AgentTopic(context.Context, string) (string, string, error)
 	SetAgentDirectory(context.Context, string, string) error
 }
@@ -50,14 +51,19 @@ type Directory struct {
 }
 
 type Settings struct {
-	Directory      Directory `json:"directory"`
-	AllowedTools   []string  `json:"allowedTools"`
-	AvailableTools []string  `json:"availableTools"`
+	Directory            Directory      `json:"directory"`
+	AllowedTools         []string       `json:"allowedTools"`
+	AvailableTools       []string       `json:"availableTools"`
+	InjectAgentMD        bool           `json:"injectAgentMd"`
+	MarkdownVisualRender bool           `json:"markdownVisualRender"`
+	Skills               []SkillSummary `json:"skills"`
 }
 
 type SettingsPatch struct {
-	DefaultDirectory *string   `json:"defaultDirectory"`
-	AllowedTools     *[]string `json:"allowedTools"`
+	DefaultDirectory     *string   `json:"defaultDirectory"`
+	AllowedTools         *[]string `json:"allowedTools"`
+	InjectAgentMD        *bool     `json:"injectAgentMd"`
+	MarkdownVisualRender *bool     `json:"markdownVisualRender"`
 }
 
 type DirectoryListing struct {
@@ -135,14 +141,24 @@ func definitions() []plugin.ChatTool {
 	if commandPath() != "" {
 		tools = append(tools, commandTool())
 	}
+	tools = append(tools, skillTool())
 	return tools
+}
+
+func isKnownTool(name string) bool {
+	if name == "bash" {
+		return true
+	}
+	return slices.ContainsFunc(definitions(), func(tool plugin.ChatTool) bool {
+		return tool.Alias == name
+	})
 }
 
 func (a *Runtime) Settings(ctx context.Context) (Settings, error) {
 	if err := a.RequireAccess(); err != nil {
 		return Settings{}, err
 	}
-	path, allowed, err := a.store.AgentSettings(ctx)
+	policy, err := a.store.AgentSettings(ctx)
 	if err != nil {
 		return Settings{}, err
 	}
@@ -150,7 +166,22 @@ func (a *Runtime) Settings(ctx context.Context) (Settings, error) {
 	for _, tool := range definitions() {
 		available = append(available, tool.Alias)
 	}
-	return Settings{a.directory(path, false), allowed, available}, nil
+	dir := a.directory(policy.DefaultDirectory, false)
+	skills := []SkillSummary{}
+	if dir.Status == DirectoryReady {
+		if root, openErr := a.open(dir.Path); openErr == nil {
+			skills = discoverSkills(ctx, root)
+			_ = root.Close()
+		}
+	}
+	return Settings{
+		Directory:            dir,
+		AllowedTools:         policy.AllowedTools,
+		AvailableTools:       available,
+		InjectAgentMD:        policy.InjectAgentMD,
+		MarkdownVisualRender: policy.MarkdownVisualRender,
+		Skills:               skills,
+	}, nil
 }
 
 func (a *Runtime) UpdateSettings(ctx context.Context, patch SettingsPatch) (Settings, error) {
@@ -167,13 +198,18 @@ func (a *Runtime) UpdateSettings(ctx context.Context, patch SettingsPatch) (Sett
 	if patch.AllowedTools != nil {
 		seen := map[string]bool{}
 		for _, name := range *patch.AllowedTools {
-			if seen[name] || (name != "bash" && !slices.ContainsFunc(fileTools, func(tool plugin.ChatTool) bool { return tool.Alias == name })) {
+			if seen[name] || !isKnownTool(name) {
 				return Settings{}, domain.NewError(domain.ErrCodeInvalidArgument, "无效的 Agent 工具名单", nil)
 			}
 			seen[name] = true
 		}
 	}
-	if err := a.store.UpdateAgentSettings(ctx, patch.DefaultDirectory, patch.AllowedTools); err != nil {
+	if err := a.store.UpdateAgentSettings(ctx, store.AgentPolicyPatch{
+		DefaultDirectory:     patch.DefaultDirectory,
+		AllowedTools:         patch.AllowedTools,
+		InjectAgentMD:        patch.InjectAgentMD,
+		MarkdownVisualRender: patch.MarkdownVisualRender,
+	}); err != nil {
 		return Settings{}, err
 	}
 	return a.Settings(ctx)
@@ -201,10 +237,11 @@ func (a *Runtime) TopicDirectory(ctx context.Context, id string) (Directory, err
 	}
 	override := path != ""
 	if !override {
-		path, _, err = a.store.AgentSettings(ctx)
+		policy, err := a.store.AgentSettings(ctx)
 		if err != nil {
 			return Directory{}, err
 		}
+		path = policy.DefaultDirectory
 	}
 	return a.directory(path, override), nil
 }
@@ -264,60 +301,97 @@ func (a *Runtime) ListDirectories(ctx context.Context, path string) (DirectoryLi
 	return listing, nil
 }
 
-func (a *Runtime) authorized(ctx context.Context, id string) (*os.Root, []string, error) {
+func (a *Runtime) authorized(ctx context.Context, id string) (*os.Root, store.AgentPolicyRecord, error) {
 	if err := a.RequireAccess(); err != nil {
-		return nil, nil, err
+		return nil, store.AgentPolicyRecord{}, err
 	}
 	mode, path, err := a.store.AgentTopic(ctx, id)
 	if err != nil {
-		return nil, nil, err
+		return nil, store.AgentPolicyRecord{}, err
 	}
 	if mode != domain.ConversationModeAgent {
-		return nil, nil, errors.New("Agent mode is not active")
+		return nil, store.AgentPolicyRecord{}, errors.New("Agent mode is not active")
 	}
-	fallback, tools, err := a.store.AgentSettings(ctx)
+	policy, err := a.store.AgentSettings(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, store.AgentPolicyRecord{}, err
 	}
 	if path == "" {
-		path = fallback
+		path = policy.DefaultDirectory
 	}
 	root, err := a.open(path)
 	if err != nil {
-		return nil, nil, unavailable()
+		return nil, store.AgentPolicyRecord{}, unavailable()
 	}
-	return root, tools, nil
+	return root, policy, nil
+}
+
+func (a *Runtime) prepareContext(ctx context.Context, id string, includeInstructions bool) (string, []plugin.ChatTool, error) {
+	root, policy, err := a.authorized(ctx, id)
+	if err != nil {
+		return "", nil, err
+	}
+	defer root.Close()
+
+	var agentMD, agentMDPath string
+	if includeInstructions && policy.InjectAgentMD {
+		agentMD, agentMDPath = readWorkspaceAgentMD(root)
+	}
+
+	var skills []SkillSummary
+	if slices.Contains(policy.AllowedTools, "skill") {
+		skills = discoverSkills(ctx, root)
+		if err := ctx.Err(); err != nil {
+			return "", nil, err
+		}
+	}
+
+	var tools []plugin.ChatTool
+	for _, def := range definitions() {
+		if !slices.Contains(policy.AllowedTools, def.Alias) {
+			continue
+		}
+		if def.Alias == "skill" && len(skills) == 0 {
+			continue
+		}
+		tools = append(tools, def)
+	}
+
+	var suffix string
+	if includeInstructions {
+		suffix = formatWorkspaceInstructionsPrompt(agentMD, agentMDPath, skills)
+	}
+	return suffix, tools, nil
+}
+
+// PrepareContext returns the workspace instructions/skill catalog suffix and
+// enabled native tools for an Agent conversation using one policy snapshot.
+func (a *Runtime) PrepareContext(ctx context.Context, id string) (string, []plugin.ChatTool, error) {
+	return a.prepareContext(ctx, id, true)
 }
 
 func (a *Runtime) Tools(ctx context.Context, id string) ([]plugin.ChatTool, error) {
-	root, allowed, err := a.authorized(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	root.Close()
-	var tools []plugin.ChatTool
-	for _, def := range definitions() {
-		if slices.Contains(allowed, def.Alias) {
-			tools = append(tools, def)
-		}
-	}
-	return tools, nil
+	_, tools, err := a.prepareContext(ctx, id, false)
+	return tools, err
 }
 
 func (a *Runtime) Execute(ctx context.Context, id, name string, args json.RawMessage) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	root, allowed, err := a.authorized(ctx, id)
+	root, policy, err := a.authorized(ctx, id)
 	if err != nil {
 		return "", errors.New("Agent workspace or tool authorization unavailable")
 	}
 	defer root.Close()
-	if !slices.Contains(allowed, name) {
+	if !slices.Contains(policy.AllowedTools, name) {
 		return "", errors.New("Agent tool is disabled")
 	}
-	if name == "bash" {
+	switch name {
+	case "bash":
 		return runCommand(ctx, root, args)
+	case "skill":
+		return runSkill(ctx, root, args)
 	}
 	if !slices.ContainsFunc(fileTools, func(def plugin.ChatTool) bool { return def.Alias == name }) {
 		return "", errors.New("unknown Agent tool")
