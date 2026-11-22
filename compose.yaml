@@ -16,12 +16,18 @@ services:
       LLMSTUDIO_PORT: "8080"
       LLMSTUDIO_DB_PATH: "/data/llmstudio.db"
       LLMSTUDIO_STATIC_DIR: "/app/web"
+      LLMSTUDIO_AGENT_ROOT: "/workspace"
       # 须设置访问令牌（仅本地调试可显式设 LLMSTUDIO_DEV_MODE=true）
       LLMSTUDIO_ACCESS_TOKEN: "${LLMSTUDIO_ACCESS_TOKEN:-}"
       LLMSTUDIO_DEV_MODE: "${LLMSTUDIO_DEV_MODE:-false}"
       LLMSTUDIO_CORS_ORIGINS: "${LLMSTUDIO_CORS_ORIGINS:-*}"
     volumes:
       - llmstudio_data:/data
+      - type: bind
+        source: ${LLMSTUDIO_AGENT_WORKSPACE:?Set LLMSTUDIO_AGENT_WORKSPACE to an existing host directory}
+        target: /workspace
+        bind:
+          create_host_path: false
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
       interval: 30s

@@ -1284,6 +1284,7 @@ export function ConversationSidebar({
                                       {conv.title}
                                     </span>
                                     <span className="wb-topic-row__sub">
+                                      {conv.mode === 'agent' && <span className="wb-topic-agent" title="Agent"><Icon name="terminal" size={13} /><span className="sr-only">Agent</span></span>}
                                       <span className="wb-topic-row__time">
                                         {formatShortTime(
                                           conv.updatedAt || conv.createdAt,

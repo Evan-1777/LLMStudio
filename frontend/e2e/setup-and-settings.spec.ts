@@ -160,17 +160,34 @@ test.describe('Setup, Settings, Provider Discovery, and Persistence', () => {
     await localDialog.getByRole('button', { name: '添加' }).click();
     await expect(page.getByRole('heading', { name: 'Direct Local' })).toBeVisible();
 
-    // The gateway owns local-request credentials, so probing and model
-    // discovery go through the authenticated API instead of browser-direct.
+    // The gateway prepares a request for the saved target; the browser sends it to the upstream.
+    const directModels = () => page.waitForRequest((req) => req.url() === upstream.url + '/v1/models' && req.method() === 'GET');
+    const prepareProbe = page.waitForRequest((req) => req.url().endsWith('/models/prepare-local') && req.method() === 'POST');
+    const browserProbe = directModels();
     await page.getByRole('button', { name: '测试连接' }).click();
+    await Promise.all([prepareProbe, browserProbe]);
     await expect(page.getByText(/连接正常.*2 个模型/)).toBeVisible();
 
+    const browserFetch = directModels();
     await page.getByRole('button', { name: '获取模型' }).first().click();
+    await browserFetch;
     const localImportDialog = page.getByRole('dialog');
     await localImportDialog.getByRole('checkbox', { name: /Mock Chat/ }).check();
     await localImportDialog.getByRole('button', { name: '导入 (1)' }).click();
     await expect(localImportDialog).toBeHidden();
     await expect(page.getByText('Mock Chat')).toBeVisible();
+
+    await page.getByRole('button', { name: '获取模型' }).first().click();
+    await expect(localImportDialog.getByRole('radio', { name: '未添加' })).toBeChecked();
+    await expect(localImportDialog.getByRole('checkbox', { name: /Mock Vision/ })).toBeVisible();
+    await expect(localImportDialog.getByText('Mock Chat', { exact: true })).toHaveCount(0);
+    await localImportDialog.getByRole('radio', { name: '全部' }).click();
+    await expect(localImportDialog.getByText('Mock Chat', { exact: true })).toBeVisible();
+    await localImportDialog.getByRole('checkbox', { name: /Mock Vision/ }).check();
+    await localImportDialog.getByRole('button', { name: '导入 (1)' }).click();
+    await expect(localImportDialog).toBeHidden();
+    await expect(page.getByText('Mock Chat')).toBeVisible();
+    await expect(page.getByText('Mock Vision')).toBeVisible();
 
     await page.getByRole('button', { name: '返回工作台' }).click();
     await page.getByLabel('消息输入框').waitFor();

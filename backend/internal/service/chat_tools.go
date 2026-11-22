@@ -20,11 +20,25 @@ const (
 )
 
 type mcpToolBinding struct {
-	BuiltIn    bool
-	Scope      plugin.ExecutionScope
-	ServerID   string
-	ServerName string
-	ToolName   string
+	NativeTopicID string
+	BuiltIn       bool
+	Scope         plugin.ExecutionScope
+	ServerID      string
+	ServerName    string
+	ToolName      string
+}
+
+func (b mcpToolBinding) source() string {
+	switch {
+	case b.NativeTopicID != "":
+		return "native"
+	case b.BuiltIn:
+		return "builtin"
+	case b.ServerID != "":
+		return "mcp"
+	default:
+		return ""
+	}
 }
 
 // ScopedMCPServer pairs an MCP server configuration with its execution scope.
@@ -161,7 +175,7 @@ func discoverToolsConcurrent(ctx context.Context, mcpClient plugin.MCPClientBoun
 	return results
 }
 
-func (s *ChatService) discoverActiveTools(ctx context.Context, builtinTimeEnabled bool) ([]plugin.ChatTool, map[string]mcpToolBinding, error) {
+func (s *ChatService) discoverActiveTools(ctx context.Context, builtinTimeEnabled bool, topicID string, native []plugin.ChatTool) ([]plugin.ChatTool, map[string]mcpToolBinding, error) {
 	usedAliases := make(map[string]struct{})
 	var tools []plugin.ChatTool
 	var bindings map[string]mcpToolBinding
@@ -177,6 +191,14 @@ func (s *ChatService) discoverActiveTools(ctx context.Context, builtinTimeEnable
 			},
 		}
 		tools = append(tools, BuiltinTimeChatTool())
+	}
+	if len(native) > 0 && bindings == nil {
+		bindings = make(map[string]mcpToolBinding)
+	}
+	for _, t := range native {
+		usedAliases[t.Alias] = struct{}{}
+		bindings[t.Alias] = mcpToolBinding{NativeTopicID: topicID, ToolName: t.Alias}
+		tools = append(tools, t)
 	}
 
 	if s.mcpStore == nil || s.mcpClient == nil {
@@ -247,77 +269,61 @@ func normalizedDescriptors(descriptors []plugin.MCPToolDescriptor) []plugin.MCPT
 }
 
 func (s *ChatService) filterEnabledToolsWithBindings(ctx context.Context, tools []plugin.ChatTool, bindings map[string]mcpToolBinding) []plugin.ChatTool {
-	if len(tools) == 0 {
-		return tools
-	}
-	var hasBuiltin, hasExternal bool
-	for _, t := range tools {
-		if b, ok := bindings[t.Alias]; ok && b.BuiltIn {
-			hasBuiltin = true
-		} else {
-			hasExternal = true
-		}
-	}
-	builtinEnabled := false
-	if hasBuiltin {
-		builtinEnabled = s.resolvePreferencesSnapshot(ctx).BuiltinTimeToolEnabled
-	}
-	if !hasExternal || s.mcpStore == nil {
-		filtered := make([]plugin.ChatTool, 0, len(tools))
-		for _, t := range tools {
-			if b, ok := bindings[t.Alias]; ok && b.BuiltIn && builtinEnabled {
-				filtered = append(filtered, t)
-			}
-		}
-		return filtered
-	}
-	entries, scoped, err := listNormalizedScopedServers(ctx, s.mcpStore)
-	if err != nil {
-		return nil
-	}
-	if !scoped {
-		byID := make(map[string]domain.MCPServerConfig, len(entries))
-		for _, entry := range entries {
-			byID[entry.Server.ID] = entry.Server
-		}
-		filtered := make([]plugin.ChatTool, 0, len(tools))
-		for _, t := range tools {
-			if b, ok := bindings[t.Alias]; ok && b.BuiltIn {
-				if builtinEnabled {
-					filtered = append(filtered, t)
-				}
-				continue
-			}
-			if byID[t.ServerID].ToolEnabled(t.ToolName) {
-				filtered = append(filtered, t)
-			}
-		}
-		return filtered
-	}
-	type scopedKey struct {
+	type key struct {
 		scope plugin.ExecutionScope
 		id    string
 	}
-	byScoped := make(map[scopedKey]domain.MCPServerConfig, len(entries))
-	for _, entry := range entries {
-		byScoped[scopedKey{scope: entry.Scope, id: entry.Server.ID}] = entry.Server
+	servers := map[key]domain.MCPServerConfig{}
+	var needMCP, needBuiltin bool
+	var nativeTopicID string
+	for _, tool := range tools {
+		b := bindings[tool.Alias]
+		switch b.source() {
+		case "mcp":
+			needMCP = true
+		case "builtin":
+			needBuiltin = true
+		case "native":
+			nativeTopicID = b.NativeTopicID
+		}
+	}
+	if needMCP && s.mcpStore != nil {
+		entries, _, err := listNormalizedScopedServers(ctx, s.mcpStore)
+		if err == nil {
+			for _, entry := range entries {
+				servers[key{entry.Scope, entry.Server.ID}] = entry.Server
+			}
+		}
+	}
+	builtin := needBuiltin && s.resolvePreferencesSnapshot(ctx).BuiltinTimeToolEnabled
+	native := map[string]bool{}
+	if nativeTopicID != "" {
+		if active, err := s.agent.Tools(ctx, nativeTopicID); err == nil {
+			for _, tool := range active {
+				native[tool.Alias] = true
+			}
+		}
 	}
 	filtered := make([]plugin.ChatTool, 0, len(tools))
-	for _, t := range tools {
-		b, hasB := bindings[t.Alias]
-		if hasB && b.BuiltIn {
-			if builtinEnabled {
-				filtered = append(filtered, t)
+	for _, tool := range tools {
+		b := bindings[tool.Alias]
+		switch b.source() {
+		case "native":
+			if !native[b.ToolName] {
+				continue
 			}
+		case "builtin":
+			if !builtin {
+				continue
+			}
+		case "mcp":
+			if !servers[key{b.Scope, b.ServerID}].ToolEnabled(b.ToolName) {
+				continue
+			}
+		default:
 			continue
 		}
-		var scope plugin.ExecutionScope
-		if hasB {
-			scope = b.Scope
-		}
-		if byScoped[scopedKey{scope: scope, id: t.ServerID}].ToolEnabled(t.ToolName) {
-			filtered = append(filtered, t)
-		}
+		filtered = append(filtered, tool)
 	}
 	return filtered
 }
@@ -327,7 +333,25 @@ func (s *ChatService) executeToolCall(
 	bindings map[string]mcpToolBinding,
 	call domain.ContentBlock,
 ) (domain.ContentBlock, error) {
-	if binding, ok := bindings[call.Name]; ok && binding.BuiltIn {
+	binding := bindings[call.Name]
+	if binding.NativeTopicID != "" {
+		args, err := normalizeCallArguments(call.Arguments)
+		var text string
+		if err == nil {
+			text, err = s.agent.Execute(ctx, binding.NativeTopicID, binding.ToolName, args)
+		}
+		if ctx.Err() != nil {
+			return domain.ContentBlock{}, ctx.Err()
+		}
+		if err != nil {
+			if text != "" {
+				text += "\n"
+			}
+			text += err.Error()
+		}
+		return domain.ContentBlock{Type: domain.BlockTypeToolResult, ToolCallID: call.ID, ToolName: call.Name, ToolSource: "native", Content: text, IsError: err != nil}, nil
+	}
+	if binding.BuiltIn {
 		return executeBuiltinBindingCall(ctx, s.preferences, binding, call), nil
 	}
 	return executeToolCallWithRuntime(ctx, s.mcpStore, s.mcpClient, bindings, call)
@@ -407,6 +431,7 @@ func executeResolvedToolCall(
 		Type:       domain.BlockTypeToolResult,
 		ToolCallID: call.ID,
 		ToolName:   call.Name,
+		ToolSource: "mcp",
 	}
 
 	if mcpStore == nil || mcpClient == nil {
@@ -621,8 +646,12 @@ func (s *ChatService) ExecuteTools(
 	in ExecuteToolsInput,
 	emit func(domain.StreamEvent) error,
 ) error {
-	if _, err := s.convs.Get(ctx, in.ConversationID); err != nil {
+	conv, err := s.convs.Get(ctx, in.ConversationID)
+	if err != nil {
 		return err
+	}
+	if conv.Mode == domain.ConversationModeAgent {
+		return domain.NewError(domain.ErrCodeInvalidArgument, "Agent 工具只在生成期间可用", nil)
 	}
 	if len(in.Calls) == 0 {
 		return domain.NewError(domain.ErrCodeInvalidArgument, "calls are required", nil)
@@ -676,8 +705,8 @@ func executeToolsStateless(
 		return domain.NewError(domain.ErrCodeInvalidArgument, "calls are required", nil)
 	}
 	var (
-		bindings          map[string]mcpToolBinding
-		serverErrs        []string
+		bindings           map[string]mcpToolBinding
+		serverErrs         []string
 		bindingsDiscovered bool
 	)
 	for idx, call := range calls {

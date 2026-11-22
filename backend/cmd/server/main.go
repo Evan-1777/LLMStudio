@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"llmstudio/backend/internal/agent"
 	"llmstudio/backend/internal/config"
 	"llmstudio/backend/internal/format"
 	"llmstudio/backend/internal/httpapi"
@@ -69,11 +70,13 @@ func main() {
 	prefSvc := service.NewPreferenceService(prefStore)
 	customFontSvc := service.NewCustomFontService(customFontStore)
 	storageSvc := service.NewStorageService(store.NewStorageMaintenance(db, cfg.DBPath))
+	agentRuntime := agent.NewGateway(store.NewAgentStore(db), cfg.AgentRoot, cfg.AccessToken != "")
 	chatSvc := service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithAssistants(assistantStore).
 		WithSearch(searchEngines, searchStore).
 		WithPreferences(prefSvc).
-		WithMCP(mcpStore, mcpRuntime)
+		WithMCP(mcpStore, mcpRuntime).
+		WithAgent(agentRuntime)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Config:              cfg,
@@ -84,6 +87,7 @@ func main() {
 		ConversationService: convSvc,
 		PluginService:       pluginSvc,
 		ChatService:         chatSvc,
+		AgentRuntime:        agentRuntime,
 		PreferenceService:   prefSvc,
 		CustomFontService:   customFontSvc,
 		StorageService:      storageSvc,

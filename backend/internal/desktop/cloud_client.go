@@ -408,6 +408,15 @@ func (c *CloudClient) ProxyCustomFont(
 	body io.Reader,
 	contentLength int64,
 ) (*http.Response, error) {
+	resp, err := c.proxyRequest(ctx, method, path, inHeaders, body, contentLength)
+	var maxBytesErr *http.MaxBytesError
+	if errors.As(err, &maxBytesErr) {
+		return nil, domain.NewError(domain.ErrCodePayloadTooLarge, "字体文件不能超过 32 MiB", err)
+	}
+	return resp, err
+}
+
+func (c *CloudClient) proxyRequest(ctx context.Context, method, path string, inHeaders http.Header, body io.Reader, contentLength int64) (*http.Response, error) {
 	if err := checkCloudConnection(ctx); err != nil {
 		return nil, err
 	}
@@ -426,7 +435,7 @@ func (c *CloudClient) ProxyCustomFont(
 
 	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, body)
 	if err != nil {
-		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "construct cloud font request failed", err)
+		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "construct cloud request failed", err)
 	}
 	if body != nil && contentLength >= 0 {
 		req.ContentLength = contentLength
@@ -445,10 +454,6 @@ func (c *CloudClient) ProxyCustomFont(
 	if err != nil {
 		if connErr := checkCloudConnection(ctx); connErr != nil {
 			return nil, connErr
-		}
-		var maxBytesErr *http.MaxBytesError
-		if errors.As(err, &maxBytesErr) {
-			return nil, domain.NewError(domain.ErrCodePayloadTooLarge, "字体文件不能超过 32 MiB", err)
 		}
 		return nil, domain.NewError(domain.ErrCodeUpstreamError, "cloud gateway unreachable", err)
 	}

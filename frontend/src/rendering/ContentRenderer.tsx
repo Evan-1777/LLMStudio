@@ -646,6 +646,8 @@ export const ContentRenderer = memo(function ContentRenderer({
           <div className="tool-trace-body" tabIndex={0} aria-label={`${title}详情`}>
             {entries.map((entry) => {
                   const toolName = entry.call?.name || entry.result?.toolName || 'tool';
+                  const source = entry.call?.toolSource ?? entry.result?.toolSource;
+                  const sourceLabel = source === 'native' ? '原生' : source === 'mcp' ? 'MCP' : null;
                   const isErr = Boolean(entry.result?.isError);
                   const entryState = ended(entry)
                     ? isErr ? 'error' : 'success'
@@ -665,7 +667,7 @@ export const ContentRenderer = memo(function ContentRenderer({
                       className={`tool-trace-entry ${isErr ? 'tool-trace-entry--error' : ''}`.trim()}
                     >
                       <summary className="tool-trace-entry__head">
-                        <span className="tool-trace-entry__name">{toolName}</span>
+                        <span className="tool-trace-entry__name">{sourceLabel && <small className="tool-trace-entry__source">{sourceLabel} · </small>}{toolName}</span>
                         <span
                           className={`tool-trace-entry__status tool-trace-entry__status--${entryState}`}
                         >

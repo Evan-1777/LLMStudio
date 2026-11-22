@@ -252,6 +252,7 @@ type ContentBlock struct {
 	Arguments json.RawMessage `json:"arguments,omitempty"`
 
 	// Reserved Agent toolResult fields.
+	ToolSource string `json:"toolSource,omitempty"` // native, mcp, or builtin
 	ToolCallID string `json:"toolCallId,omitempty"`
 	ToolName   string `json:"toolName,omitempty"`
 	Content    string `json:"content,omitempty"`
@@ -379,6 +380,15 @@ type ConversationGroup struct {
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
+const (
+	ConversationModeChat  = "chat"
+	ConversationModeAgent = "agent"
+)
+
+func ValidConversationMode(mode string) bool {
+	return mode == ConversationModeChat || mode == ConversationModeAgent
+}
+
 // Conversation represents a chat session with reserved selective sync metadata.
 type Conversation struct {
 	ID           string           `json:"id"`
@@ -392,6 +402,7 @@ type Conversation struct {
 	Pinned       bool             `json:"pinned"`
 	SortOrder    int              `json:"sortOrder"`
 	Ephemeral    bool             `json:"ephemeral,omitempty"`
+	Mode         string           `json:"mode"`
 	SyncEnabled  bool             `json:"syncEnabled"`
 	SyncState    string           `json:"syncState"`
 	SyncVersion  int64            `json:"syncVersion"`
@@ -408,6 +419,9 @@ type DeletedConversation struct {
 
 // NewConversationDefaults ensures reserved sync metadata and assistant defaults are populated.
 func NewConversationDefaults(c *Conversation) {
+	if c.Mode == "" {
+		c.Mode = ConversationModeChat
+	}
 	if c.AssistantID == "" {
 		c.AssistantID = DefaultAssistantID
 	}

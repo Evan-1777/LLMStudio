@@ -13,6 +13,7 @@ import {
 import { Icon, IconButton, type IconName } from '../../components/ui';
 import type { CloudConnectionState } from '../../core/types';
 import { AboutPage } from './AboutPage';
+import { AgentPage } from './AgentPage';
 import { AppearancePage } from './AppearancePage';
 import { ClientPage } from './ClientPage';
 import { ConnectionPage } from './ConnectionPage';
@@ -35,6 +36,7 @@ const NAV_ITEMS: readonly SettingsNavItem[] = [
   { id: 'appearance', label: '外观与显示', icon: 'sun' },
   { id: 'client', label: '客户端设置', icon: 'monitor' },
   { id: 'mcp', label: 'MCP 配置', icon: 'wrench' },
+  { id: 'agent', label: 'Agent', icon: 'terminal' },
   { id: 'storage', label: '存储', icon: 'folder' },
   { id: 'about', label: '关于', icon: 'info' },
 ];
@@ -81,6 +83,8 @@ function renderSectionContent(section: SettingsSection): ReactNode {
       return <ClientPage />;
     case 'mcp':
       return <McpPage />;
+    case 'agent':
+      return <AgentPage />;
     case 'storage':
       return <StoragePage />;
     case 'about':

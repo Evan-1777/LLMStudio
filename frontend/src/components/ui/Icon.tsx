@@ -51,6 +51,7 @@ export type IconName =
   | 'user'
   | 'layoutStream'
   | 'messageSquare'
+  | 'terminal'
   | 'pin'
   | 'pinOff'
   | 'grip'
@@ -367,6 +368,12 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
     <>
       <rect x="3" y="4" width="18" height="7" rx="2" />
       <rect x="3" y="13" width="18" height="7" rx="2" />
+    </>
+  ),
+  terminal: (
+    <>
+      <rect x="3" y="4" width="18" height="16" rx="3" />
+      <path d="m7 9 3 3-3 3m6 0h4" />
     </>
   ),
   messageSquare: (

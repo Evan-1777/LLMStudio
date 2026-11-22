@@ -10,6 +10,7 @@ export const SETTINGS_SECTIONS = [
   'appearance',
   'client',
   'mcp',
+  'agent',
   'storage',
   'about',
 ] as const;

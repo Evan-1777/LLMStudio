@@ -92,6 +92,7 @@ type DesktopStore struct {
 	Searches      *store.SearchConfigStore
 	MCPs          *store.MCPServerStore
 	Preferences   *store.PreferenceStore
+	Agent         *store.AgentStore
 	Storage       *store.StorageMaintenance
 
 	providerMu              sync.Mutex
@@ -118,6 +119,7 @@ func OpenDesktopStore(ctx context.Context, dbPath string) (*DesktopStore, error)
 	}
 	return &DesktopStore{
 		DB:            db,
+		Agent:         store.NewAgentStore(db),
 		Providers:     store.NewProviderStore(db),
 		Assistants:    store.NewAssistantStore(db),
 		Conversations: convStore,

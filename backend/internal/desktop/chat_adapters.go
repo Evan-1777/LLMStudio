@@ -1,14 +1,18 @@
 package desktop
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"llmstudio/backend/internal/agent"
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/plugin"
 	"llmstudio/backend/internal/service"
@@ -475,7 +479,8 @@ func NewDesktopChatEngine(
 		WithAssistants(&desktopAssistantLookup{store: store, cloud: cloud, live: false, nowFn: engine.now}).
 		WithSearch(searchReg, searchLookup).
 		WithPreferences(prefLookup).
-		WithMCP(compositeTools, compositeTools)
+		WithMCP(compositeTools, compositeTools).
+		WithAgent(agent.NewDesktop(store.Agent))
 
 	return engine
 }
@@ -523,9 +528,10 @@ func (e *DesktopChatEngine) serviceForScope(scope plugin.ExecutionScope) (*servi
 
 // DesktopPreparedStream keeps the connection bound through stream completion.
 type DesktopPreparedStream struct {
-	stream  *service.PreparedStream
-	ctx     context.Context
-	release func()
+	stream   *service.PreparedStream
+	response *http.Response
+	ctx      context.Context
+	release  func()
 }
 
 func (p *DesktopPreparedStream) Stream(ctx context.Context, emit func(domain.StreamEvent) error) error {
@@ -546,6 +552,20 @@ func (e *DesktopChatEngine) Prepare(ctx context.Context, scope plugin.ExecutionS
 		return nil, err
 	}
 	prepared, err := svc.Prepare(ctx, in)
+	if scope == plugin.ExecutionScopeCloud && errors.Is(err, service.ErrAgentExecutor) {
+		body, encErr := json.Marshal(in)
+		if encErr != nil {
+			release()
+			return nil, encErr
+		}
+		path := "/api/v1/conversations/" + url.PathEscape(in.ConversationID) + "/messages/stream"
+		response, proxyErr := e.cloud.proxyRequest(ctx, http.MethodPost, path, http.Header{"Content-Type": {"application/json"}, "Accept": {"text/event-stream"}}, bytes.NewReader(body), int64(len(body)))
+		if proxyErr != nil {
+			release()
+			return nil, proxyErr
+		}
+		return &DesktopPreparedStream{response: response, ctx: ctx, release: release}, nil
+	}
 	if errors.Is(err, service.ErrUpstreamAuth) && e.credCache != nil {
 		if err = e.refreshProvider(ctx, scope, in.ConversationID, in.ProviderID); err == nil {
 			prepared, err = svc.Prepare(ctx, in)
@@ -555,7 +575,7 @@ func (e *DesktopChatEngine) Prepare(ctx context.Context, scope plugin.ExecutionS
 		release()
 		return nil, err
 	}
-	return &DesktopPreparedStream{prepared, ctx, release}, nil
+	return &DesktopPreparedStream{stream: prepared, ctx: ctx, release: release}, nil
 }
 
 // Compact compacts conversation history without switching connections mid-request.
@@ -567,6 +587,10 @@ func (e *DesktopChatEngine) Compact(ctx context.Context, scope plugin.ExecutionS
 		return service.CompactConversationResult{}, err
 	}
 	res, err := svc.Compact(ctx, in)
+	if scope == plugin.ExecutionScopeCloud && errors.Is(err, service.ErrAgentExecutor) {
+		err = e.cloud.doLongJSON(ctx, http.MethodPost, "/api/v1/conversations/"+url.PathEscape(in.ConversationID)+"/compact", in, &res)
+		return res, err
+	}
 	if errors.Is(err, service.ErrUpstreamAuth) && e.credCache != nil {
 		if err = e.refreshProvider(ctx, scope, in.ConversationID, in.ProviderID); err == nil {
 			return svc.Compact(ctx, in)

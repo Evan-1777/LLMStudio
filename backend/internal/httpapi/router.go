@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"llmstudio/backend/internal/agent"
 	"llmstudio/backend/internal/config"
 	"llmstudio/backend/internal/plugin"
 	"llmstudio/backend/internal/service"
@@ -22,6 +23,7 @@ type RouterDeps struct {
 	ConversationService *service.ConversationService
 	PluginService       *service.PluginService
 	ChatService         *service.ChatService
+	AgentRuntime        *agent.Runtime
 	PreferenceService   *service.PreferenceService
 	CustomFontService   *service.CustomFontService
 	StorageService      *service.StorageService
@@ -109,6 +111,9 @@ func NewRouter(deps RouterDeps) http.Handler {
 		sh := NewStorageHandler(deps.StorageService)
 		mux.HandleFunc("GET /api/v1/storage", sh.Get)
 		mux.HandleFunc("POST /api/v1/storage/compact", sh.Compact)
+	}
+	if deps.AgentRuntime != nil {
+		RegisterAgentRoutes(mux, deps.AgentRuntime, nil)
 	}
 	if deps.ChatService != nil {
 		chatHandler := NewChatHandler(deps.ChatService)

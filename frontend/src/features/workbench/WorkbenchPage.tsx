@@ -14,9 +14,10 @@ import {
   useSearchParams,
 } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
-import { IconButton } from '../../components/ui';
-import { CHAT_WIDTH_MAX, CHAT_WIDTH_MIN } from '../../core/settings';
-import { isReasoningEffort, type Assistant, type ContentBlock, type Message, type ReasoningEffort, type TopicScope } from '../../core/types';
+import { Icon, IconButton, SegmentedControl } from '../../components/ui';
+import { CHAT_WIDTH_MAX, CHAT_WIDTH_MIN, getAgentModeVisible } from '../../core/settings';
+import { isReasoningEffort, type Assistant, type ContentBlock, type ConversationMode, type Message, type ReasoningEffort, type TopicScope } from '../../core/types';
+import { AgentTopicDirectory } from '../agent/AgentTopicDirectory';
 import { ChatProvider, useChat } from '../chat/ChatProvider';
 import { AssistantEditor } from './AssistantEditor';
 import { AssistantSidebar } from './AssistantSidebar';
@@ -119,6 +120,7 @@ function WorkbenchInner() {
 
   const {
     state: chatState,
+    sessionScope,
     isBusy,
     isGenerating,
     isCompacting,
@@ -142,6 +144,10 @@ function WorkbenchInner() {
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [sidebarManageMode, setSidebarManageMode] = useState(false);
   const [isTemporaryMode, setIsTemporaryMode] = useState(false);
+  const [draftAgent, setDraftAgent] = useState<{ key: string; mode: ConversationMode; path: string }>();
+  const [savingModeKey, setSavingModeKey] = useState<string | null>(null);
+  const modeSaveLock = useRef<string | null>(null);
+  const [showAgentMode] = useState(getAgentModeVisible);
 
   const [selectedAssistantId, setSelectedAssistantId] = useState('default');
   const [draftModel, setDraftModel] = useState<{
@@ -309,25 +315,51 @@ function WorkbenchInner() {
     [activeAssistant.id, resources.conversationGroups],
   );
 
+  const conversationBucket = activeScope === 'local' ? resources.localConversations : resources.cloudConversations;
+  const sessionConversation = sessionScope === reqScope ? chatState.conversation : null;
   const currentConversation = useMemo(() => {
     if (conversationId) {
-      if (chatState.conversation?.id === conversationId) {
-        return chatState.conversation;
-      }
-      return (
-        resources.conversations.find((c) => c.id === conversationId) ?? null
-      );
+      if (sessionConversation?.id === conversationId) return sessionConversation;
+      return conversationBucket.find((c) => c.id === conversationId) ?? null;
     }
-    if (isTemporaryMode && chatState.conversation?.ephemeral) {
-      return chatState.conversation;
-    }
-    return null;
-  }, [chatState.conversation, conversationId, isTemporaryMode, resources.conversations]);
+    return isTemporaryMode && sessionConversation?.ephemeral ? sessionConversation : null;
+  }, [conversationBucket, conversationId, isTemporaryMode, sessionConversation]);
 
   const activeConvIdRef = useRef<string | undefined>(
     currentConversation?.id ?? conversationId,
   );
   activeConvIdRef.current = currentConversation?.id ?? conversationId;
+
+  const activeId = currentConversation?.id ?? conversationId;
+  const draftKey = JSON.stringify([connectionEpoch, activeScope, activeAssistant.id, isTemporaryMode]);
+  const modeKey = JSON.stringify([draftKey, activeId]);
+  const draft = !activeId && draftAgent?.key === draftKey ? draftAgent : null;
+  const conversationMode = currentConversation?.mode ?? draft?.mode ?? 'chat';
+  const savingMode = savingModeKey === modeKey;
+  const modeBusy = isBusy || isCompacting || savingMode || (Boolean(activeId) && !currentConversation);
+  const modeKeyRef = useRef(modeKey);
+  modeKeyRef.current = modeKey;
+
+  const changeMode = async (mode: ConversationMode) => {
+    if (modeBusy || modeSaveLock.current === modeKey || conversationMode === mode) return;
+    if (!activeId) {
+      setDraftAgent({ key: draftKey, mode, path: draft?.path ?? '' });
+      return;
+    }
+    modeSaveLock.current = modeKey;
+    setSavingModeKey(modeKey);
+    try {
+      const updated = await gateway.patchConversation(activeId, { mode }, undefined, reqScope);
+      if (modeKeyRef.current !== modeKey) return;
+      if (!updated.ephemeral) upsertLocalConversation(updated, reqScope);
+      updateConversationMeta(updated);
+    } catch {
+      if (modeKeyRef.current === modeKey) toast('无法切换话题模式', 'error');
+    } finally {
+      if (modeSaveLock.current === modeKey) modeSaveLock.current = null;
+      setSavingModeKey((key) => key === modeKey ? null : key);
+    }
+  };
 
   const previousEffort = currentConversation?.params?.reasoningEffort;
   const reasoningEffort = settings.composerReasoningEffort || (isReasoningEffort(previousEffort) ? previousEffort : 'none');
@@ -457,6 +489,7 @@ function WorkbenchInner() {
   }, []);
 
   const handleStartNewTopic = useCallback(() => {
+    setDraftAgent(undefined);
     stopStreaming();
     discardTemporarySession();
     setIsTemporaryMode(false);
@@ -571,6 +604,7 @@ function WorkbenchInner() {
   };
 
   const handleSelectConversation = (id: string) => {
+    setDraftAgent(undefined);
     if (id !== conversationId || isTemporaryMode) {
       stopStreaming();
       discardTemporarySession();
@@ -644,7 +678,7 @@ function WorkbenchInner() {
     onPrepareRollback: () => void;
     onAccepted: () => void;
   }): Promise<boolean> => {
-    if (effortSaveLock.current === connectionEpoch || isSavingModel) return false;
+    if (effortSaveLock.current === connectionEpoch || isSavingModel || modeBusy || modeSaveLock.current === modeKey) return false;
     if (!selectedProviderId || !selectedModelId) {
       toast('请先配置可用模型', 'error');
       return false;
@@ -657,6 +691,7 @@ function WorkbenchInner() {
     const scopeAtSend = activeScopeRef.current;
     return sendMessage({
       conversationId: existingConvId || undefined,
+      conversationMode,
       scope: scopeAtSend,
       ensureConversation: existingConvId
         ? undefined
@@ -679,17 +714,27 @@ function WorkbenchInner() {
                   ...draftSessionParams.params,
                   reasoningEffort,
                 },
+                ...(conversationMode === 'agent' ? { mode: conversationMode } : {}),
                 ...(tempModeAtSend ? { ephemeral: true } : {}),
               },
               signal,
               scopeAtSend,
             );
+            if (conversationMode === 'agent' && draft?.path && !signal.aborted) {
+              try {
+                await gateway.setAgentTopicDirectory(created.id, draft.path, scopeAtSend, signal);
+              } catch (err) {
+                void gateway.deleteConversation(created.id, undefined, scopeAtSend).catch(() => {});
+                throw err;
+              }
+            }
             if (signal.aborted) {
-              if (tempModeAtSend) {
+              if (tempModeAtSend || conversationMode === 'agent') {
                 void gateway.deleteConversation(created.id, undefined, scopeAtSend).catch(() => {});
               }
               return null;
             }
+            setDraftAgent(undefined);
             if (tempModeAtSend) {
               temporaryConvIdRef.current = created.id;
               return created;
@@ -1003,6 +1048,17 @@ function WorkbenchInner() {
 
           <div className="wb-toolbar__spacer" />
 
+          {showAgentMode && (
+            <div className="wb-mode-control">
+              <SegmentedControl<ConversationMode> ariaLabel="话题模式" value={conversationMode} disabled={modeBusy}
+                options={[
+                  { value: 'chat', label: <Icon name="messageSquare" size={16} />, ariaLabel: '对话' },
+                  { value: 'agent', label: <Icon name="terminal" size={16} />, ariaLabel: 'Agent' },
+                ]}
+                onChange={(mode) => void changeMode(mode)} />
+            </div>
+          )}
+
           <IconButton
             icon="temporaryChat"
             label={isTemporaryMode ? '退出临时会话' : '临时会话'}
@@ -1023,6 +1079,12 @@ function WorkbenchInner() {
             onClick={handleToggleRight}
           />
         </header>
+
+        {conversationMode === 'agent' && (
+          <AgentTopicDirectory key={modeKey} gateway={gateway} scope={reqScope} topicId={activeId}
+            draftPath={draft?.path ?? ''} disabled={modeBusy}
+            onDraftPath={(path) => setDraftAgent({ key: draftKey, mode: 'agent', path })} />
+        )}
 
         <div
           ref={chatStageRef}
@@ -1081,9 +1143,9 @@ function WorkbenchInner() {
             reasoningEffort={reasoningEffort}
             savingModel={isSavingModel}
             savingEffort={savingEffort}
-            isBusy={isBusy || isCompacting}
+            isBusy={isBusy || isCompacting || savingMode}
             canStop={isGenerating}
-            messages={chatState.messages}
+            messages={sessionScope === reqScope ? chatState.messages : []}
             streaming={chatState.streaming}
             systemPrompt={currentConversation?.systemPrompt || activeAssistant.systemPrompt || ''}
             contextWindow={targetModel?.model.contextWindow}

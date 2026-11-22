@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"llmstudio/backend/internal/agent"
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/httpapi"
 	"llmstudio/backend/internal/plugin"
@@ -235,6 +236,8 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("PATCH /api/v1/conversations/{id}/messages/{messageId}", s.handleUpdateMessage)
 	mux.HandleFunc("DELETE /api/v1/conversations/{id}/messages/{messageId}", s.handleDeleteMessage)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/messages/{messageId}/branch", s.handleBranchConversation)
+
+	httpapi.RegisterAgentRoutes(mux, agent.NewDesktop(s.cfg.Store.Agent), s.dispatchAgent)
 
 	// Local-first chat streaming, compaction, and MCP tool execution for both domains.
 	mux.HandleFunc("POST /api/v1/conversations/{id}/messages/stream", s.handleChatStream)
@@ -1544,6 +1547,11 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	prepared, err := s.cfg.ChatEngine.Prepare(r.Context(), scope, in)
 	if err != nil {
 		writeDesktopError(w, err)
+		return
+	}
+	if prepared.response != nil {
+		defer prepared.release()
+		copyAgentResponse(w, prepared.response, true)
 		return
 	}
 

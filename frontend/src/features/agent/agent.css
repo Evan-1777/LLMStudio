@@ -1,0 +1,40 @@
+.agent-directory {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  min-width: 0;
+  max-width: 100%;
+}
+.agent-directory__path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.agent-directory__state { color: var(--danger); flex: none; }
+.agent-breadcrumb,
+.agent-breadcrumb > span { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.agent-breadcrumb { flex-wrap: wrap; margin-bottom: 8px; color: var(--text-secondary); }
+.agent-breadcrumb button,
+.agent-directory-list li button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  border-radius: 8px;
+  text-align: left;
+}
+.agent-breadcrumb button { padding: 4px 6px; color: var(--accent); overflow-wrap: anywhere; }
+.agent-breadcrumb [aria-current] { font-weight: 600; overflow-wrap: anywhere; }
+.agent-directory-list { max-height: min(42vh, 320px); overflow: auto; }
+.agent-directory-list ul { list-style: none; margin: 0; padding: 0 3px; }
+.agent-directory-list p,
+.agent-directory-list__error { padding: 8px; margin: 0; color: var(--text-secondary); }
+.agent-directory-list__error { display: flex; align-items: center; gap: 8px; }
+.agent-directory-list li button { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 40px; padding: 8px; }
+.agent-directory-list li button span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.agent-directory-list li button:hover:not(:disabled),
+.agent-breadcrumb button:hover:not(:disabled) { background: var(--accent-soft); }

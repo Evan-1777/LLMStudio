@@ -191,7 +191,10 @@ export interface ImageBlock {
   data?: string;
 }
 
+export type ToolSource = 'native' | 'mcp' | 'builtin';
+
 export interface ToolCallBlock {
+  toolSource?: ToolSource;
   type: 'toolCall';
   id: string;
   name: string;
@@ -201,6 +204,7 @@ export interface ToolCallBlock {
 }
 
 export interface ToolResultBlock {
+  toolSource?: ToolSource;
   type: 'toolResult';
   toolCallId: string;
   toolName?: string;
@@ -351,7 +355,32 @@ export interface BatchTransferResult {
   failed: BatchTransferItemError[];
 }
 
+export interface AgentDirectory {
+  path: string;
+  status: 'ready' | 'unset' | 'unavailable';
+  override?: boolean;
+}
+
+export interface AgentDirectoryListing {
+  path: string;
+  directories: string[];
+}
+
+export interface AgentSettings {
+  directory: AgentDirectory;
+  allowedTools: string[];
+  availableTools: string[];
+}
+
+export interface AgentSettingsPatch {
+  defaultDirectory?: string;
+  allowedTools?: string[];
+}
+
+export type ConversationMode = 'chat' | 'agent';
+
 export interface Conversation {
+  mode?: ConversationMode;
   id: string;
   assistantId: string;
   title: string;
@@ -424,6 +453,7 @@ export type ReorderConversationsInput =
     };
 
 export interface CreateConversationInput {
+  mode?: ConversationMode;
   assistantId?: string;
   title?: string;
   providerId?: string;
@@ -434,6 +464,7 @@ export interface CreateConversationInput {
 }
 
 export interface PatchConversationInput {
+  mode?: ConversationMode;
   assistantId?: string | null;
   title?: string | null;
   providerId?: string | null;

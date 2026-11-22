@@ -28,7 +28,7 @@ LABEL org.opencontainers.image.title="LLMStudio" \
       org.opencontainers.image.description="Personal AI Chat workbench with pluggable Go gateway and React Web UI" \
       org.opencontainers.image.source="https://github.com/Evan-1777/LLMStudio"
 
-RUN apk add --no-cache ca-certificates tzdata \
+RUN apk add --no-cache ca-certificates tzdata bash \
   && addgroup -g 10001 -S llmstudio \
   && adduser -u 10001 -S -G llmstudio -H -h /app llmstudio \
   && mkdir -p /app/web /data \

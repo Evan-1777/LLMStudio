@@ -57,6 +57,15 @@ func (b *DesktopBridge) OpenDataDir() error {
 	return mygo.Shell.OpenPath(b.paths.DataDir)
 }
 
+// PickDirectory opens the native folder selector and returns an empty path on cancel.
+func (b *DesktopBridge) PickDirectory(initialPath string) (string, error) {
+	paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: mygo.FocusedWindow(), Title: "选择工作目录", Directory: true, DefaultPath: initialPath})
+	if err != nil || len(paths) == 0 {
+		return "", err
+	}
+	return paths[0], nil
+}
+
 // GetClientSettings returns the confirmed tray behavior and current availability.
 func (b *DesktopBridge) GetClientSettings() (DesktopClientSettings, error) {
 	if b.getStore() == nil {

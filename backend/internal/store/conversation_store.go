@@ -25,7 +25,7 @@ func NewConversationStore(db *sql.DB) *ConversationStore {
 const conversationSelectCols = `
 	c.id, c.assistant_id, c.title, c.provider_id, c.model_id, c.system_prompt, c.params_json,
 	c.sync_enabled, c.sync_state, c.sync_version, c.last_synced_at, c.created_at, c.updated_at,
-	c.group_id, c.pinned, c.sort_order, c.ephemeral
+	c.group_id, c.pinned, c.sort_order, c.ephemeral, c.mode
 `
 
 const conversationOrderByClause = `
@@ -123,6 +123,9 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 		c.UpdatedAt = c.CreatedAt
 	}
 	domain.NewConversationDefaults(&c)
+	if !domain.ValidConversationMode(c.Mode) {
+		return domain.Conversation{}, domain.NewError(domain.ErrCodeInvalidArgument, "mode must be chat or agent", nil)
+	}
 
 	paramsBytes, err := json.Marshal(c.Params)
 	if err != nil {
@@ -154,11 +157,11 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 		INSERT INTO conversations (
 			id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
 			sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at,
-			group_id, pinned, sort_order, ephemeral
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			group_id, pinned, sort_order, ephemeral, mode
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, c.ID, c.AssistantID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes),
 		boolToInt(c.SyncEnabled), c.SyncState, c.SyncVersion, lastSynced, formatTime(c.CreatedAt), formatTime(c.UpdatedAt),
-		groupID, boolToInt(c.Pinned), c.SortOrder, boolToInt(c.Ephemeral))
+		groupID, boolToInt(c.Pinned), c.SortOrder, boolToInt(c.Ephemeral), c.Mode)
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("create conversation: %w", err)
 	}
@@ -217,6 +220,9 @@ func (s *ConversationStore) ImportConversation(
 	}
 	conv.AssistantID = strings.TrimSpace(conv.AssistantID)
 	domain.NewConversationDefaults(&conv)
+	if !domain.ValidConversationMode(conv.Mode) {
+		return domain.Conversation{}, nil, domain.NewError(domain.ErrCodeInvalidArgument, "mode must be chat or agent", nil)
+	}
 
 	syncTime := now
 	if conv.UpdatedAt.After(syncTime) {
@@ -290,11 +296,11 @@ func (s *ConversationStore) ImportConversation(
 			UPDATE conversations
 			SET assistant_id = ?, title = ?, provider_id = ?, model_id = ?, system_prompt = ?, params_json = ?,
 				sync_enabled = ?, sync_state = ?, sync_version = ?, last_synced_at = ?,
-				created_at = ?, updated_at = ?, group_id = ?, pinned = ?, ephemeral = 0
+				created_at = ?, updated_at = ?, group_id = ?, pinned = ?, ephemeral = 0, mode = ?
 			WHERE id = ?
 		`, conv.AssistantID, conv.Title, conv.ProviderID, conv.ModelID, conv.SystemPrompt, string(paramsBytes),
 			boolToInt(conv.SyncEnabled), domain.SyncStateSynced, syncVersion, formatTime(syncTime),
-			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), conv.ID); err != nil {
+			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), conv.Mode, conv.ID); err != nil {
 			return domain.Conversation{}, nil, fmt.Errorf("update imported conversation %s: %w", conv.ID, err)
 		}
 	} else {
@@ -306,11 +312,11 @@ func (s *ConversationStore) ImportConversation(
 			INSERT INTO conversations (
 				id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
 				sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at,
-				group_id, pinned, sort_order, ephemeral
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+				group_id, pinned, sort_order, ephemeral, mode
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
 		`, conv.ID, conv.AssistantID, conv.Title, conv.ProviderID, conv.ModelID, conv.SystemPrompt, string(paramsBytes),
 			boolToInt(conv.SyncEnabled), domain.SyncStateSynced, syncVersion, formatTime(syncTime),
-			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), nextHead); err != nil {
+			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), nextHead, conv.Mode); err != nil {
 			return domain.Conversation{}, nil, fmt.Errorf("insert imported conversation %s: %w", conv.ID, err)
 		}
 	}
@@ -358,6 +364,9 @@ func (s *ConversationStore) ImportConversation(
 func (s *ConversationStore) Update(ctx context.Context, c domain.Conversation) (domain.Conversation, error) {
 	c.UpdatedAt = time.Now().UTC()
 	domain.NewConversationDefaults(&c)
+	if !domain.ValidConversationMode(c.Mode) {
+		return domain.Conversation{}, domain.NewError(domain.ErrCodeInvalidArgument, "mode must be chat or agent", nil)
+	}
 	paramsBytes, err := json.Marshal(c.Params)
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("encode conversation params: %w", err)
@@ -365,9 +374,9 @@ func (s *ConversationStore) Update(ctx context.Context, c domain.Conversation) (
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE conversations
-		SET assistant_id = ?, title = ?, provider_id = ?, model_id = ?, system_prompt = ?, params_json = ?, sync_enabled = ?, updated_at = ?
+		SET assistant_id = ?, title = ?, provider_id = ?, model_id = ?, system_prompt = ?, params_json = ?, sync_enabled = ?, updated_at = ?, mode = ?
 		WHERE id = ?
-	`, c.AssistantID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes), boolToInt(c.SyncEnabled), formatTime(c.UpdatedAt), c.ID)
+	`, c.AssistantID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes), boolToInt(c.SyncEnabled), formatTime(c.UpdatedAt), c.Mode, c.ID)
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("update conversation %s: %w", c.ID, err)
 	}
@@ -439,7 +448,7 @@ func scanConversation(row rowScanner) (domain.Conversation, error) {
 	if err := row.Scan(
 		&c.ID, &c.AssistantID, &c.Title, &c.ProviderID, &c.ModelID, &c.SystemPrompt, &paramsJSON,
 		&syncEnabled, &c.SyncState, &c.SyncVersion, &lastSynced, &createdRaw, &updatedRaw,
-		&groupID, &pinnedInt, &c.SortOrder, &ephemeralInt,
+		&groupID, &pinnedInt, &c.SortOrder, &ephemeralInt, &c.Mode,
 	); err != nil {
 		return domain.Conversation{}, err
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"llmstudio/backend/internal/agent"
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/format"
 	"llmstudio/backend/internal/plugin"
@@ -145,6 +146,15 @@ type ChatService struct {
 	mcpClient   plugin.MCPClientBoundary
 	cacheStore  *promptCacheStore
 	preferences PreferenceLookup
+	agent       *agent.Runtime
+}
+
+// ErrAgentExecutor identifies an Agent topic that must run on its owning gateway.
+var ErrAgentExecutor = domain.NewError(domain.ErrCodeInvalidArgument, "Agent 话题需要在所属网关运行", nil)
+
+func (s *ChatService) WithAgent(runtime *agent.Runtime) *ChatService {
+	s.agent = runtime
+	return s
 }
 
 // NewChatService constructs a ChatService. If httpClient is nil, a default client with no overall request timeout is used.
@@ -613,6 +623,18 @@ func (s *ChatService) resolveConversationUpstreamContext(
 		return conversationUpstreamContext{}, err
 	}
 
+	if conv.Mode == domain.ConversationModeAgent {
+		if allowMissingLocalKey {
+			return conversationUpstreamContext{}, domain.NewError(domain.ErrCodeInvalidArgument, "Agent 不支持浏览器直连模式", nil)
+		}
+		if s.agent == nil {
+			return conversationUpstreamContext{}, ErrAgentExecutor
+		}
+		if err := s.agent.RequireAccess(); err != nil {
+			return conversationUpstreamContext{}, err
+		}
+	}
+
 	providerID := strings.TrimSpace(rawProviderID)
 	if providerID == "" {
 		providerID = conv.ProviderID
@@ -628,6 +650,9 @@ func (s *ChatService) resolveConversationUpstreamContext(
 	prov, err := s.providers.Get(ctx, providerID)
 	if err != nil {
 		return conversationUpstreamContext{}, err
+	}
+	if conv.Mode == domain.ConversationModeAgent && s.agent.IsGateway() && prov.LocalRequest {
+		return conversationUpstreamContext{}, domain.NewError(domain.ErrCodeInvalidArgument, "该模型依赖浏览器直连，无法在网关运行 Agent", nil)
 	}
 	if !prov.Enabled {
 		return conversationUpstreamContext{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("provider %q is disabled", prov.Name), nil)
@@ -708,6 +733,13 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	conv := up.conversation
 	prov := up.provider
 	model := up.model
+	var nativeTools []plugin.ChatTool
+	if conv.Mode == domain.ConversationModeAgent {
+		nativeTools, err = s.agent.Tools(ctx, conv.ID)
+		if err != nil {
+			return preparedUpstream{}, err
+		}
+	}
 
 	isRegen := strings.TrimSpace(in.RegenerateMessageID) != ""
 	isLocalCont := in.LocalContinuation != nil
@@ -852,7 +884,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 
 	prefs := s.resolvePreferencesSnapshot(ctx)
 
-	tools, toolBindings, err := s.discoverActiveTools(ctx, prefs.BuiltinTimeToolEnabled)
+	tools, toolBindings, err := s.discoverActiveTools(ctx, prefs.BuiltinTimeToolEnabled, conv.ID, nativeTools)
 	if err != nil {
 		return preparedUpstream{}, err
 	}
@@ -1047,6 +1079,7 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 
 			if ev.Block != nil && ev.Block.Type == domain.BlockTypeToolCall && ev.Index != nil {
 				bCopy := *ev.Block
+				bCopy.ToolSource = p.toolBindings[bCopy.Name].source()
 				idx := *ev.Index
 				switch ev.Type {
 				case domain.StreamEventBlockStart:

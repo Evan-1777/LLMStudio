@@ -1,5 +1,9 @@
 import {
   MAX_GATEWAY_BODY_BYTES,
+  type AgentDirectory,
+  type AgentDirectoryListing,
+  type AgentSettings,
+  type AgentSettingsPatch,
   type Assistant,
   type AssistantUpsertPayload,
   type BatchConversationsInput,
@@ -766,6 +770,26 @@ export class GatewayClient {
       withScopeQuery('/api/v1/conversations', scope),
       { signal },
     ).then((res) => res.conversations ?? []);
+  }
+
+  getAgentSettings(scope?: TopicScope, signal?: AbortSignal): Promise<AgentSettings> {
+    return this.requestJson('GET', withScopeQuery('/api/v1/agent/settings', scope), { signal });
+  }
+
+  updateAgentSettings(body: AgentSettingsPatch, scope?: TopicScope, signal?: AbortSignal): Promise<AgentSettings> {
+    return this.requestJson('PATCH', withScopeQuery('/api/v1/agent/settings', scope), { body, signal });
+  }
+
+  listAgentDirectories(path: string, scope?: TopicScope, signal?: AbortSignal): Promise<AgentDirectoryListing> {
+    return this.requestJson('GET', withScopeQuery(`/api/v1/agent/directories?path=${encodeURIComponent(path)}`, scope), { signal });
+  }
+
+  getAgentTopicDirectory(id: string, scope?: TopicScope, signal?: AbortSignal): Promise<AgentDirectory> {
+    return this.requestJson('GET', withScopeQuery(`/api/v1/agent/conversations/${encodeURIComponent(id)}/directory`, scope), { signal });
+  }
+
+  setAgentTopicDirectory(id: string, path: string, scope?: TopicScope, signal?: AbortSignal): Promise<AgentDirectory> {
+    return this.requestJson('PUT', withScopeQuery(`/api/v1/agent/conversations/${encodeURIComponent(id)}/directory`, scope), { body: { path }, signal });
   }
 
   createConversation(

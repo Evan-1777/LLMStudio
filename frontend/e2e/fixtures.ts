@@ -280,6 +280,20 @@ async function startMockUpstream(): Promise<{
         res.write(`data: ${JSON.stringify(obj)}\n\n`);
       };
 
+      if (prompt.includes('[AGENT_READ]')) {
+        const messages = Array.isArray(body.messages) ? body.messages : [];
+        const last = messages.at(-1);
+        if (last?.role === 'tool') {
+          writeChunk({ choices: [{ delta: { content: 'Agent verified: ' + last.content }, finish_reason: 'stop' }] });
+        } else {
+          writeChunk({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'agent-read', function: {
+            name: 'read', arguments: JSON.stringify({ path: 'note.txt' }),
+          } }] }, finish_reason: 'tool_calls' }] });
+        }
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+
       if (prompt.includes('[SLOW_ABORT]')) {
         let closed = false;
         const onAbort = () => {
@@ -637,6 +651,9 @@ export const test = base.extend<
   goInstance: async ({ workerShared }, use) => {
     const dbDir = fs.mkdtempSync(path.join(os.tmpdir(), 'llmstudio-e2e-db-'));
     const dbPath = path.join(dbDir, 'e2e.db');
+    const workspace = path.join(dbDir, 'agent-workspace');
+    fs.mkdirSync(path.join(workspace, 'project', 'empty'), { recursive: true });
+    fs.writeFileSync(path.join(workspace, 'project', 'note.txt'), 'browser-agent-sentinel');
     const goPort = await getFreePort();
     const baseUrl = `http://127.0.0.1:${goPort}`;
 
@@ -646,6 +663,7 @@ export const test = base.extend<
         LLMSTUDIO_PORT: String(goPort),
         LLMSTUDIO_DB_PATH: dbPath,
         LLMSTUDIO_STATIC_DIR: DIST_DIR,
+        LLMSTUDIO_AGENT_ROOT: workspace,
         LLMSTUDIO_ACCESS_TOKEN: E2E_TOKEN,
         LLMSTUDIO_DEV_MODE: 'false',
       },

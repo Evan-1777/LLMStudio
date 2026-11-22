@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"llmstudio/backend/internal/agent"
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/format"
 	"llmstudio/backend/internal/plugin"
@@ -108,6 +111,93 @@ func setupChatMCPFixture(t *testing.T, baseURL string, stubMCP *stubMCPClient) (
 	svc := service.NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithMCP(mcpStore, stubMCP)
 	return svc, convStore, msgStore, mcpStore, conv, db
+}
+
+func TestAgentAndSameNamedMCPShareRoundWithoutSharingPermission(t *testing.T) {
+	ctx := t.Context()
+	alias := plugin.BuildChatToolAlias("srv-a", "read", nil)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "note.txt"), []byte("native-marker"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var runtime *agent.Runtime
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Tools    []struct{ Function struct{ Name string } }
+			Messages []struct{ Role, Content string }
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			w.WriteHeader(400)
+			return
+		}
+		calls++
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls == 1 {
+			if len(body.Tools) != 2 || body.Tools[0].Function.Name != "read" || body.Tools[1].Function.Name != alias {
+				t.Errorf("first tools: %+v", body.Tools)
+			}
+			// Revoke after discovery; executing the already-advertised name must recheck.
+			none := []string{}
+			if _, err := runtime.UpdateSettings(r.Context(), agent.SettingsPatch{AllowedTools: &none}); err != nil {
+				t.Error(err)
+				w.WriteHeader(500)
+				return
+			}
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"n","function":{"name":"read","arguments":%q}},{"index":1,"id":"m","function":{"name":%q,"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\ndata: [DONE]\n\n", `{"path":"note.txt"}`, alias)
+			return
+		}
+		if len(body.Tools) != 1 || body.Tools[0].Function.Name != alias {
+			t.Errorf("continuation tools: %+v", body.Tools)
+		}
+		if n := len(body.Messages); n < 3 || !strings.Contains(body.Messages[n-2].Content, "disabled") || !strings.Contains(body.Messages[n-1].Content, "srv-a:read") {
+			t.Errorf("tool results: %+v", body.Messages)
+		}
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	stub := &stubMCPClient{toolsBySrv: map[string][]plugin.MCPToolDescriptor{"srv-a": {{Name: "read", InputSchema: json.RawMessage(`{"type":"object"}`)}}}}
+	svc, convs, msgs, mcp, conv, db := setupChatMCPFixture(t, upstream.URL, stub)
+	conv.Mode = domain.ConversationModeAgent
+	if _, err := convs.Update(ctx, conv); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mcp.Create(ctx, domain.MCPServerConfig{ID: "srv-a", Name: "test MCP", Transport: domain.MCPTransportStdio, Command: "mock", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	runtime = agent.NewGateway(store.NewAgentStore(db), dir, true)
+	allowed := []string{"read"}
+	if _, err := runtime.UpdateSettings(ctx, agent.SettingsPatch{AllowedTools: &allowed}); err != nil {
+		t.Fatal(err)
+	}
+	svc.WithAgent(runtime)
+	prep, err := svc.Prepare(ctx, service.StreamChatInput{ConversationID: conv.ID, Text: "check tools"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prep.Stream(ctx, func(domain.StreamEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	history, err := msgs.ListByConversation(ctx, conv.ID)
+	if err != nil || len(history) != 2 {
+		t.Fatalf("history %d: %v", len(history), err)
+	}
+	var results []domain.ContentBlock
+	for _, block := range history[1].Blocks {
+		if block.Type == domain.BlockTypeToolResult {
+			results = append(results, block)
+		}
+	}
+	if len(results) != 2 || results[0].ToolSource != "native" || !results[0].IsError || strings.Contains(results[0].Content, "native-marker") || results[1].ToolSource != "mcp" || results[1].IsError {
+		t.Fatalf("results: %+v", results)
+	}
+	if _, err = db.ExecContext(ctx, "UPDATE agent_settings SET allowed_tools_json = 'invalid'"); err != nil {
+		t.Fatal(err)
+	}
+	if p, err := svc.Prepare(ctx, service.StreamChatInput{ConversationID: conv.ID, Text: "reject invalid policy"}); err == nil || p != nil {
+		t.Fatal("bad policy did not fail closed")
+	}
 }
 
 func TestChatServiceMultiRoundToolsSequentialSinglePersistAndReplay(t *testing.T) {

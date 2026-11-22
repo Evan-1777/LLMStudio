@@ -11,6 +11,16 @@ export const CONNECTION_STORAGE_KEY = 'llmstudio.connection.v1';
 // First-paint theme hint per normalized gateway; never authoritative.
 export const THEME_HINT_STORAGE_PREFIX = 'llmstudio.themeHint.v1::';
 
+const AGENT_MODE_VISIBLE_KEY = 'llmstudio.agent-mode-visible.v1';
+
+export function getAgentModeVisible(): boolean {
+  return window.localStorage.getItem(AGENT_MODE_VISIBLE_KEY) !== 'false';
+}
+
+export function setAgentModeVisible(visible: boolean): void {
+  window.localStorage.setItem(AGENT_MODE_VISIBLE_KEY, String(visible));
+}
+
 export function themeHintKey(gatewayBaseUrl: string): string {
   if (isDesktopApp()) {
     return `${THEME_HINT_STORAGE_PREFIX}desktop`;

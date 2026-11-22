@@ -17,6 +17,7 @@ import type {
   CompactionMeta,
   ContentBlock,
   Conversation,
+  ConversationMode,
   ConversationDetail,
   GenerationParams,
   LocalCacheResultData,
@@ -44,6 +45,7 @@ import { estimateCompactionAfterTokens } from '../workbench/contextUsage';
 export interface SendMessageOptions {
   conversationId?: string;
   conversation?: Conversation;
+  conversationMode?: ConversationMode;
   scope?: TopicScope;
   ensureConversation?: (signal: AbortSignal) => Promise<Conversation | null>;
   blocks: ContentBlock[];
@@ -77,6 +79,7 @@ export interface CompactConversationResult {
 
 export interface ChatContextValue {
   state: ChatState;
+  sessionScope?: TopicScope;
   isBusy: boolean;
   isGenerating: boolean;
   isCompacting: boolean;
@@ -318,6 +321,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     ): Promise<ConversationDetail | null> => {
       cancelActiveStream(true);
       const reqScope = isDesktop ? (explicitScope ?? topicScopeRef.current) : undefined;
+      if (sessionScopeRef.current !== reqScope) dispatch({ type: 'CLEAR_SESSION' });
       sessionScopeRef.current = reqScope;
       const epoch = ++epochRef.current;
       const ctrl = new AbortController();
@@ -1468,6 +1472,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       });
       opts.onOptimisticStart?.();
 
+      let mode = opts.conversationMode ?? stateRef.current.conversation?.mode;
       let targetConvId = opts.conversationId ?? '';
       if (!targetConvId) {
         if (!opts.ensureConversation) {
@@ -1497,6 +1502,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             return false;
           }
           targetConvId = created.id;
+          mode = created.mode ?? mode;
           run.conversationId = targetConvId;
           dispatch({
             type: 'UPDATE_CONVERSATION_META',
@@ -1527,6 +1533,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       const useBrowserLocalRequest =
         !isDesktop &&
+        mode !== 'agent' &&
         Boolean(
           resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
         );
@@ -1610,6 +1617,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       const useBrowserLocalRequest =
         !isDesktop &&
+        conv.mode !== 'agent' &&
         Boolean(
           resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
         );
@@ -1776,7 +1784,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setIsCompacting(true);
 
       try {
-        if (isDesktop || !provider?.localRequest) {
+        if (isDesktop || conv.mode === 'agent' || !provider?.localRequest) {
           const res = await gateway.compactConversation(
             conv.id,
             {
@@ -2009,7 +2017,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const applyBranchedDetail = useCallback(
     (detail: ConversationDetail, scope?: TopicScope) => {
       cancelActiveStream(true);
-      upsertLocalConversation(detail.conversation, resolveScope(scope));
+      const reqScope = resolveScope(scope);
+      sessionScopeRef.current = reqScope;
+      upsertLocalConversation(detail.conversation, reqScope);
       dispatch({
         type: 'LOAD_SUCCESS',
         conversation: detail.conversation,
@@ -2019,9 +2029,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [cancelActiveStream, resolveScope, upsertLocalConversation],
   );
 
+  const sessionScope = sessionScopeRef.current;
   const value = useMemo<ChatContextValue>(
     () => ({
       state,
+      sessionScope,
       isBusy,
       isGenerating,
       isCompacting,
@@ -2040,6 +2052,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }),
     [
       state,
+      sessionScope,
       isBusy,
       isGenerating,
       isCompacting,

@@ -38,6 +38,7 @@ type CreateConversationInput struct {
 	SystemPrompt string                  `json:"systemPrompt"`
 	Params       domain.GenerationParams `json:"params"`
 	Ephemeral    bool                    `json:"ephemeral,omitempty"`
+	Mode         string                  `json:"mode"`
 }
 
 // PatchParamsInput supports clearing individual generation parameters when explicitly set to null or empty.
@@ -56,6 +57,7 @@ type PatchConversationInput struct {
 	SystemPrompt PatchField[string]           `json:"systemPrompt"`
 	Params       PatchField[PatchParamsInput] `json:"params"`
 	SyncEnabled  PatchField[bool]             `json:"syncEnabled"`
+	Mode         PatchField[string]           `json:"mode"`
 }
 
 // ConversationDetail bundles a conversation with its ordered messages.
@@ -129,6 +131,7 @@ func (s *ConversationService) Create(ctx context.Context, in CreateConversationI
 		SystemPrompt: in.SystemPrompt,
 		Params:       in.Params,
 		Ephemeral:    in.Ephemeral,
+		Mode:         in.Mode,
 	})
 }
 
@@ -206,6 +209,12 @@ func (s *ConversationService) Patch(ctx context.Context, id string, in PatchConv
 		return domain.Conversation{}, err
 	}
 	prevAssistantID := conv.AssistantID
+	if in.Mode.Set {
+		if !domain.ValidConversationMode(in.Mode.Value) {
+			return domain.Conversation{}, domain.NewError(domain.ErrCodeInvalidArgument, "mode must be chat or agent", nil)
+		}
+		conv.Mode = in.Mode.Value
+	}
 
 	if in.AssistantID.Set {
 		if in.AssistantID.Null || strings.TrimSpace(in.AssistantID.Value) == "" {
@@ -486,6 +495,7 @@ func (s *ConversationService) BranchFromMessage(ctx context.Context, conversatio
 		ModelID:      orig.ModelID,
 		SystemPrompt: orig.SystemPrompt,
 		Params:       orig.Params,
+		Mode:         orig.Mode,
 	})
 	if err != nil {
 		return ConversationDetail{}, err

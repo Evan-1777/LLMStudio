@@ -49,6 +49,10 @@ export async function openDesktopDataDir(): Promise<void> {
   await callDesktop('DesktopBridge.OpenDataDir');
 }
 
+export async function pickDesktopDirectory(initialPath: string): Promise<string> {
+  return callDesktop<string>('DesktopBridge.PickDirectory', initialPath);
+}
+
 export interface DesktopClientSettings {
   closeToTray: boolean;
   trayAvailable: boolean;

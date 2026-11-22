@@ -16,6 +16,7 @@ type Config struct {
 	DevMode     bool
 	CORSOrigins []string
 	StaticDir   string
+	AgentRoot   string
 }
 
 // Load reads configuration from process environment variables and validates it.
@@ -30,6 +31,7 @@ func LoadFromLookup(lookup func(string) string) (Config, error) {
 		DBPath:      strings.TrimSpace(lookup("LLMSTUDIO_DB_PATH")),
 		AccessToken: strings.TrimSpace(lookup("LLMSTUDIO_ACCESS_TOKEN")),
 		StaticDir:   strings.TrimSpace(lookup("LLMSTUDIO_STATIC_DIR")),
+		AgentRoot:   strings.TrimSpace(lookup("LLMSTUDIO_AGENT_ROOT")),
 	}
 	if cfg.Port == "" {
 		cfg.Port = "8080"
