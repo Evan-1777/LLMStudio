@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useApp } from '../../app/AppProvider';
 import {
   Button,
   EmptyState,
   ErrorBanner,
   Icon,
+  IconButton,
   Input,
   LoadingSpinner,
   Modal,
+  SegmentedControl,
 } from '../../components/ui';
+import { executeLocalModelProbe } from '../../core/localModelProbe';
 import type {
   DiscoveredModel,
   ModelConfig,
@@ -22,10 +25,13 @@ export interface ModelImportDialogProps {
   onOpenChange: (open: boolean) => void;
   providerId: string;
   providerName: string;
+  localRequest?: boolean;
   probeInput: ProviderProbeInput;
   existingModels: readonly ModelConfig[];
   onImport: (models: ModelConfig[]) => Promise<void>;
 }
+
+type ImportFilterMode = 'unadded' | 'all';
 
 function toModelConfig(item: DiscoveredModel): ModelConfig {
   return {
@@ -45,22 +51,31 @@ function toModelConfig(item: DiscoveredModel): ModelConfig {
   };
 }
 
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === 'AbortError') ||
+    (err instanceof Error && err.name === 'AbortError')
+  );
+}
+
 export function ModelImportDialog({
   open,
   onOpenChange,
   providerId,
   providerName,
+  localRequest = false,
   probeInput,
   existingModels,
   onImport,
 }: ModelImportDialogProps) {
-  const { gateway } = useApp();
+  const { gateway, isDesktop } = useApp();
 
   const [loading, setLoading] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [discovered, setDiscovered] = useState<DiscoveredModel[]>([]);
   const [search, setSearch] = useState('');
+  const [filterMode, setFilterMode] = useState<ImportFilterMode>('unadded');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
 
@@ -69,54 +84,126 @@ export function ModelImportDialog({
     [existingModels],
   );
 
-  const runFetch = useCallback(
-    async (signal?: AbortSignal) => {
+  // Freeze latest session parameters in a ref so parent re-renders never
+  // recreate the fetch effect or abort an in-flight discovery request.
+  const latestParamsRef = useRef({
+    providerId,
+    localRequest,
+    probeInput,
+  });
+  latestParamsRef.current = { providerId, localRequest, probeInput };
+
+  const frozenSessionRef = useRef<{
+    providerId: string;
+    localRequest: boolean;
+    probeInput: ProviderProbeInput;
+  } | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const requestSeqRef = useRef(0);
+
+  const startFetch = useCallback(
+    async (session: {
+      providerId: string;
+      localRequest: boolean;
+      probeInput: ProviderProbeInput;
+    }) => {
+      abortRef.current?.abort();
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      const seq = ++requestSeqRef.current;
+
       setLoading(true);
       setFetchError(null);
       setSaveError(null);
       try {
-        // The gateway performs the discovery, including local-request providers.
-        const models = await gateway.fetchProviderModels(
-          providerId,
-          probeInput,
-          signal,
-        );
-        if (signal?.aborted) return;
+        const models =
+          !isDesktop && session.localRequest
+            ? (
+                await executeLocalModelProbe(
+                  gateway,
+                  session.providerId,
+                  ctrl.signal,
+                )
+              ).models
+            : await gateway.fetchProviderModels(
+                session.providerId,
+                session.probeInput,
+                ctrl.signal,
+              );
+        if (ctrl.signal.aborted || seq !== requestSeqRef.current) return;
         setDiscovered(models);
         setSelectedIds(new Set());
       } catch (err) {
-        if (err instanceof DOMException && err.name === 'AbortError') return;
-        if (err instanceof Error && err.name === 'AbortError') return;
+        if (isAbortError(err) || ctrl.signal.aborted || seq !== requestSeqRef.current) {
+          return;
+        }
         setFetchError(errorMessageOf(err, '获取远端模型失败'));
       } finally {
-        if (!signal?.aborted) {
+        if (!ctrl.signal.aborted && seq === requestSeqRef.current) {
           setLoading(false);
         }
       }
     },
-    [gateway, probeInput, providerId],
+    [gateway, isDesktop],
   );
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      requestSeqRef.current += 1;
+      frozenSessionRef.current = null;
+      return;
+    }
+    const snapshot = {
+      providerId: latestParamsRef.current.providerId,
+      localRequest: latestParamsRef.current.localRequest,
+      probeInput: {
+        ...latestParamsRef.current.probeInput,
+        ...(latestParamsRef.current.probeInput.headers
+          ? { headers: { ...latestParamsRef.current.probeInput.headers } }
+          : {}),
+      },
+    };
+    frozenSessionRef.current = snapshot;
     setSearch('');
+    setFilterMode('unadded');
     setDiscovered([]);
     setSelectedIds(new Set());
-    const ctrl = new AbortController();
-    void runFetch(ctrl.signal);
-    return () => ctrl.abort();
-  }, [open, runFetch]);
+    void startFetch(snapshot);
+    return () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      requestSeqRef.current += 1;
+    };
+  }, [open, providerId, startFetch]);
+
+  const handleRefresh = () => {
+    const session = frozenSessionRef.current ?? {
+      providerId: latestParamsRef.current.providerId,
+      localRequest: latestParamsRef.current.localRequest,
+      probeInput: latestParamsRef.current.probeInput,
+    };
+    void startFetch(session);
+  };
+
+  const unaddedModels = useMemo(
+    () => discovered.filter((m) => !existingIds.has(m.id)),
+    [discovered, existingIds],
+  );
+
+  const visibleBase = filterMode === 'unadded' ? unaddedModels : discovered;
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    if (!q) return discovered;
-    return discovered.filter(
+    if (!q) return visibleBase;
+    return visibleBase.filter(
       (m) =>
         m.id.toLowerCase().includes(q) ||
         m.name.toLowerCase().includes(q) ||
         m.group.toLowerCase().includes(q),
     );
-  }, [discovered, search]);
+  }, [visibleBase, search]);
 
   const groups = useMemo(() => {
     const map = new Map<string, DiscoveredModel[]>();
@@ -133,6 +220,16 @@ export function ModelImportDialog({
     () => filtered.filter((m) => !existingIds.has(m.id)),
     [existingIds, filtered],
   );
+
+  const effectiveSelectedCount = useMemo(() => {
+    let count = 0;
+    for (const m of discovered) {
+      if (selectedIds.has(m.id) && !existingIds.has(m.id)) {
+        count += 1;
+      }
+    }
+    return count;
+  }, [discovered, existingIds, selectedIds]);
 
   const toggleId = (id: string) => {
     setSelectedIds((prev) => {
@@ -161,6 +258,9 @@ export function ModelImportDialog({
     }
   };
 
+  const allConfigured =
+    discovered.length > 0 && unaddedModels.length === 0 && !search.trim();
+
   return (
     <Modal
       open={open}
@@ -180,10 +280,10 @@ export function ModelImportDialog({
           </Button>
           <Button
             variant="primary"
-            disabled={loading || importing || selectedIds.size === 0}
+            disabled={loading || importing || effectiveSelectedCount === 0}
             onClick={() => void handleConfirm()}
           >
-            {importing ? '导入中...' : `导入 (${selectedIds.size})`}
+            {importing ? '导入中...' : `导入 (${effectiveSelectedCount})`}
           </Button>
         </>
       }
@@ -195,13 +295,13 @@ export function ModelImportDialog({
           <LoadingSpinner label="正在获取远端模型列表" />
         </div>
       ) : fetchError ? (
-        <ErrorBanner message={fetchError} onRetry={() => void runFetch()} />
+        <ErrorBanner message={fetchError} onRetry={handleRefresh} />
       ) : discovered.length === 0 ? (
         <EmptyState
           icon="cpu"
           title="未发现可用模型"
           action={
-            <Button variant="secondary" onClick={() => void runFetch()}>
+            <Button variant="secondary" onClick={handleRefresh}>
               重新获取
             </Button>
           }
@@ -220,6 +320,22 @@ export function ModelImportDialog({
                 onChange={(e) => setSearch(e.target.value)}
               />
             </div>
+            <SegmentedControl<ImportFilterMode>
+              ariaLabel="筛选模型状态"
+              value={filterMode}
+              options={[
+                { value: 'unadded', label: '未添加' },
+                { value: 'all', label: '全部' },
+              ]}
+              onChange={setFilterMode}
+            />
+            <IconButton
+              size="sm"
+              icon="refresh"
+              label="刷新模型列表"
+              disabled={loading || importing}
+              onClick={handleRefresh}
+            />
             <Button
               size="sm"
               variant="ghost"
@@ -237,14 +353,16 @@ export function ModelImportDialog({
             <Button
               size="sm"
               variant="ghost"
-              disabled={selectedIds.size === 0}
+              disabled={effectiveSelectedCount === 0}
               onClick={() => setSelectedIds(new Set())}
             >
               清空选择
             </Button>
           </div>
 
-          {groups.length === 0 ? (
+          {filterMode === 'unadded' && allConfigured ? (
+            <EmptyState icon="check" title="全部模型已配置" />
+          ) : groups.length === 0 ? (
             <EmptyState title="无匹配模型" />
           ) : (
             <div className="st-import-list">

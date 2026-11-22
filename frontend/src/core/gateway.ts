@@ -14,6 +14,7 @@ import {
   type CreateConversationInput,
   type CreateMessageInput,
   type CreateMessageResult,
+  type CustomFontMeta,
   type DeletedConversation,
   type DesktopConnectionConfig,
   type DesktopConnectionTestResult,
@@ -33,6 +34,7 @@ import {
   type PatchConversationInput,
   type PrepareLocalCompactInput,
   type PreparedLocalCompactRequest,
+  type PreparedLocalModelProbe,
   type PreparedLocalRequest,
   type ProviderAdapterInfo,
   type ProviderConfig,
@@ -235,7 +237,9 @@ function sanitizeProbePayload(
   if (probe.authType && probe.authType.trim() !== '') {
     out.authType = probe.authType.trim();
   }
-  if (probe.apiKey && probe.apiKey.trim() !== '') {
+  if (probe.clearApiKey) {
+    out.clearApiKey = true;
+  } else if (probe.apiKey && probe.apiKey.trim() !== '') {
     out.apiKey = probe.apiKey.trim();
   }
   if (probe.headers !== undefined) {
@@ -468,6 +472,117 @@ export class GatewayClient {
     }));
   }
 
+  getCustomFontMeta(signal?: AbortSignal): Promise<CustomFontMeta | null> {
+    return this.requestJson<{ font?: CustomFontMeta | null }>(
+      'GET',
+      '/api/v1/settings/custom-font',
+      { signal },
+    ).then((res) => res.font ?? null);
+  }
+
+  async uploadCustomFont(
+    name: string,
+    data: ArrayBuffer | Blob,
+    signal?: AbortSignal,
+  ): Promise<CustomFontMeta> {
+    const url = resolveGatewayUrl(this.baseUrl, '/api/v1/settings/custom-font');
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: 'PUT',
+        headers: this.buildHeaders(false, true, {
+          'Content-Type': 'font/ttf',
+          'X-Font-Name': encodeURIComponent(name),
+        }),
+        body: data,
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+      throw new GatewayError(
+        'NETWORK_ERROR',
+        err instanceof Error ? err.message : '上传字体失败',
+      );
+    }
+    const rawText = await response.text();
+    if (!response.ok) {
+      const env = parseErrorEnvelope(rawText, response.status);
+      throw new GatewayError(env.code, env.message, response.status);
+    }
+    try {
+      const parsed = JSON.parse(rawText) as { font?: CustomFontMeta };
+      if (!parsed.font) {
+        throw new GatewayError('INVALID_RESPONSE', '服务端未返回字体元数据', response.status);
+      }
+      return parsed.font;
+    } catch (err) {
+      if (err instanceof GatewayError) throw err;
+      throw new GatewayError('INVALID_RESPONSE', '服务端返回了无效的 JSON 响应', response.status);
+    }
+  }
+
+  setCustomFontEnabled(
+    enabled: boolean,
+    signal?: AbortSignal,
+  ): Promise<CustomFontMeta> {
+    return this.requestJson<{ font: CustomFontMeta }>(
+      'PATCH',
+      '/api/v1/settings/custom-font',
+      { body: { enabled }, signal },
+    ).then((res) => res.font);
+  }
+
+  deleteCustomFont(signal?: AbortSignal): Promise<void> {
+    return this.requestJson<void>('DELETE', '/api/v1/settings/custom-font', {
+      signal,
+    });
+  }
+
+  async downloadCustomFontFile(opts?: {
+    ifNoneMatch?: string;
+    signal?: AbortSignal;
+  }): Promise<
+    | { notModified: true; etag: string }
+    | { notModified: false; buffer: ArrayBuffer; etag: string }
+  > {
+    const url = resolveGatewayUrl(
+      this.baseUrl,
+      '/api/v1/settings/custom-font/file',
+    );
+    const extra: Record<string, string> = {};
+    if (opts?.ifNoneMatch) {
+      extra['If-None-Match'] = opts.ifNoneMatch;
+    }
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: 'GET',
+        headers: this.buildHeaders(false, true, extra),
+        signal: opts?.signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+      throw new GatewayError(
+        'NETWORK_ERROR',
+        err instanceof Error ? err.message : '下载字体失败',
+      );
+    }
+    const rawEtag = response.headers.get('ETag') ?? '';
+    const etag = rawEtag.trim().replace(/^W\//i, '').replace(/^"|"$/g, '');
+    if (response.status === 304) {
+      return { notModified: true, etag };
+    }
+    if (!response.ok) {
+      const rawText = await response.text();
+      const env = parseErrorEnvelope(rawText, response.status);
+      throw new GatewayError(env.code, env.message, response.status);
+    }
+    const buffer = await response.arrayBuffer();
+    return { notModified: false, buffer, etag };
+  }
+
   updatePreferences(
     patch: Partial<ServerPreferences>,
     signal?: AbortSignal,
@@ -593,6 +708,17 @@ export class GatewayClient {
       `/api/v1/providers/${encodeURIComponent(id)}/models/fetch`,
       { body: sanitizeProbePayload(probe), signal },
     ).then((res) => res.models ?? []);
+  }
+
+  prepareLocalModelProbe(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<PreparedLocalModelProbe> {
+    return this.requestJson<PreparedLocalModelProbe>(
+      'POST',
+      `/api/v1/providers/${encodeURIComponent(id)}/models/prepare-local`,
+      { signal },
+    );
   }
 
   listAssistants(signal?: AbortSignal): Promise<Assistant[]> {

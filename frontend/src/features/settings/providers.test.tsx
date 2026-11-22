@@ -137,6 +137,48 @@ function makeFetchMock(state: MockState) {
       });
     }
 
+    const prepareLocalMatch = url.match(
+      /\/api\/v1\/providers\/([^/]+)\/models\/prepare-local$/,
+    );
+    if (prepareLocalMatch && method === 'POST') {
+      const id = decodeURIComponent(prepareLocalMatch[1]);
+      const prov = state.providers.find((p) => p.id === id);
+      if (!prov || !prov.localRequest) {
+        return new Response(
+          JSON.stringify({ code: 'CONFLICT', message: 'not local request' }),
+          { status: 409 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          method: 'GET',
+          url: `${prov.baseURL.replace(/\/+$/, '')}/models`,
+          headers: {
+            Accept: 'application/json',
+            Authorization: 'Bearer sk-local-envelope',
+          },
+          authType: prov.authType,
+          protocol: 'openai',
+          defaultFormat: 'openai-completions',
+        }),
+        { status: 200, headers: { 'Cache-Control': 'no-store' } },
+      );
+    }
+
+    if (url === 'http://127.0.0.1:11434/v1/models' && method === 'GET') {
+      state.lastFetchBodies.push({ directUrl: url });
+      return new Response(
+        JSON.stringify({
+          data: state.discovered.map((m) => ({
+            id: m.id,
+            name: m.name,
+            reasoning: m.reasoning,
+          })),
+        }),
+        { status: 200 },
+      );
+    }
+
     const itemMatch = url.match(/\/api\/v1\/providers\/([^/]+)$/);
     if (itemMatch) {
       const id = decodeURIComponent(itemMatch[1]);
@@ -589,6 +631,10 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
       expect(within(dialog).getByText('o4-mini')).toBeInTheDocument();
     });
 
+    // Default filter is '未添加', so already-configured GPT-4.1 Upstream is hidden until switching to '全部'.
+    expect(within(dialog).queryByText('GPT-4.1 Upstream')).not.toBeInTheDocument();
+    await user.click(within(dialog).getByRole('radio', { name: '全部' }));
+
     // Existing model checkbox is disabled and tagged 已配置.
     const existingCheckbox = within(dialog).getByRole('checkbox', {
       name: /GPT-4.1 Upstream/,
@@ -679,14 +725,25 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
     expect(created?.apiKeySet).toBe(true);
     expect(created?.localRequest).toBe(true);
 
-    // Test connection and model discovery always go through the gateway, which
-    // resolves the stored credential for local-request providers.
+    // Saved localRequest=true provider on Web probes browser-direct via prepare-local envelope (never /test or /models/fetch).
     await user.click(screen.getByRole('button', { name: '测试连接' }));
     await waitFor(() => {
       expect(screen.getByText(/连接正常/)).toBeInTheDocument();
     });
-    expect(state.lastProbeBodies).toHaveLength(1);
-    expect(state.lastProbeBodies[0]).not.toHaveProperty('apiKey');
+    expect(state.lastProbeBodies).toHaveLength(0);
+    expect(state.lastFetchBodies).toEqual([
+      { directUrl: 'http://127.0.0.1:11434/v1/models' },
+    ]);
+
+    // Changing localRequest connection draft requires saving before testing or fetching.
+    const urlInput = screen.getByLabelText('API 地址');
+    await user.clear(urlInput);
+    await user.type(urlInput, 'http://127.0.0.1:11435/v1');
+    await user.click(screen.getByRole('button', { name: '测试连接' }));
+    expect(
+      screen.getByText('请先保存本地请求配置后再测试连接'),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '还原' }));
 
     state.discovered = [
       {
@@ -701,6 +758,130 @@ describe('ProvidersPage, ProviderEditor, ModelEditor, and ModelImportDialog', ()
     await waitFor(() => {
       expect(within(importDialog).getByText('qwen2.5:7b')).toBeInTheDocument();
     });
-    expect(state.lastFetchBodies).toHaveLength(1);
+    expect(state.lastFetchBodies).toHaveLength(2);
+  });
+
+  it('freezes ModelImportDialog session across parent re-renders, ignores late responses, and shows all-configured empty state', async () => {
+    let fetchCount = 0;
+    let aborted = false;
+    let resolveFirstFetch: ((res: Response) => void) | null = null;
+
+    const customFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.endsWith('/healthz')) {
+        return new Response(
+          JSON.stringify({ status: 'ok', version: '1.2.0', authRequired: false }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return new Response(
+          JSON.stringify({ formats: FORMATS, adapters: ADAPTERS }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/providers') && method === 'GET') {
+        return new Response(
+          JSON.stringify({
+            providers: [
+              {
+                id: 'p1',
+                name: 'Stable Provider',
+                adapter: 'generic-http',
+                baseURL: 'https://api.example.com/v1',
+                authType: 'bearer',
+                apiKeyMasked: 'sk-1...2345',
+                apiKeySet: true,
+                models: [
+                  {
+                    id: 'only-model',
+                    name: 'Only Model',
+                    apiFormat: 'openai-completions',
+                  },
+                ],
+                enabled: true,
+                builtIn: false,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/providers/p1/models/fetch')) {
+        fetchCount += 1;
+        init?.signal?.addEventListener('abort', () => {
+          aborted = true;
+        });
+        return new Promise<Response>((resolve) => {
+          resolveFirstFetch = resolve;
+        });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <AppProvider fetchImpl={customFetch}>
+        <MemoryRouter>
+          <ProvidersPage />
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { name: 'Stable Provider' }),
+      ).toBeInTheDocument();
+    });
+
+    await user.click(screen.getAllByRole('button', { name: '获取模型' })[0]);
+    const dialog = screen.getByRole('dialog');
+    await waitFor(() => {
+      expect(fetchCount).toBe(1);
+    });
+
+    // Re-render parent while fetch is in flight -> must NOT abort or restart fetch.
+    rerender(
+      <AppProvider fetchImpl={customFetch}>
+        <MemoryRouter>
+          <ProvidersPage />
+        </MemoryRouter>
+      </AppProvider>,
+    );
+    expect(aborted).toBe(false);
+    expect(fetchCount).toBe(1);
+
+    // Resolve with only the already-configured model -> shows '全部模型已配置'.
+    resolveFirstFetch!(
+      new Response(
+        JSON.stringify({
+          models: [
+            {
+              id: 'only-model',
+              name: 'Only Model',
+              group: 'only',
+              apiFormat: 'openai-completions',
+            },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+    await waitFor(() => {
+      expect(within(dialog).getByText('全部模型已配置')).toBeInTheDocument();
+    });
+
+    // Switching to '全部' reveals the configured model, and explicit refresh button triggers a second fetch.
+    await user.click(within(dialog).getByRole('radio', { name: '全部' }));
+    expect(within(dialog).getByText('Only Model')).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: '刷新模型列表' }));
+    await waitFor(() => {
+      expect(fetchCount).toBe(2);
+    });
+
+    // Closing dialog aborts the in-flight second fetch.
+    await user.click(within(dialog).getByRole('button', { name: '取消' }));
+    expect(aborted).toBe(true);
   });
 });

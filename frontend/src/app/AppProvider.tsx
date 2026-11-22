@@ -10,11 +10,19 @@ import {
 } from 'react';
 import {
   CUSTOM_FONT_FAMILY,
+  decodeCustomFontBuffer,
+  deleteCachedCloudFont,
   deleteCustomFont as deleteStoredCustomFont,
+  downloadVerifiedCloudFont,
   importCustomFont,
   loadStoredCustomFontFace,
+  normalizeFontGatewayKey,
+  readCachedCloudFont,
   readCustomFont,
   setStoredCustomFontEnabled,
+  syncCloudCustomFont,
+  validateAndDecodeCustomFontFile,
+  writeCachedCloudFont,
 } from '../core/customFont';
 import { getDesktopBootstrap } from '../core/desktop';
 import { GatewayClient, GatewayError, validateGatewayUrl } from '../core/gateway';
@@ -60,6 +68,8 @@ export type ConnectionState = 'checking' | 'connected' | 'auth-required' | 'erro
 export interface CustomFontInfo {
   name: string;
   enabled: boolean;
+  sha256?: string;
+  source?: 'cloud' | 'local';
 }
 
 export interface AppResources {
@@ -112,10 +122,12 @@ export interface AppContextValue {
   connectionEpoch: number;
   settings: AppSettings;
   customFont: CustomFontInfo | null;
+  legacyCustomFont: { name: string } | null;
   customFontBusy: boolean;
   uploadCustomFont: (file: File) => Promise<{ ok: boolean; error?: string }>;
   toggleCustomFont: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
   removeCustomFont: () => Promise<{ ok: boolean; error?: string }>;
+  importLegacyCustomFont: () => Promise<{ ok: boolean; error?: string }>;
   resolvedTheme: 'light' | 'dark';
   settingsNotice: string | null;
   dismissSettingsNotice: () => void;
@@ -321,9 +333,12 @@ export function AppProvider({
   // slow avatar save cannot revert a newer theme change.
   const serverPreferencesRef = useRef<AppPreferences>(defaultAppPreferences());
   const [customFont, setCustomFont] = useState<CustomFontInfo | null>(null);
+  const [legacyCustomFont, setLegacyCustomFont] = useState<{ name: string } | null>(null);
   const [customFontBusy, setCustomFontBusy] = useState(false);
   const customFontFaceRef = useRef<FontFace | null>(null);
   const customFontRevisionRef = useRef(0);
+  const customFontAbortRef = useRef<AbortController | null>(null);
+  const cloudFontGatewayKeyRef = useRef<string | null>(null);
 
   const [connectionEpoch, setConnectionEpoch] = useState(1);
   const epochRef = useRef(1);
@@ -446,39 +461,186 @@ export function AppProvider({
     [detachCustomFontFace],
   );
 
-  useEffect(() => {
-    const revision = ++customFontRevisionRef.current;
-    void (async () => {
+  const resetCustomFontRuntime = useCallback(() => {
+    customFontAbortRef.current?.abort();
+    customFontAbortRef.current = null;
+    customFontRevisionRef.current += 1;
+    detachCustomFontFace();
+    setCustomFont(null);
+    setLegacyCustomFont(null);
+  }, [detachCustomFontFace]);
+
+  const loadDeviceLegacyFont = useCallback(
+    async (revision: number) => {
       const stored = await readCustomFont();
-      if (!stored || revision !== customFontRevisionRef.current) return;
+      if (revision !== customFontRevisionRef.current) return;
+      if (!stored) {
+        detachCustomFontFace();
+        setCustomFont(null);
+        return;
+      }
       if (stored.enabled) {
         try {
           const face = await loadStoredCustomFontFace(stored);
           if (revision !== customFontRevisionRef.current) return;
           attachCustomFontFace(face);
         } catch {
-          // Keep the built-in stack when a saved font can no longer be decoded.
+          detachCustomFontFace();
         }
+      } else {
+        detachCustomFontFace();
       }
       if (revision === customFontRevisionRef.current) {
-        setCustomFont({ name: stored.name, enabled: stored.enabled });
+        setCustomFont({
+          name: stored.name,
+          enabled: stored.enabled,
+          source: 'local',
+        });
       }
-    })();
+    },
+    [attachCustomFontFace, detachCustomFontFace],
+  );
+
+  const syncCustomFontForTarget = useCallback(
+    async (
+      targetGatewayUrl: string | null,
+      cloudState: CloudConnectionState | 'connected',
+    ): Promise<void> => {
+      customFontAbortRef.current?.abort();
+      const ctrl = new AbortController();
+      customFontAbortRef.current = ctrl;
+      const revision = ++customFontRevisionRef.current;
+
+      const nextKey = targetGatewayUrl
+        ? normalizeFontGatewayKey(targetGatewayUrl)
+        : null;
+      if (nextKey !== cloudFontGatewayKeyRef.current) {
+        cloudFontGatewayKeyRef.current = nextKey;
+        detachCustomFontFace();
+        setCustomFont(null);
+        setLegacyCustomFont(null);
+      }
+
+      if (!nextKey) {
+        await loadDeviceLegacyFont(revision);
+        return;
+      }
+
+      if (cloudState === 'auth-required') {
+        detachCustomFontFace();
+        setCustomFont(null);
+        setLegacyCustomFont(null);
+        return;
+      }
+
+      const result = await syncCloudCustomFont({
+        gateway,
+        gatewayKey: nextKey,
+        signal: ctrl.signal,
+        isCurrent: () => revision === customFontRevisionRef.current,
+      });
+      if (revision !== customFontRevisionRef.current) return;
+
+      switch (result.kind) {
+        case 'stale':
+          return;
+        case 'ready':
+          if (result.face) {
+            attachCustomFontFace(result.face);
+          } else {
+            detachCustomFontFace();
+          }
+          setCustomFont({
+            name: result.font.name,
+            enabled: result.font.enabled,
+            sha256: result.font.sha256,
+            source: 'cloud',
+          });
+          setLegacyCustomFont(null);
+          return;
+        case 'empty':
+          detachCustomFontFace();
+          setCustomFont(null);
+          setLegacyCustomFont(result.legacyFont);
+          return;
+        case 'offline-cached':
+          if (result.face) {
+            attachCustomFontFace(result.face);
+          } else {
+            detachCustomFontFace();
+          }
+          setCustomFont({
+            name: result.font.name,
+            enabled: result.font.enabled,
+            sha256: result.font.sha256,
+            source: 'cloud',
+          });
+          setLegacyCustomFont(null);
+          return;
+        case 'auth-error':
+          detachCustomFontFace();
+          setCustomFont(null);
+          setLegacyCustomFont(null);
+          return;
+        case 'disconnected':
+          cloudFontGatewayKeyRef.current = null;
+          detachCustomFontFace();
+          setCustomFont(null);
+          setLegacyCustomFont(null);
+          await loadDeviceLegacyFont(revision);
+          return;
+        case 'error':
+          return;
+      }
+    },
+    [attachCustomFontFace, detachCustomFontFace, gateway, loadDeviceLegacyFont],
+  );
+
+  useEffect(() => {
+    if (skipInitialBootstrap) {
+      const revision = ++customFontRevisionRef.current;
+      void loadDeviceLegacyFont(revision);
+    }
     return () => {
+      customFontAbortRef.current?.abort();
+      customFontAbortRef.current = null;
       customFontRevisionRef.current += 1;
       detachCustomFontFace();
     };
-  }, [attachCustomFontFace, detachCustomFontFace]);
+  }, [detachCustomFontFace, loadDeviceLegacyFont, skipInitialBootstrap]);
 
   const uploadCustomFont = useCallback(
     async (file: File): Promise<{ ok: boolean; error?: string }> => {
+      customFontAbortRef.current?.abort();
+      customFontAbortRef.current = null;
       const revision = ++customFontRevisionRef.current;
+      const gatewayKey = cloudFontGatewayKeyRef.current;
       setCustomFontBusy(true);
       try {
-        const { font, face } = await importCustomFont(file);
+        if (!gatewayKey) {
+          const { font, face } = await importCustomFont(file);
+          if (revision !== customFontRevisionRef.current) return { ok: true };
+          attachCustomFontFace(face);
+          setCustomFont({ name: font.name, enabled: true, source: 'local' });
+          setLegacyCustomFont(null);
+          return { ok: true };
+        }
+        const decoded = await validateAndDecodeCustomFontFile(file);
+        const meta = await gateway.uploadCustomFont(decoded.name, decoded.buffer);
         if (revision !== customFontRevisionRef.current) return { ok: true };
-        attachCustomFontFace(face);
-        setCustomFont({ name: font.name, enabled: true });
+        attachCustomFontFace(decoded.face);
+        setCustomFont({
+          name: meta.name,
+          enabled: meta.enabled,
+          sha256: meta.sha256,
+          source: 'cloud',
+        });
+        setLegacyCustomFont(null);
+        await writeCachedCloudFont({
+          gatewayKey,
+          ...meta,
+          blob: new Blob([decoded.buffer], { type: 'font/ttf' }),
+        }).catch(() => {});
         return { ok: true };
       } catch (err) {
         return { ok: false, error: errorMessageOf(err) };
@@ -486,28 +648,79 @@ export function AppProvider({
         if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
       }
     },
-    [attachCustomFontFace],
+    [attachCustomFontFace, gateway],
   );
 
   const toggleCustomFont = useCallback(
     async (enabled: boolean): Promise<{ ok: boolean; error?: string }> => {
+      customFontAbortRef.current?.abort();
+      customFontAbortRef.current = null;
       const revision = ++customFontRevisionRef.current;
+      const gatewayKey = cloudFontGatewayKeyRef.current;
       setCustomFontBusy(true);
       try {
-        if (enabled) {
-          const stored = await readCustomFont();
-          if (!stored) throw new Error('没有可用的自定义字体');
-          const face = await loadStoredCustomFontFace(stored);
-          const saved = await setStoredCustomFontEnabled(true);
+        if (!gatewayKey) {
+          if (enabled) {
+            const stored = await readCustomFont();
+            if (!stored) throw new Error('没有可用的自定义字体');
+            const face = await loadStoredCustomFontFace(stored);
+            const saved = await setStoredCustomFontEnabled(true);
+            if (revision !== customFontRevisionRef.current) return { ok: true };
+            attachCustomFontFace(face);
+            setCustomFont({ name: saved.name, enabled: true, source: 'local' });
+          } else {
+            const saved = await setStoredCustomFontEnabled(false);
+            if (revision !== customFontRevisionRef.current) return { ok: true };
+            detachCustomFontFace();
+            setCustomFont({ name: saved.name, enabled: false, source: 'local' });
+          }
+          return { ok: true };
+        }
+
+        const meta = await gateway.setCustomFontEnabled(enabled);
+        if (revision !== customFontRevisionRef.current) return { ok: true };
+        if (meta.enabled) {
+          const cached = await readCachedCloudFont(gatewayKey);
+          if (revision !== customFontRevisionRef.current) return { ok: true };
+          let face: FontFace;
+          if (cached && cached.sha256 === meta.sha256) {
+            face = await loadStoredCustomFontFace(cached);
+            await writeCachedCloudFont({
+              ...cached,
+              name: meta.name,
+              enabled: true,
+              updatedAt: meta.updatedAt,
+            }).catch(() => {});
+          } else {
+            const downloaded = await downloadVerifiedCloudFont(gateway, meta);
+            if (!downloaded) throw new Error('云端字体已被移除');
+            face = downloaded.face;
+            await writeCachedCloudFont({
+              gatewayKey,
+              ...downloaded.meta,
+              blob: new Blob([downloaded.buffer], { type: 'font/ttf' }),
+            }).catch(() => {});
+          }
           if (revision !== customFontRevisionRef.current) return { ok: true };
           attachCustomFontFace(face);
-          setCustomFont({ name: saved.name, enabled: true });
         } else {
-          const saved = await setStoredCustomFontEnabled(false);
-          if (revision !== customFontRevisionRef.current) return { ok: true };
           detachCustomFontFace();
-          setCustomFont({ name: saved.name, enabled: false });
+          const cached = await readCachedCloudFont(gatewayKey);
+          if (cached && cached.sha256 === meta.sha256) {
+            await writeCachedCloudFont({
+              ...cached,
+              name: meta.name,
+              enabled: false,
+              updatedAt: meta.updatedAt,
+            }).catch(() => {});
+          }
         }
+        setCustomFont({
+          name: meta.name,
+          enabled: meta.enabled,
+          sha256: meta.sha256,
+          source: 'cloud',
+        });
         return { ok: true };
       } catch (err) {
         return { ok: false, error: errorMessageOf(err) };
@@ -515,27 +728,84 @@ export function AppProvider({
         if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
       }
     },
-    [attachCustomFontFace, detachCustomFontFace],
+    [attachCustomFontFace, detachCustomFontFace, gateway],
   );
 
   const removeCustomFont = useCallback(async (): Promise<{
     ok: boolean;
     error?: string;
   }> => {
+    customFontAbortRef.current?.abort();
+    customFontAbortRef.current = null;
     const revision = ++customFontRevisionRef.current;
+    const gatewayKey = cloudFontGatewayKeyRef.current;
     setCustomFontBusy(true);
     try {
-      await deleteStoredCustomFont();
+      if (!gatewayKey) {
+        await deleteStoredCustomFont();
+        if (revision !== customFontRevisionRef.current) return { ok: true };
+        detachCustomFontFace();
+        setCustomFont(null);
+        return { ok: true };
+      }
+      await gateway.deleteCustomFont();
       if (revision !== customFontRevisionRef.current) return { ok: true };
       detachCustomFontFace();
       setCustomFont(null);
+      await deleteCachedCloudFont(gatewayKey).catch(() => {});
+      const legacy = await readCustomFont();
+      if (revision === customFontRevisionRef.current) {
+        setLegacyCustomFont(legacy ? { name: legacy.name } : null);
+      }
       return { ok: true };
     } catch (err) {
       return { ok: false, error: errorMessageOf(err) };
     } finally {
       if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
     }
-  }, [detachCustomFontFace]);
+  }, [detachCustomFontFace, gateway]);
+
+  const importLegacyCustomFont = useCallback(async (): Promise<{
+    ok: boolean;
+    error?: string;
+  }> => {
+    const gatewayKey = cloudFontGatewayKeyRef.current;
+    if (!gatewayKey) {
+      return { ok: false, error: '当前未连接云端网关' };
+    }
+    customFontAbortRef.current?.abort();
+    customFontAbortRef.current = null;
+    const revision = ++customFontRevisionRef.current;
+    setCustomFontBusy(true);
+    try {
+      const legacy = await readCustomFont();
+      if (!legacy) {
+        throw new Error('没有可导入的旧字体');
+      }
+      const buffer = await legacy.blob.arrayBuffer();
+      const face = await decodeCustomFontBuffer(buffer);
+      const meta = await gateway.uploadCustomFont(legacy.name, buffer);
+      if (revision !== customFontRevisionRef.current) return { ok: true };
+      attachCustomFontFace(face);
+      setCustomFont({
+        name: meta.name,
+        enabled: meta.enabled,
+        sha256: meta.sha256,
+        source: 'cloud',
+      });
+      setLegacyCustomFont(null);
+      await writeCachedCloudFont({
+        gatewayKey,
+        ...meta,
+        blob: new Blob([buffer], { type: 'font/ttf' }),
+      }).catch(() => {});
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: errorMessageOf(err) };
+    } finally {
+      if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
+    }
+  }, [attachCustomFontFace, gateway]);
 
   const toast = useCallback(
     (message: string, tone: 'default' | 'error' = 'default') => {
@@ -1052,6 +1322,10 @@ export function AppProvider({
               : Promise.resolve(null),
             refreshPlugins(),
             refreshPreferences(),
+            syncCustomFontForTarget(
+              status?.gatewayBaseUrl || null,
+              normalizeCloudState(status?.cloudState),
+            ),
           ]);
         if (startEpoch !== epochRef.current) {
           return { ok: false, error: '连接已切换' };
@@ -1073,6 +1347,7 @@ export function AppProvider({
         refreshConversations(),
         refreshPlugins(),
         refreshPreferences(),
+        syncCustomFontForTarget(settingsRef.current.gatewayBaseUrl, 'connected'),
       ]);
       if (startEpoch !== epochRef.current) {
         return { ok: false, error: '连接已切换' };
@@ -1097,6 +1372,7 @@ export function AppProvider({
     refreshPlugins,
     refreshPreferences,
     refreshProviders,
+    syncCustomFontForTarget,
   ]);
 
   const bootstrapConnection = useCallback(
@@ -1105,6 +1381,8 @@ export function AppProvider({
         ctrl.abort();
       }
       activeControllersRef.current.clear();
+      resetCustomFontRuntime();
+      cloudFontGatewayKeyRef.current = null;
 
       const nextEpoch = epochRef.current + 1;
       epochRef.current = nextEpoch;
@@ -1151,6 +1429,12 @@ export function AppProvider({
           }
 
           const cloudReady = status?.cloudState === 'connected';
+          const fontTargetUrl = status?.gatewayBaseUrl || null;
+          const fontCloudState = status
+            ? normalizeCloudState(status.cloudState)
+            : statusFailed
+              ? 'error'
+              : 'disconnected';
           const [, provOk, asstOk, localConvs, , pluginsOk] = await Promise.all([
             hydratePreferences(signal, nextEpoch).catch(() => {}),
             refreshProviders(),
@@ -1158,6 +1442,7 @@ export function AppProvider({
             refreshConversations('local'),
             cloudReady ? refreshConversations('cloud') : Promise.resolve(null),
             refreshPlugins(cloudReady ? 'cloud' : 'local'),
+            syncCustomFontForTarget(fontTargetUrl, fontCloudState),
           ]);
           if (
             nextEpoch === epochRef.current &&
@@ -1205,6 +1490,7 @@ export function AppProvider({
           refreshAssistants(),
           refreshConversations(),
           refreshPlugins(),
+          syncCustomFontForTarget(baseUrl, 'connected'),
         ]);
         if (
           nextEpoch === epochRef.current &&
@@ -1237,6 +1523,8 @@ export function AppProvider({
       refreshConversations,
       refreshPlugins,
       refreshProviders,
+      resetCustomFontRuntime,
+      syncCustomFontForTarget,
       trackSignal,
       updateCloudConnectionState,
     ],
@@ -1270,6 +1558,10 @@ export function AppProvider({
           updateCloudConnectionState(nextCloudState);
           const epoch = epochRef.current;
           void refreshAll();
+          void syncCustomFontForTarget(
+            saved.status.gatewayBaseUrl || null,
+            nextCloudState,
+          );
           if (nextCloudState === 'connected') {
             const { signal, cleanup } = trackSignal();
             void hydratePreferences(signal, epoch)
@@ -1301,6 +1593,7 @@ export function AppProvider({
       hydratePreferences,
       isDesktop,
       refreshAll,
+      syncCustomFontForTarget,
       trackSignal,
       updateCloudConnectionState,
       updateSettings,
@@ -1380,6 +1673,7 @@ export function AppProvider({
     const status = await gateway.disconnectDesktopCloud();
     setDesktopStatus(status);
     updateCloudConnectionState(normalizeCloudState(status.cloudState));
+    void syncCustomFontForTarget(null, 'disconnected');
     setResources((prev) => {
       const nextActiveConvs =
         topicScopeRef.current === 'local' ? prev.localConversations : [];
@@ -1395,7 +1689,7 @@ export function AppProvider({
       };
     });
     return status;
-  }, [gateway, isDesktop, updateCloudConnectionState]);
+  }, [gateway, isDesktop, syncCustomFontForTarget, updateCloudConnectionState]);
 
   const retryConnection = useCallback(() => {
     void bootstrapConnection(settings.gatewayBaseUrl, settings.accessToken);
@@ -1854,10 +2148,12 @@ export function AppProvider({
       connectionEpoch,
       settings,
       customFont,
+      legacyCustomFont,
       customFontBusy,
       uploadCustomFont,
       toggleCustomFont,
       removeCustomFont,
+      importLegacyCustomFont,
       resolvedTheme,
       settingsNotice,
       dismissSettingsNotice: () => setSettingsNotice(null),
@@ -1910,10 +2206,12 @@ export function AppProvider({
       connectionEpoch,
       settings,
       customFont,
+      legacyCustomFont,
       customFontBusy,
       uploadCustomFont,
       toggleCustomFont,
       removeCustomFont,
+      importLegacyCustomFont,
       resolvedTheme,
       settingsNotice,
       updateSettings,

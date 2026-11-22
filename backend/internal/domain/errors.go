@@ -8,12 +8,14 @@ import (
 
 // Standard API and domain error codes.
 const (
-	ErrCodeUnauthorized    = "UNAUTHORIZED"
-	ErrCodeNotFound        = "NOT_FOUND"
-	ErrCodeInvalidArgument = "INVALID_ARGUMENT"
-	ErrCodeConflict        = "CONFLICT"
-	ErrCodeUpstreamError   = "UPSTREAM_ERROR"
-	ErrCodeInternalError   = "INTERNAL_ERROR"
+	ErrCodeUnauthorized      = "UNAUTHORIZED"
+	ErrCodeNotFound          = "NOT_FOUND"
+	ErrCodeInvalidArgument   = "INVALID_ARGUMENT"
+	ErrCodeConflict          = "CONFLICT"
+	ErrCodePayloadTooLarge   = "PAYLOAD_TOO_LARGE"
+	ErrCodeUpstreamError     = "UPSTREAM_ERROR"
+	ErrCodeCloudNotConnected = "CLOUD_NOT_CONNECTED"
+	ErrCodeInternalError     = "INTERNAL_ERROR"
 )
 
 // AppError represents a structured domain or gateway error mapped to an HTTP status.
@@ -45,8 +47,12 @@ func (e *AppError) HTTPStatus() int {
 		return http.StatusBadRequest
 	case ErrCodeConflict:
 		return http.StatusConflict
+	case ErrCodePayloadTooLarge:
+		return http.StatusRequestEntityTooLarge
 	case ErrCodeUpstreamError:
 		return http.StatusBadGateway
+	case ErrCodeCloudNotConnected:
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
 	}

@@ -104,7 +104,17 @@ export interface ProviderProbeInput {
   baseURL?: string;
   authType?: AuthType | string;
   apiKey?: string;
+  clearApiKey?: boolean;
   headers?: Record<string, string>;
+}
+
+export interface PreparedLocalModelProbe {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  authType: AuthType | string;
+  protocol: string;
+  defaultFormat: string;
 }
 
 export interface ProviderConnectionResult {
@@ -711,6 +721,14 @@ export interface HealthResponse {
   status: string;
   version: string;
   authRequired: boolean;
+}
+
+export interface CustomFontMeta {
+  name: string;
+  enabled: boolean;
+  sha256: string;
+  sizeBytes: number;
+  updatedAt: string;
 }
 
 export interface ApiErrorEnvelope {

@@ -16,6 +16,7 @@ import {
 import {
   importLegacyProviderKeys,
 } from '../../core/localProviderKeys';
+import { executeLocalModelProbe } from '../../core/localModelProbe';
 import type {
   AuthType,
   ModelConfig,
@@ -59,6 +60,7 @@ export interface ProviderEditorProps {
 export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
   const {
     gateway,
+    isDesktop,
     resources,
     upsertLocalProvider,
     removeLocalProvider,
@@ -105,9 +107,15 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
 
   const [modelEditorOpen, setModelEditorOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<ModelConfig | null>(null);
-  const [importOpen, setImportOpen] = useState(false);
+  const [importSession, setImportSession] = useState<{
+    providerId: string;
+    providerName: string;
+    localRequest: boolean;
+    probeInput: ProviderProbeInput;
+  } | null>(null);
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const testAbortRef = useRef<AbortController | null>(null);
 
   const syncDraftFromProvider = (p: ProviderConfig) => {
     const serialized = serializeHeaders(p.headers);
@@ -131,9 +139,19 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
   useEffect(() => {
     if (prevProviderIdRef.current !== provider.id) {
       prevProviderIdRef.current = provider.id;
+      testAbortRef.current?.abort();
+      testAbortRef.current = null;
+      setImportSession(null);
       syncDraftFromProvider(provider);
     }
   }, [provider]);
+
+  useEffect(() => {
+    return () => {
+      testAbortRef.current?.abort();
+      testAbortRef.current = null;
+    };
+  }, []);
 
   // Adopt any pre-migration browser credential exactly once; the gateway refuses
   // to overwrite values it or another browser already committed.
@@ -186,6 +204,17 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
     [activePreviewModel, baseURL, resources.formats],
   );
 
+  const hasConnectionDraftChanges =
+    adapter !== provider.adapter ||
+    baseURL.trim() !== provider.baseURL ||
+    authType !== provider.authType ||
+    apiKey.trim() !== '' ||
+    clearApiKey ||
+    localRequest !== Boolean(provider.localRequest) ||
+    headersText !== initialHeadersText;
+
+  const isLocalModeInvolved = Boolean(provider.localRequest) || localRequest;
+
   const buildProbeInput = (): ProviderProbeInput | null => {
     const errors: ProviderFieldErrors = {};
     const urlErr = validateHttpUrl(baseURL, 'API 地址');
@@ -206,7 +235,11 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
     return {
       baseURL: baseURL.trim(),
       authType,
-      ...(apiKey.trim() && !clearApiKey ? { apiKey: apiKey.trim() } : {}),
+      ...(clearApiKey
+        ? { clearApiKey: true }
+        : apiKey.trim()
+          ? { apiKey: apiKey.trim() }
+          : {}),
       headers: headersParsed.ok ? headersParsed.value : {},
     };
   };
@@ -214,23 +247,59 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
   const handleTestConnection = async () => {
     const probe = buildProbeInput();
     if (!probe) return;
+    if (isLocalModeInvolved && hasConnectionDraftChanges) {
+      setTestResult({
+        ok: false,
+        text: '请先保存本地请求配置后再测试连接',
+      });
+      return;
+    }
+    testAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    testAbortRef.current = ctrl;
     setTesting(true);
     setTestResult(null);
     setFormError(null);
     try {
-      // The gateway resolves stored credentials, including local-request providers.
-      const res = await gateway.testProviderConnection(provider.id, probe);
-      setTestResult({
-        ok: res.ok,
-        text: `${res.message || '连接正常'} · ${res.latencyMs} ms · ${res.modelCount} 个模型`,
-      });
+      if (!isDesktop && provider.localRequest) {
+        const res = await executeLocalModelProbe(
+          gateway,
+          provider.id,
+          ctrl.signal,
+        );
+        if (ctrl.signal.aborted) return;
+        setTestResult({
+          ok: true,
+          text: `连接正常 · ${res.latencyMs} ms · ${res.models.length} 个模型`,
+        });
+      } else {
+        const res = await gateway.testProviderConnection(
+          provider.id,
+          probe,
+          ctrl.signal,
+        );
+        if (ctrl.signal.aborted) return;
+        setTestResult({
+          ok: res.ok,
+          text: `${res.message || '连接正常'} · ${res.latencyMs} ms · ${res.modelCount} 个模型`,
+        });
+      }
     } catch (err) {
+      if (
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.name === 'AbortError')
+      ) {
+        return;
+      }
       setTestResult({
         ok: false,
         text: errorMessageOf(err, '连接测试失败'),
       });
     } finally {
-      setTesting(false);
+      if (testAbortRef.current === ctrl) {
+        testAbortRef.current = null;
+        setTesting(false);
+      }
     }
   };
 
@@ -411,18 +480,19 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
   const host = extractHost(provider.baseURL);
 
   const openImport = () => {
-    if (!buildProbeInput()) return;
-    setImportOpen(true);
-  };
-
-  const probeSnapshot: ProviderProbeInput = {
-    baseURL: baseURL.trim(),
-    authType,
-    ...(apiKey.trim() && !clearApiKey ? { apiKey: apiKey.trim() } : {}),
-    headers: (() => {
-      const parsed = parseJsonStringMap(headersText, '请求头');
-      return parsed.ok ? parsed.value : {};
-    })(),
+    const probe = buildProbeInput();
+    if (!probe) return;
+    if (isLocalModeInvolved && hasConnectionDraftChanges) {
+      setFormError('请先保存本地请求配置后再获取模型');
+      return;
+    }
+    setFormError(null);
+    setImportSession({
+      providerId: provider.id,
+      providerName: provider.name,
+      localRequest: Boolean(provider.localRequest),
+      probeInput: probe,
+    });
   };
 
   return (
@@ -799,11 +869,14 @@ export function ProviderEditor({ provider, onDeleted }: ProviderEditorProps) {
       />
 
       <ModelImportDialog
-        open={importOpen}
-        onOpenChange={setImportOpen}
-        providerId={provider.id}
-        providerName={provider.name}
-        probeInput={probeSnapshot}
+        open={importSession !== null}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setImportSession(null);
+        }}
+        providerId={importSession?.providerId ?? provider.id}
+        providerName={importSession?.providerName ?? provider.name}
+        localRequest={importSession?.localRequest ?? Boolean(provider.localRequest)}
+        probeInput={importSession?.probeInput ?? {}}
         existingModels={provider.models}
         onImport={handleImportModels}
       />

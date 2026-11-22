@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -395,6 +396,67 @@ func (c *CloudClient) UpdateAssistant(ctx context.Context, id string, payload js
 
 func (c *CloudClient) DeleteAssistant(ctx context.Context, id string) error {
 	return c.doJSON(ctx, http.MethodDelete, "/api/v1/assistants/"+url.PathEscape(id), nil, nil)
+}
+
+// ProxyCustomFont transparently forwards custom font metadata, upload, toggle, delete,
+// and binary file requests to the bound cloud gateway without JSON re-encoding.
+func (c *CloudClient) ProxyCustomFont(
+	ctx context.Context,
+	method string,
+	path string,
+	inHeaders http.Header,
+	body io.Reader,
+	contentLength int64,
+) (*http.Response, error) {
+	if err := checkCloudConnection(ctx); err != nil {
+		return nil, err
+	}
+	var baseURL, token string
+	if conn, _ := ctx.Value(cloudConnectionKey{}).(*cloudConnection); conn != nil {
+		baseURL, token = conn.baseURL, conn.token
+	} else {
+		baseURL, token = c.Credentials()
+	}
+	if baseURL == "" {
+		return nil, domain.NewError(domain.ErrCodeCloudNotConnected, "cloud gateway is not connected", nil)
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, body)
+	if err != nil {
+		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "construct cloud font request failed", err)
+	}
+	if body != nil && contentLength >= 0 {
+		req.ContentLength = contentLength
+	}
+	for _, key := range []string{"Content-Type", "X-Font-Name", "If-None-Match", "Accept"} {
+		if val := inHeaders.Get(key); val != "" {
+			req.Header.Set(key, val)
+		}
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	_, long := c.clients()
+	resp, err := long.Do(req)
+	if err != nil {
+		if connErr := checkCloudConnection(ctx); connErr != nil {
+			return nil, connErr
+		}
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			return nil, domain.NewError(domain.ErrCodePayloadTooLarge, "字体文件不能超过 32 MiB", err)
+		}
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, "cloud gateway unreachable", err)
+	}
+	if connErr := checkCloudConnection(ctx); connErr != nil {
+		_ = resp.Body.Close()
+		return nil, connErr
+	}
+	return resp, nil
 }
 
 func (c *CloudClient) GetSettings(ctx context.Context) (domain.Preferences, bool, error) {

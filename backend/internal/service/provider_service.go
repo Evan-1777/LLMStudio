@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -18,10 +20,22 @@ import (
 
 // ProviderProbeInput defines optional unsaved overrides when probing a provider connection or fetching models.
 type ProviderProbeInput struct {
-	BaseURL  string            `json:"baseURL,omitempty"`
-	AuthType string            `json:"authType,omitempty"`
-	APIKey   string            `json:"apiKey,omitempty"`
-	Headers  map[string]string `json:"headers,omitempty"`
+	BaseURL     string            `json:"baseURL,omitempty"`
+	AuthType    string            `json:"authType,omitempty"`
+	APIKey      string            `json:"apiKey,omitempty"`
+	ClearAPIKey bool              `json:"clearApiKey,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
+}
+
+// PreparedLocalModelProbe is a no-store upstream model list request envelope
+// prepared from a saved localRequest provider configuration.
+type PreparedLocalModelProbe struct {
+	Method        string            `json:"method"`
+	URL           string            `json:"url"`
+	Headers       map[string]string `json:"headers"`
+	AuthType      string            `json:"authType"`
+	Protocol      string            `json:"protocol"`
+	DefaultFormat string            `json:"defaultFormat"`
 }
 
 // ProviderConnectionResult summarizes a provider connectivity check.
@@ -237,6 +251,19 @@ func (s *ProviderService) ImportAPIKey(ctx context.Context, id, apiKey string) (
 	return APIKeyImportResult{Applied: true, Provider: cfg}, nil
 }
 
+// PrepareLocalModelProbe builds an authenticated upstream request envelope from
+// the single saved provider record. Only saved localRequest=true providers are eligible.
+func (s *ProviderService) PrepareLocalModelProbe(ctx context.Context, id string) (PreparedLocalModelProbe, error) {
+	cfg, err := s.store.Get(ctx, id)
+	if err != nil {
+		return PreparedLocalModelProbe{}, err
+	}
+	if !cfg.LocalRequest {
+		return PreparedLocalModelProbe{}, domain.NewError(domain.ErrCodeConflict, "provider is not in local request mode", nil)
+	}
+	return PrepareModelListRequest(s.providers, cfg)
+}
+
 // TestConnection probes upstream reachability by fetching the provider's model listing.
 func (s *ProviderService) TestConnection(ctx context.Context, id string, probe ProviderProbeInput) (ProviderConnectionResult, error) {
 	start := time.Now()
@@ -255,108 +282,321 @@ func (s *ProviderService) TestConnection(ctx context.Context, id string, probe P
 
 // FetchUpstreamModels queries the upstream provider models endpoint and normalizes OpenAI, Anthropic, and Gemini responses.
 func (s *ProviderService) FetchUpstreamModels(ctx context.Context, id string, probe ProviderProbeInput) ([]domain.DiscoveredModel, error) {
-	cfg, err := s.store.Get(ctx, id)
+	saved, err := s.store.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if baseURL := strings.TrimSpace(probe.BaseURL); baseURL != "" {
-		cfg.BaseURL = baseURL
+	cfg := ApplyProbeOverrides(saved, probe)
+	prepared, err := PrepareModelListRequest(s.providers, cfg)
+	if err != nil {
+		return nil, err
 	}
-	if authType := strings.TrimSpace(probe.AuthType); authType != "" {
-		cfg.AuthType = authType
+	return ExecuteModelListRequest(ctx, s.httpClient, prepared, cfg.APIKey)
+}
+
+// ApplyProbeOverrides merges unsaved probe draft inputs onto a saved provider configuration.
+// When the draft changes the target baseURL or authType, saved credentials and headers
+// are never inherited; only explicitly provided draft credentials/headers are applied.
+func ApplyProbeOverrides(saved domain.ProviderConfig, probe ProviderProbeInput) domain.ProviderConfig {
+	cfg := saved
+	savedBase := strings.TrimSpace(saved.BaseURL)
+	probeBase := strings.TrimSpace(probe.BaseURL)
+	targetChanged := probeBase != "" && probeBase != savedBase
+
+	savedAuth := strings.TrimSpace(saved.AuthType)
+	if savedAuth == "" {
+		savedAuth = domain.AuthTypeBearer
 	}
-	if apiKey := strings.TrimSpace(probe.APIKey); apiKey != "" {
+	probeAuth := strings.TrimSpace(probe.AuthType)
+	authChanged := probeAuth != "" && probeAuth != savedAuth
+
+	if targetChanged {
+		cfg.BaseURL = probeBase
+	}
+	if authChanged {
+		cfg.AuthType = probeAuth
+	}
+
+	if targetChanged || authChanged {
+		if probe.ClearAPIKey {
+			cfg.APIKey = ""
+		} else {
+			cfg.APIKey = strings.TrimSpace(probe.APIKey)
+		}
+		if probe.Headers != nil {
+			cfg.Headers = maps.Clone(probe.Headers)
+		} else {
+			cfg.Headers = nil
+		}
+		if authChanged && !targetChanged {
+			cfg.BaseURL = stripSensitiveQueryParams(cfg.BaseURL)
+		}
+		return cfg
+	}
+
+	if probe.ClearAPIKey {
+		cfg.APIKey = ""
+	} else if apiKey := strings.TrimSpace(probe.APIKey); apiKey != "" {
 		cfg.APIKey = apiKey
 	}
 	if probe.Headers != nil {
 		cfg.Headers = maps.Clone(probe.Headers)
 	}
-	if cfg.Adapter == "" {
+	return cfg
+}
+
+func stripSensitiveQueryParams(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.RawQuery == "" {
+		return rawURL
+	}
+	q := parsed.Query()
+	for _, key := range []string{"key", "api_key", "apikey", "token", "access_token"} {
+		q.Del(key)
+	}
+	parsed.RawQuery = q.Encode()
+	return parsed.String()
+}
+
+// PrepareModelListRequest resolves the upstream model-discovery HTTP request
+// strictly from provider authType and endpoint characteristics.
+func PrepareModelListRequest(
+	adapters *plugin.ProviderRegistry,
+	cfg domain.ProviderConfig,
+) (PreparedLocalModelProbe, error) {
+	if strings.TrimSpace(cfg.Adapter) == "" {
 		cfg.Adapter = "generic-http"
 	}
-	if cfg.AuthType == "" {
+	if strings.TrimSpace(cfg.AuthType) == "" {
 		cfg.AuthType = domain.AuthTypeBearer
 	}
 	parsed, err := url.Parse(strings.TrimSpace(cfg.BaseURL))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "valid baseURL with scheme and host is required", err)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return PreparedLocalModelProbe{}, domain.NewError(domain.ErrCodeInvalidArgument, "valid baseURL with scheme and host is required", err)
 	}
-	adapter, ok := s.providers.Get(cfg.Adapter)
+	adapter, ok := adapters.Get(cfg.Adapter)
 	if !ok {
-		return nil, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unknown provider adapter %q", cfg.Adapter), nil)
+		return PreparedLocalModelProbe{}, domain.NewError(domain.ErrCodeInvalidArgument, fmt.Sprintf("unknown provider adapter %q", cfg.Adapter), nil)
 	}
 
 	protoKind, targetPath, defaultFormat := detectModelListProtocol(cfg)
 	endpoint, err := adapter.ResolveEndpoint(cfg, domain.ModelConfig{}, targetPath, nil, domain.CompatConfig{})
 	if err != nil {
-		return nil, err
+		return PreparedLocalModelProbe{}, err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.URL, nil)
+	headers := make(map[string]string, len(endpoint.Headers)+2)
+	headers["Accept"] = "application/json"
+	hasAnthropicVersion := false
+	for k, vals := range endpoint.Headers {
+		if len(vals) == 0 {
+			continue
+		}
+		if strings.EqualFold(k, "anthropic-version") {
+			hasAnthropicVersion = true
+		}
+		headers[k] = vals[0]
+	}
+	if protoKind == "anthropic" && !hasAnthropicVersion {
+		headers["anthropic-version"] = "2023-06-01"
+	}
+
+	return PreparedLocalModelProbe{
+		Method:        http.MethodGet,
+		URL:           endpoint.URL,
+		Headers:       headers,
+		AuthType:      cfg.AuthType,
+		Protocol:      protoKind,
+		DefaultFormat: defaultFormat,
+	}, nil
+}
+
+// ExecuteModelListRequest executes a prepared model-list request with cross-origin
+// redirect credential stripping and safe error classification.
+func ExecuteModelListRequest(
+	ctx context.Context,
+	baseClient *http.Client,
+	prepared PreparedLocalModelProbe,
+	secretSentinel string,
+) ([]domain.DiscoveredModel, error) {
+	initialURL, err := url.Parse(prepared.URL)
+	if err != nil || initialURL.Scheme == "" || initialURL.Host == "" {
+		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "construct upstream models request failed", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, prepared.Method, prepared.URL, nil)
 	if err != nil {
 		return nil, domain.NewError(domain.ErrCodeInvalidArgument, "construct upstream models request failed", err)
 	}
-	req.Header.Set("Accept", "application/json")
-	for k, vals := range endpoint.Headers {
-		for _, v := range vals {
-			req.Header.Add(k, v)
-		}
-	}
-	if protoKind == "anthropic" && req.Header.Get("anthropic-version") == "" {
-		req.Header.Set("anthropic-version", "2023-06-01")
+	for k, v := range prepared.Headers {
+		req.Header.Set(k, v)
 	}
 
-	client := s.httpClient
-	if client == nil {
-		client = &http.Client{Timeout: 15 * time.Second}
-	}
+	client := scopedProbeHTTPClient(baseClient, initialURL, prepared.Headers, secretSentinel)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream request failed: %v", err), err)
+		return nil, classifyProbeNetworkError(ctx, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return nil, domain.NewError(domain.ErrCodeUpstreamError, "failed to read upstream models response", err)
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, "读取上游模型列表响应失败", nil)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg := strings.TrimSpace(string(body))
-		if msg == "" {
-			msg = resp.Status
-		}
-		return nil, domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("upstream returned HTTP %d: %s", resp.StatusCode, msg), nil)
+		return nil, classifyProbeHTTPError(resp.StatusCode)
 	}
 
-	models, err := parseDiscoveredModels(body, defaultFormat)
+	models, err := parseDiscoveredModels(body, prepared.DefaultFormat)
 	if err != nil {
-		return nil, domain.NewError(domain.ErrCodeUpstreamError, err.Error(), err)
+		return nil, domain.NewError(domain.ErrCodeUpstreamError, err.Error(), nil)
 	}
 	return models, nil
 }
 
-func detectModelListProtocol(cfg domain.ProviderConfig) (kind, path, defaultFormat string) {
-	lowerBase := strings.ToLower(cfg.BaseURL)
-	var firstFormat string
-	if len(cfg.Models) > 0 {
-		firstFormat = strings.TrimSpace(cfg.Models[0].APIFormat)
+func scopedProbeHTTPClient(
+	base *http.Client,
+	initialURL *url.URL,
+	configuredHeaders map[string]string,
+	secretSentinel string,
+) *http.Client {
+	timeout := 15 * time.Second
+	var transport http.RoundTripper
+	if base != nil {
+		transport = base.Transport
+		if base.Timeout > 0 {
+			timeout = base.Timeout
+		}
 	}
+	trimmedSecret := strings.TrimSpace(secretSentinel)
+	return &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			if !sameProbeOrigin(initialURL, req.URL) {
+				stripProbeCredentials(req, configuredHeaders, trimmedSecret)
+			}
+			return nil
+		},
+	}
+}
 
+func sameProbeOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	sa := strings.ToLower(a.Scheme)
+	sb := strings.ToLower(b.Scheme)
+	if sa != sb {
+		return false
+	}
+	return normalizeProbeHost(sa, a.Host) == normalizeProbeHost(sb, b.Host)
+}
+
+func normalizeProbeHost(scheme, host string) string {
+	h, port, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host
+		port = ""
+	}
+	h = strings.ToLower(strings.Trim(h, "[]"))
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		}
+	}
+	if port != "" {
+		return net.JoinHostPort(h, port)
+	}
+	return h
+}
+
+func stripProbeCredentials(req *http.Request, configuredHeaders map[string]string, secretSentinel string) {
+	req.Header.Del("Authorization")
+	req.Header.Del("Proxy-Authorization")
+	req.Header.Del("Cookie")
+	req.Header.Del("X-Api-Key")
+	for k := range configuredHeaders {
+		if strings.EqualFold(k, "Accept") || strings.EqualFold(k, "anthropic-version") {
+			continue
+		}
+		req.Header.Del(k)
+	}
+	if req.URL != nil && req.URL.RawQuery != "" {
+		q := req.URL.Query()
+		changed := false
+		for _, k := range []string{"key", "api_key", "apikey", "token", "access_token"} {
+			if q.Has(k) {
+				q.Del(k)
+				changed = true
+			}
+		}
+		if secretSentinel != "" {
+			for k, vals := range q {
+				for _, v := range vals {
+					if strings.Contains(v, secretSentinel) {
+						q.Del(k)
+						changed = true
+						break
+					}
+				}
+			}
+		}
+		if changed {
+			req.URL.RawQuery = q.Encode()
+		}
+	}
+}
+
+func classifyProbeNetworkError(ctx context.Context, err error) error {
+	if errors.Is(err, context.Canceled) || (ctx != nil && errors.Is(ctx.Err(), context.Canceled)) {
+		return domain.NewError(domain.ErrCodeUpstreamError, "上游请求已取消", nil)
+	}
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return domain.NewError(domain.ErrCodeUpstreamError, "上游连接超时", nil)
+	}
+	return domain.NewError(domain.ErrCodeUpstreamError, "无法连接到上游服务", nil)
+}
+
+func classifyProbeHTTPError(statusCode int) error {
+	var summary string
+	switch statusCode {
+	case http.StatusUnauthorized:
+		summary = "鉴权失败"
+	case http.StatusForbidden:
+		summary = "拒绝访问"
+	case http.StatusNotFound:
+		summary = "模型列表端点不存在"
+	case http.StatusTooManyRequests:
+		summary = "请求过于频繁"
+	case http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		summary = "服务暂不可用"
+	}
+	if summary != "" {
+		return domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("上游返回 HTTP %d（%s）", statusCode, summary), nil)
+	}
+	return domain.NewError(domain.ErrCodeUpstreamError, fmt.Sprintf("上游返回 HTTP %d", statusCode), nil)
+}
+
+func detectModelListProtocol(cfg domain.ProviderConfig) (kind, path, defaultFormat string) {
+	lowerBase := strings.ToLower(strings.TrimSpace(cfg.BaseURL))
 	switch {
 	case cfg.AuthType == domain.AuthTypeQueryKey ||
 		strings.Contains(lowerBase, "generativelanguage") ||
-		strings.Contains(lowerBase, "/v1beta") ||
-		firstFormat == "google-generative-ai":
+		strings.Contains(lowerBase, "/v1beta"):
 		return "gemini", "/v1beta/models", "google-generative-ai"
 	case cfg.AuthType == domain.AuthTypeXAPIKey ||
-		strings.Contains(lowerBase, "anthropic") ||
-		firstFormat == "anthropic-messages":
+		strings.Contains(lowerBase, "anthropic"):
 		return "anthropic", "/v1/models", "anthropic-messages"
 	default:
-		if firstFormat == "" {
-			firstFormat = "openai-completions"
-		}
-		return "openai", "/v1/models", firstFormat
+		return "openai", "/v1/models", "openai-completions"
 	}
 }
 
@@ -371,6 +611,7 @@ type discoveredStandardItem struct {
 
 func parseDiscoveredModels(raw []byte, defaultFormat string) ([]domain.DiscoveredModel, error) {
 	type geminiItem struct {
+		ID               string `json:"id"`
 		Name             string `json:"name"`
 		DisplayName      string `json:"displayName"`
 		InputTokenLimit  int    `json:"inputTokenLimit"`
@@ -379,26 +620,39 @@ func parseDiscoveredModels(raw []byte, defaultFormat string) ([]domain.Discovere
 	}
 
 	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil, errors.New("上游返回了空的模型列表响应")
+	}
 	if strings.HasPrefix(trimmed, "[") {
 		var items []discoveredStandardItem
 		if err := json.Unmarshal(raw, &items); err != nil {
-			return nil, fmt.Errorf("invalid model list array: %w", err)
+			return nil, errors.New("上游返回了无效的模型列表 JSON")
 		}
 		return normalizeStandardModels(items, defaultFormat), nil
 	}
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil, errors.New("上游返回了无法识别的模型列表格式")
+	}
 
-	var envelope struct {
-		Data   []discoveredStandardItem `json:"data"`
-		Models []geminiItem             `json:"models"`
+	var rawObj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rawObj); err != nil {
+		return nil, errors.New("上游返回了无效的模型列表 JSON")
 	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, fmt.Errorf("invalid model list JSON: %w", err)
-	}
-	if len(envelope.Models) > 0 {
-		out := make([]domain.DiscoveredModel, 0, len(envelope.Models))
-		seen := make(map[string]struct{}, len(envelope.Models))
-		for _, m := range envelope.Models {
-			id := strings.TrimSpace(strings.TrimPrefix(m.Name, "models/"))
+
+	if rawModels, ok := rawObj["models"]; ok && strings.HasPrefix(strings.TrimSpace(string(rawModels)), "[") {
+		var items []geminiItem
+		if err := json.Unmarshal(rawModels, &items); err != nil {
+			return nil, errors.New("上游返回了无效的模型列表 JSON")
+		}
+		out := make([]domain.DiscoveredModel, 0, len(items))
+		seen := make(map[string]struct{}, len(items))
+		for _, m := range items {
+			rawID := strings.TrimSpace(m.Name)
+			if rawID == "" {
+				rawID = strings.TrimSpace(m.ID)
+			}
+			isGeminiPrefixed := strings.HasPrefix(rawID, "models/")
+			id := strings.TrimSpace(strings.TrimPrefix(rawID, "models/"))
 			if id == "" {
 				continue
 			}
@@ -410,11 +664,17 @@ func parseDiscoveredModels(raw []byte, defaultFormat string) ([]domain.Discovere
 			if name == "" {
 				name = id
 			}
+			apiFormat := defaultFormat
+			if isGeminiPrefixed || defaultFormat == "google-generative-ai" || strings.HasPrefix(strings.ToLower(id), "gemini") {
+				apiFormat = "google-generative-ai"
+			} else if strings.HasPrefix(strings.ToLower(id), "claude") {
+				apiFormat = "anthropic-messages"
+			}
 			out = append(out, domain.DiscoveredModel{
 				ID:            id,
 				Name:          name,
 				Group:         deriveModelGroup(id),
-				APIFormat:     "google-generative-ai",
+				APIFormat:     apiFormat,
 				ContextWindow: m.InputTokenLimit,
 				MaxTokens:     m.OutputTokenLimit,
 				Reasoning:     m.Thinking,
@@ -422,7 +682,16 @@ func parseDiscoveredModels(raw []byte, defaultFormat string) ([]domain.Discovere
 		}
 		return out, nil
 	}
-	return normalizeStandardModels(envelope.Data, defaultFormat), nil
+
+	if rawData, ok := rawObj["data"]; ok && strings.HasPrefix(strings.TrimSpace(string(rawData)), "[") {
+		var items []discoveredStandardItem
+		if err := json.Unmarshal(rawData, &items); err != nil {
+			return nil, errors.New("上游返回了无效的模型列表 JSON")
+		}
+		return normalizeStandardModels(items, defaultFormat), nil
+	}
+
+	return nil, errors.New("上游返回了无法识别的模型列表格式")
 }
 
 func normalizeStandardModels(items []discoveredStandardItem, defaultFormat string) []domain.DiscoveredModel {

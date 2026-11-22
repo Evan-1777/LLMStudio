@@ -140,3 +140,23 @@ func (h *ProviderHandler) FetchModels(w http.ResponseWriter, r *http.Request) {
 		"models": models,
 	})
 }
+
+func (h *ProviderHandler) PrepareLocalModels(w http.ResponseWriter, r *http.Request) {
+	var rawOverrides map[string]any
+	if err := decodeOptionalJSONBody(r, &rawOverrides); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	if len(rawOverrides) > 0 {
+		WriteError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "local model probe envelope does not accept target or credential overrides")
+		return
+	}
+	prepared, err := h.svc.PrepareLocalModelProbe(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	WriteJSON(w, http.StatusOK, prepared)
+}

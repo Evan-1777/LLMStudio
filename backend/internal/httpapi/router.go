@@ -23,6 +23,7 @@ type RouterDeps struct {
 	PluginService       *service.PluginService
 	ChatService         *service.ChatService
 	PreferenceService   *service.PreferenceService
+	CustomFontService   *service.CustomFontService
 	StorageService      *service.StorageService
 }
 
@@ -45,6 +46,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("DELETE /api/v1/providers/{id}", ph.Delete)
 		mux.HandleFunc("POST /api/v1/providers/{id}/test", ph.TestConnection)
 		mux.HandleFunc("POST /api/v1/providers/{id}/models/fetch", ph.FetchModels)
+		mux.HandleFunc("POST /api/v1/providers/{id}/models/prepare-local", ph.PrepareLocalModels)
 		mux.HandleFunc("POST /api/v1/providers/{id}/keys/import", ph.ImportAPIKey)
 	}
 	if deps.AssistantService != nil {
@@ -94,6 +96,14 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("GET /api/v1/settings", prefHandler.Get)
 		mux.HandleFunc("PATCH /api/v1/settings", prefHandler.Patch)
 		mux.HandleFunc("POST /api/v1/settings/import", prefHandler.ImportOnce)
+	}
+	if deps.CustomFontService != nil {
+		fontHandler := NewCustomFontHandler(deps.CustomFontService)
+		mux.HandleFunc("GET /api/v1/settings/custom-font", fontHandler.Get)
+		mux.HandleFunc("PUT /api/v1/settings/custom-font", fontHandler.Put)
+		mux.HandleFunc("PATCH /api/v1/settings/custom-font", fontHandler.Patch)
+		mux.HandleFunc("DELETE /api/v1/settings/custom-font", fontHandler.Delete)
+		mux.HandleFunc("GET /api/v1/settings/custom-font/file", fontHandler.GetFile)
 	}
 	if deps.StorageService != nil {
 		sh := NewStorageHandler(deps.StorageService)

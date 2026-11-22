@@ -28,10 +28,12 @@ export function AppearancePage() {
     dismissSettingsNotice,
     updatePreferences,
     customFont,
+    legacyCustomFont,
     customFontBusy,
     uploadCustomFont,
     toggleCustomFont,
     removeCustomFont,
+    importLegacyCustomFont,
   } = useApp();
   const fontInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -91,6 +93,14 @@ export function AppearancePage() {
     const result = await removeCustomFont();
     if (!result.ok) {
       setCustomFontError(result.error ?? '移除字体失败');
+    }
+  };
+
+  const handleImportLegacyFont = async () => {
+    setCustomFontError(null);
+    const result = await importLegacyCustomFont();
+    if (!result.ok) {
+      setCustomFontError(result.error ?? '导入旧字体失败');
     }
   };
 
@@ -268,32 +278,44 @@ export function AppearancePage() {
                         void handleCustomFontToggle(enabled)
                       }
                     />
-                    <Button
+                    <IconButton
                       size="sm"
-                      variant="ghost"
+                      icon="upload"
+                      label="替换"
+                      loading={customFontBusy}
                       disabled={customFontBusy}
                       onClick={() => fontInputRef.current?.click()}
-                    >
-                      替换
-                    </Button>
-                    <Button
+                    />
+                    <IconButton
                       size="sm"
-                      variant="danger-ghost"
+                      icon="trash"
+                      tone="danger"
+                      label="移除"
                       disabled={customFontBusy}
                       onClick={() => void handleCustomFontRemove()}
-                    >
-                      移除
-                    </Button>
+                    />
                   </>
                 ) : (
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    loading={customFontBusy}
-                    onClick={() => fontInputRef.current?.click()}
-                  >
-                    上传字体
-                  </Button>
+                  <>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      loading={customFontBusy}
+                      onClick={() => fontInputRef.current?.click()}
+                    >
+                      上传字体
+                    </Button>
+                    {legacyCustomFont ? (
+                      <IconButton
+                        size="sm"
+                        icon="cloudUpload"
+                        label="导入旧字体"
+                        title={`导入旧字体：${legacyCustomFont.name}`}
+                        disabled={customFontBusy}
+                        onClick={() => void handleImportLegacyFont()}
+                      />
+                    ) : null}
+                  </>
                 )}
                 <input
                   ref={fontInputRef}

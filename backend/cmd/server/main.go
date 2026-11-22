@@ -44,6 +44,7 @@ func main() {
 	searchStore := store.NewSearchConfigStore(db)
 	mcpStore := store.NewMCPServerStore(db)
 	prefStore := store.NewPreferenceStore(db)
+	customFontStore := store.NewCustomFontStore(db)
 
 	formats := plugin.NewFormatRegistry()
 	formats.MustRegister(format.NewOpenAICompletionsFormat())
@@ -66,6 +67,7 @@ func main() {
 	convSvc := service.NewConversationService(convStore, msgStore).WithAssistants(assistantStore)
 	pluginSvc := service.NewPluginService(searchEngines, searchStore, mcpStore).WithMCPClient(mcpRuntime)
 	prefSvc := service.NewPreferenceService(prefStore)
+	customFontSvc := service.NewCustomFontService(customFontStore)
 	storageSvc := service.NewStorageService(store.NewStorageMaintenance(db, cfg.DBPath))
 	chatSvc := service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithAssistants(assistantStore).
@@ -83,6 +85,7 @@ func main() {
 		PluginService:       pluginSvc,
 		ChatService:         chatSvc,
 		PreferenceService:   prefSvc,
+		CustomFontService:   customFontSvc,
 		StorageService:      storageSvc,
 	})
 

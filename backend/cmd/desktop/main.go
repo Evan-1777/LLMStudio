@@ -214,6 +214,7 @@ func startDesktopRuntime(paths desktop.StoragePaths) (*desktopRuntime, error) {
 		CompositeTools: compositeTools,
 		ChatEngine:     chatEngine,
 		SyncService:    syncSvc,
+		HTTPClient:     httpClient,
 		DevMode:        mygo.IsDev(),
 		Version:        appVersion,
 	})
