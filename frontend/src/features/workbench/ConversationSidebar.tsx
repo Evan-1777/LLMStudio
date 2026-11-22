@@ -30,7 +30,12 @@ import type {
   TopicScope,
   WorkspaceEntry,
 } from '../../core/types';
-import { WorkspaceFileTree } from '../agent/WorkspaceFileTree';
+import {
+  WorkspaceFileTree,
+  type WorkspaceCreateTrigger,
+  type WorkspaceDirsRefreshTrigger,
+} from '../agent/WorkspaceFileTree';
+import { parentDirOf } from '../agent/WorkspaceDialogs';
 import { WorkspaceFileViewer } from '../agent/WorkspaceFileViewer';
 import {
   SessionInspector,
@@ -172,8 +177,11 @@ export function ConversationSidebar({
   const canBrowseWorkspace = !isDesktop || scope === 'cloud';
 
   const [rightPanelTab, setRightPanelTab] = useState<'topics' | 'files'>('topics');
-  const [filesRefreshToken, setFilesRefreshToken] = useState(0);
+  const [fileManageMode, setFileManageMode] = useState(false);
+  const [fileCreateTrigger, setFileCreateTrigger] = useState<WorkspaceCreateTrigger | null>(null);
+  const [fileDirsRefreshTrigger, setFileDirsRefreshTrigger] = useState<WorkspaceDirsRefreshTrigger | null>(null);
   const [viewingEntry, setViewingEntry] = useState<WorkspaceEntry | null>(null);
+  const [viewingInitialMode, setViewingInitialMode] = useState<'preview' | 'edit' | undefined>(undefined);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [expandedGroupIds, setExpandedGroupIds] = useState<Set<string>>(
@@ -241,18 +249,23 @@ export function ConversationSidebar({
   useEffect(() => {
     if (!canBrowseWorkspace) {
       setRightPanelTab('topics');
+      setFileManageMode(false);
       setViewingEntry(null);
+      setViewingInitialMode(undefined);
     }
   }, [canBrowseWorkspace]);
 
   useEffect(() => {
+    setFileManageMode(false);
     setViewingEntry(null);
-    setFilesRefreshToken(0);
+    setViewingInitialMode(undefined);
   }, [connectionEpoch]);
 
   useEffect(() => {
     if (cloudOffline) {
+      setFileManageMode(false);
       setViewingEntry(null);
+      setViewingInitialMode(undefined);
     }
   }, [cloudOffline]);
 
@@ -901,6 +914,9 @@ export function ConversationSidebar({
                     if (next === 'files' && manageMode) {
                       onManageModeChange(false);
                     }
+                    if (next === 'topics' && fileManageMode) {
+                      setFileManageMode(false);
+                    }
                   }}
                   options={[
                     {
@@ -922,13 +938,40 @@ export function ConversationSidebar({
               )}
               <div style={{ display: 'inline-flex', alignItems: 'center', gap: 2 }}>
                 {rightPanelTab === 'files' && canBrowseWorkspace ? (
-                  <IconButton
-                    size="sm"
-                    icon="refresh"
-                    label="刷新工作区文件"
-                    disabled={cloudOffline}
-                    onClick={() => setFilesRefreshToken((n) => n + 1)}
-                  />
+                  <>
+                    <IconButton
+                      size="sm"
+                      icon="filePlus"
+                      label="新建文件"
+                      disabled={cloudOffline}
+                      onClick={() =>
+                        setFileCreateTrigger((prev) => ({
+                          kind: 'file',
+                          seq: (prev?.seq ?? 0) + 1,
+                        }))
+                      }
+                    />
+                    <IconButton
+                      size="sm"
+                      icon="folderPlus"
+                      label="新建文件夹"
+                      disabled={cloudOffline}
+                      onClick={() =>
+                        setFileCreateTrigger((prev) => ({
+                          kind: 'dir',
+                          seq: (prev?.seq ?? 0) + 1,
+                        }))
+                      }
+                    />
+                    <IconButton
+                      size="sm"
+                      icon="checkSquare"
+                      label={fileManageMode ? '退出管理' : '管理文件'}
+                      active={fileManageMode}
+                      disabled={cloudOffline}
+                      onClick={() => setFileManageMode((v) => !v)}
+                    />
+                  </>
                 ) : (
                   <>
                     <IconButton
@@ -1028,8 +1071,36 @@ export function ConversationSidebar({
                     cloudConnectionState={cloudConnectionState}
                     connectionEpoch={connectionEpoch}
                     selectedPath={viewingEntry?.path ?? null}
-                    refreshToken={filesRefreshToken}
-                    onSelectEntry={setViewingEntry}
+                    manageMode={fileManageMode}
+                    createTrigger={fileCreateTrigger}
+                    dirsRefreshTrigger={fileDirsRefreshTrigger}
+                    onManageModeChange={setFileManageMode}
+                    onSelectEntry={(entry, initialMode) => {
+                      setViewingInitialMode(initialMode);
+                      setViewingEntry(entry);
+                    }}
+                    onEntryMoved={(oldPath, nextEntry) => {
+                      setViewingEntry((prev) => {
+                        if (!prev) return null;
+                        if (prev.path === oldPath) {
+                          return nextEntry;
+                        }
+                        if (prev.path.startsWith(`${oldPath}/`)) {
+                          const suffix = prev.path.slice(oldPath.length);
+                          return { ...prev, path: `${nextEntry.path}${suffix}` };
+                        }
+                        return prev;
+                      });
+                    }}
+                    onEntriesDeleted={(deletedPaths) => {
+                      setViewingEntry((prev) => {
+                        if (!prev) return null;
+                        const affected = deletedPaths.some(
+                          (d) => prev.path === d || prev.path.startsWith(`${d}/`),
+                        );
+                        return affected ? null : prev;
+                      });
+                    }}
                   />
                 </div>
               ) : (
@@ -1812,9 +1883,35 @@ export function ConversationSidebar({
 
       <WorkspaceFileViewer
         entry={viewingEntry}
+        initialMode={viewingInitialMode}
         gateway={gateway}
         scope={reqScope}
-        onClose={() => setViewingEntry(null)}
+        onClose={() => {
+          setViewingEntry(null);
+          setViewingInitialMode(undefined);
+        }}
+        onSaved={(res) => {
+          setFileDirsRefreshTrigger((prev) => ({
+            dirs: [parentDirOf(res.path)],
+            seq: (prev?.seq ?? 0) + 1,
+          }));
+        }}
+        onRenamed={(oldPath, nextEntry) => {
+          setViewingInitialMode(undefined);
+          setViewingEntry(nextEntry);
+          setFileDirsRefreshTrigger((prev) => ({
+            dirs: [parentDirOf(oldPath), parentDirOf(nextEntry.path)],
+            seq: (prev?.seq ?? 0) + 1,
+          }));
+        }}
+        onDeleted={(deletedPath) => {
+          setViewingEntry(null);
+          setViewingInitialMode(undefined);
+          setFileDirsRefreshTrigger((prev) => ({
+            dirs: [parentDirOf(deletedPath)],
+            seq: (prev?.seq ?? 0) + 1,
+          }));
+        }}
       />
     </>
   );

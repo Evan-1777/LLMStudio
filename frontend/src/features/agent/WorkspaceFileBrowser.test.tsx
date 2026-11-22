@@ -19,6 +19,15 @@ const appState = vi.hoisted(() => ({
     listWorkspaceEntries: vi.fn(),
     readWorkspaceFile: vi.fn(),
     writeWorkspaceFile: vi.fn(),
+    createWorkspaceFile: vi.fn(),
+    createWorkspaceDir: vi.fn(),
+    moveWorkspaceEntry: vi.fn(),
+    copyWorkspaceEntry: vi.fn(),
+    deleteWorkspaceEntry: vi.fn(),
+    batchWorkspaceEntries: vi.fn(),
+    uploadWorkspaceFile: vi.fn(),
+    downloadWorkspaceFile: vi.fn(),
+    searchWorkspaceEntries: vi.fn(),
     getAgentSettings: vi.fn(),
   },
   resources: {
@@ -291,5 +300,242 @@ describe('WorkspaceFileBrowser', () => {
       </MemoryRouter>,
     );
     expect(screen.getByRole('radio', { name: '工作区文件' })).toBeInTheDocument();
+  });
+
+  it('creates nested file and opens viewer in edit mode, creates dir, renames, moves, copies, searches, collapses, uploads with 409 overwrite, downloads unsupported file, and batch deletes', async () => {
+    const user = userEvent.setup();
+    const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:mock');
+    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    let rootItems = [
+      { name: 'docs', path: 'docs', kind: 'dir' as const, size: 0, modTime: '2026-11-22T00:00:00Z', editable: false },
+      { name: 'notes.md', path: 'notes.md', kind: 'file' as const, size: 10, modTime: '2026-11-22T00:00:00Z', previewKind: 'markdown' as const, editable: true },
+      { name: 'pic.png', path: 'pic.png', kind: 'file' as const, size: 20, modTime: '2026-11-22T00:00:00Z', previewKind: 'unsupported' as const, editable: false, unsupportedReason: 'image' },
+    ];
+    let docsItems: WorkspaceEntriesResponse['entries'] = [];
+
+    appState.gateway.listWorkspaceEntries.mockImplementation(async (p: string) => {
+      if (!p) return { path: '.', entries: rootItems, truncated: false };
+      if (p === 'docs') return { path: 'docs', entries: docsItems, truncated: false };
+      return { path: p, entries: [], truncated: false };
+    });
+    appState.gateway.getAgentSettings.mockResolvedValue({
+      directory: { path: '.', status: 'ready' },
+      allowedTools: [],
+      availableTools: ['read'],
+      injectAgentMd: true,
+      markdownVisualRender: false,
+      skills: [],
+    });
+
+    renderSidebar();
+    await user.click(screen.getByRole('radio', { name: '工作区文件' }));
+    await screen.findByRole('treeitem', { name: 'notes.md' });
+
+    // 1. Create nested Markdown file -> opens viewer directly in edit mode -> type & Ctrl+S save.
+    const createdEntry = {
+      name: 'guide.md',
+      path: 'docs/guide.md',
+      kind: 'file' as const,
+      size: 0,
+      modTime: '2026-11-22T00:00:00Z',
+      previewKind: 'markdown' as const,
+      editable: true,
+    };
+    appState.gateway.createWorkspaceFile.mockImplementation(async () => {
+      docsItems = [createdEntry];
+      return createdEntry;
+    });
+    appState.gateway.readWorkspaceFile.mockResolvedValue({
+      path: 'docs/guide.md',
+      name: 'guide.md',
+      size: 0,
+      modTime: '2026-11-22T00:00:00Z',
+      previewKind: 'markdown',
+      editable: true,
+      etag: 'e-new',
+      content: '',
+    });
+    appState.gateway.writeWorkspaceFile.mockResolvedValue({
+      path: 'docs/guide.md',
+      name: 'guide.md',
+      size: 7,
+      modTime: '2026-11-22T00:01:00Z',
+      previewKind: 'markdown',
+      editable: true,
+      etag: 'e-saved',
+    });
+
+    await user.click(screen.getByRole('button', { name: '新建文件' }));
+    const createDialog = await screen.findByRole('dialog', { name: '新建文件' });
+    await user.type(within(createDialog).getByLabelText('名称'), 'docs/guide.md');
+    await user.click(within(createDialog).getByRole('button', { name: '创建' }));
+
+    const editor = await screen.findByLabelText('文件内容编辑');
+    await user.type(editor, '# Guide');
+    await user.keyboard('{Control>}s{/Control}');
+    await waitFor(() => {
+      expect(appState.gateway.writeWorkspaceFile).toHaveBeenCalledWith(
+        { path: 'docs/guide.md', content: '# Guide', expectedEtag: 'e-new' },
+        undefined,
+        expect.any(AbortSignal),
+      );
+    });
+
+    // Rename inside viewer updates title & tree.
+    const renamedEntry = { ...createdEntry, name: 'handbook.md', path: 'docs/handbook.md' };
+    appState.gateway.moveWorkspaceEntry.mockImplementation(async () => {
+      docsItems = [renamedEntry];
+      return renamedEntry;
+    });
+    appState.gateway.readWorkspaceFile.mockResolvedValue({
+      path: 'docs/handbook.md',
+      name: 'handbook.md',
+      size: 7,
+      modTime: '2026-11-22T00:01:00Z',
+      previewKind: 'markdown',
+      editable: true,
+      etag: 'e-saved',
+      content: '# Guide',
+    });
+    await user.click(screen.getByRole('button', { name: '文件操作' }));
+    await user.click(await screen.findByRole('menuitem', { name: '重命名' }));
+    const renameModal = await screen.findByRole('dialog', { name: '重命名' });
+    const renameInput = within(renameModal).getByLabelText('名称');
+    await user.clear(renameInput);
+    await user.type(renameInput, 'handbook.md');
+    await user.click(within(renameModal).getByRole('button', { name: '重命名' }));
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: 'docs/handbook.md' })).toBeInTheDocument();
+    });
+    await user.click(screen.getByRole('button', { name: '关闭' }));
+
+    // 2. Collapse all collapses expanded docs directory.
+    expect(screen.getByRole('treeitem', { name: 'handbook.md' })).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '全部折叠' }));
+    expect(screen.queryByRole('treeitem', { name: 'handbook.md' })).not.toBeInTheDocument();
+
+    // 3. Create folder, create copy & copy path.
+    appState.gateway.createWorkspaceDir.mockResolvedValue({
+      name: 'assets',
+      path: 'assets',
+      kind: 'dir',
+      size: 0,
+      modTime: '2026-11-22T00:00:00Z',
+      editable: false,
+    });
+    await user.click(screen.getByRole('button', { name: '新建文件夹' }));
+    const dirDialog = await screen.findByRole('dialog', { name: '新建文件夹' });
+    await user.type(within(dirDialog).getByLabelText('文件夹名称'), 'assets');
+    await user.click(within(dirDialog).getByRole('button', { name: '创建' }));
+    await waitFor(() => {
+      expect(appState.gateway.createWorkspaceDir).toHaveBeenCalledWith('assets', undefined);
+    });
+
+    appState.gateway.copyWorkspaceEntry.mockResolvedValue({
+      name: 'notes copy.md',
+      path: 'notes copy.md',
+      kind: 'file',
+      size: 10,
+      modTime: '2026-11-22T00:00:00Z',
+      previewKind: 'markdown',
+      editable: true,
+    });
+    await user.click(screen.getByRole('button', { name: '操作 notes.md' }));
+    await user.click(await screen.findByRole('menuitem', { name: '创建副本' }));
+    await waitFor(() => {
+      expect(appState.gateway.copyWorkspaceEntry).toHaveBeenCalledWith(
+        { fromPath: 'notes.md', toPath: 'notes copy.md' },
+        undefined,
+      );
+    });
+
+    await user.click(screen.getByRole('button', { name: '操作 notes.md' }));
+    await user.click(await screen.findByRole('menuitem', { name: '复制路径' }));
+    expect(writeText).toHaveBeenCalledWith('notes.md');
+
+    // 4. Search cross-directory & clear restores tree.
+    appState.gateway.searchWorkspaceEntries.mockResolvedValue({
+      query: 'handbook',
+      entries: [renamedEntry],
+      truncated: false,
+    });
+    const searchInput = screen.getByLabelText('搜索文件');
+    await user.type(searchInput, 'handbook');
+    await waitFor(() => {
+      expect(appState.gateway.searchWorkspaceEntries).toHaveBeenCalledWith(
+        'handbook',
+        undefined,
+        expect.any(AbortSignal),
+      );
+    });
+    expect(await screen.findByText('handbook.md')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '清空搜索' }));
+    await screen.findByRole('treeitem', { name: 'notes.md' });
+
+    // 5. Unsupported image downloads directly from viewer.
+    appState.gateway.downloadWorkspaceFile.mockResolvedValue({
+      blob: new Blob(['png']),
+      filename: 'pic.png',
+    });
+    await user.click(screen.getByRole('treeitem', { name: 'pic.png' }));
+    await screen.findByText('图片暂不支持预览');
+    await user.click(screen.getByRole('button', { name: '下载文件' }));
+    await waitFor(() => {
+      expect(appState.gateway.downloadWorkspaceFile).toHaveBeenCalledWith('pic.png', undefined);
+    });
+    expect(createObjectURL).toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: '关闭' }));
+
+    // 6. Upload with 409 conflict confirmation.
+    appState.gateway.uploadWorkspaceFile
+      .mockRejectedValueOnce(new GatewayError('CONFLICT', '目标文件已存在', 409))
+      .mockResolvedValueOnce({
+        name: 'notes.md',
+        path: 'notes.md',
+        kind: 'file',
+        size: 5,
+        modTime: '2026-11-22T00:02:00Z',
+        previewKind: 'markdown',
+        editable: true,
+      });
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    const uploadFile = new File(['hello'], 'notes.md', { type: 'text/markdown' });
+    await user.upload(fileInput, uploadFile);
+    const overwriteDialog = await screen.findByRole('dialog', { name: '覆盖已有文件？' });
+    await user.click(within(overwriteDialog).getByRole('button', { name: '覆盖' }));
+    await waitFor(() => {
+      expect(appState.gateway.uploadWorkspaceFile).toHaveBeenLastCalledWith(
+        'notes.md',
+        uploadFile,
+        { overwrite: true, scope: undefined },
+      );
+    });
+
+    // 7. Batch manage mode multi-select delete.
+    appState.gateway.batchWorkspaceEntries.mockImplementation(async () => {
+      rootItems = rootItems.filter((i) => i.path !== 'notes.md' && i.path !== 'pic.png');
+      return { operation: 'delete', succeeded: ['notes.md', 'pic.png'], failed: [] };
+    });
+    await user.click(screen.getByRole('button', { name: '管理文件' }));
+    await user.click(screen.getByLabelText('选择 notes.md'));
+    await user.click(screen.getByLabelText('选择 pic.png'));
+    await user.click(screen.getByRole('button', { name: '删除 (2)' }));
+    const delDialog = await screen.findByRole('dialog', { name: '删除 2 项？' });
+    await user.click(within(delDialog).getByRole('button', { name: '删除' }));
+    await waitFor(() => {
+      expect(appState.gateway.batchWorkspaceEntries).toHaveBeenCalledWith(
+        { operation: 'delete', paths: ['notes.md', 'pic.png'] },
+        undefined,
+      );
+    });
+
+    createObjectURL.mockRestore();
+    revokeObjectURL.mockRestore();
   });
 });

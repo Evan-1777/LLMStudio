@@ -469,6 +469,22 @@ a {
   color: var(--accent);
 }
 
+.ui-menu-item--danger {
+  color: var(--danger);
+}
+
+.ui-menu-item--danger[data-highlighted],
+.ui-menu-item--danger:hover:not([data-disabled]) {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+
+.ui-menu-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border-hairline);
+}
+
 /* Status & Toast */
 .ui-toast {
   position: fixed;

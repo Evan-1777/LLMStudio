@@ -71,6 +71,9 @@ export type IconName =
   | 'file'
   | 'fileText'
   | 'fileCode'
+  | 'filePlus'
+  | 'folderInput'
+  | 'collapseAll'
   | 'save';
 
 const ICON_BODIES: Record<IconName, ReactNode> = {
@@ -502,6 +505,27 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
       <polyline points="14 2 14 8 20 8" />
       <path d="m10 13-2 2 2 2" />
       <path d="m14 17 2-2-2-2" />
+    </>
+  ),
+  filePlus: (
+    <>
+      <path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2Z" />
+      <polyline points="14 2 14 8 20 8" />
+      <path d="M12 18v-6" />
+      <path d="M9 15h6" />
+    </>
+  ),
+  folderInput: (
+    <>
+      <path d="M2 9V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H20a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2v-1" />
+      <path d="M2 13h10" />
+      <path d="m9 16 3-3-3-3" />
+    </>
+  ),
+  collapseAll: (
+    <>
+      <path d="m7 4 5 5 5-5" />
+      <path d="m7 20 5-5 5 5" />
     </>
   ),
   save: (

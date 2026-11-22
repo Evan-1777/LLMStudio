@@ -42,7 +42,7 @@ func CORSMiddleware(allowedOrigins []string, next http.Handler) http.Handler {
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Font-Name, If-None-Match")
-		w.Header().Set("Access-Control-Expose-Headers", "ETag")
+		w.Header().Set("Access-Control-Expose-Headers", "ETag, Content-Disposition")
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

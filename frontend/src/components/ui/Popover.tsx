@@ -39,18 +39,22 @@ export function Popover({
 }
 
 export function Dropdown({
+  open,
+  onOpenChange,
   trigger,
   children,
   align = 'start',
   side = 'bottom',
 }: {
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
   trigger: ReactNode;
   children: ReactNode;
   align?: 'start' | 'center' | 'end';
   side?: 'top' | 'bottom' | 'left' | 'right';
 }) {
   return (
-    <DropdownMenu.Root>
+    <DropdownMenu.Root open={open} onOpenChange={onOpenChange}>
       <DropdownMenu.Trigger asChild>{trigger}</DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
@@ -69,22 +73,35 @@ export function Dropdown({
 
 export function DropdownItem({
   active = false,
+  danger = false,
   disabled = false,
   onSelect,
   children,
 }: {
   active?: boolean;
+  danger?: boolean;
   disabled?: boolean;
   onSelect: () => void;
   children: ReactNode;
 }) {
+  const classes = [
+    'ui-menu-item',
+    active ? 'ui-menu-item--active' : '',
+    danger ? 'ui-menu-item--danger' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
   return (
     <DropdownMenu.Item
-      className={`ui-menu-item ${active ? 'ui-menu-item--active' : ''}`.trim()}
+      className={classes}
       disabled={disabled}
       onSelect={onSelect}
     >
       {children}
     </DropdownMenu.Item>
   );
+}
+
+export function DropdownSeparator() {
+  return <DropdownMenu.Separator className="ui-menu-separator" />;
 }

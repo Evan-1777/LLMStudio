@@ -134,3 +134,130 @@ test('injects AGENTS.md, runs skill tool continuation, and browses/renders/edits
   );
   await page.getByRole('button', { name: '关闭' }).click();
 });
+
+test('manages workspace files end-to-end: create, edit, mkdir, rename, move, copy, search, upload overwrite, download, batch delete, and responsive layout', async ({
+  page,
+  appUrl,
+  upstream,
+  agentWorkspaceDir,
+}) => {
+  for (const name of fs.readdirSync(agentWorkspaceDir)) {
+    fs.rmSync(path.join(agentWorkspaceDir, name), { recursive: true, force: true });
+  }
+  await seedMockProviderViaApi(appUrl, upstream.url);
+  await connectWithToken(page, appUrl);
+
+  await page.getByRole('radio', { name: '工作区文件' }).click();
+  await expect(page.getByText('工作区为空')).toBeVisible();
+
+  // 1. Create Markdown file from header -> auto enters edit mode -> write & Ctrl+S save.
+  await page.getByRole('button', { name: '新建文件' }).first().click();
+  const createFileDialog = page.getByRole('dialog', { name: '新建文件' });
+  await createFileDialog.getByLabel('名称').fill('draft.md');
+  await createFileDialog.getByRole('button', { name: '创建' }).click();
+
+  const editor = page.getByLabel('文件内容编辑');
+  await expect(editor).toBeVisible();
+  await editor.fill('# Draft Content\n\nCreated in E2E.');
+  const saveResp = page.waitForResponse(
+    (r) => r.url().includes('/api/v1/agent/workspace/file') && r.request().method() === 'PUT',
+  );
+  await editor.press('Control+s');
+  expect((await saveResp).status()).toBe(200);
+  expect(fs.readFileSync(path.join(agentWorkspaceDir, 'draft.md'), 'utf8')).toBe(
+    '# Draft Content\n\nCreated in E2E.',
+  );
+  await page.getByRole('button', { name: '关闭' }).click();
+
+  // 2. Create subdirectory -> rename draft.md -> move to subdirectory -> create copy.
+  await page.getByRole('button', { name: '新建文件夹' }).click();
+  const createDirDialog = page.getByRole('dialog', { name: '新建文件夹' });
+  await createDirDialog.getByLabel('文件夹名称').fill('docs');
+  await createDirDialog.getByRole('button', { name: '创建' }).click();
+  await expect(page.getByRole('treeitem', { name: 'docs' })).toBeVisible();
+
+  await page.getByRole('button', { name: '操作 draft.md' }).click({ force: true });
+  await page.getByRole('menuitem', { name: '重命名' }).click();
+  const renameDialog = page.getByRole('dialog', { name: '重命名' });
+  await renameDialog.getByLabel('名称').fill('spec.md');
+  await renameDialog.getByRole('button', { name: '重命名' }).click();
+  await expect(page.getByRole('treeitem', { name: 'spec.md' })).toBeVisible();
+
+  await page.getByRole('button', { name: '操作 spec.md' }).click({ force: true });
+  await page.getByRole('menuitem', { name: '移动' }).click();
+  const moveDialog = page.getByRole('dialog', { name: '移动「spec.md」' });
+  await moveDialog.getByRole('listitem', { name: 'docs' }).click();
+  await moveDialog.getByRole('button', { name: '移至此处' }).click();
+  await expect(page.getByRole('treeitem', { name: 'spec.md' })).toHaveCount(0);
+
+  // Expand docs and create a copy.
+  await page.getByRole('treeitem', { name: 'docs' }).click();
+  await expect(page.getByRole('treeitem', { name: 'spec.md' })).toBeVisible();
+  await page.getByRole('button', { name: '操作 spec.md' }).click({ force: true });
+  await page.getByRole('menuitem', { name: '创建副本' }).click();
+  await expect(page.getByRole('treeitem', { name: 'spec copy.md' })).toBeVisible();
+
+  // 3. Search across directories and verify download content.
+  await page.getByLabel('搜索文件').fill('spec.md');
+  await expect(page.getByRole('list', { name: '文件搜索结果' }).getByText('spec.md')).toBeVisible();
+  const dlRespPromise = page.waitForResponse(
+    (r) => r.url().includes('/api/v1/agent/workspace/download') && r.request().method() === 'GET',
+  );
+  const downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '操作 spec.md' }).click({ force: true });
+  await page.getByRole('menuitem', { name: '下载' }).click();
+  const [dlResp, download] = await Promise.all([dlRespPromise, downloadPromise]);
+  const expectedBody = '# Draft Content\n\nCreated in E2E.';
+  expect(fs.readFileSync(path.join(agentWorkspaceDir, 'docs', 'spec.md'), 'utf8')).toBe(expectedBody);
+  expect(fs.readFileSync(path.join(agentWorkspaceDir, 'docs', 'spec copy.md'), 'utf8')).toBe(expectedBody);
+  expect(dlResp.status()).toBe(200);
+  expect(dlResp.headers()['content-disposition']).toContain('spec.md');
+  expect(dlResp.headers()['content-length']).toBe(String(Buffer.byteLength(expectedBody)));
+  expect(download.suggestedFilename()).toBe('spec.md');
+  await page.getByRole('button', { name: '清空搜索' }).click();
+
+  // 4. Upload file and trigger 409 overwrite confirmation.
+  const fileInput = page.locator('.ws-panel input[type="file"]');
+  await fileInput.setInputFiles({
+    name: 'upload.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('upload-v1'),
+  });
+  await expect(page.getByRole('treeitem', { name: 'upload.txt' })).toBeVisible();
+  expect(fs.readFileSync(path.join(agentWorkspaceDir, 'upload.txt'), 'utf8')).toBe('upload-v1');
+
+  await fileInput.setInputFiles({
+    name: 'upload.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('upload-v2'),
+  });
+  const overwriteDialog = page.getByRole('dialog', { name: '覆盖已有文件？' });
+  await expect(overwriteDialog).toBeVisible();
+  await overwriteDialog.getByRole('button', { name: '覆盖' }).click();
+  await expect(overwriteDialog).toBeHidden();
+  await expect.poll(() => fs.readFileSync(path.join(agentWorkspaceDir, 'upload.txt'), 'utf8')).toBe('upload-v2');
+
+  // 5. Responsive & light/dark/reduced-motion layout check across 1280 / 768 / 375 px.
+  for (const width of [1280, 768, 375]) {
+    await page.setViewportSize({ width, height: 800 });
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await page.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
+      ).toBe(true);
+    }
+  }
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
+
+  // 6. Batch delete docs and upload.txt and verify removed from disk.
+  await page.getByRole('button', { name: '管理文件' }).click();
+  await page.getByLabel('选择 docs').click();
+  await page.getByLabel('选择 upload.txt').click();
+  await page.getByRole('button', { name: '删除 (2)' }).click();
+  const delDialog = page.getByRole('dialog', { name: '删除 2 项？' });
+  await delDialog.getByRole('button', { name: '删除' }).click();
+  await expect(page.getByText('工作区为空')).toBeVisible();
+  expect(fs.existsSync(path.join(agentWorkspaceDir, 'docs'))).toBe(false);
+  expect(fs.existsSync(path.join(agentWorkspaceDir, 'upload.txt'))).toBe(false);
+});

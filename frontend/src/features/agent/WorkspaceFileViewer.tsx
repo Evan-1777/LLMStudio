@@ -11,6 +11,9 @@ import { useApp } from '../../app/AppProvider';
 import {
   Button,
   ConfirmDialog,
+  Dropdown,
+  DropdownItem,
+  DropdownSeparator,
   EmptyState,
   ErrorBanner,
   Icon,
@@ -23,8 +26,14 @@ import type {
   TopicScope,
   WorkspaceEntry,
   WorkspaceFileDocument,
+  WorkspaceFileWriteResult,
 } from '../../core/types';
 import { MarkdownDocument } from '../../rendering/ContentRenderer';
+import {
+  WorkspaceNameDialog,
+  parentDirOf,
+  triggerBlobDownload,
+} from './WorkspaceDialogs';
 import './workspace.css';
 
 function formatBytes(bytes: number): string {
@@ -43,14 +52,22 @@ function fileHeaderIcon(entry: WorkspaceEntry): 'fileText' | 'fileCode' | 'image
 
 export function WorkspaceFileViewer({
   entry,
+  initialMode,
   gateway,
   scope,
   onClose,
+  onSaved,
+  onRenamed,
+  onDeleted,
 }: {
   entry: WorkspaceEntry | null;
+  initialMode?: 'preview' | 'edit';
   gateway: GatewayClient;
   scope?: TopicScope;
   onClose: () => void;
+  onSaved?: (res: WorkspaceFileWriteResult) => void;
+  onRenamed?: (oldPath: string, nextEntry: WorkspaceEntry) => void;
+  onDeleted?: (deletedPath: string) => void;
 }) {
   const { toast } = useApp();
 
@@ -64,8 +81,16 @@ export function WorkspaceFileViewer({
   const [saveError, setSaveError] = useState<{ message: string; conflict: boolean } | null>(null);
   const [copied, setCopied] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<'close' | 'reload' | null>(null);
+
+  // Rename & delete modals inside viewer
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
 
   const loadAbortRef = useRef<AbortController | null>(null);
   const saveAbortRef = useRef<AbortController | null>(null);
@@ -76,6 +101,7 @@ export function WorkspaceFileViewer({
   const open = entry !== null;
   const unsupported = entry?.previewKind === 'unsupported';
   const isDirty = Boolean(doc && draftContent !== doc.content);
+  const subDialogOpen = discardConfirmOpen || renameOpen || deleteOpen;
 
   useEffect(() => {
     if (open && !wasOpenRef.current) {
@@ -94,7 +120,7 @@ export function WorkspaceFileViewer({
   }, []);
 
   const fetchDocument = useCallback(
-    async (target: WorkspaceEntry) => {
+    async (target: WorkspaceEntry, preferredMode?: 'preview' | 'edit') => {
       loadAbortRef.current?.abort();
       const ctrl = new AbortController();
       loadAbortRef.current = ctrl;
@@ -114,7 +140,13 @@ export function WorkspaceFileViewer({
         if (ctrl.signal.aborted) return;
         setDoc(fileRes);
         setDraftContent(fileRes.content);
-        setMode(fileRes.previewKind === 'markdown' ? 'preview' : 'edit');
+        setMode(
+          preferredMode === 'edit'
+            ? 'edit'
+            : fileRes.previewKind === 'markdown'
+              ? 'preview'
+              : 'edit',
+        );
         setMarkdownVisualRender(Boolean(settingsRes?.markdownVisualRender));
       } catch (err) {
         if (ctrl.signal.aborted) return;
@@ -142,6 +174,9 @@ export function WorkspaceFileViewer({
     setCopied(false);
     setDiscardConfirmOpen(false);
     setPendingAction(null);
+    setRenameOpen(false);
+    setRenameError(null);
+    setDeleteOpen(false);
 
     if (!entry) {
       setFullscreen(false);
@@ -151,8 +186,8 @@ export function WorkspaceFileViewer({
       setLoading(false);
       return;
     }
-    void fetchDocument(entry);
-  }, [entry, fetchDocument]);
+    void fetchDocument(entry, initialMode);
+  }, [entry, fetchDocument, initialMode]);
 
   const handleSave = useCallback(
     async (forceOverwrite: boolean) => {
@@ -182,6 +217,7 @@ export function WorkspaceFileViewer({
           content: draftContent,
         });
         toast('已保存');
+        onSaved?.(res);
       } catch (err) {
         if (ctrl.signal.aborted) return;
         const isConflict =
@@ -199,7 +235,7 @@ export function WorkspaceFileViewer({
         }
       }
     },
-    [doc, draftContent, gateway, saving, scope, toast],
+    [doc, draftContent, gateway, onSaved, saving, scope, toast],
   );
 
   const handleCopy = async () => {
@@ -214,15 +250,73 @@ export function WorkspaceFileViewer({
     }
   };
 
+  const handleDownload = async () => {
+    if (!entry || downloading) return;
+    setDownloading(true);
+    try {
+      const { blob, filename } = await gateway.downloadWorkspaceFile(entry.path, scope);
+      triggerBlobDownload(blob, filename);
+    } catch (err) {
+      toast(err instanceof GatewayError ? err.message : '下载文件失败', 'error');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const handleCopyPath = async () => {
+    if (!entry) return;
+    try {
+      await navigator.clipboard.writeText(entry.path);
+      toast('已复制路径');
+    } catch {
+      toast('无法写入剪贴板', 'error');
+    }
+  };
+
+  const handleRenameSubmit = async (resolvedPath: string) => {
+    if (!entry) return;
+    setRenameBusy(true);
+    setRenameError(null);
+    try {
+      const moved = await gateway.moveWorkspaceEntry(
+        { fromPath: entry.path, toPath: resolvedPath },
+        scope,
+      );
+      setRenameOpen(false);
+      toast('已重命名');
+      onRenamed?.(entry.path, moved);
+    } catch (err) {
+      setRenameError(err instanceof GatewayError ? err.message : '重命名失败');
+    } finally {
+      setRenameBusy(false);
+    }
+  };
+
+  const handleDeleteConfirm = async () => {
+    if (!entry) return;
+    setDeleteBusy(true);
+    try {
+      const deletedPath = entry.path;
+      await gateway.deleteWorkspaceEntry(deletedPath, scope);
+      setDeleteOpen(false);
+      toast('已删除');
+      onDeleted?.(deletedPath);
+    } catch (err) {
+      toast(err instanceof GatewayError ? err.message : '删除失败', 'error');
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
   const requestClose = useCallback(() => {
-    if (saving) return;
+    if (saving || renameBusy || deleteBusy) return;
     if (isDirty) {
       setPendingAction('close');
       setDiscardConfirmOpen(true);
       return;
     }
     onClose();
-  }, [isDirty, onClose, saving]);
+  }, [deleteBusy, isDirty, onClose, renameBusy, saving]);
 
   const requestReload = useCallback(() => {
     if (!entry || loading || saving) return;
@@ -282,7 +376,7 @@ export function WorkspaceFileViewer({
             aria-describedby={undefined}
             onKeyDown={handleKeyDown}
             onEscapeKeyDown={(e) => {
-              if (saving || discardConfirmOpen) {
+              if (saving || subDialogOpen) {
                 e.preventDefault();
                 return;
               }
@@ -292,7 +386,7 @@ export function WorkspaceFileViewer({
               }
             }}
             onPointerDownOutside={(e) => {
-              if (saving || discardConfirmOpen) {
+              if (saving || subDialogOpen) {
                 e.preventDefault();
                 return;
               }
@@ -387,6 +481,56 @@ export function WorkspaceFileViewer({
                     />
                   </>
                 ) : null}
+
+                {entry ? (
+                  <>
+                    <IconButton
+                      size="sm"
+                      icon="download"
+                      label="下载文件"
+                      loading={downloading}
+                      disabled={downloading}
+                      onClick={() => void handleDownload()}
+                    />
+                    <Dropdown
+                      align="end"
+                      trigger={
+                        <IconButton
+                          size="sm"
+                          icon="ellipsis"
+                          label="文件操作"
+                          disabled={saving}
+                        />
+                      }
+                    >
+                      <DropdownItem
+                        disabled={isDirty || saving}
+                        onSelect={() => {
+                          setRenameError(null);
+                          setRenameOpen(true);
+                        }}
+                      >
+                        <Icon name="edit" size={14} />
+                        <span>重命名</span>
+                      </DropdownItem>
+                      <DropdownItem onSelect={() => void handleCopyPath()}>
+                        <Icon name="link" size={14} />
+                        <span>复制路径</span>
+                      </DropdownItem>
+                      <DropdownSeparator />
+                      <DropdownItem
+                        danger
+                        disabled={saving}
+                        onSelect={() => setDeleteOpen(true)}
+                      >
+                        <Icon name="trash" size={14} />
+                        <span>删除</span>
+                      </DropdownItem>
+                    </Dropdown>
+                  </>
+                ) : null}
+
+                <span className="ws-viewer__divider" aria-hidden="true" />
 
                 <IconButton
                   size="sm"
@@ -521,6 +665,36 @@ export function WorkspaceFileViewer({
         confirmLabel="放弃"
         danger
         onConfirm={handleConfirmDiscard}
+      />
+
+      <WorkspaceNameDialog
+        open={renameOpen && entry !== null}
+        mode="rename"
+        parentDir={entry ? parentDirOf(entry.path) : ''}
+        initialName={entry?.name ?? ''}
+        entryKind={entry?.kind ?? 'file'}
+        busy={renameBusy}
+        error={renameError}
+        onOpenChange={(next) => {
+          if (!next && !renameBusy) {
+            setRenameOpen(false);
+            setRenameError(null);
+          }
+        }}
+        onSubmit={handleRenameSubmit}
+      />
+
+      <ConfirmDialog
+        open={deleteOpen && entry !== null}
+        onOpenChange={(next) => {
+          if (!next && !deleteBusy) setDeleteOpen(false);
+        }}
+        title="删除文件？"
+        message={`确认永久删除「${entry?.name ?? ''}」？此操作无法撤销。`}
+        confirmLabel="删除"
+        danger
+        busy={deleteBusy}
+        onConfirm={handleDeleteConfirm}
       />
     </>
   );

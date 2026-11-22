@@ -1,6 +1,7 @@
 import type {
   InputHTMLAttributes,
   ReactNode,
+  Ref,
   SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from 'react';
@@ -29,12 +30,14 @@ export function Field({ label, htmlFor, error, children }: FieldProps) {
 }
 
 export interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
+  ref?: Ref<HTMLInputElement>;
   compact?: boolean;
 }
 
-export function Input({ compact = false, className = '', ...rest }: InputProps) {
+export function Input({ ref, compact = false, className = '', ...rest }: InputProps) {
   return (
     <input
+      ref={ref}
       className={`ui-input ${compact ? 'ui-input--sm' : ''} ${className}`.trim()}
       {...rest}
     />

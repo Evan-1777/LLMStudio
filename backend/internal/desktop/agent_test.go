@@ -379,3 +379,132 @@ func TestDesktopCloudWorkspaceFileBrowserAndLargeSaveProxy(t *testing.T) {
 		t.Fatalf("expected 400 image error, got %d %s", st, body)
 	}
 }
+
+func TestDesktopCloudWorkspaceManagementProxyAndLocalIsolation(t *testing.T) {
+	ctx := t.Context()
+	gatewayDir := t.TempDir()
+
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ls, err := OpenDesktopStore(ctx, filepath.Join(t.TempDir(), "desktop.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ls.Close()
+
+	cloudRuntime := agent.NewGateway(store.NewAgentStore(db), gatewayDir, true)
+	cloudSrv := httptest.NewServer(httpapi.NewRouter(httpapi.RouterDeps{
+		Config:       config.Config{AccessToken: "gw-tok"},
+		AgentRuntime: cloudRuntime,
+	}))
+	defer cloudSrv.Close()
+
+	cloud := NewCloudClient(cloudSrv.URL, "gw-tok")
+	facade, err := NewServer(ServerConfig{Store: ls, Cloud: cloud})
+	if err != nil {
+		t.Fatal(err)
+	}
+	desktopSrv := httptest.NewServer(facade.Handler())
+	defer desktopSrv.Close()
+
+	doRaw := func(method, path, contentType string, body []byte) (*http.Response, []byte) {
+		t.Helper()
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		req, err := http.NewRequestWithContext(ctx, method, desktopSrv.URL+path, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+facade.Token())
+		if contentType != "" {
+			req.Header.Set("Content-Type", contentType)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, data
+	}
+
+	// 1. Desktop scope=local rejects all new management endpoints with 404.
+	localCases := []struct {
+		method, path, body string
+	}{
+		{"POST", "/api/v1/agent/workspace/file?scope=local", `{"path":"a.md","content":"hi"}`},
+		{"POST", "/api/v1/agent/workspace/dir?scope=local", `{"path":"sub"}`},
+		{"POST", "/api/v1/agent/workspace/move?scope=local", `{"fromPath":"a.md","toPath":"b.md"}`},
+		{"POST", "/api/v1/agent/workspace/copy?scope=local", `{"fromPath":"a.md","toPath":"b.md"}`},
+		{"DELETE", "/api/v1/agent/workspace/entry?scope=local&path=a.md", ""},
+		{"POST", "/api/v1/agent/workspace/batch?scope=local", `{"operation":"delete","paths":["a.md"]}`},
+		{"POST", "/api/v1/agent/workspace/upload?scope=local&path=a.bin", "abc"},
+		{"GET", "/api/v1/agent/workspace/download?scope=local&path=a.bin", ""},
+		{"GET", "/api/v1/agent/workspace/search?scope=local&q=a", ""},
+	}
+	for _, tc := range localCases {
+		ct := ""
+		var b []byte
+		if tc.body != "" {
+			ct = "application/json"
+			b = []byte(tc.body)
+		}
+		resp, _ := doRaw(tc.method, tc.path, ct, b)
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("local %s %s expected 404, got %d", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+
+	// 2. Cloud proxy: create file (>64 KiB JSON), create dir, upload binary (>64 KiB) + conflict + overwrite.
+	largeMD := strings.Repeat("# heading\nbody line\n", 4500) // ~90 KiB
+	createPayload, _ := json.Marshal(map[string]string{"path": "docs/spec.md", "content": largeMD})
+	if resp, body := doRaw("POST", "/api/v1/agent/workspace/file?scope=cloud", "application/json", createPayload); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create file status=%d body=%s", resp.StatusCode, body)
+	}
+	if resp, body := doRaw("POST", "/api/v1/agent/workspace/dir?scope=cloud", "application/json", []byte(`{"path":"assets"}`)); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create dir status=%d body=%s", resp.StatusCode, body)
+	}
+
+	binPayload := bytes.Repeat([]byte{0xde, 0xad, 0xbe, 0xef}, 24*1024) // 96 KiB > 64 KiB
+	if resp, body := doRaw("POST", "/api/v1/agent/workspace/upload?scope=cloud&path=assets/blob.bin", "application/octet-stream", binPayload); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload binary status=%d body=%s", resp.StatusCode, body)
+	}
+	if resp, _ := doRaw("POST", "/api/v1/agent/workspace/upload?scope=cloud&path=assets/blob.bin", "application/octet-stream", []byte("conflict")); resp.StatusCode != http.StatusConflict {
+		t.Fatalf("expected 409 upload conflict, got %d", resp.StatusCode)
+	}
+	updatedBin := append([]byte("v2:"), binPayload...)
+	if resp, body := doRaw("POST", "/api/v1/agent/workspace/upload?scope=cloud&path=assets/blob.bin&overwrite=true", "application/octet-stream", updatedBin); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("upload overwrite status=%d body=%s", resp.StatusCode, body)
+	}
+
+	// 3. Download through desktop proxy preserves bytes and Content-Disposition header.
+	dlResp, dlBody := doRaw("GET", "/api/v1/agent/workspace/download?scope=cloud&path=assets/blob.bin", "", nil)
+	if dlResp.StatusCode != http.StatusOK || !bytes.Equal(dlBody, updatedBin) {
+		t.Fatalf("download status=%d len=%d want=%d", dlResp.StatusCode, len(dlBody), len(updatedBin))
+	}
+	if cd := dlResp.Header.Get("Content-Disposition"); !strings.Contains(cd, "blob.bin") {
+		t.Fatalf("missing Content-Disposition header: %q", cd)
+	}
+
+	// 4. Move, copy, search, single delete, batch delete.
+	if resp, body := doRaw("POST", "/api/v1/agent/workspace/move?scope=cloud", "application/json", []byte(`{"fromPath":"docs/spec.md","toPath":"docs/design.md"}`)); resp.StatusCode != http.StatusOK {
+		t.Fatalf("move status=%d body=%s", resp.StatusCode, body)
+	}
+	if resp, body := doRaw("POST", "/api/v1/agent/workspace/copy?scope=cloud", "application/json", []byte(`{"fromPath":"docs/design.md","toPath":"docs/design copy.md"}`)); resp.StatusCode != http.StatusCreated {
+		t.Fatalf("copy status=%d body=%s", resp.StatusCode, body)
+	}
+	if resp, body := doRaw("GET", "/api/v1/agent/workspace/search?scope=cloud&q=design", "", nil); resp.StatusCode != http.StatusOK || !strings.Contains(string(body), "docs/design.md") {
+		t.Fatalf("search status=%d body=%s", resp.StatusCode, body)
+	}
+	if resp, body := doRaw("DELETE", "/api/v1/agent/workspace/entry?scope=cloud&path=docs/design+copy.md", "", nil); resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("single delete status=%d body=%s", resp.StatusCode, body)
+	}
+	if resp, body := doRaw("POST", "/api/v1/agent/workspace/batch?scope=cloud", "application/json", []byte(`{"operation":"delete","paths":["docs","assets"]}`)); resp.StatusCode != http.StatusOK || !strings.Contains(string(body), `"docs"`) {
+		t.Fatalf("batch delete status=%d body=%s", resp.StatusCode, body)
+	}
+}

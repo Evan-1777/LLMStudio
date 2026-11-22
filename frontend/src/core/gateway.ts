@@ -58,15 +58,40 @@ import {
   type StreamChatInput,
   type ToolCallExecutionInput,
   type TopicScope,
+  type WorkspaceBatchOperation,
+  type WorkspaceBatchResult,
   type WorkspaceEntriesResponse,
+  type WorkspaceEntry,
   type WorkspaceFileDocument,
   type WorkspaceFileWriteResult,
+  type WorkspaceSearchResponse,
 } from './types';
 
 function withScopeQuery(path: string, scope?: TopicScope): string {
   if (!scope) return path;
   const sep = path.includes('?') ? '&' : '?';
   return `${path}${sep}scope=${encodeURIComponent(scope)}`;
+}
+
+function parseDispositionFilename(header: string): string | null {
+  if (!header) return null;
+  const utf8Match = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(header);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1].trim());
+    } catch {
+      return utf8Match[1].trim();
+    }
+  }
+  const quotedMatch = /filename\s*=\s*"([^"]+)"/i.exec(header);
+  if (quotedMatch?.[1]) {
+    return quotedMatch[1];
+  }
+  const bareMatch = /filename\s*=\s*([^;\s]+)/i.exec(header);
+  if (bareMatch?.[1]) {
+    return bareMatch[1];
+  }
+  return null;
 }
 
 export class GatewayError extends Error {
@@ -809,6 +834,161 @@ export class GatewayClient {
     signal?: AbortSignal,
   ): Promise<WorkspaceFileWriteResult> {
     return this.requestJson('PUT', withScopeQuery('/api/v1/agent/workspace/file', scope), { body: input, signal });
+  }
+
+  createWorkspaceFile(
+    input: { path: string; content?: string },
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceEntry> {
+    return this.requestJson('POST', withScopeQuery('/api/v1/agent/workspace/file', scope), {
+      body: { path: input.path, content: input.content ?? '' },
+      signal,
+    });
+  }
+
+  createWorkspaceDir(
+    path: string,
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceEntry> {
+    return this.requestJson('POST', withScopeQuery('/api/v1/agent/workspace/dir', scope), {
+      body: { path },
+      signal,
+    });
+  }
+
+  moveWorkspaceEntry(
+    input: { fromPath: string; toPath: string },
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceEntry> {
+    return this.requestJson('POST', withScopeQuery('/api/v1/agent/workspace/move', scope), {
+      body: input,
+      signal,
+    });
+  }
+
+  copyWorkspaceEntry(
+    input: { fromPath: string; toPath: string },
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceEntry> {
+    return this.requestJson('POST', withScopeQuery('/api/v1/agent/workspace/copy', scope), {
+      body: input,
+      signal,
+    });
+  }
+
+  deleteWorkspaceEntry(
+    path: string,
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.requestJson(
+      'DELETE',
+      withScopeQuery(`/api/v1/agent/workspace/entry?path=${encodeURIComponent(path)}`, scope),
+      { signal },
+    );
+  }
+
+  batchWorkspaceEntries(
+    input: { operation: WorkspaceBatchOperation; paths: string[]; targetDir?: string },
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceBatchResult> {
+    return this.requestJson('POST', withScopeQuery('/api/v1/agent/workspace/batch', scope), {
+      body: input,
+      signal,
+    });
+  }
+
+  async uploadWorkspaceFile(
+    path: string,
+    file: Blob,
+    opts?: { overwrite?: boolean; scope?: TopicScope; signal?: AbortSignal },
+  ): Promise<WorkspaceEntry> {
+    const query = `path=${encodeURIComponent(path)}&overwrite=${opts?.overwrite ? 'true' : 'false'}`;
+    const url = resolveGatewayUrl(
+      this.baseUrl,
+      withScopeQuery(`/api/v1/agent/workspace/upload?${query}`, opts?.scope),
+    );
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: 'POST',
+        headers: this.buildHeaders(false, true, {
+          'Content-Type': file.type || 'application/octet-stream',
+        }),
+        body: file,
+        signal: opts?.signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+      throw new GatewayError(
+        'NETWORK_ERROR',
+        err instanceof Error ? err.message : '上传文件失败',
+      );
+    }
+    const rawText = await response.text();
+    if (!response.ok) {
+      const env = parseErrorEnvelope(rawText, response.status);
+      throw new GatewayError(env.code, env.message, response.status);
+    }
+    try {
+      return JSON.parse(rawText) as WorkspaceEntry;
+    } catch {
+      throw new GatewayError('INVALID_RESPONSE', '服务端返回了无效的 JSON 响应', response.status);
+    }
+  }
+
+  async downloadWorkspaceFile(
+    path: string,
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<{ blob: Blob; filename: string }> {
+    const url = resolveGatewayUrl(
+      this.baseUrl,
+      withScopeQuery(`/api/v1/agent/workspace/download?path=${encodeURIComponent(path)}`, scope),
+    );
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: 'GET',
+        headers: this.buildHeaders(false, true),
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      if (err instanceof Error && err.name === 'AbortError') throw err;
+      throw new GatewayError(
+        'NETWORK_ERROR',
+        err instanceof Error ? err.message : '下载文件失败',
+      );
+    }
+    if (!response.ok) {
+      const rawText = await response.text();
+      const env = parseErrorEnvelope(rawText, response.status);
+      throw new GatewayError(env.code, env.message, response.status);
+    }
+    const blob = await response.blob();
+    const fallbackName = path.split('/').filter(Boolean).pop() || 'download';
+    const disposition = response.headers.get('Content-Disposition') ?? '';
+    const filename = parseDispositionFilename(disposition) || fallbackName;
+    return { blob, filename };
+  }
+
+  searchWorkspaceEntries(
+    query: string,
+    scope?: TopicScope,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceSearchResponse> {
+    return this.requestJson(
+      'GET',
+      withScopeQuery(`/api/v1/agent/workspace/search?q=${encodeURIComponent(query)}`, scope),
+      { signal },
+    );
   }
 
   createConversation(

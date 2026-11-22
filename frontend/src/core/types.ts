@@ -428,6 +428,26 @@ export interface WorkspaceFileWriteResult {
   etag: string;
 }
 
+export interface WorkspaceSearchResponse {
+  query: string;
+  entries: WorkspaceEntry[];
+  truncated: boolean;
+}
+
+export type WorkspaceBatchOperation = 'delete' | 'move';
+
+export interface WorkspaceBatchItemError {
+  path: string;
+  code: string;
+  message: string;
+}
+
+export interface WorkspaceBatchResult {
+  operation: WorkspaceBatchOperation;
+  succeeded: string[];
+  failed: WorkspaceBatchItemError[];
+}
+
 export type ConversationMode = 'chat' | 'agent';
 
 export interface Conversation {

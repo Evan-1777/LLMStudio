@@ -19,6 +19,6 @@ export {
   type ConfirmDialogProps,
   type ModalProps,
 } from './Modal';
-export { Dropdown, DropdownItem, Popover } from './Popover';
+export { Dropdown, DropdownItem, DropdownSeparator, Popover } from './Popover';
 export { EmptyState, ErrorBanner, LoadingSpinner } from './StateViews';
 export { Switch, type SwitchProps } from './Switch';

@@ -1,6 +1,7 @@
 package desktop
 
 import (
+	"errors"
 	"io"
 	"net/http"
 
@@ -33,11 +34,19 @@ func (s *Server) dispatchAgent(local http.HandlerFunc) http.HandlerFunc {
 			target += "?" + q.Encode()
 		}
 		maxBody := int64(64 << 10)
-		if r.Method == http.MethodPut && r.URL.Path == "/api/v1/agent/workspace/file" {
+		switch {
+		case (r.Method == http.MethodPut || r.Method == http.MethodPost) && r.URL.Path == "/api/v1/agent/workspace/file":
 			maxBody = 3 << 20
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agent/workspace/upload":
+			maxBody = (32 << 20) + (64 << 10)
 		}
 		resp, err := s.cfg.Cloud.proxyRequest(ctx, r.Method, target, r.Header, http.MaxBytesReader(w, r.Body, maxBody), r.ContentLength)
 		if err != nil {
+			var maxErr *http.MaxBytesError
+			if errors.As(err, &maxErr) {
+				writeDesktopError(w, domain.NewError(domain.ErrCodePayloadTooLarge, "请求体超过大小限制", err))
+				return
+			}
 			writeDesktopError(w, err)
 			return
 		}
@@ -47,7 +56,7 @@ func (s *Server) dispatchAgent(local http.HandlerFunc) http.HandlerFunc {
 
 func copyAgentResponse(w http.ResponseWriter, resp *http.Response, stream bool) {
 	defer resp.Body.Close()
-	for _, key := range []string{"Content-Type", "Cache-Control", "X-Accel-Buffering"} {
+	for _, key := range []string{"Content-Type", "Cache-Control", "X-Accel-Buffering", "Content-Disposition", "Content-Length", "X-Content-Type-Options"} {
 		if value := resp.Header.Get(key); value != "" {
 			w.Header().Set(key, value)
 		}
