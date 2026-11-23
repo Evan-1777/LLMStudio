@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -36,6 +37,7 @@ import {
 } from './attachments';
 
 export function Composer({
+  compact = false,
   selectedProviderId,
   selectedModelId,
   reasoningEffort,
@@ -57,6 +59,7 @@ export function Composer({
   canCompact = false,
   isCompacting = false,
 }: {
+  compact?: boolean;
   selectedProviderId: string;
   selectedModelId: string;
   reasoningEffort: ReasoningEffort;
@@ -93,13 +96,29 @@ export function Composer({
   const [webSearch, setWebSearch] = useState(false);
   const [bodyError, setBodyError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const drawerId = useId();
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const drawerToggleRef = useRef<HTMLButtonElement | null>(null);
+  const drawerInnerRef = useRef<HTMLDivElement | null>(null);
   const attachmentsRef = useRef<PendingAttachment[]>([]);
   attachmentsRef.current = attachments;
   const pendingSnapshotRef = useRef<PendingAttachment[] | null>(null);
   const draftVersionRef = useRef(0);
+
+  useEffect(() => {
+    if (!compact) {
+      setDrawerOpen(false);
+    }
+  }, [compact]);
+
+  useEffect(() => {
+    const inner = drawerInnerRef.current;
+    if (!inner) return;
+    inner.inert = compact && !drawerOpen;
+  }, [compact, drawerOpen]);
 
   useEffect(() => {
     return () => {
@@ -248,6 +267,7 @@ export function Composer({
           setDraft('');
           setAttachments([]);
           setBodyError(null);
+          setDrawerOpen(false);
           if (textareaRef.current) {
             textareaRef.current.style.height = '40px';
           }
@@ -312,6 +332,100 @@ export function Composer({
     setWebSearch((v) => !v);
   };
 
+  const handleDrawerKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'Escape') return;
+    if (document.querySelector('[role="dialog"], [role="menu"]')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDrawerOpen(false);
+    drawerToggleRef.current?.focus({ preventScroll: true });
+  };
+
+  const webSearchActive = webSearch && Boolean(activeEngine);
+  const drawerIndicatorLevel: 'danger' | 'warning' | 'active' | undefined =
+    contextUsage.rawPercent !== null && contextUsage.rawPercent >= 90
+      ? 'danger'
+      : contextUsage.rawPercent !== null && contextUsage.rawPercent >= 70
+        ? 'warning'
+        : webSearchActive || mcpActive
+          ? 'active'
+          : undefined;
+
+  const drawerTabIndex = compact && !drawerOpen ? -1 : undefined;
+
+  const webSearchButton = (
+    <IconButton
+      size="sm"
+      icon="globe"
+      tabIndex={drawerTabIndex}
+      active={webSearchActive}
+      aria-pressed={webSearchActive}
+      label={webSearchActive ? '关闭联网搜索' : '开启联网搜索'}
+      disabled={isBusy}
+      onClick={handleToggleSearch}
+    />
+  );
+
+  const mcpButton = onToggleMcp ? (
+    <IconButton
+      size="sm"
+      icon="wrench"
+      tabIndex={drawerTabIndex}
+      active={mcpActive}
+      aria-pressed={mcpActive}
+      label={mcpActive ? '关闭 MCP 工具' : '开启 MCP 工具'}
+      disabled={isBusy}
+      onClick={onToggleMcp}
+    />
+  ) : null;
+
+  const attachButton = (
+    <IconButton
+      size="sm"
+      icon="paperclip"
+      tabIndex={drawerTabIndex}
+      label="添加附件"
+      disabled={isBusy}
+      onClick={() => fileInputRef.current?.click()}
+    />
+  );
+
+  const contextRingControl = (
+    <ContextUsageRing
+      usage={contextUsage}
+      onCompact={onCompact}
+      canCompact={Boolean(
+        canCompact && !isBusy && !isCompacting && contextUsage.canCompact,
+      )}
+      isCompacting={isCompacting}
+      triggerTabIndex={drawerTabIndex}
+    />
+  );
+
+  const primaryActionButton = stoppable ? (
+    <button
+      key="stop-btn"
+      type="button"
+      className="wb-send-btn wb-send-btn--stop"
+      aria-label="停止生成"
+      title="停止生成"
+      onClick={onStop}
+    >
+      <Icon name="stop" size={14} />
+    </button>
+  ) : (
+    <button
+      key="send-btn"
+      type="submit"
+      className="wb-send-btn"
+      aria-label="发送消息"
+      title="发送消息"
+      disabled={!canSend}
+    >
+      <Icon name="arrowUp" size={16} />
+    </button>
+  );
+
   return (
     <div className="wb-composer-wrap">
       <form className="wb-composer" onSubmit={handleSubmit}>
@@ -346,38 +460,37 @@ export function Composer({
           onPaste={handlePaste}
         />
 
+        <input
+          ref={fileInputRef}
+          type="file"
+          hidden
+          multiple
+          accept={FILE_INPUT_ACCEPT}
+          onChange={handleFileChange}
+        />
+
         <div className="wb-composer__tools">
-          <IconButton
-            size="sm"
-            icon="globe"
-            active={webSearch && Boolean(activeEngine)}
-            aria-pressed={webSearch && Boolean(activeEngine)}
-            label={webSearch && activeEngine ? '关闭联网搜索' : '开启联网搜索'}
-            disabled={isBusy}
-            onClick={handleToggleSearch}
-          />
-          {onToggleMcp && (
+          {compact ? (
             <IconButton
+              ref={drawerToggleRef}
               size="sm"
-              icon="wrench"
-              active={mcpActive}
-              aria-pressed={mcpActive}
-              label={mcpActive ? '关闭 MCP 工具' : '开启 MCP 工具'}
-              disabled={isBusy}
-              onClick={onToggleMcp}
+              className="wb-composer-drawer-toggle"
+              icon="plus"
+              active={drawerOpen}
+              aria-expanded={drawerOpen}
+              aria-controls={drawerId}
+              data-indicator={!drawerOpen ? drawerIndicatorLevel : undefined}
+              label={drawerOpen ? '收起工具' : '展开工具'}
+              onClick={() => setDrawerOpen((v) => !v)}
             />
+          ) : (
+            <>
+              {webSearchButton}
+              {mcpButton}
+              {attachButton}
+            </>
           )}
 
-          {/* 2. Attachment Upload */}
-          <IconButton
-            size="sm"
-            icon="paperclip"
-            label="添加附件"
-            disabled={isBusy}
-            onClick={() => fileInputRef.current?.click()}
-          />
-
-          {/* 3. Unified Model Picker & Reasoning Effort */}
           <ModelPicker
             providers={resources.providers}
             selectedProviderId={selectedProviderId}
@@ -390,49 +503,35 @@ export function Composer({
             onChangeReasoningEffort={onChangeReasoningEffort}
           />
 
-          <input
-            ref={fileInputRef}
-            type="file"
-            hidden
-            multiple
-            accept={FILE_INPUT_ACCEPT}
-            onChange={handleFileChange}
-          />
-
           <div className="wb-composer__right">
-            <ContextUsageRing
-              usage={contextUsage}
-              onCompact={onCompact}
-              canCompact={Boolean(
-                canCompact && !isBusy && !isCompacting && contextUsage.canCompact,
-              )}
-              isCompacting={isCompacting}
-            />
-            {stoppable ? (
-              <button
-                key="stop-btn"
-                type="button"
-                className="wb-send-btn wb-send-btn--stop"
-                aria-label="停止生成"
-                title="停止生成"
-                onClick={onStop}
-              >
-                <Icon name="stop" size={14} />
-              </button>
-            ) : (
-              <button
-                key="send-btn"
-                type="submit"
-                className="wb-send-btn"
-                aria-label="发送消息"
-                title="发送消息"
-                disabled={!canSend}
-              >
-                <Icon name="arrowUp" size={16} />
-              </button>
-            )}
+            {!compact && contextRingControl}
+            {primaryActionButton}
           </div>
         </div>
+
+        {compact && (
+          <div
+            id={drawerId}
+            className={`wb-composer-drawer${
+              drawerOpen ? ' wb-composer-drawer--open' : ''
+            }`}
+            aria-hidden={!drawerOpen}
+            onKeyDown={handleDrawerKeyDown}
+          >
+            <div ref={drawerInnerRef} className="wb-composer-drawer__inner">
+              <div className="wb-composer-drawer__tray">
+                <div className="wb-composer-drawer__actions">
+                  {attachButton}
+                  {webSearchButton}
+                  {mcpButton}
+                </div>
+                <div className="wb-composer-drawer__right">
+                  {contextRingControl}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </form>
     </div>
   );

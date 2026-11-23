@@ -2196,4 +2196,259 @@ describe('Workbench flows and attachments', () => {
       delete document.documentElement.dataset.desktop;
     }
   });
+
+  it('folds toolbar secondary actions and composer tools on compact viewport and restores desktop layout on resize', async () => {
+    localStorage.clear();
+    const originalMatchMedia = window.matchMedia;
+    let compactMatches = true;
+    const listeners = new Set<(e: MediaQueryListEvent) => void>();
+
+    window.matchMedia = vi.fn((query: string) => {
+      const isCompactQuery = query === '(max-width: 767px)';
+      return {
+        get matches() {
+          return isCompactQuery ? compactMatches : false;
+        },
+        media: query,
+        onchange: null,
+        addEventListener: (_event: string, listener: EventListenerOrEventListenerObject) => {
+          if (isCompactQuery && typeof listener === 'function') {
+            listeners.add(listener as (e: MediaQueryListEvent) => void);
+          }
+        },
+        removeEventListener: (_event: string, listener: EventListenerOrEventListenerObject) => {
+          if (isCompactQuery && typeof listener === 'function') {
+            listeners.delete(listener as (e: MediaQueryListEvent) => void);
+          }
+        },
+        addListener: () => {},
+        removeListener: () => {},
+        dispatchEvent: () => true,
+      } as MediaQueryList;
+    });
+
+    const emitCompactChange = (next: boolean) => {
+      compactMatches = next;
+      const evt = { matches: next, media: '(max-width: 767px)' } as MediaQueryListEvent;
+      for (const listener of listeners) listener(evt);
+    };
+
+    try {
+      const branchedConv = {
+        id: 'c1',
+        assistantId: 'default',
+        title: '分支话题',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: 'Topic prompt',
+        params: {},
+        activeLeafId: 'm-a1',
+        graphState: {
+          enabled: true,
+          activeBranchId: 'br-alt',
+          branches: [{ id: 'br-alt', label: '备选分支', parentMessageId: 'm-a1' }],
+        },
+        syncEnabled: false,
+        syncState: 'local_only' as const,
+        syncVersion: 0,
+        createdAt: '2026-11-17T08:00:00Z',
+        updatedAt: '2026-11-17T08:00:00Z',
+      };
+      const { fetchMock } = makeWorkbenchFetch(true);
+      const compactFetch = vi.fn<typeof fetch>(async (input, init) => {
+        const url = typeof input === 'string' ? input : input.toString();
+        const method = init?.method ?? 'GET';
+        if (url.endsWith('/api/v1/plugins/search') && method === 'GET') {
+          return new Response(
+            JSON.stringify({
+              engines: [
+                { engineId: 'tavily', name: 'Tavily', enabled: true, isDefault: true },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/mcp/servers') && method === 'GET') {
+          return new Response(
+            JSON.stringify({
+              servers: [
+                { id: 'mcp-1', name: 'Demo MCP', enabled: true, transport: 'http', url: 'http://127.0.0.1:9001' },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/conversations') && method === 'GET') {
+          return new Response(JSON.stringify({ conversations: [branchedConv] }), {
+            status: 200,
+          });
+        }
+        if (url.endsWith('/api/v1/conversations/c1') && method === 'GET') {
+          return new Response(
+            JSON.stringify({
+              conversation: branchedConv,
+              messages: [
+                {
+                  id: 'm-u1',
+                  conversationId: 'c1',
+                  role: 'user',
+                  blocks: [{ type: 'text', text: '起始提问' }],
+                  createdAt: '2026-11-17T08:00:00Z',
+                },
+                {
+                  id: 'm-a1',
+                  conversationId: 'c1',
+                  parentId: 'm-u1',
+                  role: 'assistant',
+                  providerId: 'openai',
+                  modelId: 'gpt-4.1',
+                  blocks: [{ type: 'text', text: '分支回复' }],
+                  stopReason: 'stop',
+                  createdAt: '2026-11-17T08:00:05Z',
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        if (url.endsWith('/api/v1/conversations/c1/messages/stream') && method === 'POST') {
+          const encoder = new TextEncoder();
+          const body = new ReadableStream<Uint8Array>({
+            start(c) {
+              c.enqueue(encoder.encode('data: {"type":"message_start","messageId":"m-a2"}\n\n'));
+              c.enqueue(
+                encoder.encode(
+                  'data: {"type":"message_end","message":{"id":"m-a2","conversationId":"c1","parentId":"m-u2","role":"assistant","blocks":[{"type":"text","text":"已发送完成"}],"stopReason":"stop","createdAt":"2026-11-17T08:01:00Z"}}\n\n',
+                ),
+              );
+              c.close();
+            },
+          });
+          return new Response(body, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' },
+          });
+        }
+        return fetchMock(input, init);
+      });
+
+      const user = userEvent.setup();
+      render(
+        <AppProvider fetchImpl={compactFetch}>
+          <MemoryRouter initialEntries={['/chat/c1']}>
+            <Routes>
+              <Route path="/chat" element={<WorkbenchPage />} />
+              <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+            </Routes>
+          </MemoryRouter>
+        </AppProvider>,
+      );
+
+      await waitFor(() => expect(screen.getByText('分支回复')).toBeInTheDocument());
+
+      // Compact top bar folds secondary actions into 「更多话题操作」 with active dot for active branch.
+      const moreBtn = screen.getByRole('button', { name: '更多话题操作' });
+      expect(moreBtn).toHaveAttribute('data-has-active', 'true');
+      expect(screen.queryByRole('button', { name: '临时会话' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '话题参数' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: '对话缩略图' })).not.toBeInTheDocument();
+
+      // Open toolbar popover -> displays branch badge and opens graph view with direct return button.
+      await user.click(moreBtn);
+      const toolbarPopover = await screen.findByRole('dialog', { name: '更多话题操作' });
+      expect(within(toolbarPopover).getByText('备选分支')).toBeInTheDocument();
+      await user.click(within(toolbarPopover).getByRole('button', { name: /对话缩略图/ }));
+      const directReturnBtn = await screen.findByRole('button', { name: '返回对话' });
+      expect(screen.getByRole('region', { name: '对话图谱' })).toBeInTheDocument();
+      await user.click(directReturnBtn);
+      await waitFor(() => {
+        expect(screen.queryByRole('region', { name: '对话图谱' })).not.toBeInTheDocument();
+      });
+
+      // Open topic parameters from toolbar popover.
+      await user.click(moreBtn);
+      const paramsPopover = await screen.findByRole('dialog', { name: '更多话题操作' });
+      await user.click(within(paramsPopover).getByRole('button', { name: '话题参数' }));
+      expect(await screen.findByLabelText('系统提示词')).toBeInTheDocument();
+      expect(moreBtn).toHaveAttribute('data-has-active', 'true');
+      fireEvent.keyDown(window, { key: 'Escape' });
+      await waitFor(() => {
+        expect(screen.queryByLabelText('系统提示词')).not.toBeInTheDocument();
+      });
+
+      // Compact composer folds tools into inline drawer; collapsed controls stay out of accessibility & tab order.
+      const drawerToggle = screen.getByRole('button', { name: '展开工具' });
+      expect(drawerToggle).toHaveAttribute('aria-expanded', 'false');
+      expect(drawerToggle).toHaveAttribute('data-indicator', 'active');
+      const drawerEl = document.querySelector('.wb-composer-drawer');
+      expect(drawerEl).toHaveAttribute('aria-hidden', 'true');
+      expect(screen.queryByRole('button', { name: '添加附件' })).not.toBeInTheDocument();
+
+      // Expand drawer -> toggle web search & MCP, inspect context usage ring.
+      await user.click(drawerToggle);
+      expect(drawerToggle).toHaveAttribute('aria-expanded', 'true');
+      expect(drawerEl).toHaveAttribute('aria-hidden', 'false');
+      const attachBtn = screen.getByRole('button', { name: '添加附件' });
+      const searchBtn = screen.getByRole('button', { name: '开启联网搜索' });
+      const mcpBtn = screen.getByRole('button', { name: '关闭 MCP 工具' });
+      expect(attachBtn).not.toHaveAttribute('tabindex', '-1');
+
+      await user.click(searchBtn);
+      expect(screen.getByRole('button', { name: '关闭联网搜索' })).toHaveAttribute('aria-pressed', 'true');
+      await user.click(mcpBtn);
+      expect(screen.getByRole('button', { name: '开启 MCP 工具' })).toHaveAttribute('aria-pressed', 'false');
+
+      const ctxBtn = document.querySelector('.wb-ctx-ring-btn') as HTMLButtonElement;
+      expect(ctxBtn).not.toBeNull();
+      await user.click(ctxBtn);
+      expect(await screen.findByRole('dialog', { name: '上下文占用明细' })).toBeInTheDocument();
+      await user.keyboard('{Escape}');
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog', { name: '上下文占用明细' })).not.toBeInTheDocument();
+      });
+
+      // Pressing Escape inside the drawer collapses it and restores focus to the toggle button.
+      attachBtn.focus();
+      fireEvent.keyDown(attachBtn, { key: 'Escape' });
+      expect(drawerToggle).toHaveAttribute('aria-expanded', 'false');
+      expect(drawerToggle).toHaveFocus();
+      expect(drawerToggle).toHaveAttribute('data-indicator', 'active');
+
+      // Sending a message auto-collapses the expanded composer drawer.
+      await user.click(drawerToggle);
+      expect(drawerToggle).toHaveAttribute('aria-expanded', 'true');
+      const draftBox = screen.getByLabelText('消息输入框');
+      await user.type(draftBox, '移动端发送收起抽屉');
+      fireEvent.keyDown(draftBox, { key: 'Enter' });
+      await waitFor(() => {
+        expect(drawerToggle).toHaveAttribute('aria-expanded', 'false');
+      });
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: '发送消息' })).toBeInTheDocument();
+      });
+      expect(draftBox).toHaveValue('');
+
+      // Toggle temporary chat via compact toolbar menu.
+      await user.click(moreBtn);
+      const tempPopover = await screen.findByRole('dialog', { name: '更多话题操作' });
+      await user.click(within(tempPopover).getByRole('button', { name: '临时会话' }));
+      await waitFor(() => {
+        expect(moreBtn).toHaveAttribute('data-has-active', 'true');
+      });
+
+      // Resizing back to desktop restores flat toolbar & composer controls.
+      await waitFor(() => {
+        emitCompactChange(false);
+      });
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: '更多话题操作' })).not.toBeInTheDocument();
+      });
+      expect(screen.queryByRole('button', { name: '展开工具' })).not.toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '退出临时会话' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '话题参数' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '添加附件' })).toBeInTheDocument();
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
+  });
 });

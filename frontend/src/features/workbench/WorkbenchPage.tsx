@@ -14,7 +14,7 @@ import {
   useSearchParams,
 } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
-import { Icon, IconButton, SegmentedControl } from '../../components/ui';
+import { Icon, IconButton, Popover, SegmentedControl } from '../../components/ui';
 import { CHAT_WIDTH_MAX, CHAT_WIDTH_MIN, getAgentModeVisible } from '../../core/settings';
 import { isReasoningEffort, type Assistant, type ContentBlock, type GraphMutationInput, type ConversationMode, type Message, type ReasoningEffort, type TopicScope } from '../../core/types';
 import { AgentTopicDirectory } from '../agent/AgentTopicDirectory';
@@ -77,8 +77,33 @@ function useComposerViewport() {
   return shellRef;
 }
 
+function useCompactViewport() {
+  const [compact, setCompact] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 767px)').matches
+      : false,
+  );
+
+  useEffect(() => {
+    if (
+      typeof window === 'undefined' ||
+      typeof window.matchMedia !== 'function'
+    ) {
+      return;
+    }
+    const mql = window.matchMedia('(max-width: 767px)');
+    const update = () => setCompact(mql.matches);
+    update();
+    mql.addEventListener('change', update);
+    return () => mql.removeEventListener('change', update);
+  }, []);
+
+  return compact;
+}
+
 function WorkbenchInner() {
   const shellRef = useComposerViewport();
+  const isCompact = useCompactViewport();
   const { conversationId } = useParams<{ conversationId?: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -147,6 +172,7 @@ function WorkbenchInner() {
   const [rightOpenDesktop, setRightOpenDesktop] = useState(true);
   const [leftDrawerOpen, setLeftDrawerOpen] = useState(false);
   const [rightDrawerOpen, setRightDrawerOpen] = useState(false);
+  const [toolbarMenuOpen, setToolbarMenuOpen] = useState(false);
   const [inspectorOpen, setInspectorOpen] = useState(false);
   const [sidebarManageMode, setSidebarManageMode] = useState(false);
   const [isTemporaryMode, setIsTemporaryMode] = useState(false);
@@ -351,7 +377,17 @@ function WorkbenchInner() {
   const activeBranch = branches?.find((branch) => branch.id === (graphConversation?.graphState?.activeBranchId || graphConversation?.activeLeafId));
   const showBranch = Boolean(graphConversation?.graphState?.activeBranchId || (branches && branches.length > 1));
 
-  useEffect(() => { setGraphViewKey(null); setJumpTarget(null); }, [modeKey]);
+  useEffect(() => {
+    setGraphViewKey(null);
+    setJumpTarget(null);
+    setToolbarMenuOpen(false);
+  }, [modeKey]);
+
+  useEffect(() => {
+    if (!isCompact || leftDrawerOpen || rightDrawerOpen) {
+      setToolbarMenuOpen(false);
+    }
+  }, [isCompact, leftDrawerOpen, rightDrawerOpen]);
 
   const submitGraphMutation = async (input: GraphMutationInput) => {
     if (!graphReady || graphLock.current) return null;
@@ -1114,49 +1150,175 @@ function WorkbenchInner() {
           <div className="wb-toolbar__spacer" />
 
           {showAgentMode && (
-            <div className="wb-mode-control">
-              <SegmentedControl<ConversationMode> ariaLabel="话题模式" value={conversationMode} disabled={modeBusy}
-                options={[
-                  { value: 'chat', label: <Icon name="messageSquare" size={16} />, ariaLabel: '对话' },
-                  { value: 'agent', label: <Icon name="terminal" size={16} />, ariaLabel: 'Agent' },
-                ]}
-                onChange={(mode) => void changeMode(mode)} />
-            </div>
+            <>
+              <div className="wb-mode-control">
+                <SegmentedControl<ConversationMode>
+                  ariaLabel="话题模式"
+                  value={conversationMode}
+                  disabled={modeBusy}
+                  options={[
+                    { value: 'chat', label: <Icon name="messageSquare" size={16} />, ariaLabel: '对话' },
+                    { value: 'agent', label: <Icon name="terminal" size={16} />, ariaLabel: 'Agent' },
+                  ]}
+                  onChange={(mode) => void changeMode(mode)}
+                />
+              </div>
+              {!isCompact && (
+                <span className="wb-toolbar__divider" aria-hidden="true" />
+              )}
+            </>
           )}
 
-          {showBranch && (
-            <button type="button" className="wb-branch-badge" disabled={!graphReady || graphBusy} aria-label={activeBranch?.label ?? '话题分支'}
-              aria-pressed={graphOpen} onClick={() => setGraphViewKey(modeKey)}>
-              <Icon name="branch" size={14} /><span>{activeBranch?.label ?? branches?.length}</span>
-            </button>
+          {isCompact ? (
+            <>
+              {graphOpen && graphConversation && (
+                <IconButton
+                  ref={graphToggleRef}
+                  className="wb-graph-toggle"
+                  icon="messageSquare"
+                  label="返回对话"
+                  active
+                  aria-pressed
+                  disabled={graphBusy || !graphReady}
+                  onClick={closeGraph}
+                />
+              )}
+              <Popover
+                open={toolbarMenuOpen}
+                onOpenChange={setToolbarMenuOpen}
+                side="bottom"
+                align="end"
+                contentProps={{ 'aria-label': '更多话题操作' }}
+                trigger={
+                  <IconButton
+                    className="wb-toolbar-more"
+                    icon="ellipsis"
+                    label="更多话题操作"
+                    active={toolbarMenuOpen}
+                    aria-expanded={toolbarMenuOpen}
+                    data-has-active={
+                      showBranch || isTemporaryMode || inspectorOpen
+                        ? 'true'
+                        : undefined
+                    }
+                  />
+                }
+              >
+                <div className="wb-toolbar-menu" role="group" aria-label="话题操作">
+                  {graphConversation && (
+                    <button
+                      type="button"
+                      className={`wb-toolbar-menu__item${
+                        graphOpen ? ' wb-toolbar-menu__item--active' : ''
+                      }`}
+                      disabled={graphBusy || !graphReady}
+                      aria-pressed={graphOpen}
+                      onClick={() => {
+                        setToolbarMenuOpen(false);
+                        if (graphOpen) closeGraph();
+                        else setGraphViewKey(modeKey);
+                      }}
+                    >
+                      <Icon name={graphOpen ? 'messageSquare' : 'mindMap'} size={15} />
+                      <span className="wb-toolbar-menu__label">
+                        {graphOpen ? '返回对话' : '对话缩略图'}
+                      </span>
+                      {showBranch && (
+                        <span className="wb-toolbar-menu__badge">
+                          <Icon name="branch" size={12} />
+                          <span>{activeBranch?.label ?? branches?.length}</span>
+                        </span>
+                      )}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className={`wb-toolbar-menu__item${
+                      isTemporaryMode ? ' wb-toolbar-menu__item--active' : ''
+                    }`}
+                    aria-pressed={isTemporaryMode}
+                    onClick={() => {
+                      setToolbarMenuOpen(false);
+                      handleToggleTemporaryMode();
+                    }}
+                  >
+                    <Icon name="temporaryChat" size={15} />
+                    <span className="wb-toolbar-menu__label">
+                      {isTemporaryMode ? '退出临时会话' : '临时会话'}
+                    </span>
+                    {isTemporaryMode && (
+                      <Icon name="check" size={14} className="wb-toolbar-menu__check" />
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    className={`wb-toolbar-menu__item${
+                      inspectorOpen ? ' wb-toolbar-menu__item--active' : ''
+                    }`}
+                    aria-pressed={inspectorOpen}
+                    onClick={() => {
+                      setToolbarMenuOpen(false);
+                      handleToggleParams();
+                    }}
+                  >
+                    <Icon name="sliders" size={15} />
+                    <span className="wb-toolbar-menu__label">话题参数</span>
+                    {inspectorOpen && (
+                      <Icon name="check" size={14} className="wb-toolbar-menu__check" />
+                    )}
+                  </button>
+                </div>
+              </Popover>
+            </>
+          ) : (
+            <>
+              {showBranch && (
+                <button
+                  type="button"
+                  className="wb-branch-badge"
+                  disabled={!graphReady || graphBusy}
+                  aria-label={activeBranch?.label ?? '话题分支'}
+                  aria-pressed={graphOpen}
+                  onClick={() => setGraphViewKey(modeKey)}
+                >
+                  <Icon name="branch" size={14} />
+                  <span>{activeBranch?.label ?? branches?.length}</span>
+                </button>
+              )}
+              {graphConversation && (
+                <IconButton
+                  ref={graphToggleRef}
+                  className="wb-graph-toggle"
+                  data-branch={showBranch || undefined}
+                  aria-description={
+                    showBranch ? activeBranch?.label ?? '多个话题内分支' : undefined
+                  }
+                  icon={graphOpen ? 'messageSquare' : 'mindMap'}
+                  label={graphOpen ? '返回对话' : '对话缩略图'}
+                  active={graphOpen}
+                  aria-pressed={graphOpen}
+                  disabled={graphBusy || !graphReady}
+                  onClick={() => {
+                    if (graphOpen) closeGraph();
+                    else setGraphViewKey(modeKey);
+                  }}
+                />
+              )}
+              <IconButton
+                icon="temporaryChat"
+                label={isTemporaryMode ? '退出临时会话' : '临时会话'}
+                active={isTemporaryMode}
+                onClick={handleToggleTemporaryMode}
+              />
+              <IconButton
+                icon="sliders"
+                label="话题参数"
+                active={inspectorOpen}
+                onClick={handleToggleParams}
+              />
+              <span className="wb-toolbar__divider" aria-hidden="true" />
+            </>
           )}
-          {graphConversation && <IconButton
-            ref={graphToggleRef}
-            className="wb-graph-toggle"
-            data-branch={showBranch || undefined}
-            aria-description={showBranch ? activeBranch?.label ?? '多个话题内分支' : undefined}
-            icon={graphOpen ? 'messageSquare' : 'mindMap'}
-            label={graphOpen ? '返回对话' : '对话缩略图'}
-            active={graphOpen}
-            aria-pressed={graphOpen}
-            disabled={graphBusy || !graphReady}
-            onClick={() => {
-              if (graphOpen) closeGraph();
-              else setGraphViewKey(modeKey);
-            }}
-          />}
-          <IconButton
-            icon="temporaryChat"
-            label={isTemporaryMode ? '退出临时会话' : '临时会话'}
-            active={isTemporaryMode}
-            onClick={handleToggleTemporaryMode}
-          />
-          <IconButton
-            icon="sliders"
-            label="话题参数"
-            active={inspectorOpen}
-            onClick={handleToggleParams}
-          />
           <IconButton
             ref={rightToggleRef}
             icon="history"
@@ -1232,6 +1394,7 @@ function WorkbenchInner() {
           />
 
           <Composer
+            compact={isCompact}
             selectedProviderId={selectedProviderId}
             selectedModelId={selectedModelId}
             reasoningEffort={reasoningEffort}

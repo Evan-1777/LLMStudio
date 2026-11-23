@@ -367,9 +367,9 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
   stop: <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" stroke="none" />,
   ellipsis: (
     <>
-      <circle cx="5" cy="12" r="1.2" fill="currentColor" stroke="none" />
-      <circle cx="12" cy="12" r="1.2" fill="currentColor" stroke="none" />
-      <circle cx="19" cy="12" r="1.2" fill="currentColor" stroke="none" />
+      <circle cx="5.5" cy="12" r="1.65" fill="currentColor" stroke="none" />
+      <circle cx="12" cy="12" r="1.65" fill="currentColor" stroke="none" />
+      <circle cx="18.5" cy="12" r="1.65" fill="currentColor" stroke="none" />
     </>
   ),
   info: (

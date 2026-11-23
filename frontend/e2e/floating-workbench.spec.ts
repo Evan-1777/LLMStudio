@@ -25,7 +25,15 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
     await write('conversations/batch', { assistantId: 'default', ids: [conversation.id], operation: 'move', groupId: i < 2 ? group.id : refs.id });
   }
   await write(`conversations/${ids[0]}/messages`, { role: 'user', blocks: [{ type: 'text', text: '先核对发布清单与各端测试结果。' }] });
-  await write(`conversations/${ids[0]}/messages`, { role: 'assistant', blocks: [{ type: 'text', text: '发布清单已整理。桌面与移动端的验证记录可在工作记录分组中查看。' }] });
+  const assistantMsg = await write<{ message: { id: string } }>(
+    `conversations/${ids[0]}/messages`,
+    { role: 'assistant', blocks: [{ type: 'text', text: '发布清单已整理。桌面与移动端的验证记录可在工作记录分组中查看。' }] },
+  );
+  await write(
+    `conversations/${ids[0]}/graph`,
+    { op: 'createBranch', parentMessageId: assistantMsg.message.id, x: 320, y: 120, activate: true },
+    'PATCH',
+  );
 
   for (const [mode, width, height] of [['light', 1280, 800], ['dark', 1280, 800], ['light', 768, 900], ['dark', 768, 900], ['light', 375, 812], ['dark', 375, 812]] as const) {
     const context = await browser.newContext({ viewport: { width, height }, hasTouch: width < 1000, reducedMotion: 'reduce' });
@@ -89,12 +97,12 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
             const c = channel / 255;
             return sum + [0.2126, 0.7152, 0.0722][index] * (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
           }, 0);
-          return Math.min(...Array.from(document.querySelectorAll('.wb-eyebrow, .wb-nav-row--active .wb-nav-row__btn, .wb-topic-group__toggle, .wb-topic-row__time, .wb-topic-row__title, .wb-assistant-pill, .wb-model-btn, .wb-asst-name, .wb-asst-tag, .wb-user-bubble, .prose')).filter(el => el.checkVisibility({ visibilityProperty: true })).map(el => {
+          return Math.min(...Array.from(document.querySelectorAll('.wb-eyebrow, .wb-nav-row--active .wb-nav-row__btn, .wb-topic-group__toggle, .wb-topic-row__time, .wb-topic-row__title, .wb-assistant-pill, .wb-branch-badge, .wb-model-btn, .wb-asst-name, .wb-asst-tag, .wb-user-bubble, .prose')).filter(el => el.checkVisibility({ visibilityProperty: true })).map(el => {
             const panel = el.closest('.wb-rail, .wb-history, .wb-main')!;
             const layer = el.closest('.wb-topic-row, .wb-nav-row, .wb-toolbar, .wb-user-bubble');
             const colors = [root.getPropertyValue('--bg-base'), getComputedStyle(panel).backgroundColor];
             if (layer) colors.push(getComputedStyle(layer).backgroundColor);
-            if (el.matches('.wb-asst-tag')) colors.push(getComputedStyle(el).backgroundColor);
+            if (el.matches('.wb-asst-tag, .wb-branch-badge')) colors.push(getComputedStyle(el).backgroundColor);
             const background = luminance(pixel(...colors));
             const foreground = luminance(pixel(getComputedStyle(el).color));
             return (Math.max(background, foreground) + 0.05) / (Math.min(background, foreground) + 0.05);
@@ -138,6 +146,21 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
           expect(Math.abs(railHead.y - toolbar.y)).toBeLessThanOrEqual(1);
           expect(Math.abs(historyHead.y - toolbar.y)).toBeLessThanOrEqual(1);
 
+          // Unified 8px radius and 32px height across desktop toolbar & composer auxiliary controls.
+          for (const selector of [
+            '.wb-assistant-pill',
+            '.wb-branch-badge',
+            '.wb-graph-toggle',
+            '.wb-composer__tools > .ui-icon-btn--sm',
+            '.wb-ctx-ring-btn',
+          ]) {
+            const el = page.locator(selector).first();
+            await expect(el).toBeVisible();
+            await expect(el).toHaveCSS('border-radius', '8px');
+            const box = (await el.boundingBox())!;
+            expect(Math.abs(box.height - 32)).toBeLessThanOrEqual(1);
+          }
+
           await left.click();
           await expect(rail).toBeHidden();
           const collapsedLeftMain = (await mainEl.boundingBox())!;
@@ -159,6 +182,65 @@ test('keeps floating rails usable in both themes and at every drawer breakpoint'
         await page.keyboard.press('Escape');
         await expect(history).toBeHidden();
         await expect(right).toBeFocused();
+      }
+      if (!baseline && width < 768) {
+        // Verify compact top bar secondary menu & composer inline tool drawer in both light/dark + reduced motion.
+        const moreBtn = page.getByRole('button', { name: '更多话题操作' });
+        await expect(moreBtn).toBeVisible();
+        await expect(moreBtn).toHaveAttribute('data-has-active', 'true');
+        await moreBtn.click();
+        const menuDialog = page.getByRole('dialog', { name: '更多话题操作' });
+        await expect(menuDialog).toBeVisible();
+        await expect(menuDialog.locator('.wb-toolbar-menu__badge')).toBeVisible();
+        await expect(menuDialog.getByRole('button', { name: '临时会话' })).toBeVisible();
+        await snap('-mobile-menu');
+        const menuContrast = await page.evaluate(() => {
+          const root = getComputedStyle(document.documentElement);
+          const ctx = document.createElement('canvas').getContext('2d')!;
+          const pixel = (...colors: string[]) => {
+            ctx.clearRect(0, 0, 1, 1);
+            for (const color of colors) {
+              ctx.fillStyle = color;
+              ctx.fillRect(0, 0, 1, 1);
+            }
+            return Array.from(ctx.getImageData(0, 0, 1, 1).data).slice(0, 3);
+          };
+          const luminance = (rgb: number[]) => rgb.reduce((sum, channel, index) => {
+            const c = channel / 255;
+            return sum + [0.2126, 0.7152, 0.0722][index] * (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+          }, 0);
+          const popoverBg = getComputedStyle(document.querySelector('.ui-popover-content')!).backgroundColor;
+          const targets = Array.from(document.querySelectorAll('.wb-toolbar-menu__item, .wb-toolbar-menu__badge'));
+          return Math.min(...targets.map((el) => {
+            const colors = [root.getPropertyValue('--bg-surface'), popoverBg];
+            if (el.matches('.wb-toolbar-menu__badge')) colors.push(getComputedStyle(el).backgroundColor);
+            const bg = luminance(pixel(...colors));
+            const fg = luminance(pixel(getComputedStyle(el).color));
+            return (Math.max(bg, fg) + 0.05) / (Math.min(bg, fg) + 0.05);
+          }));
+        });
+        expect(menuContrast).toBeGreaterThanOrEqual(4.5);
+        await menuDialog.getByRole('button', { name: '话题参数' }).click();
+        await expect(page.getByLabel('系统提示词')).toBeVisible();
+        await page.keyboard.press('Escape');
+        await expect(history).toBeHidden();
+
+        const modelBox = (await page.locator('.wb-model-btn').boundingBox())!;
+        expect(modelBox.width).toBeGreaterThanOrEqual(160);
+        const drawerToggle = page.getByRole('button', { name: '展开工具' });
+        await expect(drawerToggle).toBeVisible();
+        await expect(page.locator('.wb-composer-drawer')).toHaveCSS('transition-duration', '0s');
+        await expect(drawerToggle.locator('svg')).toHaveCSS('transition-duration', '0s');
+        await drawerToggle.click();
+        await expect(page.getByRole('button', { name: '添加附件' })).toBeVisible();
+        await expect(page.getByRole('button', { name: '开启联网搜索' })).toBeVisible();
+        await expect(page.locator('.wb-ctx-ring-btn')).toBeVisible();
+        await snap('-mobile-drawer');
+        await page.locator('.wb-ctx-ring-btn').click();
+        await expect(page.getByRole('dialog', { name: '上下文占用明细' })).toBeVisible();
+        await page.keyboard.press('Escape');
+        expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(width);
+        await page.getByRole('button', { name: '收起工具' }).click();
       }
       if (mode === 'dark') await write('settings', { themeMode: 'light' }, 'PATCH');
     } finally {

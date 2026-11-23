@@ -16,6 +16,7 @@ export interface ContextUsageRingProps {
   onCompact?: () => Promise<void> | void;
   canCompact?: boolean;
   isCompacting?: boolean;
+  triggerTabIndex?: number;
 }
 
 export function ContextUsageRing({
@@ -23,6 +24,7 @@ export function ContextUsageRing({
   onCompact,
   canCompact = false,
   isCompacting = false,
+  triggerTabIndex,
 }: ContextUsageRingProps) {
   const [openMode, setOpenMode] = useState<'hover' | 'focus' | 'pinned' | null>(
     null,
@@ -107,6 +109,7 @@ export function ContextUsageRing({
         <button
           type="button"
           className="wb-ctx-ring-btn"
+          tabIndex={triggerTabIndex}
           data-level={level}
           data-compacting={isCompacting ? 'true' : undefined}
           aria-label={summaryLabel}

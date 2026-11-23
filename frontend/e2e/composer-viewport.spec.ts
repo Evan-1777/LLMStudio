@@ -40,7 +40,7 @@ test('keeps the composer within the visible mobile viewport without changing dra
       return { top: Math.round(r.top), bottom: Math.round(r.bottom), height: Math.round(r.height) };
     });
     const expectComposerInside = async (bottom: number) => {
-      for (const control of [input, send, page.getByRole('button', { name: '添加附件' })]) {
+      for (const control of [input, send, page.getByRole('button', { name: '选择模型' })]) {
         const rect = await control.boundingBox();
         expect(rect).not.toBeNull();
         expect(rect!.y + rect!.height).toBeLessThanOrEqual(bottom);
@@ -66,6 +66,13 @@ test('keeps the composer within the visible mobile viewport without changing dra
     await input.focus();
     await resize(812);
     await expect.poll(metrics).toEqual({ top: 0, bottom: 812, height: 812 });
+    const toggleTools = page.getByRole('button', { name: '展开工具' });
+    await toggleTools.click();
+    await expect(page.getByRole('button', { name: '添加附件' })).toBeVisible();
+    await expect(page.locator('.wb-ctx-ring-btn')).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(375);
+    await page.getByRole('button', { name: '收起工具' }).click();
+    await input.focus();
     await page.setViewportSize({ width: 812, height: 375 });
     await resize(375); // Native layout already shrank to the available height.
     await expect.poll(metrics).toEqual({ top: 0, bottom: 375, height: 375 });
