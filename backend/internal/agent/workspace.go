@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -141,10 +142,30 @@ func classifyWorkspaceFile(name string) (previewKind string, editable bool, unsu
 	if imageExtensions[ext] {
 		return "unsupported", false, "image"
 	}
-	if textExtensions[ext] || textBasenames[lowerName] || strings.HasPrefix(lowerName, ".env.") {
+	if ext == "" || textExtensions[ext] || textBasenames[lowerName] || strings.HasPrefix(lowerName, ".env.") {
 		return "text", true, ""
 	}
 	return "unsupported", false, "binary"
+}
+
+func workspaceNameNeedsTextProbe(name string) bool {
+	return path.Ext(strings.TrimSpace(name)) == ""
+}
+
+func mapWorkspaceWriteError(err error, fallback string) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	switch {
+	case errors.Is(err, fs.ErrExist):
+		return domain.NewError(domain.ErrCodeConflict, "目标已存在", err)
+	case errors.Is(err, syscall.EROFS):
+		return domain.NewError(domain.ErrCodeInvalidArgument, "工作区目录为只读状态", err)
+	case errors.Is(err, fs.ErrPermission):
+		return domain.NewError(domain.ErrCodeInvalidArgument, "工作区目录无写入权限", err)
+	default:
+		return domain.NewError(domain.ErrCodeInvalidArgument, fallback, err)
+	}
 }
 
 func sha256Hex(data []byte) string {
@@ -254,6 +275,17 @@ func (a *Runtime) ListWorkspaceEntries(ctx context.Context, relPath string) (Wor
 	if len(items) > maxWorkspaceListEntries {
 		items = items[:maxWorkspaceListEntries]
 		truncated = true
+	}
+	for i := range items {
+		entry := &items[i]
+		if entry.Kind == "file" && workspaceNameNeedsTextProbe(entry.Name) {
+			if err := ctx.Err(); err != nil {
+				return WorkspaceEntriesResponse{}, err
+			}
+			if _, err := readText(targetRoot, entry.Name); err != nil {
+				entry.PreviewKind, entry.Editable, entry.UnsupportedReason = "unsupported", false, "binary"
+			}
+		}
 	}
 	return WorkspaceEntriesResponse{
 		Path:      slashRel,
@@ -372,15 +404,18 @@ func (a *Runtime) WriteWorkspaceFile(ctx context.Context, relPath, content, expe
 		return WorkspaceFileWriteResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "文件内容必须为 2 MiB 以内的有效 UTF-8 文本", nil)
 	}
 
-	if expectedEtag != "" {
+	if expectedEtag != "" || workspaceNameNeedsTextProbe(base) {
 		current, readErr := readText(parent, base)
-		if readErr != nil || sha256Hex(current) != expectedEtag {
+		if expectedEtag != "" && (readErr != nil || sha256Hex(current) != expectedEtag) {
 			return WorkspaceFileWriteResult{}, domain.NewError(domain.ErrCodeConflict, "文件已被外部修改，请重新加载或确认覆盖", readErr)
+		}
+		if readErr != nil {
+			return WorkspaceFileWriteResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "该文件类型不支持编辑保存", readErr)
 		}
 	}
 
 	if err := writeText(ctx, parent, base, content); err != nil {
-		return WorkspaceFileWriteResult{}, err
+		return WorkspaceFileWriteResult{}, mapWorkspaceWriteError(err, "写入文件失败")
 	}
 
 	updatedInfo, err := parent.Lstat(base)
@@ -432,7 +467,7 @@ func ensureRegularSubdir(root *os.Root, slashRel string) (*os.Root, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			if mkErr := cur.Mkdir(part, 0755); mkErr != nil && !errors.Is(mkErr, fs.ErrExist) {
 				closeOpened()
-				return nil, domain.NewError(domain.ErrCodeInvalidArgument, "无法创建目录", mkErr)
+				return nil, mapWorkspaceWriteError(mkErr, "无法创建目录")
 			}
 			info, err = cur.Lstat(part)
 		}
@@ -458,7 +493,7 @@ func ensureRegularSubdir(root *os.Root, slashRel string) (*os.Root, error) {
 	return cur, nil
 }
 
-func buildWorkspaceEntry(slashRel, base string, info fs.FileInfo) WorkspaceEntry {
+func buildWorkspaceEntry(root *os.Root, filePath, slashRel, base string, info fs.FileInfo) WorkspaceEntry {
 	modTime := info.ModTime().UTC().Format(time.RFC3339)
 	if info.IsDir() {
 		return WorkspaceEntry{
@@ -469,6 +504,11 @@ func buildWorkspaceEntry(slashRel, base string, info fs.FileInfo) WorkspaceEntry
 		}
 	}
 	previewKind, editable, unsupportedReason := classifyWorkspaceFile(base)
+	if workspaceNameNeedsTextProbe(base) {
+		if _, err := readText(root, filePath); err != nil {
+			previewKind, editable, unsupportedReason = "unsupported", false, "binary"
+		}
+	}
 	return WorkspaceEntry{
 		Name:              base,
 		Path:              slashRel,
@@ -518,22 +558,19 @@ func (a *Runtime) CreateWorkspaceFile(ctx context.Context, relPath, content stri
 
 	f, err := parent.OpenFile(base, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return WorkspaceEntry{}, domain.NewError(domain.ErrCodeConflict, "目标已存在", err)
-		}
-		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInvalidArgument, "无法创建文件", err)
+		return WorkspaceEntry{}, mapWorkspaceWriteError(err, "无法创建文件")
 	}
 	_, writeErr := io.WriteString(f, content)
 	closeErr := f.Close()
 	if err := errors.Join(writeErr, closeErr); err != nil {
 		_ = parent.Remove(base)
-		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "写入文件失败", err)
+		return WorkspaceEntry{}, mapWorkspaceWriteError(err, "写入文件失败")
 	}
 	info, err := parent.Lstat(base)
 	if err != nil {
 		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "读取新建文件信息失败", err)
 	}
-	return buildWorkspaceEntry(slashRel, base, info), nil
+	return buildWorkspaceEntry(parent, base, slashRel, base, info), nil
 }
 
 func (a *Runtime) CreateWorkspaceDir(ctx context.Context, relPath string) (WorkspaceEntry, error) {
@@ -562,16 +599,13 @@ func (a *Runtime) CreateWorkspaceDir(ctx context.Context, relPath string) (Works
 	}
 
 	if err := parent.Mkdir(base, 0755); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return WorkspaceEntry{}, domain.NewError(domain.ErrCodeConflict, "目标已存在", err)
-		}
-		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInvalidArgument, "无法创建目录", err)
+		return WorkspaceEntry{}, mapWorkspaceWriteError(err, "无法创建目录")
 	}
 	info, err := parent.Lstat(base)
 	if err != nil {
 		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "读取新建目录信息失败", err)
 	}
-	return buildWorkspaceEntry(slashRel, base, info), nil
+	return buildWorkspaceEntry(parent, base, slashRel, base, info), nil
 }
 
 func (a *Runtime) MoveWorkspaceEntry(ctx context.Context, fromPath, toPath string) (WorkspaceEntry, error) {
@@ -628,16 +662,13 @@ func (a *Runtime) MoveWorkspaceEntry(ctx context.Context, fromPath, toPath strin
 	}
 
 	if err := root.Rename(filepath.FromSlash(from), filepath.FromSlash(to)); err != nil {
-		if errors.Is(err, fs.ErrExist) {
-			return WorkspaceEntry{}, domain.NewError(domain.ErrCodeConflict, "目标已存在", err)
-		}
-		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInvalidArgument, "移动失败", err)
+		return WorkspaceEntry{}, mapWorkspaceWriteError(err, "移动失败")
 	}
 	info, err := dstParent.Lstat(dstBase)
 	if err != nil {
 		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "读取目标信息失败", err)
 	}
-	return buildWorkspaceEntry(to, dstBase, info), nil
+	return buildWorkspaceEntry(dstParent, dstBase, to, dstBase, info), nil
 }
 
 func copyRegularFileBetweenRoots(ctx context.Context, srcParent *os.Root, srcBase string, dstParent *os.Root, dstBase string, maxBytes int64) (int64, error) {
@@ -664,14 +695,14 @@ func copyRegularFileBetweenRoots(ctx context.Context, srcParent *os.Root, srcBas
 	tmp := randomTempName(".llmstudio-copy-")
 	dstFile, err := dstParent.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
 	if err != nil {
-		return 0, domain.NewError(domain.ErrCodeInternalError, "无法创建临时文件", err)
+		return 0, mapWorkspaceWriteError(err, "无法创建临时文件")
 	}
 	defer dstParent.Remove(tmp)
 
 	n, copyErr := io.Copy(dstFile, io.LimitReader(srcFile, maxBytes+1))
 	closeErr := dstFile.Close()
 	if err := errors.Join(copyErr, closeErr); err != nil {
-		return 0, domain.NewError(domain.ErrCodeInternalError, "复制文件失败", err)
+		return 0, mapWorkspaceWriteError(err, "复制文件失败")
 	}
 	if n > maxBytes {
 		return 0, domain.NewError(domain.ErrCodePayloadTooLarge, "文件超出复制大小限制", nil)
@@ -680,7 +711,7 @@ func copyRegularFileBetweenRoots(ctx context.Context, srcParent *os.Root, srcBas
 		return 0, err
 	}
 	if err := dstParent.Rename(tmp, dstBase); err != nil {
-		return 0, domain.NewError(domain.ErrCodeInternalError, "提交复制文件失败", err)
+		return 0, mapWorkspaceWriteError(err, "提交复制文件失败")
 	}
 	return n, nil
 }
@@ -716,7 +747,7 @@ func copyDirRecursive(ctx context.Context, srcDir, dstDir *os.Root, budget *copy
 				return domain.NewError(domain.ErrCodePayloadTooLarge, "复制条目数超出上限", nil)
 			}
 			if err := dstDir.Mkdir(name, 0755); err != nil {
-				return domain.NewError(domain.ErrCodeInternalError, "创建目标子目录失败", err)
+				return mapWorkspaceWriteError(err, "创建目标子目录失败")
 			}
 			subSrc, err := srcDir.OpenRoot(name)
 			if err != nil {
@@ -819,10 +850,7 @@ func (a *Runtime) CopyWorkspaceEntry(ctx context.Context, fromPath, toPath strin
 		}
 		defer srcDir.Close()
 		if err := dstParent.Mkdir(dstBase, 0755); err != nil {
-			if errors.Is(err, fs.ErrExist) {
-				return WorkspaceEntry{}, domain.NewError(domain.ErrCodeConflict, "目标已存在", err)
-			}
-			return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "创建目标目录失败", err)
+			return WorkspaceEntry{}, mapWorkspaceWriteError(err, "创建目标目录失败")
 		}
 		dstDir, err := dstParent.OpenRoot(dstBase)
 		if err != nil {
@@ -842,7 +870,7 @@ func (a *Runtime) CopyWorkspaceEntry(ctx context.Context, fromPath, toPath strin
 	if err != nil {
 		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "读取目标信息失败", err)
 	}
-	return buildWorkspaceEntry(to, dstBase, info), nil
+	return buildWorkspaceEntry(dstParent, dstBase, to, dstBase, info), nil
 }
 
 func (a *Runtime) DeleteWorkspaceEntry(ctx context.Context, relPath string) error {
@@ -878,7 +906,7 @@ func (a *Runtime) DeleteWorkspaceEntry(ctx context.Context, relPath string) erro
 	}
 	if info.IsDir() {
 		if err := parent.RemoveAll(base); err != nil {
-			return domain.NewError(domain.ErrCodeInternalError, "删除目录失败", err)
+			return mapWorkspaceWriteError(err, "删除目录失败")
 		}
 		return nil
 	}
@@ -886,7 +914,7 @@ func (a *Runtime) DeleteWorkspaceEntry(ctx context.Context, relPath string) erro
 		return domain.NewError(domain.ErrCodeInvalidArgument, "不支持删除非常规文件", nil)
 	}
 	if err := parent.Remove(base); err != nil {
-		return domain.NewError(domain.ErrCodeInternalError, "删除文件失败", err)
+		return mapWorkspaceWriteError(err, "删除文件失败")
 	}
 	return nil
 }
@@ -1034,17 +1062,17 @@ func (a *Runtime) UploadWorkspaceFile(ctx context.Context, relPath string, body 
 	tmp := randomTempName(".llmstudio-upload-")
 	f, err := parent.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
-		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "无法创建上传临时文件", err)
+		return WorkspaceEntry{}, mapWorkspaceWriteError(err, "无法创建上传临时文件")
 	}
 	defer parent.Remove(tmp)
 
 	n, copyErr := io.Copy(f, io.LimitReader(body, maxWorkspaceUploadBytes+1))
 	closeErr := f.Close()
 	if copyErr != nil {
-		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInvalidArgument, "读取上传内容失败", copyErr)
+		return WorkspaceEntry{}, mapWorkspaceWriteError(copyErr, "读取上传内容失败")
 	}
 	if closeErr != nil {
-		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "保存上传临时文件失败", closeErr)
+		return WorkspaceEntry{}, mapWorkspaceWriteError(closeErr, "保存上传临时文件失败")
 	}
 	if n > maxWorkspaceUploadBytes {
 		return WorkspaceEntry{}, domain.NewError(domain.ErrCodePayloadTooLarge, "上传文件不能超过 32 MiB", nil)
@@ -1065,13 +1093,13 @@ func (a *Runtime) UploadWorkspaceFile(ctx context.Context, relPath string, body 
 	}
 
 	if err := parent.Rename(tmp, base); err != nil {
-		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "写入上传文件失败", err)
+		return WorkspaceEntry{}, mapWorkspaceWriteError(err, "写入上传文件失败")
 	}
 	info, err := parent.Lstat(base)
 	if err != nil {
 		return WorkspaceEntry{}, domain.NewError(domain.ErrCodeInternalError, "读取上传文件信息失败", err)
 	}
-	return buildWorkspaceEntry(slashRel, base, info), nil
+	return buildWorkspaceEntry(parent, base, slashRel, base, info), nil
 }
 
 func (a *Runtime) OpenWorkspaceFileDownload(ctx context.Context, relPath string) (*os.File, fs.FileInfo, string, func(), error) {
@@ -1192,7 +1220,7 @@ func (a *Runtime) SearchWorkspaceEntries(ctx context.Context, query string) (Wor
 			truncated = true
 			return errWorkspaceSearchLimit
 		}
-		matches = append(matches, buildWorkspaceEntry(p, d.Name(), info))
+		matches = append(matches, buildWorkspaceEntry(root, p, p, d.Name(), info))
 		return nil
 	})
 	if walkErr != nil && !errors.Is(walkErr, errWorkspaceSearchLimit) {

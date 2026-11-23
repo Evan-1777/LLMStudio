@@ -2,14 +2,16 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { GatewayError } from '../../core/gateway';
+import { GatewayError, type GatewayClient } from '../../core/gateway';
 import type {
   AgentSettings,
   TopicScope,
   WorkspaceEntriesResponse,
+  WorkspaceEntry,
   WorkspaceFileDocument,
 } from '../../core/types';
 import { ConversationSidebar } from '../workbench/ConversationSidebar';
+import { WorkspaceFileTree } from './WorkspaceFileTree';
 
 const appState = vi.hoisted(() => ({
   isDesktop: false,
@@ -91,6 +93,58 @@ function renderSidebar(scope: TopicScope = 'cloud', onScopeChange = vi.fn()) {
 }
 
 describe('WorkspaceFileBrowser', () => {
+  it('disables header mutations when the root is not configured or returns an error', async () => {
+    const user = userEvent.setup();
+    appState.gateway.listWorkspaceEntries
+      .mockRejectedValueOnce(new GatewayError('INVALID_ARGUMENT', '工作目录不可用', 400))
+      .mockRejectedValueOnce(new GatewayError('INTERNAL_ERROR', '无法读取目录', 500));
+    renderSidebar();
+    await user.click(screen.getByRole('radio', { name: '工作区文件' }));
+    await screen.findByText('未配置工作区目录');
+    for (const name of ['新建文件', '新建文件夹', '管理文件']) {
+      expect(screen.getByRole('button', { name })).toBeDisabled();
+    }
+    await user.click(screen.getByRole('button', { name: '重新检测工作区' }));
+    await screen.findByText('无法读取目录');
+    expect(screen.getByRole('button', { name: '管理文件' })).toBeDisabled();
+  });
+
+  it('passes the refreshed editable entry to the viewer after a batch move', async () => {
+    const user = userEvent.setup();
+    const metadata = { size: 12, modTime: '2026-11-22T00:00:00Z' };
+    const dir: WorkspaceEntry = { ...metadata, name: 'docs', path: 'docs', kind: 'dir', editable: false };
+    const file: WorkspaceEntry = { ...metadata, name: 'notes.md', path: 'notes.md', kind: 'file', previewKind: 'markdown', editable: true };
+    const moved = { ...file, path: 'docs/notes.md' };
+    let didMove = false;
+    appState.gateway.listWorkspaceEntries.mockImplementation(async (p: string) => ({
+      path: p || '.',
+      entries: p === 'docs' ? (didMove ? [moved] : []) : (didMove ? [dir] : [dir, file]),
+      truncated: false,
+    }));
+    appState.gateway.batchWorkspaceEntries.mockImplementation(async () => {
+      didMove = true;
+      return { operation: 'move', succeeded: [file.path], failed: [] };
+    });
+    const onEntryMoved = vi.fn();
+    render(<WorkspaceFileTree
+      gateway={appState.gateway as unknown as GatewayClient}
+      isDesktop={false}
+      cloudConnectionState="connected"
+      connectionEpoch={1}
+      selectedPath={file.path}
+      manageMode
+      onManageModeChange={vi.fn()}
+      onSelectEntry={vi.fn()}
+      onEntryMoved={onEntryMoved}
+    />);
+    await user.click(await screen.findByRole('checkbox', { name: '选择 notes.md' }));
+    await user.click(screen.getByRole('button', { name: '批量移动' }));
+    const dialog = await screen.findByRole('dialog', { name: '移动「1 项」' });
+    await user.click(await within(dialog).findByRole('listitem', { name: 'docs' }));
+    await user.click(within(dialog).getByRole('button', { name: '移至此处' }));
+    await waitFor(() => expect(onEntryMoved).toHaveBeenCalledExactlyOnceWith(file.path, moved));
+  });
+
   it('lazily expands directories, respects image/binary blocks, gates Markdown visual HTML on agent settings, saves with Cmd/Ctrl+S, handles 409 conflicts, and confirms dirty close', async () => {
     const user = userEvent.setup();
     const rootEntries: WorkspaceEntriesResponse = {

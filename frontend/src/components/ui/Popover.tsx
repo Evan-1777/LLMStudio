@@ -41,11 +41,15 @@ export function Popover({
 export function Dropdown({
   open,
   onOpenChange,
+  modal,
+  onCloseAutoFocus,
   trigger,
   children,
   align = 'start',
   side = 'bottom',
 }: {
+  modal?: boolean;
+  onCloseAutoFocus?: (event: Event) => void;
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   trigger: ReactNode;
@@ -54,7 +58,7 @@ export function Dropdown({
   side?: 'top' | 'bottom' | 'left' | 'right';
 }) {
   return (
-    <DropdownMenu.Root open={open} onOpenChange={onOpenChange}>
+    <DropdownMenu.Root open={open} onOpenChange={onOpenChange} modal={modal}>
       <DropdownMenu.Trigger asChild>{trigger}</DropdownMenu.Trigger>
       <DropdownMenu.Portal>
         <DropdownMenu.Content
@@ -63,6 +67,7 @@ export function Dropdown({
           sideOffset={6}
           collisionPadding={10}
           className="ui-menu-content"
+          onCloseAutoFocus={onCloseAutoFocus}
         >
           {children}
         </DropdownMenu.Content>

@@ -231,6 +231,7 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("POST /api/v1/conversations/reorder", s.handleReorderConversations)
 	mux.HandleFunc("GET /api/v1/conversations/{id}", s.handleGetConversation)
 	mux.HandleFunc("PATCH /api/v1/conversations/{id}", s.handlePatchConversation)
+	mux.HandleFunc("PATCH /api/v1/conversations/{id}/graph", s.handleMutateConversationGraph)
 	mux.HandleFunc("DELETE /api/v1/conversations/{id}", s.handleDeleteConversation)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/messages", s.handleCreateMessage)
 	mux.HandleFunc("PATCH /api/v1/conversations/{id}/messages/{messageId}", s.handleUpdateMessage)
@@ -1404,6 +1405,38 @@ func (s *Server) handlePatchConversation(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	httpapi.WriteJSON(w, http.StatusOK, map[string]any{"conversation": updated})
+}
+
+func (s *Server) handleMutateConversationGraph(w http.ResponseWriter, r *http.Request) {
+	scope, err := scopeFromRequest(r)
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	id := r.PathValue("id")
+	if scope == plugin.ExecutionScopeLocal {
+		rec := &statusTrackingWriter{ResponseWriter: w, status: http.StatusOK}
+		s.localConvHandler.MutateGraph(rec, r)
+		if rec.status < 400 {
+			_ = s.cfg.Store.MarkConversationPending(r.Context(), id)
+		}
+		return
+	}
+	if !s.requireCloud(w) {
+		return
+	}
+	body, err := readRawBody(r, 16*1024*1024)
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	// Cloud chat details are cached per generation, not shared across requests.
+	detail, err := s.cfg.Cloud.MutateConversationGraph(r.Context(), id, body)
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	httpapi.WriteJSON(w, http.StatusOK, detail)
 }
 
 func (s *Server) handleDeleteConversation(w http.ResponseWriter, r *http.Request) {

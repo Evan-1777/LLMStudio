@@ -25,8 +25,7 @@ import { formatCompactTokens, parseCompactionMeta } from './contextUsage';
 import { MessageActions } from '../chat/MessageActions';
 import { MessageEditor } from './MessageEditor';
 import {
-  insertMessageAt,
-  materializeStreamingMessage,
+  streamingChatMessages,
   type ChatState,
 } from '../chat/chatReducer';
 
@@ -224,6 +223,8 @@ function CompactionCheckpointCard({
   return (
     <section
       className="wb-compaction"
+      data-message-id={message.id}
+      tabIndex={-1}
       aria-label="压缩检查点"
       data-expanded={expanded ? 'true' : 'false'}
     >
@@ -284,6 +285,8 @@ function CompactionCheckpointCard({
 
 export function ChatCanvas({
   state,
+  activeMessages = state.messages,
+  jumpTarget,
   assistant,
   providers = [],
   hasConversationId,
@@ -297,6 +300,8 @@ export function ChatCanvas({
   onResetToNewTopic,
 }: {
   state: ChatState;
+  activeMessages?: Message[];
+  jumpTarget?: { messageId: string; seq: number } | null;
   assistant: Assistant;
   providers?: readonly ProviderConfig[];
   hasConversationId: boolean;
@@ -327,16 +332,28 @@ export function ChatCanvas({
   const [deletingCompactionBusy, setDeletingCompactionBusy] = useState(false);
   const isBusy = savingEdit || state.runState === 'loading' || state.runState === 'streaming';
 
-  const visibleMessages = useMemo(() => {
-    if (!state.streaming) {
-      return state.messages;
-    }
-    return insertMessageAt(
-      state.messages,
-      materializeStreamingMessage(state.conversation?.id ?? '', state.streaming),
-      state.streaming.insertIndex,
-    );
-  }, [state.conversation?.id, state.messages, state.streaming]);
+  const visibleMessages = useMemo(() => streamingChatMessages(state, activeMessages), [state, activeMessages]);
+
+  useEffect(() => {
+    if (!jumpTarget) return;
+    let target: HTMLElement | null = null;
+    let timer: number | undefined;
+    const frame = requestAnimationFrame(() => {
+      target = scrollRef.current?.querySelector<HTMLElement>('[data-message-id="' + CSS.escape(jumpTarget.messageId) + '"]') ?? null;
+      if (!target) return;
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      stickToBottomRef.current = false;
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({ behavior: reduced ? 'instant' : 'smooth', block: 'center' });
+      target.classList.add('wb-msg--jump-highlight');
+      timer = window.setTimeout(() => target?.classList.remove('wb-msg--jump-highlight'), 1250);
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      if (timer !== undefined) window.clearTimeout(timer);
+      target?.classList.remove('wb-msg--jump-highlight');
+    };
+  }, [jumpTarget]);
 
   const streamingBlockCompleted = useMemo(() => {
     if (!state.streaming) return undefined;
@@ -520,6 +537,8 @@ export function ChatCanvas({
                 return (
                   <article
                     key={uiKey}
+                    data-message-id={msg.id}
+                    tabIndex={-1}
                     className={`wb-feed-msg ${
                       isUser ? 'wb-feed-msg--user' : 'wb-feed-msg--asst'
                     }`.trim()}
@@ -609,7 +628,7 @@ export function ChatCanvas({
 
               if (msg.role === 'user') {
                 return (
-                  <div key={uiKey} className="wb-user-msg">
+                  <div key={uiKey} className="wb-user-msg" data-message-id={msg.id} tabIndex={-1}>
                     {isEditingThis ? (
                       inlineEditor
                     ) : (
@@ -645,7 +664,7 @@ export function ChatCanvas({
               const sourceMeta = resolveMessageSourceMeta(msg, providers);
 
               return (
-                <article key={uiKey} className="wb-asst-msg">
+                <article key={uiKey} className="wb-asst-msg" data-message-id={msg.id} tabIndex={-1}>
                   <AssistantMetaHeader
                     headClassName="wb-asst-head"
                     assistant={assistant}

@@ -60,6 +60,7 @@ type StreamChatInput struct {
 	ModelID             string                     `json:"modelId"`
 	Params              domain.GenerationParams    `json:"params"`
 	RegenerateMessageID string                     `json:"regenerateMessageId"`
+	MCPToolsEnabled     *bool                      `json:"mcpToolsEnabled,omitempty"`
 	WebSearch           bool                       `json:"webSearch"`
 	SearchEngineID      string                     `json:"searchEngineId,omitempty"`
 	LocalContinuation   *LocalContinuationInput    `json:"localContinuation,omitempty"`
@@ -248,6 +249,7 @@ func (s *ChatService) WithMCP(mcpStore MCPCatalog, mcpClient plugin.MCPClientBou
 
 // PreparedStream holds a validated, open upstream HTTP response ready to stream SSE events to the client.
 type PreparedStream struct {
+	graphWrite           *domain.MessageGraphWrite
 	maxToolRounds        int
 	service              *ChatService
 	conversation         domain.Conversation
@@ -287,6 +289,8 @@ type PreparedLocalCacheStep struct {
 // PreparedLocalRequest holds a pre-encoded upstream request for browser-direct execution.
 // Server-stored API keys are never included in URL or Headers.
 type PreparedLocalRequest struct {
+	ParentID             *string                  `json:"parentId,omitempty"`
+	ConsumeBranchID      string                   `json:"consumeBranchId,omitempty"`
 	Method               string                   `json:"method"`
 	URL                  string                   `json:"url"`
 	Headers              map[string]string        `json:"headers"`
@@ -303,6 +307,7 @@ type PreparedLocalRequest struct {
 }
 
 type preparedUpstream struct {
+	graphWrite           *domain.MessageGraphWrite
 	conversation         domain.Conversation
 	provider             domain.ProviderConfig
 	resolveProv          domain.ProviderConfig
@@ -366,15 +371,21 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	}
 
 	conv := prep.conversation
+	var assistantWrite *domain.MessageGraphWrite
 	if !prep.isRegen {
-		if _, err := s.msgs.Create(ctx, domain.Message{
+		saved, err := s.msgs.Create(ctx, domain.Message{
+			GraphWrite:     prep.graphWrite,
 			ConversationID: conv.ID,
 			Role:           domain.RoleUser,
 			Blocks:         prep.userBlocks,
 			CreatedAt:      time.Now().UTC(),
-		}); err != nil {
+		})
+		if err != nil {
 			_ = resp.Body.Close()
 			return nil, err
+		}
+		if prep.graphWrite != nil {
+			assistantWrite = &domain.MessageGraphWrite{ParentID: &saved.ID}
 		}
 		// Auto-title freshly created conversations from the first user prompt.
 		if (conv.Title == "" || conv.Title == "New Chat") && prep.historyLen == 1 {
@@ -388,6 +399,7 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	}
 
 	return &PreparedStream{
+		graphWrite:           assistantWrite,
 		maxToolRounds:        prep.mcpMaxToolRounds,
 		service:              s,
 		conversation:         conv,
@@ -582,7 +594,13 @@ func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (Pre
 		body = json.RawMessage("{}")
 	}
 
+	var write domain.MessageGraphWrite
+	if prep.graphWrite != nil {
+		write = *prep.graphWrite
+	}
 	return PreparedLocalRequest{
+		ParentID:             write.ParentID,
+		ConsumeBranchID:      write.ConsumeBranchID,
 		Method:               encoded.Method,
 		URL:                  endpoint.URL,
 		Headers:              headersToStringMap(mergeRequestHeaders(encoded.Headers, endpoint.Headers)),
@@ -804,8 +822,16 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		return preparedUpstream{}, err
 	}
 
+	active := resolveActiveBranchPath(conv, history)
+	var graphWrite *domain.MessageGraphWrite
 	var replaceMessageID, insertAfterMessageID string
 	if isRegen {
+		if graphEnabled(conv) {
+			history, err = resolvePathUpToMessage(history, in.RegenerateMessageID)
+			if err != nil {
+				return preparedUpstream{}, err
+			}
+		}
 		targetIdx := -1
 		for i, m := range history {
 			if m.ID == in.RegenerateMessageID {
@@ -816,53 +842,67 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		if targetIdx < 0 {
 			return preparedUpstream{}, domain.NewError(domain.ErrCodeNotFound, "target message not found in conversation", nil)
 		}
-		if history[targetIdx].Role == domain.RoleUser {
-			if targetIdx+1 < len(history) {
-				if history[targetIdx+1].Role == domain.RoleAssistant {
-					replaceMessageID = history[targetIdx+1].ID
-				} else {
-					insertAfterMessageID = history[targetIdx].ID
+		target := history[targetIdx]
+		if target.Role == domain.RoleUser {
+			if graphEnabled(conv) {
+				insertAfterMessageID = target.ID
+			}
+			for i, m := range active {
+				if m.ID != target.ID || i+1 == len(active) {
+					continue
 				}
+				if active[i+1].Role == domain.RoleAssistant {
+					replaceMessageID, insertAfterMessageID = active[i+1].ID, ""
+				} else {
+					insertAfterMessageID = target.ID
+				}
+				break
 			}
 			history = history[:targetIdx+1]
 		} else {
-			replaceMessageID = history[targetIdx].ID
+			replaceMessageID = target.ID
 			history = history[:targetIdx]
-		}
-		if isLocalCont {
-			history = append(history, domain.Message{
-				ConversationID: conv.ID,
-				Role:           domain.RoleAssistant,
-				Blocks:         filterBlocksForModelHistory(in.LocalContinuation.Blocks),
-				ProviderID:     prov.ID,
-				ModelID:        model.ID,
-			})
 		}
 	} else if isLocalCont {
 		anchorID := strings.TrimSpace(in.LocalContinuation.UserMessageID)
-		anchorIdx := -1
-		for i, m := range history {
-			if m.ID == anchorID {
-				anchorIdx = i
-				break
+		if graphEnabled(conv) {
+			history, err = resolvePathUpToMessage(history, anchorID)
+			if err != nil {
+				return preparedUpstream{}, err
+			}
+		} else {
+			for i, m := range history {
+				if m.ID == anchorID {
+					history = history[:i+1]
+					break
+				}
 			}
 		}
-		if anchorIdx < 0 || history[anchorIdx].Role != domain.RoleUser {
+		if len(history) == 0 || history[len(history)-1].ID != anchorID {
 			return preparedUpstream{}, domain.NewError(domain.ErrCodeNotFound, "anchor user message not found in conversation", nil)
 		}
-		history = append(history[:anchorIdx+1], domain.Message{
+	} else {
+		if graphEnabled(conv) {
+			parentID := ""
+			if len(active) > 0 {
+				parentID = active[len(active)-1].ID
+			}
+			graphWrite = &domain.MessageGraphWrite{ParentID: &parentID, ConsumeBranchID: conv.GraphState.ActiveBranchID}
+		}
+		history = append(active, domain.Message{
+			ConversationID: conv.ID,
+			Role:           domain.RoleUser,
+			Blocks:         userBlocks,
+			CreatedAt:      time.Now().UTC(),
+		})
+	}
+	if isLocalCont {
+		history = append(history, domain.Message{
 			ConversationID: conv.ID,
 			Role:           domain.RoleAssistant,
 			Blocks:         filterBlocksForModelHistory(in.LocalContinuation.Blocks),
 			ProviderID:     prov.ID,
 			ModelID:        model.ID,
-		})
-	} else {
-		history = append(history, domain.Message{
-			ConversationID: conv.ID,
-			Role:           domain.RoleUser,
-			Blocks:         userBlocks,
-			CreatedAt:      time.Now().UTC(),
 		})
 	}
 
@@ -892,7 +932,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 
 	prefs := s.resolvePreferencesSnapshot(ctx)
 
-	tools, toolBindings, err := s.discoverActiveTools(ctx, prefs.BuiltinTimeToolEnabled, conv.ID, nativeTools)
+	tools, toolBindings, err := s.discoverActiveTools(ctx, prefs.BuiltinTimeToolEnabled, conv.ID, nativeTools, in.MCPToolsEnabled == nil || *in.MCPToolsEnabled)
 	if err != nil {
 		return preparedUpstream{}, err
 	}
@@ -913,6 +953,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	cacheScope := buildPromptCacheScope(prov, model, up.apiFormat.ID(), up.compat, conv.ID)
 
 	return preparedUpstream{
+		graphWrite:           graphWrite,
 		conversation:         conv,
 		provider:             prov,
 		resolveProv:          up.resolveProv,
@@ -999,6 +1040,9 @@ func mergeRequestHeaders(encodedHeaders, endpointHeaders http.Header) http.Heade
 // handles cancellation, and persists the single resulting assistant message.
 func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEvent) error) error {
 	assistantID := domain.NewUUID()
+	if graphEnabled(p.conversation) && p.replaceMessageID != "" {
+		assistantID = p.replaceMessageID
+	}
 	acc := newStreamAccumulator()
 
 	startEvent := domain.StreamEvent{
@@ -1390,6 +1434,7 @@ func (p *PreparedStream) persistResult(
 	blocks := acc.blocksSlice()
 	msg := domain.Message{
 		ID:             assistantID,
+		GraphWrite:     p.graphWrite,
 		ConversationID: p.conversation.ID,
 		Role:           domain.RoleAssistant,
 		Blocks:         blocks,

@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -11,6 +12,7 @@ import {
   ErrorBanner,
   Field,
   Icon,
+  IconButton,
   Input,
   LoadingSpinner,
   Modal,
@@ -21,11 +23,40 @@ import './workspace.css';
 
 export type WorkspaceNameDialogMode = 'create-file' | 'create-dir' | 'rename';
 
+function normalizeWorkspaceName(raw: string, mode: WorkspaceNameDialogMode): string {
+  const trimmed = raw.trim();
+  return mode === 'create-dir' ? trimmed.replace(/\/+$/, '') : trimmed;
+}
+
+// Radix restores menu focus on exit, which may finish after the dialog has opened.
+export function useWorkspaceMenuDialog() {
+  const frame = useRef<number | null>(null);
+  const handingOff = useRef(false);
+  useEffect(() => () => {
+    if (frame.current !== null) window.cancelAnimationFrame(frame.current);
+  }, []);
+  return {
+    openAfterMenu(open: () => void) {
+      handingOff.current = true;
+      if (frame.current !== null) window.cancelAnimationFrame(frame.current);
+      frame.current = window.requestAnimationFrame(() => {
+        frame.current = null;
+        open();
+      });
+    },
+    onCloseAutoFocus(event: Event) {
+      if (!handingOff.current) return;
+      event.preventDefault();
+      handingOff.current = false;
+    },
+  };
+}
+
 export function validateWorkspaceNameInput(
   raw: string,
   mode: WorkspaceNameDialogMode,
 ): string | null {
-  const value = raw.trim();
+  const value = normalizeWorkspaceName(raw, mode);
   if (!value) {
     return mode === 'create-dir' ? '请输入文件夹名称' : '请输入名称';
   }
@@ -71,6 +102,8 @@ export function WorkspaceNameDialog({
   onOpenChange: (open: boolean) => void;
   onSubmit: (resolvedPath: string) => Promise<void> | void;
 }) {
+  const formId = useId();
+  const inputId = useId();
   const [value, setValue] = useState(initialName);
   const [localError, setLocalError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -122,7 +155,7 @@ export function WorkspaceNameDialog({
       setLocalError(validationErr);
       return;
     }
-    const clean = value.trim();
+    const clean = normalizeWorkspaceName(value, mode);
     if (mode === 'rename' && clean === initialName) {
       onOpenChange(false);
       return;
@@ -154,7 +187,7 @@ export function WorkspaceNameDialog({
           </Button>
           <Button
             type="submit"
-            form="ws-name-dialog-form"
+            form={formId}
             variant="primary"
             loading={busy}
             disabled={busy}
@@ -165,7 +198,7 @@ export function WorkspaceNameDialog({
       }
     >
       <form
-        id="ws-name-dialog-form"
+        id={formId}
         className="ws-dialog-form"
         noValidate
         onSubmit={handleSubmit}
@@ -179,11 +212,11 @@ export function WorkspaceNameDialog({
         ) : null}
         <Field
           label={mode === 'create-dir' ? '文件夹名称' : '名称'}
-          htmlFor="ws-name-dialog-input"
+          htmlFor={inputId}
         >
           <Input
             ref={inputRef}
-            id="ws-name-dialog-input"
+            id={inputId}
             value={value}
             placeholder={placeholder}
             disabled={busy}
@@ -241,6 +274,10 @@ export function WorkspaceMoveDialog({
   onConfirm: (targetDir: string) => Promise<void> | void;
 }) {
   const [currentDir, setCurrentDir] = useState('');
+  const [folderName, setFolderName] = useState<string | null>(null);
+  const [folderError, setFolderError] = useState<string | null>(null);
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const dialogBusy = busy || creatingFolder;
   const [dirs, setDirs] = useState<WorkspaceEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -274,6 +311,8 @@ export function WorkspaceMoveDialog({
       return;
     }
     setCurrentDir('');
+    setFolderName(null);
+    setFolderError(null);
     void loadSubdirs('');
     return () => {
       abortRef.current?.abort();
@@ -281,8 +320,32 @@ export function WorkspaceMoveDialog({
   }, [loadSubdirs, open]);
 
   const navigateTo = (nextDir: string) => {
+    setFolderName(null);
+    setFolderError(null);
     setCurrentDir(nextDir);
     void loadSubdirs(nextDir);
+  };
+
+  const createTargetFolder = async (event: FormEvent) => {
+    event.preventDefault();
+    if (folderName === null || dialogBusy) return;
+    const error = validateWorkspaceNameInput(folderName, 'create-dir');
+    if (error) {
+      setFolderError(error);
+      return;
+    }
+    const name = normalizeWorkspaceName(folderName, 'create-dir');
+    const path = currentDir ? `${currentDir}/${name}` : name;
+    setCreatingFolder(true);
+    setFolderError(null);
+    try {
+      const created = await gateway.createWorkspaceDir(path, scope);
+      navigateTo(created.path);
+    } catch (err) {
+      setFolderError(err instanceof GatewayError ? err.message : '无法创建文件夹');
+    } finally {
+      setCreatingFolder(false);
+    }
   };
 
   const segments = useMemo(
@@ -313,17 +376,14 @@ export function WorkspaceMoveDialog({
   return (
     <Modal
       open={open}
-      busy={busy}
-      onOpenChange={(next) => {
-        if (!next && busy) return;
-        onOpenChange(next);
-      }}
+      busy={dialogBusy}
+      onOpenChange={onOpenChange}
       title={title}
       footer={
         <>
           <Button
             variant="secondary"
-            disabled={busy}
+            disabled={dialogBusy}
             onClick={() => onOpenChange(false)}
           >
             取消
@@ -331,7 +391,7 @@ export function WorkspaceMoveDialog({
           <Button
             variant="primary"
             loading={busy}
-            disabled={busy || loading || allAlreadyInCurrentDir}
+            disabled={dialogBusy || folderName !== null || loading || !!loadError || allAlreadyInCurrentDir}
             onClick={() => void onConfirm(currentDir)}
           >
             {busy ? '移动中…' : '移至此处'}
@@ -342,34 +402,71 @@ export function WorkspaceMoveDialog({
       <div className="ws-move-picker">
         {error ? <ErrorBanner message={error} /> : null}
 
-        <nav className="ws-breadcrumb" aria-label="目标目录路径">
-          <button
-            type="button"
-            className={`ws-breadcrumb__seg ${segments.length === 0 ? 'ws-breadcrumb__seg--current' : ''}`.trim()}
-            disabled={busy || segments.length === 0}
-            onClick={() => navigateTo('')}
-          >
-            <Icon name="folder" size={13} />
-            <span>工作区</span>
-          </button>
-          {segments.map((seg, idx) => {
-            const target = segments.slice(0, idx + 1).join('/');
-            const isCurrent = idx === segments.length - 1;
-            return (
-              <span key={target} className="ws-breadcrumb__item">
-                <Icon name="chevronRight" size={11} className="ws-breadcrumb__sep" />
-                <button
-                  type="button"
-                  className={`ws-breadcrumb__seg ${isCurrent ? 'ws-breadcrumb__seg--current' : ''}`.trim()}
-                  disabled={busy || isCurrent}
-                  onClick={() => navigateTo(target)}
-                >
-                  {seg}
-                </button>
-              </span>
-            );
-          })}
-        </nav>
+        <div className="ws-move-picker__head">
+          <nav className="ws-breadcrumb" aria-label="目标目录路径">
+            <button
+              type="button"
+              className={`ws-breadcrumb__seg ${segments.length === 0 ? 'ws-breadcrumb__seg--current' : ''}`.trim()}
+              disabled={dialogBusy || segments.length === 0}
+              onClick={() => navigateTo('')}
+            >
+              <Icon name="folder" size={13} />
+              <span>工作区</span>
+            </button>
+            {segments.map((seg, idx) => {
+              const target = segments.slice(0, idx + 1).join('/');
+              const isCurrent = idx === segments.length - 1;
+              return (
+                <span key={target} className="ws-breadcrumb__item">
+                  <Icon name="chevronRight" size={11} className="ws-breadcrumb__sep" />
+                  <button
+                    type="button"
+                    className={`ws-breadcrumb__seg ${isCurrent ? 'ws-breadcrumb__seg--current' : ''}`.trim()}
+                    disabled={dialogBusy || isCurrent}
+                    onClick={() => navigateTo(target)}
+                  >
+                    {seg}
+                  </button>
+                </span>
+              );
+            })}
+          </nav>
+          <IconButton
+            size="sm"
+            icon="folderPlus"
+            label="新建文件夹"
+            disabled={dialogBusy || loading || !!loadError || folderName !== null}
+            onClick={() => setFolderName('')}
+          />
+        </div>
+        {folderName !== null ? (
+          <form className="ws-dialog-form" onSubmit={createTargetFolder}>
+            {folderError ? <ErrorBanner message={folderError} /> : null}
+            <div className="ws-move-picker__create">
+              <Input
+                autoFocus
+                aria-label="文件夹名称"
+                value={folderName}
+                disabled={dialogBusy}
+                onChange={(event) => {
+                  setFolderName(event.target.value);
+                  setFolderError(null);
+                }}
+              />
+              <Button type="submit" loading={creatingFolder} disabled={dialogBusy}>创建</Button>
+              <IconButton
+                size="sm"
+                icon="close"
+                label="取消新建文件夹"
+                disabled={dialogBusy}
+                onClick={() => {
+                  setFolderName(null);
+                  setFolderError(null);
+                }}
+              />
+            </div>
+          </form>
+        ) : null}
 
         <div className="ws-move-list" role="list" aria-label="子目录列表">
           {loading ? (
@@ -387,7 +484,7 @@ export function WorkspaceMoveDialog({
             <div className="ws-move-list__empty">无子文件夹</div>
           ) : (
             dirs.map((dir) => {
-              const disabled = busy || isForbiddenTarget(dir.path);
+              const disabled = dialogBusy || isForbiddenTarget(dir.path);
               return (
                 <button
                   key={dir.path}

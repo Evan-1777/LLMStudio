@@ -273,18 +273,50 @@ type Usage struct {
 	ContextTokens            int `json:"contextTokens,omitempty"`
 }
 
+// MessageGraphMeta stores display preferences for a conversation node.
+type MessageGraphMeta struct {
+	Collapsed bool     `json:"collapsed,omitempty"`
+	Summary   string   `json:"summary,omitempty"`
+	X         *float64 `json:"x,omitempty"`
+	Y         *float64 `json:"y,omitempty"`
+}
+
+type ConversationBranchSlot struct {
+	ID              string    `json:"id"`
+	Label           string    `json:"label"`
+	ParentMessageID string    `json:"parentMessageId"`
+	X               *float64  `json:"x,omitempty"`
+	Y               *float64  `json:"y,omitempty"`
+	CreatedAt       time.Time `json:"createdAt"`
+}
+
+type ConversationGraphState struct {
+	Enabled        bool                     `json:"enabled"`
+	ActiveBranchID string                   `json:"activeBranchId,omitempty"`
+	Branches       []ConversationBranchSlot `json:"branches"`
+}
+
+// MessageGraphWrite carries insertion options, not persisted message data.
+type MessageGraphWrite struct {
+	ParentID        *string
+	ConsumeBranchID string
+}
+
 // Message represents a persisted turn in a conversation.
 type Message struct {
-	ID             string         `json:"id"`
-	ConversationID string         `json:"conversationId"`
-	Role           string         `json:"role"`
-	Blocks         []ContentBlock `json:"blocks"`
-	ProviderID     string         `json:"providerId,omitempty"`
-	ModelID        string         `json:"modelId,omitempty"`
-	Usage          *Usage         `json:"usage,omitempty"`
-	StopReason     string         `json:"stopReason,omitempty"`
-	ErrorMessage   string         `json:"errorMessage,omitempty"`
-	CreatedAt      time.Time      `json:"createdAt"`
+	GraphWrite     *MessageGraphWrite `json:"-"`
+	ParentID       string             `json:"parentId,omitempty"`
+	GraphMeta      *MessageGraphMeta  `json:"graphMeta,omitempty"`
+	ID             string             `json:"id"`
+	ConversationID string             `json:"conversationId"`
+	Role           string             `json:"role"`
+	Blocks         []ContentBlock     `json:"blocks"`
+	ProviderID     string             `json:"providerId,omitempty"`
+	ModelID        string             `json:"modelId,omitempty"`
+	Usage          *Usage             `json:"usage,omitempty"`
+	StopReason     string             `json:"stopReason,omitempty"`
+	ErrorMessage   string             `json:"errorMessage,omitempty"`
+	CreatedAt      time.Time          `json:"createdAt"`
 }
 
 // Assistant represents a reusable persona preset bound to conversations.
@@ -391,24 +423,26 @@ func ValidConversationMode(mode string) bool {
 
 // Conversation represents a chat session with reserved selective sync metadata.
 type Conversation struct {
-	ID           string           `json:"id"`
-	AssistantID  string           `json:"assistantId"`
-	Title        string           `json:"title"`
-	ProviderID   string           `json:"providerId,omitempty"`
-	ModelID      string           `json:"modelId,omitempty"`
-	SystemPrompt string           `json:"systemPrompt,omitempty"`
-	Params       GenerationParams `json:"params"`
-	GroupID      *string          `json:"groupId"`
-	Pinned       bool             `json:"pinned"`
-	SortOrder    int              `json:"sortOrder"`
-	Ephemeral    bool             `json:"ephemeral,omitempty"`
-	Mode         string           `json:"mode"`
-	SyncEnabled  bool             `json:"syncEnabled"`
-	SyncState    string           `json:"syncState"`
-	SyncVersion  int64            `json:"syncVersion"`
-	LastSyncedAt *time.Time       `json:"lastSyncedAt,omitempty"`
-	CreatedAt    time.Time        `json:"createdAt"`
-	UpdatedAt    time.Time        `json:"updatedAt"`
+	ActiveLeafID string                  `json:"activeLeafId,omitempty"`
+	GraphState   *ConversationGraphState `json:"graphState,omitempty"`
+	ID           string                  `json:"id"`
+	AssistantID  string                  `json:"assistantId"`
+	Title        string                  `json:"title"`
+	ProviderID   string                  `json:"providerId,omitempty"`
+	ModelID      string                  `json:"modelId,omitempty"`
+	SystemPrompt string                  `json:"systemPrompt,omitempty"`
+	Params       GenerationParams        `json:"params"`
+	GroupID      *string                 `json:"groupId"`
+	Pinned       bool                    `json:"pinned"`
+	SortOrder    int                     `json:"sortOrder"`
+	Ephemeral    bool                    `json:"ephemeral,omitempty"`
+	Mode         string                  `json:"mode"`
+	SyncEnabled  bool                    `json:"syncEnabled"`
+	SyncState    string                  `json:"syncState"`
+	SyncVersion  int64                   `json:"syncVersion"`
+	LastSyncedAt *time.Time              `json:"lastSyncedAt,omitempty"`
+	CreatedAt    time.Time               `json:"createdAt"`
+	UpdatedAt    time.Time               `json:"updatedAt"`
 }
 
 // DeletedConversation identifies a removed topic and its assistant.

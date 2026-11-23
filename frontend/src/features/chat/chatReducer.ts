@@ -5,6 +5,7 @@ import type {
   StreamEvent,
   TokenUsage,
 } from '../../core/types';
+import { resolveActiveBranchMessages } from '../workbench/conversationGraph';
 
 export type ChatRunState =
   | 'empty'
@@ -29,6 +30,7 @@ export interface StreamingDraft {
   providerId: string;
   modelId: string;
   insertIndex?: number;
+  graphTarget?: { afterId: string; replaceId?: string };
   blockOrder: number[];
   blocksByIndex: Record<number, StreamingBlockBuffer>;
   usage?: TokenUsage;
@@ -83,6 +85,58 @@ export function insertMessageAt(
 
 export function isLocalMessageId(id: string): boolean {
   return id.startsWith('local-');
+}
+
+export function activeChatMessages(state: ChatState): Message[] {
+  const path = resolveActiveBranchMessages(state.conversation, state.messages);
+  if (path === state.messages) return path;
+  const last = state.messages.at(-1);
+  return state.streaming && !state.streaming.graphTarget && last?.id.startsWith('local-user-')
+    ? [...path, last]
+    : path;
+}
+
+export function streamingChatMessages(state: ChatState, active: Message[]): Message[] {
+  const stream = state.streaming;
+  if (!stream) return active;
+  const draft = materializeStreamingMessage(state.conversation?.id ?? '', stream);
+  if (!state.conversation?.graphState?.enabled) return insertMessageAt(active, draft, stream.insertIndex);
+  const target = stream.graphTarget;
+  if (target?.replaceId) return active.map((message) => message.id === target.replaceId ? draft : message);
+  const index = target ? active.findIndex((message) => message.id === target.afterId) : -1;
+  return insertMessageAt(active, draft, index >= 0 ? index + 1 : undefined);
+}
+
+function applyStreamMessage(state: ChatState, message: Message | null): Pick<ChatState, 'conversation' | 'messages'> {
+  const { conversation, messages, streaming } = state;
+  if (!message) return { conversation, messages };
+  const graph = conversation?.graphState;
+  if (!conversation || !graph?.enabled) {
+    return { conversation, messages: insertMessageAt(messages, message, streaming?.insertIndex ?? state.pendingInsertIndex) };
+  }
+  const path = activeChatMessages(state);
+  const target = streaming?.graphTarget;
+  const afterId = target?.afterId ?? path.at(-1)?.id ?? '';
+  const replaceId = target?.replaceId;
+  if (replaceId) {
+    const old = messages.find((item) => item.id === replaceId);
+    const next = { ...message, parentId: old?.parentId, graphMeta: old?.graphMeta };
+    return {
+      conversation: { ...conversation, activeLeafId: conversation.activeLeafId === replaceId ? next.id : conversation.activeLeafId,
+        graphState: { ...graph, branches: graph.branches?.map((slot) => slot.parentMessageId === replaceId ? { ...slot, parentMessageId: next.id } : slot) } },
+      messages: messages.map((item) => item.id === replaceId ? next : item.parentId === replaceId ? { ...item, parentId: next.id } : item),
+    };
+  }
+  const successor = target ? path[path.findIndex((item) => item.id === afterId) + 1]?.id : undefined;
+  const next = { ...message, parentId: afterId };
+  const branches = target
+    ? graph.branches?.map((slot) => slot.id === graph.activeBranchId ? { ...slot, parentMessageId: next.id } : slot)
+    : graph.branches?.filter((slot) => slot.id !== graph.activeBranchId);
+  return {
+    conversation: successor ? conversation : { ...conversation, activeLeafId: next.id,
+      graphState: { ...graph, activeBranchId: target ? graph.activeBranchId : undefined, branches } },
+    messages: [...(successor ? messages.map((item) => item.id === successor ? { ...item, parentId: next.id } : item) : messages), next],
+  };
 }
 
 export function deriveRestState(messages: Message[]): {
@@ -220,7 +274,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     }
 
     case 'LOAD_SUCCESS': {
-      const rest = deriveRestState(action.messages);
+      const rest = deriveRestState(resolveActiveBranchMessages(action.conversation, action.messages));
       return {
         ...state,
         conversation: action.conversation,
@@ -309,6 +363,19 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (idx < 0) return state;
 
       const target = state.messages[idx];
+      if (state.conversation?.graphState?.enabled) {
+        const path = activeChatMessages(state);
+        const successor = path[path.findIndex((message) => message.id === target.id) + 1];
+        return {
+          ...state, runState: 'streaming', errorCode: null, errorMessage: null,
+          needsReloadAfterAbort: false, pendingInsertIndex: null, pendingRollback: null,
+          streaming: {
+            messageId: action.placeholderAssistantId, providerId: action.providerId, modelId: action.modelId,
+            graphTarget: { afterId: target.id, replaceId: target.role !== 'user' ? target.id : successor?.role === 'assistant' ? successor.id : undefined },
+            blockOrder: [], blocksByIndex: {},
+          },
+        };
+      }
       let nextMessages = state.messages;
       let insertIndex = idx;
       let rollback: { message: Message; index: number } | null = null;
@@ -552,11 +619,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
                 stopReason: state.streaming.stopReason || 'stop',
               })
             : null);
-        const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
-        const nextMessages = finalMsg
-          ? insertMessageAt(state.messages, finalMsg, slotIndex)
-          : state.messages;
-        const rest = deriveRestState(nextMessages);
+        const updated = applyStreamMessage(state, finalMsg);
+        const rest = deriveRestState(resolveActiveBranchMessages(updated.conversation, updated.messages));
         let nextKeys = state.uiKeyByMsgId;
         if (
           state.streaming &&
@@ -570,7 +634,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         }
         return {
           ...state,
-          messages: nextMessages,
+          ...updated,
           pendingInsertIndex: null,
           streaming: null,
           runState: rest.runState,
@@ -584,7 +648,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (ev.type === 'error') {
         const errMsg = ev.error?.message || '流式生成失败';
         const errCode = ev.error?.code || 'UPSTREAM_ERROR';
-        const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
         const finalized = state.streaming
           ? materializeStreamingMessage(convId, state.streaming, {
               stopReason: 'error',
@@ -593,9 +656,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           : null;
         return {
           ...state,
-          messages: finalized
-            ? insertMessageAt(state.messages, finalized, slotIndex)
-            : state.messages,
+          ...applyStreamMessage(state, finalized),
           pendingInsertIndex: null,
           streaming: null,
           runState: 'error',
@@ -627,7 +688,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         };
       }
       const convId = state.conversation?.id ?? '';
-      const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
       const partial =
         state.streaming && state.streaming.blockOrder.length > 0
           ? materializeStreamingMessage(convId, state.streaming, {
@@ -636,9 +696,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           : null;
       return {
         ...state,
-        messages: partial
-          ? insertMessageAt(state.messages, partial, slotIndex)
-          : state.messages,
+        ...applyStreamMessage(state, partial),
         pendingInsertIndex: null,
         pendingRollback: null,
         streaming: null,
@@ -650,7 +708,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'STREAM_EOF_INCOMPLETE': {
       const convId = state.conversation?.id ?? '';
-      const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
       const partial = state.streaming
         ? materializeStreamingMessage(convId, state.streaming, {
             stopReason: 'error',
@@ -659,9 +716,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         : null;
       return {
         ...state,
-        messages: partial
-          ? insertMessageAt(state.messages, partial, slotIndex)
-          : state.messages,
+        ...applyStreamMessage(state, partial),
         pendingInsertIndex: null,
         streaming: null,
         runState: 'error',
@@ -672,7 +727,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
 
     case 'STREAM_NETWORK_ERROR': {
       const convId = state.conversation?.id ?? '';
-      const slotIndex = state.streaming?.insertIndex ?? state.pendingInsertIndex;
       const partial = state.streaming
         ? materializeStreamingMessage(convId, state.streaming, {
             stopReason: 'error',
@@ -681,9 +735,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         : null;
       return {
         ...state,
-        messages: partial
-          ? insertMessageAt(state.messages, partial, slotIndex)
-          : state.messages,
+        ...applyStreamMessage(state, partial),
         pendingInsertIndex: null,
         streaming: null,
         runState: 'error',
@@ -693,7 +745,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
     }
 
     case 'RECONCILE_DETAIL': {
-      const rest = deriveRestState(action.messages);
+      const rest = deriveRestState(resolveActiveBranchMessages(action.conversation, action.messages));
       let nextKeys = state.uiKeyByMsgId;
       if (state.messages.length === action.messages.length) {
         for (let i = 0; i < state.messages.length; i++) {
@@ -748,7 +800,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return {
         ...state,
         messages: state.messages.map((m) =>
-          m.id === action.targetId ? action.message : m,
+          m.id === action.targetId ? action.message : state.conversation?.graphState?.enabled && m.parentId === action.targetId ? { ...m, parentId: action.message.id } : m,
         ),
         uiKeyByMsgId: nextKeys,
       };

@@ -522,6 +522,64 @@ async function badgeContrast(badge: Locator) {
 }
 
 test.describe('MCP End-to-End Integration', () => {
+  test('composer MCP policy reaches forward, browser-direct and retry requests', async ({ page, appUrl }) => {
+    const mock = await startE2EMcpAndLlmServer();
+    try {
+      await apiPost(appUrl, '/api/v1/mcp/servers', {
+        name: 'mcp-http', transport: 'streamable-http', endpoint: mock.baseUrl + '/mcp-http', enabled: true,
+      });
+      for (const localRequest of [false, true]) {
+        const id = localRequest ? 'composer-direct' : 'composer-forward';
+        await apiPost(appUrl, '/api/v1/providers', {
+          id, name: id, adapter: 'generic-http', baseURL: mock.baseUrl, authType: 'bearer', apiKey: 'key',
+          localRequest, enabled: true, models: [{ id, name: id, apiFormat: 'openai-completions' }],
+        });
+      }
+      await connectWithToken(page, appUrl);
+      await expect(page.getByRole('button', { name: '选择搜索引擎' })).toHaveCount(0);
+      for (const [model, route] of [['composer-forward', 'stream'], ['composer-direct', 'prepare-local']]) {
+        await page.getByRole('button', { name: '新建话题' }).click();
+        await page.getByRole('button', { name: '选择模型' }).click();
+        await page.getByRole('option', { name: model }).click();
+        const off = page.getByRole('button', { name: '关闭 MCP 工具' });
+        const on = page.getByRole('button', { name: '开启 MCP 工具' });
+        if (await on.isVisible()) await on.click();
+        await expect(off).toHaveAttribute('aria-pressed', 'true');
+        const waitRequest = () => page.waitForRequest((request) => request.method() === 'POST' && request.url().endsWith('/messages/' + route));
+        const send = async (label: string) => {
+          const expected = mock.llmCalls.length + 1;
+          const request = waitRequest();
+          await page.getByLabel('消息输入框').fill(label);
+          await page.getByRole('button', { name: '发送消息' }).click();
+          const body = (await request).postDataJSON() as { mcpToolsEnabled?: boolean };
+          await expect.poll(() => mock.llmCalls.length).toBe(expected);
+          await expect(page.getByRole('button', { name: '对话缩略图' })).toBeEnabled();
+          return { body, tools: mock.llmCalls.at(-1)?.toolNames ?? [] };
+        };
+        const enabled = await send('MCP enabled');
+        expect(enabled.body.mcpToolsEnabled).toBe(true);
+        expect(enabled.tools.some((name) => name.startsWith('safe_note'))).toBe(true);
+        await off.click();
+        await expect(on).toHaveAttribute('aria-pressed', 'false');
+        const disabled = await send('MCP disabled');
+        expect(disabled.body.mcpToolsEnabled).toBe(false);
+        expect(disabled.tools).toEqual([]);
+        const expected = mock.llmCalls.length + 1;
+        const retry = waitRequest();
+        const lastReply = page.locator('.wb-asst-msg, .wb-feed-msg--asst').last();
+        await lastReply.hover();
+        await lastReply.getByRole('button', { name: '重试消息' }).click();
+        await page.getByRole('dialog').getByRole('button', { name: '重新生成', exact: true }).click();
+        expect((await retry).postDataJSON()).toMatchObject({ mcpToolsEnabled: false, regenerateMessageId: expect.any(String) });
+        await expect.poll(() => mock.llmCalls.length).toBe(expected);
+        expect(mock.llmCalls.at(-1)?.toolNames).toEqual([]);
+        await expect(page.getByRole('button', { name: '对话缩略图' })).toBeEnabled();
+      }
+    } finally {
+      await mock.close();
+    }
+  });
+
   test('probes MCP catalog, executes forward & localRequest multi-round traces safely, respects disable and mobile scroll', async ({
     page,
     appUrl,

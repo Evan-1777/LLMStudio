@@ -150,6 +150,12 @@ test('manages workspace files end-to-end: create, edit, mkdir, rename, move, cop
   await page.getByRole('radio', { name: '工作区文件' }).click();
   await expect(page.getByText('工作区为空')).toBeVisible();
 
+  await page.locator('.ws-empty-actions').getByRole('button', { name: '新建文件夹' }).click();
+  const emptyShortcut = page.getByRole('dialog', { name: '新建文件夹' });
+  await expect(emptyShortcut.getByLabel('文件夹名称')).toBeFocused();
+  await emptyShortcut.getByRole('button', { name: '取消' }).click();
+  await expect(emptyShortcut).toBeHidden();
+
   // 1. Create Markdown file from header -> auto enters edit mode -> write & Ctrl+S save.
   await page.getByRole('button', { name: '新建文件' }).first().click();
   const createFileDialog = page.getByRole('dialog', { name: '新建文件' });
@@ -260,4 +266,125 @@ test('manages workspace files end-to-end: create, edit, mkdir, rename, move, cop
   await expect(page.getByText('工作区为空')).toBeVisible();
   expect(fs.existsSync(path.join(agentWorkspaceDir, 'docs'))).toBe(false);
   expect(fs.existsSync(path.join(agentWorkspaceDir, 'upload.txt'))).toBe(false);
+});
+
+test('hands off workspace menus to dialogs and reveals created and moved entries', async ({
+  page,
+  browser,
+  appUrl,
+  agentWorkspaceDir,
+}) => {
+  fs.mkdirSync(path.join(agentWorkspaceDir, 'docs'));
+  fs.writeFileSync(path.join(agentWorkspaceDir, 'notes.md'), '# Planning');
+  await connectWithToken(page, appUrl);
+  const filesTab = page.getByRole('radio', { name: '工作区文件' });
+  await filesTab.click();
+  const docs = page.getByRole('treeitem', { name: 'docs' });
+
+  await docs.click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '新建文件', exact: true }).click();
+  const createFile = page.getByRole('dialog', { name: '新建文件', exact: true });
+  const fileName = createFile.getByLabel('名称');
+  await expect(fileName).toBeFocused();
+  await fileName.pressSequentially('notes');
+  await fileName.press('Enter');
+  const editor = page.getByLabel('文件内容编辑');
+  await expect(editor).toHaveValue('');
+  await editor.fill('Deployment notes');
+  await page.getByRole('button', { name: '保存', exact: true }).click();
+  await expect.poll(() => fs.readFileSync(path.join(agentWorkspaceDir, 'docs', 'notes'), 'utf8')).toBe('Deployment notes');
+  await page.getByRole('button', { name: '关闭', exact: true }).click();
+
+  const search = page.getByLabel('搜索文件');
+  await search.fill('docs');
+  const results = page.getByRole('list', { name: '文件搜索结果' });
+  await results.getByRole('button', { name: 'docs', exact: true }).hover();
+  await results.getByRole('button', { name: '操作 docs' }).click();
+  await page.getByRole('menuitem', { name: '新建文件夹' }).click();
+  const createDir = page.getByRole('dialog', { name: '新建文件夹' });
+  const folderName = createDir.getByLabel('文件夹名称');
+  await expect(folderName).toBeFocused();
+  await folderName.fill('plans///');
+  await createDir.getByRole('button', { name: '创建', exact: true }).click();
+  await expect(search).toHaveValue('');
+  const plans = page.getByRole('treeitem', { name: 'plans' });
+  await plans.click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '新建文件夹' }).click();
+  await expect(folderName).toBeFocused();
+  await folderName.fill('releases');
+  await folderName.press('Enter');
+  await expect(page.getByRole('treeitem', { name: 'releases' })).toBeVisible();
+
+  const scroll = page.locator('.ws-tree-scroll');
+  const scrollHeight = await scroll.evaluate((el) => el.clientHeight);
+  await scroll.click({ button: 'right', position: { x: 24, y: scrollHeight - 12 } });
+  const menu = page.getByRole('menu');
+  await expect(menu.getByRole('menuitem')).toHaveText(['新建文件', '新建文件夹', '上传文件', '刷新']);
+  await menu.getByRole('menuitem', { name: '新建文件夹' }).click();
+  await expect(folderName).toBeFocused();
+  await folderName.fill('exports');
+  await folderName.press('Enter');
+  await expect(page.getByRole('treeitem', { name: 'exports' })).toBeVisible();
+
+  const header = page.locator('.ws-history-head');
+  await header.getByRole('button', { name: '新建文件', exact: true }).click();
+  await expect(fileName).toBeFocused();
+  await createFile.getByRole('button', { name: '取消' }).click();
+  await page.getByRole('radio', { name: '话题', exact: true }).click();
+  await filesTab.click();
+  await expect(header.getByRole('button', { name: '新建文件', exact: true })).toBeEnabled();
+  await expect(createFile).toHaveCount(0);
+
+  await docs.click();
+  await expect(page.getByRole('treeitem', { name: 'notes', exact: true })).toBeVisible();
+  await plans.click();
+  await expect(page.getByRole('treeitem', { name: 'releases' })).toBeVisible();
+  await docs.click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '移动' }).click();
+  const move = page.getByRole('dialog', { name: '移动「docs」' });
+  await move.getByRole('listitem', { name: 'exports' }).click();
+  await move.getByRole('button', { name: '新建文件夹' }).click();
+  const targetName = move.getByRole('textbox', { name: '文件夹名称' });
+  await expect(targetName).toBeFocused();
+  await targetName.fill('archive/');
+  await targetName.press('Enter');
+  await expect(move.getByRole('navigation')).toContainText('archive');
+  await move.getByRole('button', { name: '移至此处' }).click();
+  await expect(page.getByRole('treeitem', { name: 'notes', exact: true })).toHaveAttribute('title', 'exports/archive/docs/notes');
+  await expect(page.getByRole('treeitem', { name: 'releases' })).toHaveAttribute('title', 'exports/archive/docs/plans/releases');
+
+  await header.getByRole('button', { name: '管理文件' }).click();
+  const markdown = page.getByRole('treeitem', { name: 'notes.md' });
+  await markdown.click({ button: 'right' });
+  await expect(menu).toHaveCount(0);
+  await page.getByRole('checkbox', { name: '选择 notes.md' }).check();
+  await page.getByRole('button', { name: '批量移动' }).click();
+  const batch = page.getByRole('dialog', { name: '移动「1 项」' });
+  await batch.getByRole('listitem', { name: 'exports' }).click();
+  await batch.getByRole('button', { name: '移至此处' }).click();
+  await expect(batch).toBeHidden();
+  await page.getByRole('button', { name: '退出管理' }).first().click();
+  await expect(markdown).toHaveAttribute('title', 'exports/notes.md');
+  await markdown.click();
+  await page.getByRole('radio', { name: '编辑' }).click();
+  await expect(editor).toHaveValue('# Planning');
+
+  const touchContext = await browser.newContext({ hasTouch: true, viewport: { width: 375, height: 800 } });
+  try {
+    const touchPage = await touchContext.newPage();
+    await connectWithToken(touchPage, appUrl);
+    expect(await touchPage.evaluate(() => matchMedia('(pointer: coarse)').matches)).toBe(true);
+    await touchPage.getByRole('button', { name: '切换话题栏' }).tap();
+    await touchPage.getByRole('radio', { name: '工作区文件' }).tap();
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await touchPage.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
+      for (const selector of ['.ws-history-head', '.ws-toolbar']) {
+        const region = touchPage.locator(selector);
+        await expect(region).toBeVisible();
+        expect(await region.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+      }
+    }
+  } finally {
+    await touchContext.close();
+  }
 });

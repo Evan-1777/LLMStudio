@@ -95,6 +95,20 @@ func (h *ConversationHandler) Patch(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *ConversationHandler) MutateGraph(w http.ResponseWriter, r *http.Request) {
+	var in service.GraphMutationInput
+	if err := decodeJSONBody(r, &in); err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	detail, err := h.svc.MutateGraph(r.Context(), r.PathValue("id"), in)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, detail)
+}
+
 func (h *ConversationHandler) Delete(w http.ResponseWriter, r *http.Request) {
 	if err := h.svc.Delete(r.Context(), r.PathValue("id")); err != nil {
 		writeServiceError(w, err)

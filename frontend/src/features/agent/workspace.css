@@ -117,6 +117,13 @@
   flex-direction: column;
 }
 
+.ws-root-menu-anchor {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+
 .ws-tree,
 .ws-search-results {
   display: flex;
@@ -239,6 +246,26 @@
 }
 
 @media (pointer: coarse) {
+  .wb-history__head.ws-history-head {
+    gap: 4px;
+    padding-inline: 8px;
+  }
+
+  .ws-history-head .ui-segmented__item {
+    min-width: 34px;
+    padding-inline: 6px;
+  }
+
+  .ws-history-head .ui-icon-btn--sm,
+  .ws-toolbar .ui-icon-btn--sm {
+    width: 36px;
+    min-width: 36px;
+    height: 36px;
+    min-height: 36px;
+  }
+
+  .ws-toolbar { gap: 4px; }
+
   .ws-tree-row__actions {
     opacity: 1;
   }
@@ -380,6 +407,19 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.ws-move-picker__head,
+.ws-move-picker__create {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ws-move-picker__head .ws-breadcrumb,
+.ws-move-picker__create input {
+  flex: 1;
+  min-width: 0;
 }
 
 .ws-breadcrumb {
@@ -697,11 +737,6 @@
 
   .ws-viewer__actions .ui-segmented__item {
     padding: 4px 6px;
-  }
-
-  .ws-toolbar .ui-icon-btn--sm {
-    min-width: 30px;
-    min-height: 30px;
   }
 
   .ws-tree-item .ws-tree-row__actions .ui-icon-btn--sm {

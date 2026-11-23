@@ -294,6 +294,11 @@ func (r *cloudChatRepo) recordDetail(detail service.ConversationDetail) {
 func (r *cloudChatRepo) invalidateConversation(convID string) {
 	r.mu.Lock()
 	delete(r.convMsgs, convID)
+	for id, m := range r.msgsByID {
+		if m.ConversationID == convID {
+			delete(r.msgsByID, id)
+		}
+	}
 	r.mu.Unlock()
 }
 
@@ -363,7 +368,7 @@ func (r *cloudChatRepo) InsertAfter(ctx context.Context, conversationID, afterMe
 }
 
 func (r *cloudChatRepo) createMessage(ctx context.Context, convID string, m domain.Message, replaceID, afterID string) (domain.Message, error) {
-	res, err := r.cloud.CreateMessage(ctx, convID, service.CreateMessageInput{
+	in := service.CreateMessageInput{
 		Role:             m.Role,
 		Blocks:           m.Blocks,
 		ProviderID:       m.ProviderID,
@@ -373,7 +378,11 @@ func (r *cloudChatRepo) createMessage(ctx context.Context, convID string, m doma
 		ErrorMessage:     m.ErrorMessage,
 		ReplaceMessageID: replaceID,
 		AfterMessageID:   afterID,
-	})
+	}
+	if m.GraphWrite != nil {
+		in.ParentID, in.ConsumeBranchID = m.GraphWrite.ParentID, m.GraphWrite.ConsumeBranchID
+	}
+	res, err := r.cloud.CreateMessage(ctx, convID, in)
 	if err != nil {
 		return domain.Message{}, err
 	}

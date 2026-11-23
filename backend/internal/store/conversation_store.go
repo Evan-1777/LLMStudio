@@ -25,7 +25,7 @@ func NewConversationStore(db *sql.DB) *ConversationStore {
 const conversationSelectCols = `
 	c.id, c.assistant_id, c.title, c.provider_id, c.model_id, c.system_prompt, c.params_json,
 	c.sync_enabled, c.sync_state, c.sync_version, c.last_synced_at, c.created_at, c.updated_at,
-	c.group_id, c.pinned, c.sort_order, c.ephemeral, c.mode
+	c.group_id, c.pinned, c.sort_order, c.ephemeral, c.mode, c.active_leaf_id, c.graph_state_json
 `
 
 const conversationOrderByClause = `
@@ -131,6 +131,10 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("encode conversation params: %w", err)
 	}
+	graphJSON, err := json.Marshal(c.GraphState)
+	if err != nil {
+		return domain.Conversation{}, err
+	}
 	var lastSynced sql.NullString
 	if c.LastSyncedAt != nil {
 		lastSynced = sql.NullString{String: formatTime(*c.LastSyncedAt), Valid: true}
@@ -157,11 +161,11 @@ func (s *ConversationStore) Create(ctx context.Context, c domain.Conversation) (
 		INSERT INTO conversations (
 			id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
 			sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at,
-			group_id, pinned, sort_order, ephemeral, mode
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			group_id, pinned, sort_order, ephemeral, mode, active_leaf_id, graph_state_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, c.ID, c.AssistantID, c.Title, c.ProviderID, c.ModelID, c.SystemPrompt, string(paramsBytes),
 		boolToInt(c.SyncEnabled), c.SyncState, c.SyncVersion, lastSynced, formatTime(c.CreatedAt), formatTime(c.UpdatedAt),
-		groupID, boolToInt(c.Pinned), c.SortOrder, boolToInt(c.Ephemeral), c.Mode)
+		groupID, boolToInt(c.Pinned), c.SortOrder, boolToInt(c.Ephemeral), c.Mode, c.ActiveLeafID, string(graphJSON))
 	if err != nil {
 		return domain.Conversation{}, fmt.Errorf("create conversation: %w", err)
 	}
@@ -233,6 +237,10 @@ func (s *ConversationStore) ImportConversation(
 		return domain.Conversation{}, nil, fmt.Errorf("encode conversation params: %w", err)
 	}
 
+	graphJSON, err := json.Marshal(conv.GraphState)
+	if err != nil {
+		return domain.Conversation{}, nil, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.Conversation{}, nil, fmt.Errorf("begin import conversation tx: %w", err)
@@ -296,11 +304,11 @@ func (s *ConversationStore) ImportConversation(
 			UPDATE conversations
 			SET assistant_id = ?, title = ?, provider_id = ?, model_id = ?, system_prompt = ?, params_json = ?,
 				sync_enabled = ?, sync_state = ?, sync_version = ?, last_synced_at = ?,
-				created_at = ?, updated_at = ?, group_id = ?, pinned = ?, ephemeral = 0, mode = ?
+				created_at = ?, updated_at = ?, group_id = ?, pinned = ?, ephemeral = 0, mode = ?, active_leaf_id = ?, graph_state_json = ?
 			WHERE id = ?
 		`, conv.AssistantID, conv.Title, conv.ProviderID, conv.ModelID, conv.SystemPrompt, string(paramsBytes),
 			boolToInt(conv.SyncEnabled), domain.SyncStateSynced, syncVersion, formatTime(syncTime),
-			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), conv.Mode, conv.ID); err != nil {
+			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), conv.Mode, conv.ActiveLeafID, string(graphJSON), conv.ID); err != nil {
 			return domain.Conversation{}, nil, fmt.Errorf("update imported conversation %s: %w", conv.ID, err)
 		}
 	} else {
@@ -312,11 +320,11 @@ func (s *ConversationStore) ImportConversation(
 			INSERT INTO conversations (
 				id, assistant_id, title, provider_id, model_id, system_prompt, params_json,
 				sync_enabled, sync_state, sync_version, last_synced_at, created_at, updated_at,
-				group_id, pinned, sort_order, ephemeral, mode
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+				group_id, pinned, sort_order, ephemeral, mode, active_leaf_id, graph_state_json
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
 		`, conv.ID, conv.AssistantID, conv.Title, conv.ProviderID, conv.ModelID, conv.SystemPrompt, string(paramsBytes),
 			boolToInt(conv.SyncEnabled), domain.SyncStateSynced, syncVersion, formatTime(syncTime),
-			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), nextHead, conv.Mode); err != nil {
+			formatTime(conv.CreatedAt), formatTime(conv.UpdatedAt), groupArg, boolToInt(conv.Pinned), nextHead, conv.Mode, conv.ActiveLeafID, string(graphJSON)); err != nil {
 			return domain.Conversation{}, nil, fmt.Errorf("insert imported conversation %s: %w", conv.ID, err)
 		}
 	}
@@ -331,15 +339,8 @@ func (s *ConversationStore) ImportConversation(
 		if m.CreatedAt.IsZero() {
 			m.CreatedAt = conv.CreatedAt.Add(time.Duration(i) * time.Microsecond)
 		}
-		blocksJSON, usageJSON, err := encodeMessagePayloads(m.Blocks, m.Usage)
-		if err != nil {
-			return domain.Conversation{}, nil, err
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO messages (
-				id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, m.ID, conv.ID, m.Role, blocksJSON, m.ProviderID, m.ModelID, usageJSON, m.StopReason, m.ErrorMessage, formatTime(m.CreatedAt)); err != nil {
+		m.ConversationID = conv.ID
+		if err := insertMessage(ctx, tx, m); err != nil {
 			return domain.Conversation{}, nil, fmt.Errorf("insert imported message %s: %w", m.ID, err)
 		}
 	}
@@ -360,7 +361,7 @@ func (s *ConversationStore) ImportConversation(
 }
 
 // Update persists mutable conversation settings including the reserved sync_enabled flag,
-// intentionally leaving sync_state and sync_version untouched until remote sync is implemented.
+// It leaves sync bookkeeping and graph state to their dedicated write paths.
 func (s *ConversationStore) Update(ctx context.Context, c domain.Conversation) (domain.Conversation, error) {
 	c.UpdatedAt = time.Now().UTC()
 	domain.NewConversationDefaults(&c)
@@ -437,6 +438,7 @@ func scanConversation(row rowScanner) (domain.Conversation, error) {
 	var (
 		c            domain.Conversation
 		paramsJSON   string
+		graphJSON    string
 		syncEnabled  int
 		lastSynced   sql.NullString
 		createdRaw   string
@@ -448,7 +450,7 @@ func scanConversation(row rowScanner) (domain.Conversation, error) {
 	if err := row.Scan(
 		&c.ID, &c.AssistantID, &c.Title, &c.ProviderID, &c.ModelID, &c.SystemPrompt, &paramsJSON,
 		&syncEnabled, &c.SyncState, &c.SyncVersion, &lastSynced, &createdRaw, &updatedRaw,
-		&groupID, &pinnedInt, &c.SortOrder, &ephemeralInt, &c.Mode,
+		&groupID, &pinnedInt, &c.SortOrder, &ephemeralInt, &c.Mode, &c.ActiveLeafID, &graphJSON,
 	); err != nil {
 		return domain.Conversation{}, err
 	}
@@ -463,6 +465,11 @@ func scanConversation(row rowScanner) (domain.Conversation, error) {
 	if paramsJSON != "" && paramsJSON != "{}" {
 		if err := json.Unmarshal([]byte(paramsJSON), &c.Params); err != nil {
 			return domain.Conversation{}, fmt.Errorf("decode conversation params: %w", err)
+		}
+	}
+	if graphJSON != "{}" {
+		if err := json.Unmarshal([]byte(graphJSON), &c.GraphState); err != nil {
+			return domain.Conversation{}, fmt.Errorf("decode conversation graph state: %w", err)
 		}
 	}
 	if lastSynced.Valid && lastSynced.String != "" {

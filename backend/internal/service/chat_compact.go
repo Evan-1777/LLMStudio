@@ -314,6 +314,40 @@ func selectCompactionPlan(history []domain.Message) (compactionPlan, error) {
 	return plan, nil
 }
 
+// A shared successor cannot be reparented without changing another branch. In
+// that case summarize the whole active path and append the checkpoint instead.
+func selectCompactionPlanForBranch(conv domain.Conversation, all, history []domain.Message) (compactionPlan, error) {
+	plan, err := selectCompactionPlan(history)
+	if err != nil || !graphEnabled(conv) || plan.insertAfterMessageID == "" {
+		return plan, err
+	}
+	suffix := make(map[string]bool, len(plan.keptMessages))
+	for _, m := range plan.keptMessages {
+		suffix[m.ID] = true
+	}
+	shared := conv.GraphState.ActiveBranchID != ""
+	for _, m := range all {
+		if suffix[m.ParentID] && !suffix[m.ID] {
+			shared = true
+			break
+		}
+	}
+	for _, slot := range conv.GraphState.Branches {
+		if suffix[slot.ParentMessageID] {
+			shared = true
+			break
+		}
+	}
+	if shared {
+		plan.insertAfterMessageID = ""
+		plan.compactedSpan = history[plan.activeStart:]
+		plan.promptMessages = projectModelHistory(plan.compactedSpan)
+		plan.compactedCount += plan.keptCount
+		plan.keptCount, plan.keptMessages = 0, nil
+	}
+	return plan, nil
+}
+
 func buildCompactionChatInput(up conversationUpstreamContext, promptMessages []domain.Message) plugin.ChatInput {
 	msgs := make([]domain.Message, len(promptMessages)+1)
 	copy(msgs, promptMessages)
@@ -354,7 +388,9 @@ func (s *ChatService) prepareCompactionUpstream(ctx context.Context, in CompactC
 	if err != nil {
 		return preparedCompactionUpstream{}, err
 	}
-	plan, err := selectCompactionPlan(history)
+	all := history
+	history = resolveActiveBranchPath(up.conversation, all)
+	plan, err := selectCompactionPlanForBranch(up.conversation, all, history)
 	if err != nil {
 		return preparedCompactionUpstream{}, err
 	}
@@ -461,6 +497,9 @@ func (s *ChatService) Compact(ctx context.Context, in CompactConversationInput) 
 		CreatedAt:  time.Now().UTC(),
 	}
 
+	if graphEnabled(prep.up.conversation) && prep.plan.insertAfterMessageID == "" {
+		checkpoint.GraphWrite = &domain.MessageGraphWrite{ParentID: &prep.plan.snapshotLastMessageID, ConsumeBranchID: prep.up.conversation.GraphState.ActiveBranchID}
+	}
 	var saved domain.Message
 	if prep.plan.insertAfterMessageID != "" {
 		saved, err = s.msgs.InsertAfter(ctx, prep.up.conversation.ID, prep.plan.insertAfterMessageID, checkpoint)

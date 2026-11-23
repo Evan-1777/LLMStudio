@@ -73,6 +73,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("POST /api/v1/conversations/reorder", ch.Reorder)
 		mux.HandleFunc("GET /api/v1/conversations/{id}", ch.GetDetail)
 		mux.HandleFunc("PATCH /api/v1/conversations/{id}", ch.Patch)
+		mux.HandleFunc("PATCH /api/v1/conversations/{id}/graph", ch.MutateGraph)
 		mux.HandleFunc("DELETE /api/v1/conversations/{id}", ch.Delete)
 		mux.HandleFunc("POST /api/v1/conversations/{id}/messages", ch.CreateMessage)
 		mux.HandleFunc("PATCH /api/v1/conversations/{id}/messages/{messageId}", ch.UpdateMessage)

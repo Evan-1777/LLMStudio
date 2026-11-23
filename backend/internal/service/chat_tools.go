@@ -175,12 +175,12 @@ func discoverToolsConcurrent(ctx context.Context, mcpClient plugin.MCPClientBoun
 	return results
 }
 
-func (s *ChatService) discoverActiveTools(ctx context.Context, builtinTimeEnabled bool, topicID string, native []plugin.ChatTool) ([]plugin.ChatTool, map[string]mcpToolBinding, error) {
+func (s *ChatService) discoverActiveTools(ctx context.Context, builtinTimeEnabled bool, topicID string, native []plugin.ChatTool, mcpEnabled bool) ([]plugin.ChatTool, map[string]mcpToolBinding, error) {
 	usedAliases := make(map[string]struct{})
 	var tools []plugin.ChatTool
 	var bindings map[string]mcpToolBinding
 
-	if builtinTimeEnabled {
+	if mcpEnabled && builtinTimeEnabled {
 		usedAliases[BuiltinTimeToolName] = struct{}{}
 		bindings = map[string]mcpToolBinding{
 			BuiltinTimeToolName: {
@@ -201,7 +201,7 @@ func (s *ChatService) discoverActiveTools(ctx context.Context, builtinTimeEnable
 		tools = append(tools, t)
 	}
 
-	if s.mcpStore == nil || s.mcpClient == nil {
+	if !mcpEnabled || s.mcpStore == nil || s.mcpClient == nil {
 		return tools, bindings, nil
 	}
 	entries, _, err := listNormalizedScopedServers(ctx, s.mcpStore)

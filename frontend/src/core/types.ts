@@ -272,7 +272,44 @@ export interface TokenUsage {
 
 export type StopReason = 'stop' | 'length' | 'toolUse' | 'aborted' | 'error' | '';
 
+export interface MessageGraphMeta {
+  collapsed?: boolean;
+  summary?: string;
+  x?: number;
+  y?: number;
+}
+
+export interface ConversationBranchSlot {
+  id: string;
+  label: string;
+  parentMessageId?: string;
+  x?: number;
+  y?: number;
+  createdAt: string;
+}
+
+export interface ConversationGraphState {
+  enabled: boolean;
+  activeBranchId?: string;
+  branches?: ConversationBranchSlot[];
+}
+
+export type GraphPosition = { x: number; y: number } & (
+  { messageId: string; branchId?: never } | { branchId: string; messageId?: never }
+);
+
+export type GraphMutationInput =
+  | { op: 'reparent'; messageId: string; parentId: string }
+  | { op: 'setNodeMeta'; messageId: string; graphMeta: MessageGraphMeta }
+  | { op: 'setNodeMeta'; positions: GraphPosition[] }
+  | { op: 'createBranch'; parentMessageId: string; x: number; y: number; activate?: boolean }
+  | { op: 'deleteBranch'; branchId: string }
+  | { op: 'activateBranch'; branchId: string }
+  | { op: 'activateBranch'; leafMessageId: string };
+
 export interface Message {
+  parentId?: string;
+  graphMeta?: MessageGraphMeta;
   id: string;
   conversationId: string;
   role: 'user' | 'assistant' | 'toolResult' | 'compaction' | string;
@@ -451,6 +488,8 @@ export interface WorkspaceBatchResult {
 export type ConversationMode = 'chat' | 'agent';
 
 export interface Conversation {
+  activeLeafId?: string;
+  graphState?: ConversationGraphState;
   mode?: ConversationMode;
   id: string;
   assistantId: string;
@@ -735,6 +774,7 @@ export interface StreamChatInput {
   regenerateMessageId?: string;
   webSearch?: boolean;
   searchEngineId?: string;
+  mcpToolsEnabled?: boolean;
   localContinuation?: LocalContinuationInput;
   preparedSearch?: PreparedSearchInput;
   cacheState?: PromptCacheState;
@@ -745,6 +785,8 @@ export interface StreamChatInput {
 }
 
 export interface CreateMessageInput {
+  parentId?: string;
+  consumeBranchId?: string;
   role: 'user' | 'assistant' | 'toolResult' | 'compaction';
   blocks: ContentBlock[];
   providerId?: string;
@@ -805,6 +847,8 @@ export interface PreparedLocalCacheStep {
 }
 
 export interface PreparedLocalRequest {
+  parentId?: string;
+  consumeBranchId?: string;
   method: string;
   url: string;
   headers: Record<string, string>;

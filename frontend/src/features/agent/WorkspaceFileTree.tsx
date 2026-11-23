@@ -7,6 +7,7 @@ import {
   type ChangeEvent,
   type DragEvent,
 } from 'react';
+import { createPortal } from 'react-dom';
 import { useApp } from '../../app/AppProvider';
 import {
   ConfirmDialog,
@@ -32,6 +33,7 @@ import {
   WorkspaceNameDialog,
   parentDirOf,
   triggerBlobDownload,
+  useWorkspaceMenuDialog,
   type WorkspaceNameDialogMode,
 } from './WorkspaceDialogs';
 import './workspace.css';
@@ -51,10 +53,7 @@ interface VisibleNode {
   truncated: boolean;
 }
 
-export interface WorkspaceCreateTrigger {
-  kind: 'file' | 'dir';
-  seq: number;
-}
+export type WorkspaceCreateTrigger = 'file' | 'dir';
 
 export interface WorkspaceDirsRefreshTrigger {
   dirs: string[];
@@ -115,8 +114,10 @@ export function WorkspaceFileTree({
   selectedPath,
   manageMode,
   createTrigger,
+  onCreateTriggerConsumed,
   dirsRefreshTrigger,
   onManageModeChange,
+  onAvailabilityChange,
   onSelectEntry,
   onEntryMoved,
   onEntriesDeleted,
@@ -129,13 +130,16 @@ export function WorkspaceFileTree({
   selectedPath: string | null;
   manageMode: boolean;
   createTrigger?: WorkspaceCreateTrigger | null;
+  onCreateTriggerConsumed?: () => void;
   dirsRefreshTrigger?: WorkspaceDirsRefreshTrigger | null;
   onManageModeChange: (next: boolean) => void;
+  onAvailabilityChange?: (canMutate: boolean) => void;
   onSelectEntry: (entry: WorkspaceEntry, initialMode?: 'preview' | 'edit') => void;
   onEntryMoved?: (oldPath: string, nextEntry: WorkspaceEntry) => void;
   onEntriesDeleted?: (deletedPaths: string[]) => void;
 }) {
   const { toast } = useApp();
+  const { openAfterMenu, onCloseAutoFocus } = useWorkspaceMenuDialog();
   const cloudOffline = isDesktop && scope === 'cloud' && cloudConnectionState !== 'connected';
 
   const [dirMap, setDirMap] = useState<Record<string, DirState>>({});
@@ -153,6 +157,7 @@ export function WorkspaceFileTree({
   // Selection & row menu state
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
   const [openMenuPath, setOpenMenuPath] = useState<string | null>(null);
+  const [rootMenuPoint, setRootMenuPoint] = useState<{ x: number; y: number } | null>(null);
 
   // Dialogs state
   const [nameDialog, setNameDialog] = useState<{
@@ -201,6 +206,16 @@ export function WorkspaceFileTree({
   const dirMapRef = useRef(dirMap);
   dirMapRef.current = dirMap;
 
+  const rootState = dirMap['.'];
+  const rootLoading = loadingDirs.has('.');
+  const rootError = dirErrors['.'];
+  const canMutate = Boolean(!cloudOffline && rootState && !rootLoading && !rootUnconfigured && !rootError);
+
+  useEffect(() => {
+    onAvailabilityChange?.(canMutate);
+    return () => onAvailabilityChange?.(false);
+  }, [canMutate, onAvailabilityChange]);
+
   const trimmedSearch = searchQuery.trim();
   const isSearching = trimmedSearch.length > 0;
 
@@ -246,6 +261,7 @@ export function WorkspaceFileTree({
           ...prev,
           [key]: { entries: res.entries ?? [], truncated: Boolean(res.truncated) },
         }));
+        return res.entries ?? [];
       } catch (err) {
         if (ctrl.signal.aborted) return;
         if (key === '.' && isWorkspaceUnsetError(err)) {
@@ -296,10 +312,11 @@ export function WorkspaceFileTree({
   const refreshDirs = useCallback(
     async (dirs: string[]) => {
       const unique = Array.from(new Set(dirs.map((d) => d || '.')));
-      await Promise.all(unique.map((d) => loadDir(d)));
+      const entries = await Promise.all(unique.map((d) => loadDir(d)));
       if (trimmedSearch) {
         void runSearch(trimmedSearch);
       }
+      return new Map(unique.map((dir, index) => [dir, entries[index]]));
     },
     [loadDir, runSearch, trimmedSearch],
   );
@@ -340,25 +357,26 @@ export function WorkspaceFileTree({
 
   // Clear selection when exiting manage mode.
   useEffect(() => {
-    if (!manageMode) {
+    if (manageMode) {
+      setOpenMenuPath(null);
+    } else {
       setSelectedPaths(new Set());
     }
   }, [manageMode]);
 
   // Header create trigger from ConversationSidebar.
-  const lastCreateSeqRef = useRef(0);
   useEffect(() => {
-    if (!createTrigger || createTrigger.seq === lastCreateSeqRef.current) return;
-    lastCreateSeqRef.current = createTrigger.seq;
-    if (cloudOffline) return;
+    if (!createTrigger) return;
+    onCreateTriggerConsumed?.();
+    if (!canMutate) return;
     setNameDialogError(null);
     setNameDialog({
-      mode: createTrigger.kind === 'file' ? 'create-file' : 'create-dir',
+      mode: createTrigger === 'file' ? 'create-file' : 'create-dir',
       parentDir: '',
       initialName: '',
-      entryKind: createTrigger.kind,
+      entryKind: createTrigger,
     });
-  }, [cloudOffline, createTrigger]);
+  }, [canMutate, createTrigger, onCreateTriggerConsumed]);
 
   // External targeted directory refresh (e.g. from WorkspaceFileViewer save/rename/delete).
   const lastDirsRefreshSeqRef = useRef(0);
@@ -502,23 +520,26 @@ export function WorkspaceFileTree({
 
   const migrateDirCachesOnRename = (oldPath: string, newPath: string) => {
     const oldPrefix = `${oldPath}/`;
-    setExpandedDirs((prev) => {
-      const next = new Set<string>();
-      for (const p of prev) {
-        if (p === oldPath) next.add(newPath);
-        else if (p.startsWith(oldPrefix)) next.add(`${newPath}/${p.slice(oldPrefix.length)}`);
-        else next.add(p);
-      }
-      return next;
-    });
+    const isMigrated = (p: string) => p === oldPath || p.startsWith(oldPrefix);
+    const remap = (p: string) => newPath + p.slice(oldPath.length);
+    const refreshPaths = [...expandedRef.current].filter(isMigrated).map(remap);
+    setExpandedDirs((prev) => new Set([...prev].map((p) => isMigrated(p) ? remap(p) : p)));
     setDirMap((prev) => {
       const next: Record<string, DirState> = {};
       for (const [k, v] of Object.entries(prev)) {
-        if (k === oldPath || k.startsWith(oldPrefix)) continue;
+        if (isMigrated(k)) continue;
         next[k] = v;
       }
       return next;
     });
+    for (const [key, ctrl] of controllersRef.current) {
+      if (!isMigrated(key)) continue;
+      ctrl.abort();
+      controllersRef.current.delete(key);
+    }
+    setLoadingDirs((prev) => new Set([...prev].filter((p) => !isMigrated(p))));
+    setDirErrors((prev) => Object.fromEntries(Object.entries(prev).filter(([p]) => !isMigrated(p))));
+    return refreshPaths;
   };
 
   const pruneDirCachesOnDelete = (deletedPaths: string[]) => {
@@ -569,6 +590,14 @@ export function WorkspaceFileTree({
     });
   };
 
+  const revealCreatedEntry = async (entry: WorkspaceEntry) => {
+    setSearchQuery('');
+    const parent = parentDirOf(entry.path);
+    const ancestors = parent ? ancestorDirsOf(parent) : [];
+    setExpandedDirs((prev) => new Set([...prev, ...ancestors]));
+    await Promise.all(['.', ...ancestors].map(loadDir));
+  };
+
   const handleNameDialogSubmit = async (resolvedPath: string) => {
     if (!nameDialog) return;
     setNameDialogBusy(true);
@@ -576,16 +605,7 @@ export function WorkspaceFileTree({
     try {
       if (nameDialog.mode === 'create-file') {
         const created = await gateway.createWorkspaceFile({ path: resolvedPath, content: '' }, scope);
-        const parent = parentDirOf(created.path);
-        const ancestors = parent ? ancestorDirsOf(parent) : [];
-        if (ancestors.length > 0) {
-          setExpandedDirs((prev) => {
-            const next = new Set(prev);
-            for (const a of ancestors) next.add(a);
-            return next;
-          });
-        }
-        await refreshDirs(['.', ...ancestors]);
+        await revealCreatedEntry(created);
         setNameDialog(null);
         toast('已创建文件');
         if (created.editable) {
@@ -593,16 +613,7 @@ export function WorkspaceFileTree({
         }
       } else if (nameDialog.mode === 'create-dir') {
         const created = await gateway.createWorkspaceDir(resolvedPath, scope);
-        const parent = parentDirOf(created.path);
-        const ancestors = parent ? ancestorDirsOf(parent) : [];
-        if (ancestors.length > 0) {
-          setExpandedDirs((prev) => {
-            const next = new Set(prev);
-            for (const a of ancestors) next.add(a);
-            return next;
-          });
-        }
-        await refreshDirs(['.', ...ancestors]);
+        await revealCreatedEntry(created);
         setNameDialog(null);
         toast('已创建文件夹');
       } else if (nameDialog.targetPath) {
@@ -610,10 +621,8 @@ export function WorkspaceFileTree({
           { fromPath: nameDialog.targetPath, toPath: resolvedPath },
           scope,
         );
-        if (nameDialog.entryKind === 'dir') {
-          migrateDirCachesOnRename(nameDialog.targetPath, moved.path);
-        }
-        await refreshDirs([parentDirOf(nameDialog.targetPath), parentDirOf(moved.path)]);
+        const expanded = moved.kind === 'dir' ? migrateDirCachesOnRename(nameDialog.targetPath, moved.path) : [];
+        await refreshDirs([parentDirOf(nameDialog.targetPath), parentDirOf(moved.path), ...expanded]);
         onEntryMoved?.(nameDialog.targetPath, moved);
         setNameDialog(null);
         toast('已重命名');
@@ -677,10 +686,10 @@ export function WorkspaceFileTree({
         const base = fromPath.split('/').pop() || fromPath;
         const toPath = targetDir ? `${targetDir}/${base}` : base;
         const moved = await gateway.moveWorkspaceEntry({ fromPath, toPath }, scope);
-        if (moved.kind === 'dir') {
-          migrateDirCachesOnRename(fromPath, moved.path);
-        }
-        await refreshDirs([parentDirOf(fromPath), targetDir]);
+        const expanded = moved.kind === 'dir' ? migrateDirCachesOnRename(fromPath, moved.path) : [];
+        const ancestors = expanded.length > 0 && targetDir ? ancestorDirsOf(targetDir) : [];
+        if (ancestors.length > 0) setExpandedDirs((prev) => new Set([...prev, ...ancestors]));
+        await refreshDirs([parentDirOf(fromPath), targetDir, ...ancestors, ...expanded]);
         onEntryMoved?.(fromPath, moved);
         setMoveDialog(null);
         toast('已移动');
@@ -690,21 +699,20 @@ export function WorkspaceFileTree({
           scope,
         );
         const affectedParents = new Set<string>([targetDir || '.']);
-        for (const p of res.succeeded) {
-          affectedParents.add(parentDirOf(p) || '.');
-          const base = p.split('/').pop() || p;
+        const movedPaths = res.succeeded.map((oldPath) => {
+          affectedParents.add(parentDirOf(oldPath) || '.');
+          const base = oldPath.split('/').pop() || oldPath;
           const nextPath = targetDir ? `${targetDir}/${base}` : base;
-          migrateDirCachesOnRename(p, nextPath);
-          onEntryMoved?.(p, {
-            name: base,
-            path: nextPath,
-            kind: 'file',
-            size: 0,
-            modTime: new Date().toISOString(),
-            editable: false,
-          });
+          for (const path of migrateDirCachesOnRename(oldPath, nextPath)) affectedParents.add(path);
+          return { oldPath, nextPath };
+        });
+        const refreshed = await refreshDirs([...affectedParents]);
+        const destination = refreshed.get(targetDir || '.');
+        for (const { oldPath, nextPath } of movedPaths) {
+          if (selectedPath !== oldPath && !selectedPath?.startsWith(`${oldPath}/`)) continue;
+          const entry = destination?.find((item) => item.path === nextPath);
+          if (entry) onEntryMoved?.(oldPath, entry);
         }
-        await refreshDirs(Array.from(affectedParents));
         setSelectedPaths(new Set());
         setMoveDialog(null);
         if (res.failed.length > 0) {
@@ -882,6 +890,8 @@ export function WorkspaceFileTree({
       >
         <Dropdown
           align="end"
+          modal={false}
+          onCloseAutoFocus={onCloseAutoFocus}
           open={isOpen}
           onOpenChange={(next) => setOpenMenuPath(next ? entry.path : null)}
           trigger={
@@ -894,11 +904,11 @@ export function WorkspaceFileTree({
         >
           {isDir ? (
             <>
-              <DropdownItem onSelect={() => openCreateDialog('file', entry.path)}>
+              <DropdownItem onSelect={() => openAfterMenu(() => openCreateDialog('file', entry.path))}>
                 <Icon name="filePlus" size={14} />
                 <span>新建文件</span>
               </DropdownItem>
-              <DropdownItem onSelect={() => openCreateDialog('dir', entry.path)}>
+              <DropdownItem onSelect={() => openAfterMenu(() => openCreateDialog('dir', entry.path))}>
                 <Icon name="folderPlus" size={14} />
                 <span>新建文件夹</span>
               </DropdownItem>
@@ -914,15 +924,15 @@ export function WorkspaceFileTree({
               <span>下载</span>
             </DropdownItem>
           )}
-          <DropdownItem onSelect={() => openRenameDialog(entry)}>
+          <DropdownItem onSelect={() => openAfterMenu(() => openRenameDialog(entry))}>
             <Icon name="edit" size={14} />
             <span>重命名</span>
           </DropdownItem>
           <DropdownItem
-            onSelect={() => {
+            onSelect={() => openAfterMenu(() => {
               setMoveDialogError(null);
               setMoveDialog({ paths: [entry.path], label: entry.name, batch: false });
-            }}
+            })}
           >
             <Icon name="folderInput" size={14} />
             <span>移动</span>
@@ -938,13 +948,11 @@ export function WorkspaceFileTree({
           <DropdownSeparator />
           <DropdownItem
             danger
-            onSelect={() =>
-              setDeleteConfirm({
-                paths: [entry.path],
-                label: entry.name,
-                isDir,
-              })
-            }
+            onSelect={() => openAfterMenu(() => setDeleteConfirm({
+              paths: [entry.path],
+              label: entry.name,
+              isDir,
+            }))}
           >
             <Icon name="trash" size={14} />
             <span>删除</span>
@@ -961,10 +969,6 @@ export function WorkspaceFileTree({
       </div>
     );
   }
-
-  const rootState = dirMap['.'];
-  const rootLoading = loadingDirs.has('.');
-  const rootError = dirErrors['.'];
 
   return (
     <div
@@ -1092,7 +1096,44 @@ export function WorkspaceFileTree({
         </div>
       ) : null}
 
-      <div className="ws-tree-scroll">
+      <div
+        className="ws-tree-scroll"
+        onContextMenu={(event) => {
+          if (event.defaultPrevented || !canMutate || manageMode) return;
+          if (!(event.target instanceof Element) || !event.currentTarget.contains(event.target)) return;
+          if (event.target.closest('button, input, a, .ws-tree-item')) return;
+          event.preventDefault();
+          setRootMenuPoint({ x: event.clientX, y: event.clientY });
+          setOpenMenuPath('');
+        }}
+      >
+        {rootMenuPoint && createPortal(
+          <Dropdown
+            modal={false}
+            onCloseAutoFocus={onCloseAutoFocus}
+            open={openMenuPath === ''}
+            onOpenChange={(open) => setOpenMenuPath(open ? '' : null)}
+            trigger={<span className="ws-root-menu-anchor" style={{ left: rootMenuPoint.x, top: rootMenuPoint.y }} />}
+          >
+            <DropdownItem onSelect={() => openAfterMenu(() => openCreateDialog('file'))}>
+              <Icon name="filePlus" size={14} />
+              <span>新建文件</span>
+            </DropdownItem>
+            <DropdownItem onSelect={() => openAfterMenu(() => openCreateDialog('dir'))}>
+              <Icon name="folderPlus" size={14} />
+              <span>新建文件夹</span>
+            </DropdownItem>
+            <DropdownItem disabled={uploading} onSelect={() => triggerFilePicker()}>
+              <Icon name="upload" size={14} />
+              <span>上传文件</span>
+            </DropdownItem>
+            <DropdownSeparator />
+            <DropdownItem onSelect={handleRefreshAll}>
+              <Icon name="refresh" size={14} />
+              <span>刷新</span>
+            </DropdownItem>
+          </Dropdown>, document.body,
+        )}
         {rootLoading && !rootState && !isSearching ? (
           <div className="ws-tree-state">
             <LoadingSpinner label="加载工作区文件" />
@@ -1143,6 +1184,7 @@ export function WorkspaceFileTree({
                       role="listitem"
                       className={`ws-tree-item ${isActive ? 'ws-tree-item--active' : ''}`.trim()}
                       onContextMenu={(e) => {
+                        if (manageMode) return;
                         e.preventDefault();
                         setOpenMenuPath(entry.path);
                       }}
@@ -1277,6 +1319,7 @@ export function WorkspaceFileTree({
                     .filter(Boolean)
                     .join(' ')}
                   onContextMenu={(e) => {
+                    if (manageMode) return;
                     e.preventDefault();
                     setOpenMenuPath(entry.path);
                   }}

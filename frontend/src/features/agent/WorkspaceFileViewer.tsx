@@ -33,6 +33,7 @@ import {
   WorkspaceNameDialog,
   parentDirOf,
   triggerBlobDownload,
+  useWorkspaceMenuDialog,
 } from './WorkspaceDialogs';
 import './workspace.css';
 
@@ -70,6 +71,7 @@ export function WorkspaceFileViewer({
   onDeleted?: (deletedPath: string) => void;
 }) {
   const { toast } = useApp();
+  const { openAfterMenu, onCloseAutoFocus } = useWorkspaceMenuDialog();
 
   const [doc, setDoc] = useState<WorkspaceFileDocument | null>(null);
   const [draftContent, setDraftContent] = useState('');
@@ -494,6 +496,8 @@ export function WorkspaceFileViewer({
                     />
                     <Dropdown
                       align="end"
+                      modal={false}
+                      onCloseAutoFocus={onCloseAutoFocus}
                       trigger={
                         <IconButton
                           size="sm"
@@ -505,10 +509,10 @@ export function WorkspaceFileViewer({
                     >
                       <DropdownItem
                         disabled={isDirty || saving}
-                        onSelect={() => {
+                        onSelect={() => openAfterMenu(() => {
                           setRenameError(null);
                           setRenameOpen(true);
-                        }}
+                        })}
                       >
                         <Icon name="edit" size={14} />
                         <span>重命名</span>
@@ -521,7 +525,7 @@ export function WorkspaceFileViewer({
                       <DropdownItem
                         danger
                         disabled={saving}
-                        onSelect={() => setDeleteOpen(true)}
+                        onSelect={() => openAfterMenu(() => setDeleteOpen(true))}
                       >
                         <Icon name="trash" size={14} />
                         <span>删除</span>

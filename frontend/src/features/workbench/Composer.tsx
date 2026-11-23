@@ -8,11 +8,8 @@ import {
   type FormEvent,
   type KeyboardEvent,
 } from 'react';
-import { Link, useLocation } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import {
-  Dropdown,
-  DropdownItem,
   ErrorBanner,
   Icon,
   IconButton,
@@ -42,6 +39,8 @@ export function Composer({
   selectedProviderId,
   selectedModelId,
   reasoningEffort,
+  mcpActive = false,
+  onToggleMcp,
   savingModel = false,
   savingEffort,
   isBusy,
@@ -61,6 +60,8 @@ export function Composer({
   selectedProviderId: string;
   selectedModelId: string;
   reasoningEffort: ReasoningEffort;
+  mcpActive?: boolean;
+  onToggleMcp?: () => void;
   savingModel?: boolean;
   savingEffort: boolean;
   isBusy: boolean;
@@ -85,13 +86,11 @@ export function Composer({
   canCompact?: boolean;
   isCompacting?: boolean;
 }) {
-  const location = useLocation();
   const { settings, resources, toast } = useApp();
 
   const [draft, setDraft] = useState('');
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [webSearch, setWebSearch] = useState(false);
-  const [selectedEngineId, setSelectedEngineId] = useState<string>('');
   const [bodyError, setBodyError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -121,14 +120,7 @@ export function Composer({
     [resources.searchEngines],
   );
 
-  const activeEngine = useMemo(() => {
-    if (enabledEngines.length === 0) return null;
-    return (
-      enabledEngines.find((e) => e.engineId === selectedEngineId) ??
-      enabledEngines.find((e) => e.isDefault) ??
-      enabledEngines[0]
-    );
-  }, [enabledEngines, selectedEngineId]);
+  const activeEngine = enabledEngines.find((engine) => engine.isDefault) ?? enabledEngines[0];
 
   const contextUsage = useMemo(
     () =>
@@ -355,72 +347,26 @@ export function Composer({
         />
 
         <div className="wb-composer__tools">
-          {/* 1. Web Search Toggle + Engine Menu */}
-          <div
-            className={`wb-tool-pill ${
-              webSearch && activeEngine ? 'wb-tool-pill--active' : ''
-            }`.trim()}
-          >
+          <IconButton
+            size="sm"
+            icon="globe"
+            active={webSearch && Boolean(activeEngine)}
+            aria-pressed={webSearch && Boolean(activeEngine)}
+            label={webSearch && activeEngine ? '关闭联网搜索' : '开启联网搜索'}
+            disabled={isBusy}
+            onClick={handleToggleSearch}
+          />
+          {onToggleMcp && (
             <IconButton
               size="sm"
-              icon="globe"
-              active={webSearch && Boolean(activeEngine)}
-              label={
-                webSearch && activeEngine ? '关闭联网搜索' : '开启联网搜索'
-              }
+              icon="wrench"
+              active={mcpActive}
+              aria-pressed={mcpActive}
+              label={mcpActive ? '关闭 MCP 工具' : '开启 MCP 工具'}
               disabled={isBusy}
-              onClick={handleToggleSearch}
+              onClick={onToggleMcp}
             />
-            <Dropdown
-              side="top"
-              align="start"
-              trigger={
-                <IconButton
-                  size="sm"
-                  icon="chevronDown"
-                  label="选择搜索引擎"
-                  disabled={isBusy}
-                  style={{ width: 20, minWidth: 20 }}
-                />
-              }
-            >
-              {enabledEngines.length === 0 ? (
-                <div style={{ padding: '6px 8px', fontSize: 12 }}>
-                  <Link
-                    to="/settings/plugins"
-                    state={{ from: `${location.pathname}${location.search}` }}
-                    className="ui-menu-item"
-                  >
-                    <Icon name="settings" size={14} />
-                    <span>配置搜索引擎</span>
-                  </Link>
-                </div>
-              ) : (
-                enabledEngines.map((eng) => {
-                  const selected = activeEngine?.engineId === eng.engineId;
-                  return (
-                    <DropdownItem
-                      key={eng.engineId}
-                      active={selected}
-                      onSelect={() => {
-                        setSelectedEngineId(eng.engineId);
-                        setWebSearch(true);
-                      }}
-                    >
-                      <span>{eng.displayName || eng.engineId}</span>
-                      {selected ? (
-                        <Icon
-                          name="check"
-                          size={14}
-                          className="wb-toolbar__spacer"
-                        />
-                      ) : null}
-                    </DropdownItem>
-                  );
-                })
-              )}
-            </Dropdown>
-          </div>
+          )}
 
           {/* 2. Attachment Upload */}
           <IconButton

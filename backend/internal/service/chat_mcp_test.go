@@ -30,6 +30,7 @@ type stubMCPClient struct {
 	calls      []string
 	callFunc   func(ctx context.Context, server domain.MCPServerConfig, name string, arguments json.RawMessage) (plugin.MCPCallToolResult, error)
 	closedIDs  []string
+	listCalls  int
 }
 
 func (c *stubMCPClient) ID() string { return "stub-mcp" }
@@ -37,6 +38,7 @@ func (c *stubMCPClient) ID() string { return "stub-mcp" }
 func (c *stubMCPClient) ListTools(_ context.Context, server domain.MCPServerConfig) ([]plugin.MCPToolDescriptor, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.listCalls++
 	return append([]plugin.MCPToolDescriptor(nil), c.toolsBySrv[server.ID]...), nil
 }
 
@@ -111,6 +113,76 @@ func setupChatMCPFixture(t *testing.T, baseURL string, stubMCP *stubMCPClient) (
 	svc := service.NewChatService(provStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithMCP(mcpStore, stubMCP)
 	return svc, convStore, msgStore, mcpStore, conv, db
+}
+
+func TestRequestMCPDisabledSkipsDiscoveryAndKeepsNativeTools(t *testing.T) {
+	ctx := t.Context()
+	stub := &stubMCPClient{toolsBySrv: map[string][]plugin.MCPToolDescriptor{
+		"mcp": {{Name: "test_tool", InputSchema: json.RawMessage("{\"type\":\"object\"}")}},
+	}}
+	type requestBody struct {
+		Tools []struct{ Function struct{ Name string } }
+	}
+	captured := make(chan requestBody, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body requestBody
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		captured <- body
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+	svc, convStore, _, mcpStore, conv, db := setupChatMCPFixture(t, upstream.URL, stub)
+	prefs := domain.DefaultPreferences()
+	prefs.BuiltinTimeToolEnabled = true
+	svc.WithPreferences(&countingPreferenceLookup{prefs: prefs})
+	if _, err := mcpStore.Create(ctx, domain.MCPServerConfig{ID: "mcp", Name: "MCP", Transport: domain.MCPTransportStdio, Command: "mock", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	prepare := func(flag *bool) []string {
+		t.Helper()
+		prep, err := svc.PrepareLocal(ctx, service.StreamChatInput{ConversationID: conv.ID, Text: "hello", MCPToolsEnabled: flag})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var payload requestBody
+		if err := json.Unmarshal(prep.Body, &payload); err != nil {
+			t.Fatal(err)
+		}
+		names := make([]string, 0, len(payload.Tools))
+		for _, tool := range payload.Tools {
+			names = append(names, tool.Function.Name)
+		}
+		return names
+	}
+	disabled := false
+	if names := prepare(&disabled); len(names) != 0 || stub.listCalls != 0 {
+		t.Fatalf("disabled MCP: tools=%v; discoveries=%d", names, stub.listCalls)
+	}
+	if names := prepare(nil); len(names) != 2 || stub.listCalls != 1 {
+		t.Fatalf("default MCP: tools=%v; discoveries=%d", names, stub.listCalls)
+	}
+	conv.Mode = domain.ConversationModeAgent
+	if _, err := convStore.Update(ctx, conv); err != nil {
+		t.Fatal(err)
+	}
+	runtime := agent.NewGateway(store.NewAgentStore(db), t.TempDir(), true)
+	allowed := []string{"read"}
+	if _, err := runtime.UpdateSettings(ctx, agent.SettingsPatch{AllowedTools: &allowed}); err != nil {
+		t.Fatal(err)
+	}
+	svc.WithAgent(runtime)
+	prep, err := svc.Prepare(ctx, service.StreamChatInput{ConversationID: conv.ID, Text: "native only", MCPToolsEnabled: &disabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prep.Stream(ctx, func(domain.StreamEvent) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	tools := (<-captured).Tools
+	if len(tools) != 1 || tools[0].Function.Name != "read" || stub.listCalls != 1 {
+		t.Fatalf("native agent tools with MCP disabled: %+v; discoveries=%d", tools, stub.listCalls)
+	}
 }
 
 func TestAgentAndSameNamedMCPShareRoundWithoutSharingPermission(t *testing.T) {

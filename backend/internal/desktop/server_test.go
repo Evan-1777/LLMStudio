@@ -227,6 +227,50 @@ func TestDesktopLoopbackServerAuthCORSAndRoutes(t *testing.T) {
 		t.Fatalf("cloud PATCH altered local message: %v", err)
 	}
 
+	// A graph patch must stay in its requested scope, then round-trip via sync.
+	graphPath := "/api/v1/conversations/" + locOut.Conversation.ID + "/graph?scope="
+	patchGraph := func(scope string, input map[string]any) service.ConversationDetail {
+		t.Helper()
+		rec := doReq(http.MethodPatch, graphPath+scope, tok, "", input)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s graph PATCH: %d %s", scope, rec.Code, rec.Body.String())
+		}
+		var detail service.ConversationDetail
+		if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+			t.Fatal(err)
+		}
+		return detail
+	}
+	localGraph := patchGraph("local", map[string]any{"op": "setNodeMeta", "messageId": original.ID, "graphMeta": map[string]any{"collapsed": true, "summary": "local summary"}})
+	if !localGraph.Conversation.GraphState.Enabled || !localGraph.Messages[0].GraphMeta.Collapsed {
+		t.Fatalf("missing local graph: %+v", localGraph)
+	}
+	cloudConv, err := cloudConvStore.Get(ctx, locOut.Conversation.ID)
+	if err != nil || cloudConv.GraphState != nil {
+		t.Fatalf("local graph PATCH polluted cloud: %+v %v", cloudConv, err)
+	}
+	msgRec := doReq(http.MethodPost, "/api/v1/conversations/"+locOut.Conversation.ID+"/messages?scope=local", tok, "", map[string]any{"role": "assistant", "blocks": withoutImage, "parentId": original.ID})
+	if msgRec.Code != http.StatusCreated {
+		t.Fatalf("graph message write failed: %d %s", msgRec.Code, msgRec.Body.String())
+	}
+	localGraph = patchGraph("local", map[string]any{"op": "createBranch", "parentMessageId": original.ID, "activate": true})
+	if len(localGraph.Messages) != 2 || localGraph.Messages[1].ParentID != original.ID {
+		t.Fatalf("graph parent pointer missing: %+v", localGraph)
+	}
+	upRes, err := syncSvc.UploadConversation(ctx, locOut.Conversation.ID, true)
+	if err != nil || upRes.Conversation.GraphState == nil || !reflect.DeepEqual(upRes.Messages, localGraph.Messages) || !reflect.DeepEqual(upRes.Conversation.GraphState, localGraph.Conversation.GraphState) || upRes.Conversation.ActiveLeafID != original.ID {
+		t.Fatalf("graph upload did not preserve state: %+v %v", upRes, err)
+	}
+	cloudGraph := patchGraph("cloud", map[string]any{"op": "setNodeMeta", "messageId": original.ID, "summary": "cloud summary"})
+	localMessage, err = localStore.Messages.Get(ctx, original.ID)
+	if err != nil || localMessage.GraphMeta.Summary != "local summary" || cloudGraph.Messages[0].GraphMeta.Summary != "cloud summary" {
+		t.Fatalf("cloud patch did not isolate scopes: %+v %v", cloudGraph, err)
+	}
+	pullRes, err := syncSvc.PullConversation(ctx, locOut.Conversation.ID, true)
+	if err != nil || !reflect.DeepEqual(pullRes.Messages, cloudGraph.Messages) || !reflect.DeepEqual(pullRes.Conversation.GraphState, cloudGraph.Conversation.GraphState) || pullRes.Conversation.ActiveLeafID != cloudGraph.Conversation.ActiveLeafID {
+		t.Fatalf("graph pull did not preserve state: %+v %v", pullRes, err)
+	}
+
 	// Local storage stats, compact, and clear-cache (preserving local topic).
 	stInfoRec := doReq(http.MethodGet, "/api/v1/desktop/storage", tok, "", nil)
 	if stInfoRec.Code != http.StatusOK {

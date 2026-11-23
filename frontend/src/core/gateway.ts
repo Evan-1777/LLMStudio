@@ -350,6 +350,7 @@ function buildStreamChatPayload(input: StreamChatInput): Record<string, unknown>
   if (input.regenerateMessageId) {
     payload.regenerateMessageId = input.regenerateMessageId;
   }
+  if (input.mcpToolsEnabled !== undefined) payload.mcpToolsEnabled = input.mcpToolsEnabled;
   if (input.webSearch) {
     payload.webSearch = true;
   }
@@ -1012,6 +1013,19 @@ export class GatewayClient {
       'GET',
       withScopeQuery(`/api/v1/conversations/${encodeURIComponent(id)}`, scope),
       { signal },
+    );
+  }
+
+  mutateConversationGraph(
+    id: string,
+    input: import('./types').GraphMutationInput,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<ConversationDetail> {
+    return this.requestJson<ConversationDetail>(
+      'PATCH',
+      withScopeQuery(`/api/v1/conversations/${encodeURIComponent(id)}/graph`, scope),
+      { body: input, signal },
     );
   }
 

@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -178,7 +179,9 @@ export function ConversationSidebar({
 
   const [rightPanelTab, setRightPanelTab] = useState<'topics' | 'files'>('topics');
   const [fileManageMode, setFileManageMode] = useState(false);
+  const [workspaceAvailable, setWorkspaceAvailable] = useState(false);
   const [fileCreateTrigger, setFileCreateTrigger] = useState<WorkspaceCreateTrigger | null>(null);
+  const clearFileCreateTrigger = useCallback(() => setFileCreateTrigger(null), []);
   const [fileDirsRefreshTrigger, setFileDirsRefreshTrigger] = useState<WorkspaceDirsRefreshTrigger | null>(null);
   const [viewingEntry, setViewingEntry] = useState<WorkspaceEntry | null>(null);
   const [viewingInitialMode, setViewingInitialMode] = useState<'preview' | 'edit' | undefined>(undefined);
@@ -249,6 +252,7 @@ export function ConversationSidebar({
   useEffect(() => {
     if (!canBrowseWorkspace) {
       setRightPanelTab('topics');
+      setFileCreateTrigger(null);
       setFileManageMode(false);
       setViewingEntry(null);
       setViewingInitialMode(undefined);
@@ -904,7 +908,7 @@ export function ConversationSidebar({
           />
         ) : (
           <>
-            <div className="wb-history__head">
+            <div className={`wb-history__head${rightPanelTab === 'files' && canBrowseWorkspace ? ' ws-history-head' : ''}`}>
               {canBrowseWorkspace ? (
                 <SegmentedControl<'topics' | 'files'>
                   ariaLabel="右侧面板"
@@ -914,7 +918,8 @@ export function ConversationSidebar({
                     if (next === 'files' && manageMode) {
                       onManageModeChange(false);
                     }
-                    if (next === 'topics' && fileManageMode) {
+                    if (next === 'topics') {
+                      setFileCreateTrigger(null);
                       setFileManageMode(false);
                     }
                   }}
@@ -943,32 +948,22 @@ export function ConversationSidebar({
                       size="sm"
                       icon="filePlus"
                       label="新建文件"
-                      disabled={cloudOffline}
-                      onClick={() =>
-                        setFileCreateTrigger((prev) => ({
-                          kind: 'file',
-                          seq: (prev?.seq ?? 0) + 1,
-                        }))
-                      }
+                      disabled={!workspaceAvailable || cloudOffline}
+                      onClick={() => setFileCreateTrigger('file')}
                     />
                     <IconButton
                       size="sm"
                       icon="folderPlus"
                       label="新建文件夹"
-                      disabled={cloudOffline}
-                      onClick={() =>
-                        setFileCreateTrigger((prev) => ({
-                          kind: 'dir',
-                          seq: (prev?.seq ?? 0) + 1,
-                        }))
-                      }
+                      disabled={!workspaceAvailable || cloudOffline}
+                      onClick={() => setFileCreateTrigger('dir')}
                     />
                     <IconButton
                       size="sm"
                       icon="checkSquare"
                       label={fileManageMode ? '退出管理' : '管理文件'}
                       active={fileManageMode}
-                      disabled={cloudOffline}
+                      disabled={!workspaceAvailable || cloudOffline}
                       onClick={() => setFileManageMode((v) => !v)}
                     />
                   </>
@@ -1073,8 +1068,10 @@ export function ConversationSidebar({
                     selectedPath={viewingEntry?.path ?? null}
                     manageMode={fileManageMode}
                     createTrigger={fileCreateTrigger}
+                    onCreateTriggerConsumed={clearFileCreateTrigger}
                     dirsRefreshTrigger={fileDirsRefreshTrigger}
                     onManageModeChange={setFileManageMode}
+                    onAvailabilityChange={setWorkspaceAvailable}
                     onSelectEntry={(entry, initialMode) => {
                       setViewingInitialMode(initialMode);
                       setViewingEntry(entry);

@@ -314,6 +314,8 @@ func (s *ConversationService) Delete(ctx context.Context, id string) error {
 
 // CreateMessageInput describes payload fields for persisting a single message (including local-request writes).
 type CreateMessageInput struct {
+	ParentID         *string               `json:"parentId,omitempty"`
+	ConsumeBranchID  string                `json:"consumeBranchId,omitempty"`
 	Role             string                `json:"role"`
 	Blocks           []domain.ContentBlock `json:"blocks"`
 	ProviderID       string                `json:"providerId,omitempty"`
@@ -382,6 +384,12 @@ func (s *ConversationService) CreateMessage(ctx context.Context, conversationID 
 		CreatedAt:      time.Now().UTC(),
 	}
 
+	if in.ParentID != nil || in.ConsumeBranchID != "" {
+		if replaceID != "" || afterID != "" {
+			return CreateMessageResult{}, domain.NewError(domain.ErrCodeInvalidArgument, "parentId/consumeBranchId cannot be combined with replacement or interval insertion", nil)
+		}
+		msg.GraphWrite = &domain.MessageGraphWrite{ParentID: in.ParentID, ConsumeBranchID: in.ConsumeBranchID}
+	}
 	var saved domain.Message
 	switch {
 	case replaceID != "":
@@ -483,7 +491,15 @@ func (s *ConversationService) BranchFromMessage(ctx context.Context, conversatio
 	if err != nil {
 		return ConversationDetail{}, err
 	}
-	msgs, err := s.msgs.ListUpTo(ctx, conversationID, messageID)
+	var msgs []domain.Message
+	if graphEnabled(orig) {
+		msgs, err = s.msgs.ListByConversation(ctx, conversationID)
+		if err == nil {
+			msgs, err = resolvePathUpToMessage(msgs, messageID)
+		}
+	} else {
+		msgs, err = s.msgs.ListUpTo(ctx, conversationID, messageID)
+	}
 	if err != nil {
 		return ConversationDetail{}, err
 	}

@@ -196,7 +196,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     const originalIds = new Set(originalDetailBeforeBranch.messages.map((m) => m.id));
 
     // 5. Branch from the FIRST assistant message -> new URL, 2 messages with newly assigned IDs; original retains 8 messages.
-    const branchButtons = page.getByRole('button', { name: '从此处分支' });
+    const branchButtons = page.getByRole('button', { name: '复制为新话题' });
     await branchButtons.first().click();
     await expect(page).not.toHaveURL(new RegExp(`${convId}$`));
     const branchId = new URL(page.url()).pathname.split('/').pop()!;

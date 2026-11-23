@@ -8,11 +8,100 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"llmstudio/backend/internal/domain"
 	"llmstudio/backend/internal/store"
 )
+
+func TestWorkspaceExtensionlessTextAndBinary(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rt := NewGateway(store.NewAgentStore(db), dir, true)
+	entry, err := rt.CreateWorkspaceFile(ctx, "notes", "")
+	if err != nil || entry.PreviewKind != "text" || !entry.Editable {
+		t.Fatalf("create: %+v %v", entry, err)
+	}
+	doc, err := rt.ReadWorkspaceFile(ctx, "notes")
+	if err != nil || !doc.Editable || doc.Content != "" {
+		t.Fatalf("read: %+v %v", doc, err)
+	}
+	if _, err := rt.WriteWorkspaceFile(ctx, "notes", "工作记录", doc.ETag); err != nil {
+		t.Fatal(err)
+	}
+	doc, err = rt.ReadWorkspaceFile(ctx, "notes")
+	if err != nil || doc.Content != "工作记录" {
+		t.Fatalf("saved: %+v %v", doc, err)
+	}
+	for name, data := range map[string][]byte{"nul": {0}, "invalid": {0xff}} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rt.ReadWorkspaceFile(ctx, name); err == nil {
+			t.Fatalf("read accepted %s", name)
+		}
+		if _, err := rt.WriteWorkspaceFile(ctx, name, "overwrite", ""); err == nil {
+			t.Fatalf("write accepted %s", name)
+		}
+	}
+	listing, err := rt.ListWorkspaceEntries(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Entries) != 3 {
+		t.Fatalf("listing: %+v", listing)
+	}
+	for _, entry := range listing.Entries {
+		if entry.Name == "notes" {
+			if entry.PreviewKind != "text" || !entry.Editable {
+				t.Fatalf("listing text: %+v", entry)
+			}
+		} else if entry.PreviewKind != "unsupported" || entry.Editable || entry.UnsupportedReason != "binary" {
+			t.Fatalf("listing binary: %+v", entry)
+		}
+	}
+}
+
+func TestWorkspaceWritePermission(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		text string
+	}{{os.ErrPermission, "工作区目录无写入权限"}, {syscall.EROFS, "工作区目录为只读状态"}} {
+		err := mapWorkspaceWriteError(&os.PathError{Op: "create", Path: "notes", Err: tc.err}, "无法创建文件")
+		if !strings.Contains(err.Error(), tc.text) {
+			t.Fatalf("mapped error: %v", err)
+		}
+	}
+	ctx := t.Context()
+	dir := t.TempDir()
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rt := NewGateway(store.NewAgentStore(db), dir, true)
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Skipf("chmod unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+	if err := os.WriteFile(filepath.Join(dir, "permission-probe"), nil, 0600); !errors.Is(err, os.ErrPermission) {
+		t.Skipf("runner does not enforce directory write mode: %v", err)
+	}
+	_, fileErr := rt.CreateWorkspaceFile(ctx, "notes", "")
+	_, dirErr := rt.CreateWorkspaceDir(ctx, "docs")
+	_, nestedErr := rt.CreateWorkspaceFile(ctx, "new/notes", "")
+	for _, err := range []error{fileErr, dirErr, nestedErr} {
+		if err == nil || !strings.Contains(err.Error(), "权限") {
+			t.Fatalf("write error: %v", err)
+		}
+	}
+}
 
 func TestWorkspaceBrowserListingReadWriteAndSecurity(t *testing.T) {
 	ctx := t.Context()

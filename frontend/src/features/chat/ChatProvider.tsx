@@ -20,6 +20,7 @@ import type {
   ConversationMode,
   ConversationDetail,
   GenerationParams,
+  GraphMutationInput,
   LocalCacheResultData,
   Message,
   PreparedLocalHTTPRequest,
@@ -33,6 +34,7 @@ import type {
   TopicScope,
 } from '../../core/types';
 import {
+  activeChatMessages,
   bufferToBlock,
   chatReducer,
   initialChatState,
@@ -53,6 +55,7 @@ export interface SendMessageOptions {
   providerId: string;
   modelId: string;
   params?: GenerationParams;
+  mcpToolsEnabled?: boolean;
   webSearch?: boolean;
   searchEngineId?: string;
   onOptimisticStart?: () => void;
@@ -66,6 +69,7 @@ export interface RegenerateOptions {
   modelId: string;
   scope?: TopicScope;
   params?: GenerationParams;
+  mcpToolsEnabled?: boolean;
   webSearch?: boolean;
   searchEngineId?: string;
 }
@@ -79,6 +83,8 @@ export interface CompactConversationResult {
 
 export interface ChatContextValue {
   state: ChatState;
+  activeMessages: Message[];
+  mutateGraph: (input: GraphMutationInput, scope?: TopicScope) => Promise<ConversationDetail | null>;
   sessionScope?: TopicScope;
   isBusy: boolean;
   isGenerating: boolean;
@@ -214,6 +220,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const loadConnectionEpochRef = useRef<number | null>(null);
   const compactAbortRef = useRef<AbortController | null>(null);
   const compactingRef = useRef(false);
+  const graphMutationRef = useRef(false);
   const topicScopeRef = useRef(topicScope);
   topicScopeRef.current = topicScope;
   const sessionScopeRef = useRef<TopicScope | undefined>(
@@ -434,6 +441,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         modelId: string;
         params?: GenerationParams;
         regenerateMessageId?: string;
+        mcpToolsEnabled?: boolean;
         webSearch?: boolean;
         searchEngineId?: string;
       };
@@ -767,6 +775,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         modelId: string;
         params?: GenerationParams;
         regenerateMessageId?: string;
+        mcpToolsEnabled?: boolean;
         webSearch?: boolean;
         searchEngineId?: string;
       };
@@ -867,6 +876,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             {
               role: 'user',
               blocks: userBlocks,
+              ...(prepared.parentId !== undefined ? { parentId: prepared.parentId, consumeBranchId: prepared.consumeBranchId } : {}),
             },
             run.ctrl.signal,
             reqScope,
@@ -1364,6 +1374,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           {
             role: 'assistant',
             blocks: finalBlocks,
+            ...(persistedUserMessageId && prepared.parentId !== undefined ? { parentId: persistedUserMessageId } : {}),
             providerId: opts.input.providerId,
             modelId: opts.input.modelId,
             ...(accUsage ? { usage: accUsage } : {}),
@@ -1386,6 +1397,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           targetId: localAssistantId,
           message: saved.message,
         });
+        dispatch({ type: 'UPDATE_CONVERSATION_META', conversation: saved.conversation });
         void reconcileAfterStream(
           opts.conversationId,
           run.epoch,
@@ -1547,6 +1559,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           providerId: opts.providerId,
           modelId: opts.modelId,
           params: opts.params,
+          mcpToolsEnabled: opts.mcpToolsEnabled,
           webSearch: opts.webSearch,
           searchEngineId: opts.searchEngineId,
         },
@@ -1577,14 +1590,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         toast('请先重新加载以获取服务端消息 ID', 'error');
         return false;
       }
-      const idx = stateRef.current.messages.findIndex(
-        (m) => m.id === opts.targetMessageId,
-      );
+      const path = activeChatMessages(stateRef.current);
+      const idx = path.findIndex((m) => m.id === opts.targetMessageId);
       if (idx < 0) return false;
-      const target = stateRef.current.messages[idx];
-      const isReplacing =
-        target.role !== 'user' ||
-        stateRef.current.messages[idx + 1]?.role === 'assistant';
+      const isReplacing = path[idx].role !== 'user' || path[idx + 1]?.role === 'assistant';
       const expectedCountOnAbort = isReplacing
         ? stateRef.current.messages.length
         : stateRef.current.messages.length + 1;
@@ -1630,6 +1639,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           modelId: opts.modelId,
           params: opts.params,
           regenerateMessageId: opts.targetMessageId,
+          mcpToolsEnabled: opts.mcpToolsEnabled,
           webSearch: opts.webSearch,
           searchEngineId: opts.searchEngineId,
         },
@@ -1714,14 +1724,24 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           undefined,
           resolveScope(scope),
         );
-        dispatch({ type: 'REMOVE_MESSAGE', messageId });
+        if (conv.graphState?.enabled) {
+          const reqScope = resolveScope(scope);
+          const epoch = epochRef.current;
+          const detail = await gateway.getConversationDetail(conv.id, undefined, reqScope);
+          if (epoch === epochRef.current && stateRef.current.conversation?.id === conv.id && resolveScope() === reqScope) {
+            dispatch({ type: 'RECONCILE_DETAIL', ...detail });
+            upsertLocalConversation(detail.conversation, reqScope);
+          }
+        } else {
+          dispatch({ type: 'REMOVE_MESSAGE', messageId });
+        }
         return true;
       } catch (err) {
         toast(formatError(err).message, 'error');
         return false;
       }
     },
-    [gateway, resolveScope, toast],
+    [gateway, resolveScope, toast, upsertLocalConversation],
   );
 
   const branchFromMessage = useCallback(
@@ -1965,7 +1985,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             stopReason: 'stop',
             ...(prepared.plan.insertAfterMessageId
               ? { afterMessageId: prepared.plan.insertAfterMessageId }
-              : {}),
+              : conv.graphState?.enabled ? { parentId: prepared.plan.snapshotLastMessageId, consumeBranchId: conv.graphState.activeBranchId } : {}),
           },
           ctrl.signal,
         );
@@ -2029,10 +2049,34 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [cancelActiveStream, resolveScope, upsertLocalConversation],
   );
 
+  const mutateGraph = useCallback(async (input: GraphMutationInput, scope?: TopicScope) => {
+    const conversation = stateRef.current.conversation;
+    if (!conversation || activeGenRef.current || compactingRef.current || graphMutationRef.current) return null;
+    graphMutationRef.current = true;
+    const reqScope = resolveScope(scope);
+    const epoch = ++epochRef.current;
+    const connection = connectionEpochRef.current;
+    const isCurrent = () => epochRef.current === epoch && connectionEpochRef.current === connection && stateRef.current.conversation?.id === conversation.id && resolveScope() === reqScope;
+    try {
+      const detail = await gateway.mutateConversationGraph(conversation.id, input, undefined, reqScope);
+      if (!isCurrent()) return null;
+      dispatch({ type: 'RECONCILE_DETAIL', ...detail });
+      upsertLocalConversation(detail.conversation, reqScope);
+      return detail;
+    } catch (err) {
+      if (isCurrent()) toast(formatError(err).message, 'error');
+      return null;
+    } finally {
+      graphMutationRef.current = false;
+    }
+  }, [gateway, resolveScope, toast, upsertLocalConversation]);
+  const activeMessages = useMemo(() => activeChatMessages(state), [state.conversation, state.messages, state.streaming?.graphTarget, Boolean(state.streaming)]);
   const sessionScope = sessionScopeRef.current;
   const value = useMemo<ChatContextValue>(
     () => ({
       state,
+      activeMessages,
+      mutateGraph,
       sessionScope,
       isBusy,
       isGenerating,
@@ -2052,6 +2096,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }),
     [
       state,
+      activeMessages,
+      mutateGraph,
       sessionScope,
       isBusy,
       isGenerating,

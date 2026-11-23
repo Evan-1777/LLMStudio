@@ -21,10 +21,12 @@ func NewMessageStore(db *sql.DB) *MessageStore {
 	return &MessageStore{db: db}
 }
 
+const messageSelectCols = `id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at, parent_id, graph_meta_json`
+
 // ListByConversation returns messages belonging to conversationID in chronological order.
 func (s *MessageStore) ListByConversation(ctx context.Context, conversationID string) ([]domain.Message, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
+		SELECT `+messageSelectCols+`
 		FROM messages
 		WHERE conversation_id = ?
 		ORDER BY created_at ASC, rowid ASC
@@ -51,7 +53,7 @@ func (s *MessageStore) ListByConversation(ctx context.Context, conversationID st
 // Get fetches a single message by ID.
 func (s *MessageStore) Get(ctx context.Context, id string) (domain.Message, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
+		SELECT `+messageSelectCols+`
 		FROM messages
 		WHERE id = ?
 	`, id)
@@ -73,18 +75,23 @@ func (s *MessageStore) Create(ctx context.Context, m domain.Message) (domain.Mes
 	if m.CreatedAt.IsZero() {
 		m.CreatedAt = time.Now().UTC()
 	}
-	blocksJSON, usageJSON, err := encodeMessagePayloads(m.Blocks, m.Usage)
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.Message{}, err
 	}
-
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO messages (
-			id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, m.ID, m.ConversationID, m.Role, blocksJSON, m.ProviderID, m.ModelID, usageJSON, m.StopReason, m.ErrorMessage, formatTime(m.CreatedAt))
+	defer tx.Rollback()
+	c, err := graphConversationTx(ctx, tx, m.ConversationID)
 	if err != nil {
+		return domain.Message{}, err
+	}
+	if err := appendGraphMessageTx(ctx, tx, &c, &m); err != nil {
+		return domain.Message{}, err
+	}
+	if err := insertMessage(ctx, tx, m); err != nil {
 		return domain.Message{}, fmt.Errorf("create message: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return domain.Message{}, err
 	}
 	return s.Get(ctx, m.ID)
 }
@@ -122,7 +129,19 @@ func (s *MessageStore) ReplaceByID(ctx context.Context, conversationID, targetMe
 	if err != nil {
 		return domain.Message{}, err
 	}
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	defer tx.Rollback()
+	c, err := graphConversationTx(ctx, tx, conversationID)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if graphEnabled(c) {
+		next.ID = targetMessageID
+	}
+	res, err := tx.ExecContext(ctx, `
 		UPDATE messages
 		SET id = ?, role = ?, blocks_json = ?, provider_id = ?, model_id = ?, usage_json = ?, stop_reason = ?, error_message = ?
 		WHERE id = ? AND conversation_id = ?
@@ -137,6 +156,9 @@ func (s *MessageStore) ReplaceByID(ctx context.Context, conversationID, targetMe
 	if affected == 0 {
 		return domain.Message{}, domain.NewError(domain.ErrCodeNotFound, "message not found in conversation", nil)
 	}
+	if err := tx.Commit(); err != nil {
+		return domain.Message{}, err
+	}
 	return s.Get(ctx, next.ID)
 }
 
@@ -145,11 +167,6 @@ func (s *MessageStore) InsertAfter(ctx context.Context, conversationID, afterMes
 	if next.ID == "" {
 		next.ID = domain.NewUUID()
 	}
-	blocksJSON, usageJSON, err := encodeMessagePayloads(next.Blocks, next.Usage)
-	if err != nil {
-		return domain.Message{}, err
-	}
-
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return domain.Message{}, fmt.Errorf("begin insertAfter tx: %w", err)
@@ -214,11 +231,18 @@ func (s *MessageStore) InsertAfter(ctx context.Context, conversationID, afterMes
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO messages (
-			id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, next.ID, conversationID, next.Role, blocksJSON, next.ProviderID, next.ModelID, usageJSON, next.StopReason, next.ErrorMessage, formatTime(insertAt)); err != nil {
+	c, err := graphConversationTx(ctx, tx, conversationID)
+	if err != nil {
+		return domain.Message{}, err
+	}
+	if graphEnabled(c) {
+		next.ParentID = afterMessageID
+		if err := spliceActiveGraphPathTx(ctx, tx, c, afterMessageID, next.ID); err != nil {
+			return domain.Message{}, err
+		}
+	}
+	next.ConversationID, next.CreatedAt = conversationID, insertAt
+	if err := insertMessage(ctx, tx, next); err != nil {
 		return domain.Message{}, fmt.Errorf("insert message after %s: %w", afterMessageID, err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -268,6 +292,23 @@ func shiftMessagesForward(ctx context.Context, tx *sql.Tx, conversationID, after
 		}
 	}
 	return nil
+}
+
+func insertMessage(ctx context.Context, db interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, m domain.Message) error {
+	blocksJSON, usageJSON, err := encodeMessagePayloads(m.Blocks, m.Usage)
+	if err != nil {
+		return err
+	}
+	graphJSON, err := json.Marshal(m.GraphMeta)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `INSERT INTO messages (`+messageSelectCols+`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, m.ID, m.ConversationID, m.Role, blocksJSON,
+		m.ProviderID, m.ModelID, usageJSON, m.StopReason, m.ErrorMessage, formatTime(m.CreatedAt), m.ParentID, string(graphJSON))
+	return err
 }
 
 func encodeMessagePayloads(blocks []domain.ContentBlock, usage *domain.Usage) (string, sql.NullString, error) {
@@ -331,7 +372,26 @@ func (s *MessageStore) DeleteFrom(ctx context.Context, conversationID, fromMessa
 
 // DeleteByID deletes a single message in a conversation without removing subsequent messages.
 func (s *MessageStore) DeleteByID(ctx context.Context, conversationID, messageID string) error {
-	res, err := s.db.ExecContext(ctx, `
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	c, err := graphConversationTx(ctx, tx, conversationID)
+	if err != nil {
+		return err
+	}
+	var parentID string
+	if graphEnabled(c) {
+		err := tx.QueryRowContext(ctx, `SELECT parent_id FROM messages WHERE conversation_id = ? AND id = ?`, conversationID, messageID).Scan(&parentID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return domain.NewError(domain.ErrCodeNotFound, "message not found in conversation", err)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	res, err := tx.ExecContext(ctx, `
 		DELETE FROM messages
 		WHERE id = ? AND conversation_id = ?
 	`, messageID, conversationID)
@@ -345,7 +405,12 @@ func (s *MessageStore) DeleteByID(ctx context.Context, conversationID, messageID
 	if affected == 0 {
 		return domain.NewError(domain.ErrCodeNotFound, "message not found in conversation", nil)
 	}
-	return nil
+	if graphEnabled(c) {
+		if err := reconnectGraphChildrenTx(ctx, tx, c, messageID, parentID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ListUpTo returns messages in chronological order up to and including upToMessageID.
@@ -373,7 +438,7 @@ func (s *MessageStore) ListUpTo(ctx context.Context, conversationID, upToMessage
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, conversation_id, role, blocks_json, provider_id, model_id, usage_json, stop_reason, error_message, created_at
+		SELECT `+messageSelectCols+`
 		FROM messages
 		WHERE conversation_id = ?
 		  AND (created_at < ? OR (created_at = ? AND rowid <= ?))
@@ -404,10 +469,11 @@ func scanMessage(row rowScanner) (domain.Message, error) {
 		blocksJSON string
 		usageJSON  sql.NullString
 		createdRaw string
+		graphJSON  string
 	)
 	if err := row.Scan(
 		&m.ID, &m.ConversationID, &m.Role, &blocksJSON, &m.ProviderID, &m.ModelID,
-		&usageJSON, &m.StopReason, &m.ErrorMessage, &createdRaw,
+		&usageJSON, &m.StopReason, &m.ErrorMessage, &createdRaw, &m.ParentID, &graphJSON,
 	); err != nil {
 		return domain.Message{}, err
 	}
@@ -422,6 +488,11 @@ func scanMessage(row rowScanner) (domain.Message, error) {
 			return domain.Message{}, fmt.Errorf("decode message usage: %w", err)
 		}
 		m.Usage = &u
+	}
+	if graphJSON != "{}" {
+		if err := json.Unmarshal([]byte(graphJSON), &m.GraphMeta); err != nil {
+			return domain.Message{}, fmt.Errorf("decode message graph metadata: %w", err)
+		}
 	}
 	var err error
 	if m.CreatedAt, err = parseTime(createdRaw); err != nil {

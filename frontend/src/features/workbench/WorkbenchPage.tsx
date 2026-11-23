@@ -16,7 +16,7 @@ import {
 import { useApp } from '../../app/AppProvider';
 import { Icon, IconButton, SegmentedControl } from '../../components/ui';
 import { CHAT_WIDTH_MAX, CHAT_WIDTH_MIN, getAgentModeVisible } from '../../core/settings';
-import { isReasoningEffort, type Assistant, type ContentBlock, type ConversationMode, type Message, type ReasoningEffort, type TopicScope } from '../../core/types';
+import { isReasoningEffort, type Assistant, type ContentBlock, type GraphMutationInput, type ConversationMode, type Message, type ReasoningEffort, type TopicScope } from '../../core/types';
 import { AgentTopicDirectory } from '../agent/AgentTopicDirectory';
 import { ChatProvider, useChat } from '../chat/ChatProvider';
 import { AssistantEditor } from './AssistantEditor';
@@ -24,6 +24,9 @@ import { AssistantSidebar } from './AssistantSidebar';
 import { ChatCanvas } from './ChatCanvas';
 import { Composer } from './Composer';
 import { ConversationSidebar } from './ConversationSidebar';
+import { ConversationGraphView } from './ConversationGraphView';
+import { resolveBranchSummaries } from './conversationGraph';
+import { isLocalMessageId } from '../chat/chatReducer';
 import {
   getDefaultModelOption,
   resolveModelOption,
@@ -104,6 +107,7 @@ function WorkbenchInner() {
   const reqScope: TopicScope | undefined = isDesktop ? activeScope : undefined;
   const activeScopeRef = useRef<TopicScope | undefined>(reqScope);
   activeScopeRef.current = reqScope;
+  const [mcpToolsEnabled, setMcpToolsEnabled] = useState(true);
   const prevUrlScopeRef = useRef<TopicScope | null>(null);
 
   useEffect(() => {
@@ -120,6 +124,8 @@ function WorkbenchInner() {
 
   const {
     state: chatState,
+    activeMessages,
+    mutateGraph,
     sessionScope,
     isBusy,
     isGenerating,
@@ -333,8 +339,58 @@ function WorkbenchInner() {
   const activeId = currentConversation?.id ?? conversationId;
   const draftKey = JSON.stringify([connectionEpoch, activeScope, activeAssistant.id, isTemporaryMode]);
   const modeKey = JSON.stringify([draftKey, activeId]);
+  const [graphViewKey, setGraphViewKey] = useState<string | null>(null);
+  const [jumpTarget, setJumpTarget] = useState<{ messageId: string; seq: number } | null>(null);
+  const [graphBusy, setGraphBusy] = useState(false);
+  const graphLock = useRef(false);
+  const graphToggleRef = useRef<HTMLButtonElement>(null);
+  const graphConversation = !isTemporaryMode && sessionConversation?.id === conversationId ? sessionConversation : null;
+  const graphOpen = graphViewKey === modeKey && Boolean(graphConversation);
+  const graphReady = Boolean(graphConversation) && !isBusy && !isCompacting && !chatState.messages.some((msg) => isLocalMessageId(msg.id));
+  const branches = useMemo(() => graphConversation && resolveBranchSummaries(graphConversation, chatState.messages), [graphConversation, chatState.messages]);
+  const activeBranch = branches?.find((branch) => branch.id === (graphConversation?.graphState?.activeBranchId || graphConversation?.activeLeafId));
+  const showBranch = Boolean(graphConversation?.graphState?.activeBranchId || (branches && branches.length > 1));
+
+  useEffect(() => { setGraphViewKey(null); setJumpTarget(null); }, [modeKey]);
+
+  const submitGraphMutation = async (input: GraphMutationInput) => {
+    if (!graphReady || graphLock.current) return null;
+    graphLock.current = true;
+    setGraphBusy(true);
+    try {
+      const detail = await mutateGraph(input, reqScope);
+      if (detail && input.op === 'reparent' && !input.parentId) toast('已断开上下文');
+      return detail;
+    } finally { graphLock.current = false; setGraphBusy(false); }
+  };
+  const closeGraph = () => {
+    setGraphViewKey(null);
+    graphToggleRef.current?.focus({ preventScroll: true });
+  };
+  const activateGraphBranch = async (target: { leafMessageId: string } | { branchId: string }) => {
+    const isCurrent = 'branchId' in target ? target.branchId === graphConversation?.graphState?.activeBranchId
+      : !graphConversation?.graphState?.activeBranchId && target.leafMessageId === activeMessages.at(-1)?.id;
+    if (isCurrent || await submitGraphMutation({ op: 'activateBranch', ...target })) closeGraph();
+  };
+  const jumpToGraphMessage = async (messageId: string) => {
+    if (!activeMessages.some((msg) => msg.id === messageId)) {
+      const branch = branches?.find((item) => item.messageIds.includes(messageId));
+      const target = branch && 'branchId' in branch && branch.branchId ? { branchId: branch.branchId } : { leafMessageId: branch?.id ?? messageId };
+      if (!await submitGraphMutation({ op: 'activateBranch', ...target })) return;
+    }
+    setJumpTarget((prior) => ({ messageId, seq: (prior?.seq ?? 0) + 1 }));
+    setGraphViewKey(null);
+  };
   const draft = !activeId && draftAgent?.key === draftKey ? draftAgent : null;
   const conversationMode = currentConversation?.mode ?? draft?.mode ?? 'chat';
+  // Desktop chat discovers both tool catalogs; cloud Agent execution runs on the gateway.
+  const cloudAgent = reqScope === 'cloud' && conversationMode === 'agent';
+  const hasMcpSource = settings.builtinTimeToolEnabled || resources.cloudMcpServers.some((server) => server.enabled)
+    || (!cloudAgent && resources.mcpServers.some((server) => server.enabled));
+  const toggleMcp = () => {
+    if (!hasMcpSource) toast('请先在设置中启用 MCP 服务', 'error');
+    else setMcpToolsEnabled((value) => !value);
+  };
   const savingMode = savingModeKey === modeKey;
   const modeBusy = isBusy || isCompacting || savingMode || (Boolean(activeId) && !currentConversation);
   const modeKeyRef = useRef(modeKey);
@@ -561,6 +617,12 @@ function WorkbenchInner() {
           setInspectorOpen(false);
           return;
         }
+        if (graphOpen) {
+          e.preventDefault();
+          setGraphViewKey(null);
+          graphToggleRef.current?.focus({ preventScroll: true });
+          return;
+        }
         if (isGenerating) {
           e.preventDefault();
           stopStreaming();
@@ -572,6 +634,7 @@ function WorkbenchInner() {
   }, [
     closeDrawers,
     handleStartNewTopic,
+    graphOpen,
     inspectorOpen,
     isGenerating,
     leftDrawerOpen,
@@ -749,6 +812,7 @@ function WorkbenchInner() {
       providerId: selectedProviderId,
       modelId: selectedModelId,
       params: { reasoningEffort },
+      mcpToolsEnabled,
       webSearch: opts.webSearch,
       searchEngineId: opts.searchEngineId,
       onOptimisticStart: opts.onOptimisticStart,
@@ -763,6 +827,7 @@ function WorkbenchInner() {
       providerId: selectedProviderId,
       modelId: selectedModelId,
       params: { reasoningEffort },
+      mcpToolsEnabled,
       scope: activeScopeRef.current,
     });
 
@@ -798,7 +863,7 @@ function WorkbenchInner() {
     const detail = await branchFromMessage(message.id, activeScopeRef.current);
     if (detail) {
       navigate(buildChatUrl(detail.conversation.id));
-      toast('已创建分支话题');
+      toast('已复制为独立新话题');
     }
   };
 
@@ -1059,6 +1124,27 @@ function WorkbenchInner() {
             </div>
           )}
 
+          {showBranch && (
+            <button type="button" className="wb-branch-badge" disabled={!graphReady || graphBusy} aria-label={activeBranch?.label ?? '话题分支'}
+              aria-pressed={graphOpen} onClick={() => setGraphViewKey(modeKey)}>
+              <Icon name="branch" size={14} /><span>{activeBranch?.label ?? branches?.length}</span>
+            </button>
+          )}
+          {graphConversation && <IconButton
+            ref={graphToggleRef}
+            className="wb-graph-toggle"
+            data-branch={showBranch || undefined}
+            aria-description={showBranch ? activeBranch?.label ?? '多个话题内分支' : undefined}
+            icon={graphOpen ? 'messageSquare' : 'mindMap'}
+            label={graphOpen ? '返回对话' : '对话缩略图'}
+            active={graphOpen}
+            aria-pressed={graphOpen}
+            disabled={graphBusy || !graphReady}
+            onClick={() => {
+              if (graphOpen) closeGraph();
+              else setGraphViewKey(modeKey);
+            }}
+          />}
           <IconButton
             icon="temporaryChat"
             label={isTemporaryMode ? '退出临时会话' : '临时会话'}
@@ -1093,7 +1179,7 @@ function WorkbenchInner() {
           data-resizing={resizingWidth ? 'true' : undefined}
           style={chatStageStyle}
         >
-          {manualWidthActive ? (
+          {!graphOpen && manualWidthActive ? (
             <>
               <div
                 role="separator"
@@ -1122,7 +1208,15 @@ function WorkbenchInner() {
             </>
           ) : null}
 
+          {graphOpen && graphConversation && <ConversationGraphView
+            key={modeKey} conversation={graphConversation} messages={chatState.messages} activeMessages={activeMessages}
+            busy={graphBusy || !graphReady} mutate={submitGraphMutation} onJump={(id) => void jumpToGraphMessage(id)}
+            onActivate={(target) => void activateGraphBranch(target)} onDelete={handleDeleteMessage}
+          />}
+          <div className="wb-chat-view" hidden={graphOpen}>
           <ChatCanvas
+            activeMessages={activeMessages}
+            jumpTarget={jumpTarget}
             scope={reqScope}
             state={chatState}
             assistant={activeAssistant}
@@ -1141,11 +1235,13 @@ function WorkbenchInner() {
             selectedProviderId={selectedProviderId}
             selectedModelId={selectedModelId}
             reasoningEffort={reasoningEffort}
+            mcpActive={hasMcpSource && mcpToolsEnabled}
+            onToggleMcp={toggleMcp}
             savingModel={isSavingModel}
             savingEffort={savingEffort}
             isBusy={isBusy || isCompacting || savingMode}
             canStop={isGenerating}
-            messages={sessionScope === reqScope ? chatState.messages : []}
+            messages={sessionScope === reqScope ? activeMessages : []}
             streaming={chatState.streaming}
             systemPrompt={currentConversation?.systemPrompt || activeAssistant.systemPrompt || ''}
             contextWindow={targetModel?.model.contextWindow}
@@ -1163,6 +1259,7 @@ function WorkbenchInner() {
             )}
             isCompacting={isCompacting}
           />
+          </div>
         </div>
       </main>
 

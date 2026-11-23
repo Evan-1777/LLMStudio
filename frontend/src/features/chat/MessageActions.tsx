@@ -133,7 +133,7 @@ export function MessageActions({
           <IconButton
             size="sm"
             icon="branch"
-            label="从此处分支"
+            label="复制为新话题"
             disabled={disabled || isLocal}
             onClick={() => void onBranch(message)}
           />

@@ -627,6 +627,12 @@ func (c *CloudClient) ImportConversation(ctx context.Context, conv domain.Conver
 	return out, err
 }
 
+func (c *CloudClient) MutateConversationGraph(ctx context.Context, convID string, payload json.RawMessage) (service.ConversationDetail, error) {
+	var out service.ConversationDetail
+	err := c.doLongJSON(ctx, http.MethodPatch, "/api/v1/conversations/"+url.PathEscape(convID)+"/graph", payload, &out)
+	return out, err
+}
+
 func (c *CloudClient) CreateMessage(ctx context.Context, convID string, in service.CreateMessageInput) (service.CreateMessageResult, error) {
 	var out service.CreateMessageResult
 	err := c.doLongJSON(ctx, http.MethodPost, "/api/v1/conversations/"+url.PathEscape(convID)+"/messages", in, &out)
