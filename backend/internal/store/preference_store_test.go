@@ -208,6 +208,40 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	if err != nil || reloaded.MathRenderEnabled {
 		t.Fatalf("expected mathRenderEnabled false after reopen, got %+v err=%v", reloaded, err)
 	}
+
+	// Graph Markdown & visual HTML render preferences default true, persist explicit false,
+	// and are not overwritten by unrelated updates or legacy import.
+	if !reloaded.GraphMarkdownRender || !reloaded.GraphVisualHTMLRender {
+		t.Fatalf("expected graph render preferences default true, got %+v", reloaded)
+	}
+	disableGraph := false
+	graphUpdated, _, err := prefs.Update(ctx, domain.PreferencesPatch{
+		GraphMarkdownRender:   &disableGraph,
+		GraphVisualHTMLRender: &disableGraph,
+	}, false, validatePrefs)
+	if err != nil || graphUpdated.GraphMarkdownRender || graphUpdated.GraphVisualHTMLRender {
+		t.Fatalf("expected graph render preferences persisted false, got %+v err=%v", graphUpdated, err)
+	}
+	anotherSize := 15
+	afterUnrelated, _, err := prefs.Update(ctx, domain.PreferencesPatch{FontSize: &anotherSize}, false, validatePrefs)
+	if err != nil || afterUnrelated.GraphMarkdownRender || afterUnrelated.GraphVisualHTMLRender {
+		t.Fatalf("unrelated patch overwrote graph render preferences: %+v err=%v", afterUnrelated, err)
+	}
+	if _, _, err := prefs.Update(ctx, patchFromPreferences(domain.DefaultPreferences()), true, validatePrefs); err != nil {
+		t.Fatalf("legacy import after graph render update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db for graph render prefs: %v", err)
+	}
+	db, err = OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen sqlite for graph render prefs: %v", err)
+	}
+	prefs = NewPreferenceStore(db)
+	reloadedGraph, _, err := prefs.Get(ctx)
+	if err != nil || reloadedGraph.GraphMarkdownRender || reloadedGraph.GraphVisualHTMLRender {
+		t.Fatalf("expected graph render preferences false after reopen, got %+v err=%v", reloadedGraph, err)
+	}
 }
 
 func TestMigration005BackfillsManagedAPIKeys(t *testing.T) {

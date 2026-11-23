@@ -15,6 +15,8 @@ import (
 type GraphMutationInput struct {
 	Op              string          `json:"op"`
 	MessageID       string          `json:"messageId,omitempty"`
+	MessageIDs      []string        `json:"messageIds,omitempty"`
+	BranchIDs       []string        `json:"branchIds,omitempty"`
 	ParentID        *string         `json:"parentId,omitempty"`
 	GraphMeta       *GraphMetaPatch `json:"graphMeta,omitempty"`
 	Collapsed       *bool           `json:"collapsed,omitempty"`
@@ -110,6 +112,30 @@ func branchIndex(state *domain.ConversationGraphState, id string) int {
 	return slices.IndexFunc(state.Branches, func(slot domain.ConversationBranchSlot) bool { return slot.ID == id })
 }
 
+func dedupeNonEmpty(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+func fallbackGraphLeafTx(ctx context.Context, tx *sql.Tx, conversationID string) (string, error) {
+	leaf, err := newestGraphMessageTx(ctx, tx, conversationID, true)
+	if err != nil || leaf != "" {
+		return leaf, err
+	}
+	return newestGraphMessageTx(ctx, tx, conversationID, false)
+}
+
 func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, in GraphMutationInput) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -125,6 +151,26 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 	case "reparent":
 		if in.ParentID == nil {
 			return invalidGraph("缺少 parentId")
+		}
+		if len(in.MessageIDs) > 0 {
+			if *in.ParentID != "" {
+				return invalidGraph("批量重连仅支持断开上下文")
+			}
+			msgIDs := dedupeNonEmpty(in.MessageIDs)
+			if len(msgIDs) == 0 {
+				return invalidGraph("请选择要操作的节点")
+			}
+			for _, mid := range msgIDs {
+				if _, err := graphMessageTx(ctx, tx, id, mid); err != nil {
+					return err
+				}
+			}
+			for _, mid := range msgIDs {
+				if _, err := tx.ExecContext(ctx, `UPDATE messages SET parent_id = '' WHERE conversation_id = ? AND id = ?`, id, mid); err != nil {
+					return err
+				}
+			}
+			break
 		}
 		if _, err := graphMessageTx(ctx, tx, id, in.MessageID); err != nil {
 			return err
@@ -154,8 +200,20 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 			return invalidGraph("缺少节点元数据或坐标")
 		}
 		if in.GraphMeta != nil {
-			if err := updateGraphMetaTx(ctx, tx, id, in.MessageID, *in.GraphMeta); err != nil {
-				return err
+			if len(in.MessageIDs) > 0 {
+				msgIDs := dedupeNonEmpty(in.MessageIDs)
+				if len(msgIDs) == 0 {
+					return invalidGraph("请选择要操作的节点")
+				}
+				for _, mid := range msgIDs {
+					if err := updateGraphMetaTx(ctx, tx, id, mid, *in.GraphMeta); err != nil {
+						return err
+					}
+				}
+			} else {
+				if err := updateGraphMetaTx(ctx, tx, id, in.MessageID, *in.GraphMeta); err != nil {
+					return err
+				}
 			}
 		}
 		for _, pos := range in.Positions {
@@ -171,6 +229,107 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 			} else {
 				return invalidGraph("话题内分支不存在")
 			}
+		}
+	case "deleteNodes":
+		msgIDs := dedupeNonEmpty(in.MessageIDs)
+		branchIDs := dedupeNonEmpty(in.BranchIDs)
+		if len(msgIDs) == 0 && len(branchIDs) == 0 {
+			return invalidGraph("请选择要删除的节点")
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT id, parent_id FROM messages WHERE conversation_id = ?`, id)
+		if err != nil {
+			return err
+		}
+		parentOf := make(map[string]string)
+		allMsgIDs := make([]string, 0)
+		for rows.Next() {
+			var mid, pid string
+			if err := rows.Scan(&mid, &pid); err != nil {
+				rows.Close()
+				return err
+			}
+			parentOf[mid] = pid
+			allMsgIDs = append(allMsgIDs, mid)
+		}
+		if err := rows.Close(); err != nil {
+			return err
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		deleteMsgSet := make(map[string]bool, len(msgIDs))
+		for _, mid := range msgIDs {
+			if _, ok := parentOf[mid]; !ok {
+				return invalidGraph("消息不在当前话题中")
+			}
+			deleteMsgSet[mid] = true
+		}
+		deleteBranchSet := make(map[string]bool, len(branchIDs))
+		for _, bid := range branchIDs {
+			if branchIndex(state, bid) < 0 {
+				return invalidGraph("话题内分支不存在")
+			}
+			deleteBranchSet[bid] = true
+		}
+		survivingAncestor := func(start string) string {
+			seen := make(map[string]bool)
+			for cur := start; cur != ""; {
+				if !deleteMsgSet[cur] {
+					return cur
+				}
+				if seen[cur] {
+					return ""
+				}
+				seen[cur] = true
+				cur = parentOf[cur]
+			}
+			return ""
+		}
+		for _, mid := range allMsgIDs {
+			if deleteMsgSet[mid] {
+				continue
+			}
+			if parent := parentOf[mid]; parent != "" && deleteMsgSet[parent] {
+				if _, err := tx.ExecContext(ctx, `UPDATE messages SET parent_id = ? WHERE conversation_id = ? AND id = ?`, survivingAncestor(parent), id, mid); err != nil {
+					return err
+				}
+			}
+		}
+		for _, mid := range msgIDs {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ? AND id = ?`, id, mid); err != nil {
+				return err
+			}
+		}
+		remaining := make([]domain.ConversationBranchSlot, 0, len(state.Branches))
+		for _, slot := range state.Branches {
+			if deleteBranchSet[slot.ID] {
+				continue
+			}
+			if slot.ParentMessageID != "" && deleteMsgSet[slot.ParentMessageID] {
+				slot.ParentMessageID = survivingAncestor(slot.ParentMessageID)
+			}
+			remaining = append(remaining, slot)
+		}
+		state.Branches = remaining
+		if state.ActiveBranchID != "" {
+			if deleteBranchSet[state.ActiveBranchID] {
+				state.ActiveBranchID = ""
+				c.ActiveLeafID, err = fallbackGraphLeafTx(ctx, tx, id)
+				if err != nil {
+					return err
+				}
+			} else if i := branchIndex(state, state.ActiveBranchID); i >= 0 {
+				c.ActiveLeafID = state.Branches[i].ParentMessageID
+			}
+		} else if c.ActiveLeafID != "" && deleteMsgSet[c.ActiveLeafID] {
+			next := survivingAncestor(c.ActiveLeafID)
+			if next == "" {
+				next, err = fallbackGraphLeafTx(ctx, tx, id)
+				if err != nil {
+					return err
+				}
+			}
+			c.ActiveLeafID = next
 		}
 	case "createBranch":
 		if in.ParentMessageID != "" {

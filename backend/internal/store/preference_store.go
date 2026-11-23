@@ -13,7 +13,8 @@ const preferencesSelect = "SELECT theme_mode, seed_color_value, enter_to_send, v
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
 	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, mcp_max_tool_rounds, " +
-	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, math_render_enabled, imported " +
+	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, math_render_enabled, " +
+	"graph_markdown_render, graph_visual_html_render, imported " +
 	"FROM user_preferences WHERE id = 1"
 
 const preferencesUpsert = "INSERT INTO user_preferences (" +
@@ -21,8 +22,9 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"chat_display_mode, auto_collapse_enabled, auto_collapse_thinking_on_complete, " +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
 	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, mcp_max_tool_rounds, " +
-	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, math_render_enabled, imported, updated_at" +
-	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
+	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, math_render_enabled, " +
+	"graph_markdown_render, graph_visual_html_render, imported, updated_at" +
+	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
 	"ON CONFLICT(id) DO UPDATE SET " +
 	"theme_mode = excluded.theme_mode, " +
 	"seed_color_value = excluded.seed_color_value, " +
@@ -45,6 +47,8 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"font_size = excluded.font_size, " +
 	"builtin_time_tool_enabled = excluded.builtin_time_tool_enabled, " +
 	"math_render_enabled = excluded.math_render_enabled, " +
+	"graph_markdown_render = excluded.graph_markdown_render, " +
+	"graph_visual_html_render = excluded.graph_visual_html_render, " +
 	"imported = 1, " +
 	"updated_at = excluded.updated_at"
 
@@ -131,6 +135,8 @@ func (s *PreferenceStore) Update(
 		next.FontSize,
 		boolToInt(next.BuiltinTimeToolEnabled),
 		boolToInt(next.MathRenderEnabled),
+		boolToInt(next.GraphMarkdownRender),
+		boolToInt(next.GraphVisualHTMLRender),
 		formatTime(time.Now().UTC()),
 	); err != nil {
 		return domain.Preferences{}, false, fmt.Errorf("write preferences: %w", err)
@@ -158,6 +164,8 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 		autoCache     int
 		builtinTime   int
 		mathRender    int
+		graphMarkdown int
+		graphVisual   int
 		initialized   int
 	)
 	err := q.QueryRowContext(ctx, preferencesSelect).Scan(
@@ -182,6 +190,8 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 		&prefs.FontSize,
 		&builtinTime,
 		&mathRender,
+		&graphMarkdown,
+		&graphVisual,
 		&initialized,
 	)
 	if err != nil {
@@ -197,5 +207,7 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 	prefs.AutoCreateCache = autoCache != 0
 	prefs.BuiltinTimeToolEnabled = builtinTime != 0
 	prefs.MathRenderEnabled = mathRender != 0
+	prefs.GraphMarkdownRender = graphMarkdown != 0
+	prefs.GraphVisualHTMLRender = graphVisual != 0
 	return prefs, initialized != 0, nil
 }

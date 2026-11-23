@@ -1,6 +1,7 @@
 import type { Conversation, ConversationBranchSlot, Message } from '../../core/types';
 
 export interface Point { x: number; y: number }
+export interface Rect { left: number; top: number; right: number; bottom: number }
 export interface GraphNode extends Point {
   id: string;
   parentId: string;
@@ -8,6 +9,58 @@ export interface GraphNode extends Point {
   height: number;
   message?: Message;
   branch?: ConversationBranchSlot;
+}
+
+export function normalizeRect(a: Point, b: Point): Rect {
+  return {
+    left: Math.min(a.x, b.x),
+    top: Math.min(a.y, b.y),
+    right: Math.max(a.x, b.x),
+    bottom: Math.max(a.y, b.y),
+  };
+}
+
+export function rectIntersectsNode(
+  rect: Rect,
+  node: Pick<GraphNode, 'x' | 'y' | 'width' | 'height'>,
+): boolean {
+  return (
+    rect.left <= node.x + node.width &&
+    rect.right >= node.x &&
+    rect.top <= node.y + node.height &&
+    rect.bottom >= node.y
+  );
+}
+
+export function collectSubtreeIds(
+  nodes: readonly GraphNode[],
+  rootIds: Iterable<string>,
+): Set<string> {
+  const byId = new Set(nodes.map((node) => node.id));
+  const children = new Map<string, string[]>();
+  for (const node of nodes) {
+    if (!node.parentId) continue;
+    const list = children.get(node.parentId);
+    if (list) list.push(node.id);
+    else children.set(node.parentId, [node.id]);
+  }
+  const visited = new Set<string>();
+  const queue: string[] = [];
+  for (const id of rootIds) {
+    if (byId.has(id) && !visited.has(id)) {
+      visited.add(id);
+      queue.push(id);
+    }
+  }
+  for (let i = 0; i < queue.length; i++) {
+    for (const childId of children.get(queue[i]) ?? []) {
+      if (!visited.has(childId)) {
+        visited.add(childId);
+        queue.push(childId);
+      }
+    }
+  }
+  return visited;
 }
 
 function *ancestors<T extends { parentId?: string }>(byId: ReadonlyMap<string, T>, leaf: string) {
@@ -63,18 +116,30 @@ export function extractUserSummary(message: Message): string {
   return message.graphMeta?.summary?.trim() || Array.from(extractNodePreview(message)).slice(0, 40).join('') || '用户消息';
 }
 
-export function computeAutoLayout(conversation: Conversation, messages: Message[], useSavedPositions = true): GraphNode[] {
+export function computeAutoLayout(
+  conversation: Conversation,
+  messages: Message[],
+  useSavedPositions = true,
+  sizeOverrides?: ReadonlyMap<string, { width: number; height: number }>,
+): GraphNode[] {
   const graph = conversation.graphState;
   const nodes: GraphNode[] = messages.map((message, index) => {
     const summary = message.role === 'user' && message.graphMeta?.collapsed;
     const compact = message.role === 'compaction';
+    const override = sizeOverrides?.get(message.id);
     return {
       message, id: message.id, parentId: graph?.enabled ? message.parentId ?? '' : messages[index - 1]?.id ?? '',
-      x: 0, y: 0, width: summary ? 196 : compact ? 208 : 248, height: summary ? 32 : compact ? 40 : message.role === 'user' ? 92 : 104,
+      x: 0, y: 0,
+      width: override?.width ?? (summary ? 196 : compact ? 208 : 248),
+      height: override?.height ?? (summary ? 32 : compact ? 40 : message.role === 'user' ? 92 : 104),
     };
   });
   for (const branch of graph?.branches ?? []) {
-    nodes.push({ branch, id: branch.id, parentId: branch.parentMessageId ?? '', x: 0, y: 0, width: 212, height: 68 });
+    const override = sizeOverrides?.get(branch.id);
+    nodes.push({
+      branch, id: branch.id, parentId: branch.parentMessageId ?? '',
+      x: 0, y: 0, width: override?.width ?? 212, height: override?.height ?? 68,
+    });
   }
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const children = new Map<string, GraphNode[]>();

@@ -578,6 +578,34 @@ export function AppearancePage() {
             </div>
           </div>
         </section>
+
+        <section>
+          <h3 className="st-subhead">对话缩略图</h3>
+          <div className="st-group">
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">缩略图渲染 Markdown</span>
+              <Switch
+                checked={settings.graphMarkdownRender}
+                label="缩略图渲染 Markdown"
+                onCheckedChange={(graphMarkdownRender) =>
+                  void updatePreferences({ graphMarkdownRender })
+                }
+              />
+            </div>
+
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">缩略图可视化渲染</span>
+              <Switch
+                checked={settings.graphVisualHtmlRender}
+                label="缩略图可视化渲染"
+                disabled={!settings.graphMarkdownRender}
+                onCheckedChange={(graphVisualHtmlRender) =>
+                  void updatePreferences({ graphVisualHtmlRender })
+                }
+              />
+            </div>
+          </div>
+        </section>
       </div>
     </div>
   );

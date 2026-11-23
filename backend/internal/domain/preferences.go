@@ -77,6 +77,8 @@ type Preferences struct {
 	FontSize                     int    `json:"fontSize"`
 	BuiltinTimeToolEnabled       bool   `json:"builtinTimeToolEnabled"`
 	MathRenderEnabled            bool   `json:"mathRenderEnabled"`
+	GraphMarkdownRender          bool   `json:"graphMarkdownRender"`
+	GraphVisualHTMLRender        bool   `json:"graphVisualHtmlRender"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -100,6 +102,8 @@ func DefaultPreferences() Preferences {
 		FontFamily:                   FontFamilySystem,
 		FontSize:                     DefaultFontSize,
 		MathRenderEnabled:            true,
+		GraphMarkdownRender:          true,
+		GraphVisualHTMLRender:        true,
 	}
 }
 
@@ -128,6 +132,8 @@ type PreferencesPatch struct {
 	FontSize                     *int    `json:"fontSize"`
 	BuiltinTimeToolEnabled       *bool   `json:"builtinTimeToolEnabled"`
 	MathRenderEnabled            *bool   `json:"mathRenderEnabled"`
+	GraphMarkdownRender          *bool   `json:"graphMarkdownRender"`
+	GraphVisualHTMLRender        *bool   `json:"graphVisualHtmlRender"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -195,6 +201,12 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	}
 	if p.MathRenderEnabled != nil {
 		out.MathRenderEnabled = *p.MathRenderEnabled
+	}
+	if p.GraphMarkdownRender != nil {
+		out.GraphMarkdownRender = *p.GraphMarkdownRender
+	}
+	if p.GraphVisualHTMLRender != nil {
+		out.GraphVisualHTMLRender = *p.GraphVisualHTMLRender
 	}
 	return out
 }

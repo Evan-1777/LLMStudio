@@ -41,6 +41,7 @@ export type IconName =
   | 'paperclip'
   | 'branch'
   | 'mindMap'
+  | 'boxSelect'
   | 'fitView'
   | 'autoLayout'
   | 'unlink'
@@ -84,6 +85,7 @@ export type IconName =
 
 const ICON_BODIES: Record<IconName, ReactNode> = {
   mindMap: <><rect x="9" y="3" width="6" height="5" rx="1" /><rect x="3" y="16" width="6" height="5" rx="1" /><rect x="15" y="16" width="6" height="5" rx="1" /><path d="M12 8v4m-6 4v-4h12v4" /></>,
+  boxSelect: <path d="M5 3a2 2 0 0 0-2 2m16-2a2 2 0 0 1 2 2m0 14a2 2 0 0 1-2 2M5 21a2 2 0 0 1-2-2M9 3h1m4 0h1M9 21h1m4 0h1M3 9v1m0 4v1m18-6v1m0 4v1" />,
   fitView: <path d="M8 4H4v4m12-4h4v4M4 16v4h4m12-4v4h-4" />,
   autoLayout: <><rect x="4" y="4" width="7" height="6" rx="1" /><rect x="13" y="14" width="7" height="6" rx="1" /><path d="M7.5 10v7H13m3-13h4v5" /></>,
   unlink: <path d="m10 13 4-4m-7 5-2 2a3 3 0 0 0 4 4l2-2m2-12 2-2a3 3 0 0 1 4 4l-2 2M3 9h4M9 3v4m6 10v4m2-6h4" />,

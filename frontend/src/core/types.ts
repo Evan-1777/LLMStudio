@@ -300,8 +300,11 @@ export type GraphPosition = { x: number; y: number } & (
 
 export type GraphMutationInput =
   | { op: 'reparent'; messageId: string; parentId: string }
+  | { op: 'reparent'; messageIds: string[]; parentId: '' }
   | { op: 'setNodeMeta'; messageId: string; graphMeta: MessageGraphMeta }
+  | { op: 'setNodeMeta'; messageIds: string[]; graphMeta: Pick<MessageGraphMeta, 'collapsed'> }
   | { op: 'setNodeMeta'; positions: GraphPosition[] }
+  | { op: 'deleteNodes'; messageIds?: string[]; branchIds?: string[] }
   | { op: 'createBranch'; parentMessageId: string; x: number; y: number; activate?: boolean }
   | { op: 'deleteBranch'; branchId: string }
   | { op: 'activateBranch'; branchId: string }

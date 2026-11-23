@@ -172,6 +172,8 @@ export interface AppSettings {
   fontSize: number;
   builtinTimeToolEnabled: boolean;
   mathRenderEnabled: boolean;
+  graphMarkdownRender: boolean;
+  graphVisualHtmlRender: boolean;
 }
 
 export interface SettingsLoadResult {
@@ -210,6 +212,8 @@ export const APP_PREFERENCE_KEYS = [
   'fontSize',
   'builtinTimeToolEnabled',
   'mathRenderEnabled',
+  'graphMarkdownRender',
+  'graphVisualHtmlRender',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -239,6 +243,8 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     fontSize: settings.fontSize,
     builtinTimeToolEnabled: settings.builtinTimeToolEnabled,
     mathRenderEnabled: settings.mathRenderEnabled,
+    graphMarkdownRender: settings.graphMarkdownRender,
+    graphVisualHtmlRender: settings.graphVisualHtmlRender,
   };
 }
 
@@ -272,6 +278,8 @@ export function defaultSettings(): AppSettings {
     fontSize: FONT_SIZE_DEFAULT,
     builtinTimeToolEnabled: false,
     mathRenderEnabled: true,
+    graphMarkdownRender: true,
+    graphVisualHtmlRender: true,
   };
 }
 
@@ -392,6 +400,14 @@ export function normalizeSettings(raw: unknown): AppSettings {
       typeof obj.mathRenderEnabled === 'boolean'
         ? obj.mathRenderEnabled
         : defaults.mathRenderEnabled,
+    graphMarkdownRender:
+      typeof obj.graphMarkdownRender === 'boolean'
+        ? obj.graphMarkdownRender
+        : defaults.graphMarkdownRender,
+    graphVisualHtmlRender:
+      typeof obj.graphVisualHtmlRender === 'boolean'
+        ? obj.graphVisualHtmlRender
+        : defaults.graphVisualHtmlRender,
   };
 }
 
@@ -589,6 +605,8 @@ export function readLegacyPreferences(
         fontSize: _fs,
         builtinTimeToolEnabled: _bt,
         mathRenderEnabled: _mr,
+        graphMarkdownRender: _gm,
+        graphVisualHtmlRender: _gv,
         ...legacy
       } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
       return legacy;
@@ -604,6 +622,8 @@ export function readLegacyPreferences(
         fontSize: _fs,
         builtinTimeToolEnabled: _bt,
         mathRenderEnabled: _mr,
+        graphMarkdownRender: _gm,
+        graphVisualHtmlRender: _gv,
         ...legacy
       } = pickAppPreferences(
         normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),

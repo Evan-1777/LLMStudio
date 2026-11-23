@@ -65,6 +65,8 @@ describe('settings storage and migration', () => {
       fontSize: 14,
       builtinTimeToolEnabled: false,
       mathRenderEnabled: true,
+      graphMarkdownRender: true,
+      graphVisualHtmlRender: true,
     });
 
     expect(defaultSettings()).toMatchObject({
@@ -302,5 +304,42 @@ describe('settings storage and migration', () => {
     const legacy = readLegacyPreferences(storage);
     expect(legacy).not.toBeNull();
     expect('mathRenderEnabled' in (legacy as Record<string, unknown>)).toBe(false);
+  });
+
+  it('defaults graphMarkdownRender and graphVisualHtmlRender to true, preserves explicit false, and excludes them from legacy import', () => {
+    expect(defaultSettings().graphMarkdownRender).toBe(true);
+    expect(defaultSettings().graphVisualHtmlRender).toBe(true);
+    expect(normalizeSettings({ graphMarkdownRender: false, graphVisualHtmlRender: false })).toMatchObject({
+      graphMarkdownRender: false,
+      graphVisualHtmlRender: false,
+    });
+    expect(normalizeSettings({ graphMarkdownRender: 'no', graphVisualHtmlRender: 0 })).toMatchObject({
+      graphMarkdownRender: true,
+      graphVisualHtmlRender: true,
+    });
+    expect(normalizeServerPreferences({})).toMatchObject({
+      graphMarkdownRender: true,
+      graphVisualHtmlRender: true,
+    });
+    expect(normalizeServerPreferences({ graphMarkdownRender: false, graphVisualHtmlRender: false })).toMatchObject({
+      graphMarkdownRender: false,
+      graphVisualHtmlRender: false,
+    });
+
+    const storeMap = new Map<string, string>([
+      ['llmstudio.settings.v2', JSON.stringify({ themeMode: 'dark', graphMarkdownRender: false, graphVisualHtmlRender: false })],
+    ]);
+    const storage: Storage = {
+      length: 1,
+      clear: () => storeMap.clear(),
+      key: () => null,
+      removeItem: (k) => { storeMap.delete(k); },
+      getItem: (k) => storeMap.get(k) ?? null,
+      setItem: (k, v) => { storeMap.set(k, v); },
+    };
+    const legacy = readLegacyPreferences(storage);
+    expect(legacy).not.toBeNull();
+    expect('graphMarkdownRender' in (legacy as Record<string, unknown>)).toBe(false);
+    expect('graphVisualHtmlRender' in (legacy as Record<string, unknown>)).toBe(false);
   });
 });

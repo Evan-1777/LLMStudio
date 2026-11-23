@@ -499,6 +499,7 @@ export const ContentRenderer = memo(function ContentRenderer({
   blockCompleted,
   stopReason,
   isUser = false,
+  visualHtmlRender,
 }: {
   messageId: string;
   collapsePrefix?: string;
@@ -507,6 +508,7 @@ export const ContentRenderer = memo(function ContentRenderer({
   blockCompleted?: readonly boolean[];
   stopReason?: string;
   isUser?: boolean;
+  visualHtmlRender?: boolean;
 }) {
   const { settings } = useApp();
   const [zoomedSrc, setZoomedSrc] = useState<string | null>(null);
@@ -557,7 +559,7 @@ export const ContentRenderer = memo(function ContentRenderer({
           content={text}
           collapsePrefix={baseKey}
           isStreaming={isStreaming}
-          visualHtmlRender={settings.visualHtmlRender}
+          visualHtmlRender={visualHtmlRender ?? settings.visualHtmlRender}
         />,
       );
       return;

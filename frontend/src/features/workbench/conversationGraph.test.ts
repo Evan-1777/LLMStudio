@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { Conversation, Message } from '../../core/types';
-import { computeAutoLayout, extractUserSummary, resolveActiveBranchMessages, resolveBranchSummaries, wouldCreateCycle } from './conversationGraph';
+import {
+  collectSubtreeIds,
+  computeAutoLayout,
+  extractUserSummary,
+  normalizeRect,
+  rectIntersectsNode,
+  resolveActiveBranchMessages,
+  resolveBranchSummaries,
+  wouldCreateCycle,
+} from './conversationGraph';
 import { activeChatMessages, chatReducer, initialChatState, streamingChatMessages } from '../chat/chatReducer';
 
 function message(id: string, parentId = '', role = 'user'): Message {
@@ -48,5 +57,35 @@ describe('conversation graph', () => {
     const final = chatReducer(retry, { type: 'STREAM_EVENT', event: { type: 'message_end', message: message('b', 'a', 'assistant') }, fallbackProviderId: 'p', fallbackModelId: 'm' });
     expect(ids(activeChatMessages(final))).toEqual(['a', 'b', 'c']);
     expect(final.messages.find(({ id }) => id === 'd')).toEqual(messages[3]);
+  });
+
+  it('normalizes marquee rectangles, detects node intersections, collects subtrees safely, and respects sizeOverrides', () => {
+    const rect = normalizeRect({ x: 180, y: 120 }, { x: 40, y: 20 });
+    expect(rect).toEqual({ left: 40, top: 20, right: 180, bottom: 120 });
+    expect(rectIntersectsNode(rect, { x: 60, y: 40, width: 80, height: 40 })).toBe(true);
+    expect(rectIntersectsNode(rect, { x: 170, y: 110, width: 100, height: 60 })).toBe(true);
+    expect(rectIntersectsNode(rect, { x: 181, y: 40, width: 80, height: 40 })).toBe(false);
+    expect(rectIntersectsNode(rect, { x: 60, y: 121, width: 80, height: 40 })).toBe(false);
+
+    const layout = computeAutoLayout(conversation, messages, false);
+    expect(Array.from(collectSubtreeIds(layout, ['a'])).sort()).toEqual(['a', 'b', 'c', 'd', 'fork']);
+    expect(Array.from(collectSubtreeIds(layout, ['b', 'e', 'missing'])).sort()).toEqual(['b', 'c', 'e']);
+
+    const cyclic = [
+      { id: 'x', parentId: 'y', x: 0, y: 0, width: 10, height: 10 },
+      { id: 'y', parentId: 'x', x: 0, y: 0, width: 10, height: 10 },
+    ];
+    expect(Array.from(collectSubtreeIds(cyclic, ['x'])).sort()).toEqual(['x', 'y']);
+
+    const overrides = new Map([
+      ['b', { width: 420, height: 320 }],
+      ['d', { width: 420, height: 320 }],
+    ]);
+    const expandedLayout = computeAutoLayout(conversation, messages, false, overrides);
+    expect(expandedLayout.find((n) => n.id === 'b')).toMatchObject({ width: 420, height: 320 });
+    for (const a of expandedLayout) for (const b of expandedLayout) {
+      if (a === b) continue;
+      expect(a.x + a.width <= b.x || b.x + b.width <= a.x || a.y + a.height <= b.y || b.y + b.height <= a.y).toBe(true);
+    }
   });
 });
