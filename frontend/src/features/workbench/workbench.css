@@ -1676,6 +1676,20 @@
     box-shadow var(--duration-fast) var(--ease-apple);
 }
 
+.wb-search-input--searching {
+  padding-right: 28px;
+}
+
+.wb-search-spinner {
+  position: absolute;
+  right: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  pointer-events: none;
+}
+
 .wb-search-input:focus {
   outline: none;
   background: var(--bg-surface);
@@ -1958,6 +1972,29 @@
 
 .wb-topic-row--active .wb-topic-row__title {
   font-weight: 650;
+}
+
+.wb-topic-row__snippet {
+  width: 100%;
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wb-search-mark {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--text-primary);
+  font-weight: 560;
+  border-radius: 3px;
+  padding: 0 2px;
+}
+
+.wb-topic-row--active .wb-search-mark {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
 }
 
 .wb-topic-row__time {
@@ -2666,4 +2703,143 @@
 
 .wb-foot-status__icon--error {
   color: var(--danger);
+}
+
+/* Message side-reference branch badge & Layer 3 glass popover */
+.wb-sideref-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  margin-top: 6px;
+}
+
+.wb-sideref-row--end {
+  justify-content: flex-end;
+  padding-inline-end: 42px;
+}
+
+.wb-sideref-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: var(--radius-full);
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border-subtle));
+  background: color-mix(in srgb, var(--accent-soft) 55%, var(--bg-overlay-glass));
+  backdrop-filter: saturate(160%) blur(12px);
+  color: var(--accent);
+  font-size: 11.5px;
+  font-weight: 550;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-apple),
+    border-color var(--duration-fast) var(--ease-apple),
+    color var(--duration-fast) var(--ease-apple),
+    box-shadow var(--duration-fast) var(--ease-apple);
+}
+
+.wb-sideref-pill:hover,
+.wb-sideref-pill:focus-visible {
+  background: color-mix(in srgb, var(--accent-soft) 82%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--accent) 52%, var(--border-strong));
+  box-shadow: var(--shadow-xs);
+}
+
+.wb-sideref-pill--empty {
+  border-color: var(--border-subtle);
+  background: var(--bg-surface-secondary);
+  color: var(--text-secondary);
+}
+
+.wb-sideref-pill--empty:hover,
+.wb-sideref-pill--empty:focus-visible {
+  background: var(--bg-hover);
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.wb-sideref-popover {
+  width: min(360px, calc(100vw - 24px));
+  padding: 8px;
+}
+
+.wb-sideref-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(360px, 60vh);
+  overflow-y: auto;
+}
+
+.wb-sideref-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-surface-secondary);
+}
+
+.wb-sideref-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wb-sideref-card__meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.wb-sideref-card__meta svg {
+  flex: none;
+  color: var(--accent);
+}
+
+.wb-sideref-card__count {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.wb-sideref-card__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+.wb-sideref-card__body {
+  max-height: 156px;
+  overflow-y: auto;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-hairline);
+}
+
+.wb-sideref-card__empty {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  padding-top: 2px;
+}
+
+@media (max-width: 520px) {
+  .wb-sideref-row--end {
+    padding-inline-end: 0;
+  }
 }

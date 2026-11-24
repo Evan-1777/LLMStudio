@@ -240,7 +240,7 @@ func messageHasToolResultBlocks(m domain.Message) bool {
 	return false
 }
 
-func estimateCompactionBeforeTokens(systemPrompt string, history []domain.Message, plan compactionPlan) int {
+func estimateCompactionBeforeTokens(systemPrompt string, all, history []domain.Message, plan compactionPlan) int {
 	for i := len(history) - 1; i >= plan.contentStart; i-- {
 		m := history[i]
 		if m.Role != domain.RoleAssistant || m.Usage == nil {
@@ -258,14 +258,28 @@ func estimateCompactionBeforeTokens(systemPrompt string, history []domain.Messag
 			}
 		}
 		if anchorTokens > 0 {
+			expanded := expandSideReferences(all, history[plan.activeStart:])
+			anchorPos := -1
+			for k := len(expanded) - 1; k >= 0; k-- {
+				if expanded[k].ID == m.ID {
+					anchorPos = k
+					break
+				}
+			}
 			trailing := 0
-			for j := i + 1; j < len(history); j++ {
-				trailing += estimateMessageTokens(history[j])
+			if anchorPos >= 0 {
+				for j := anchorPos + 1; j < len(expanded); j++ {
+					trailing += estimateMessageTokens(expanded[j])
+				}
+			} else {
+				for j := i + 1; j < len(history); j++ {
+					trailing += estimateMessageTokens(history[j])
+				}
 			}
 			return anchorTokens + trailing
 		}
 	}
-	return estimateMessagesTokens(systemPrompt, history[plan.activeStart:])
+	return estimateMessagesTokens(systemPrompt, expandSideReferences(all, history[plan.activeStart:]))
 }
 
 func selectCompactionPlan(history []domain.Message) (compactionPlan, error) {
@@ -310,7 +324,7 @@ func selectCompactionPlan(history []domain.Message) (compactionPlan, error) {
 		plan.keptCount = 0
 	}
 	plan.promptMessages = projectModelHistory(plan.compactedSpan)
-	plan.beforeTokens = estimateCompactionBeforeTokens("", history, plan)
+	plan.beforeTokens = estimateCompactionBeforeTokens("", history, history, plan)
 	return plan, nil
 }
 
@@ -394,7 +408,8 @@ func (s *ChatService) prepareCompactionUpstream(ctx context.Context, in CompactC
 	if err != nil {
 		return preparedCompactionUpstream{}, err
 	}
-	plan.beforeTokens = estimateCompactionBeforeTokens(up.systemPrompt, history, plan)
+	plan.promptMessages = expandSideReferences(all, plan.promptMessages)
+	plan.beforeTokens = estimateCompactionBeforeTokens(up.systemPrompt, all, history, plan)
 	chatInput := buildCompactionChatInput(up, plan.promptMessages)
 	return preparedCompactionUpstream{
 		up:        up,

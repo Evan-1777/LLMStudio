@@ -273,12 +273,20 @@ type Usage struct {
 	ContextTokens            int `json:"contextTokens,omitempty"`
 }
 
-// MessageGraphMeta stores display preferences for a conversation node.
+// MessageSideRef represents a side-branch reference attached to a message node.
+type MessageSideRef struct {
+	SourceMessageID string `json:"sourceMessageId"`
+	Side            string `json:"side,omitempty"` // "left" or "right"
+}
+
+// MessageGraphMeta stores display preferences and side references for a conversation node.
 type MessageGraphMeta struct {
-	Collapsed bool     `json:"collapsed,omitempty"`
-	Summary   string   `json:"summary,omitempty"`
-	X         *float64 `json:"x,omitempty"`
-	Y         *float64 `json:"y,omitempty"`
+	Collapsed bool             `json:"collapsed,omitempty"`
+	Expanded  bool             `json:"expanded,omitempty"`
+	Summary   string           `json:"summary,omitempty"`
+	X         *float64         `json:"x,omitempty"`
+	Y         *float64         `json:"y,omitempty"`
+	SideRefs  []MessageSideRef `json:"sideRefs,omitempty"`
 }
 
 type ConversationBranchSlot struct {
@@ -290,10 +298,38 @@ type ConversationBranchSlot struct {
 	CreatedAt       time.Time `json:"createdAt"`
 }
 
+// ConversationGraphNote stores a pure visual text annotation on the graph canvas.
+type ConversationGraphNote struct {
+	ID        string    `json:"id"`
+	Text      string    `json:"text"`
+	X         *float64  `json:"x,omitempty"`
+	Y         *float64  `json:"y,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// ConversationGraphNoteEdge stores a pure visual connector attached to at least one note.
+type ConversationGraphNoteEdge struct {
+	ID         string `json:"id"`
+	SourceID   string `json:"sourceId"`
+	SourcePort string `json:"sourcePort"`
+	TargetID   string `json:"targetId"`
+	TargetPort string `json:"targetPort"`
+}
+
 type ConversationGraphState struct {
-	Enabled        bool                     `json:"enabled"`
-	ActiveBranchID string                   `json:"activeBranchId,omitempty"`
-	Branches       []ConversationBranchSlot `json:"branches"`
+	Enabled        bool                        `json:"enabled"`
+	ActiveBranchID string                      `json:"activeBranchId,omitempty"`
+	Branches       []ConversationBranchSlot    `json:"branches"`
+	Notes          []ConversationGraphNote     `json:"notes,omitempty"`
+	NoteEdges      []ConversationGraphNoteEdge `json:"noteEdges,omitempty"`
+}
+
+// ConversationSearchHit represents a conversation matched by title or message content.
+type ConversationSearchHit struct {
+	ConversationID string `json:"conversationId"`
+	MatchType      string `json:"matchType"` // "title" or "message"
+	MessageID      string `json:"messageId,omitempty"`
+	Snippet        string `json:"snippet,omitempty"`
 }
 
 // MessageGraphWrite carries insertion options, not persisted message data.

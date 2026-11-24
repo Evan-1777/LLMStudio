@@ -885,6 +885,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	if err != nil {
 		return preparedUpstream{}, err
 	}
+	allMessages := history
 
 	active := resolveActiveBranchPath(conv, history)
 	var graphWrite *domain.MessageGraphWrite
@@ -993,6 +994,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	if searchPrompt != "" {
 		history = appendSearchContext(history, searchPrompt)
 	}
+	history = expandSideReferences(allMessages, history)
 
 	prefs := s.resolvePreferencesSnapshot(ctx)
 

@@ -349,16 +349,15 @@ test('expands nodes inline as mind-map cards and respects Markdown and visual HT
   await visualSwitch.click();
   await expect(visualSwitch).not.toBeChecked();
 
-  // Return to graph and verify iframe degrades to raw HTML code card while Markdown stays rendered.
+  // Return to graph and verify expanded state persists while iframe degrades to raw HTML code card and Markdown stays rendered.
   await page.goto(chatUrl);
   await openGraph.click();
-  await assistantNode.locator('.cg-node__body').dblclick();
   await expect(assistantNode).toHaveAttribute('data-expanded', 'true');
   await expect(assistantNode.locator('.cg-node__detail iframe')).toHaveCount(0);
-  await userNode.locator('.cg-node__body').dblclick();
+  await expect(userNode).toHaveAttribute('data-expanded', 'true');
   await expect(userNode.locator('.cg-node__detail strong')).toContainText('BoldInsight');
 
-  // Disable graphMarkdownRender and confirm visual switch is disabled and cards degrade to plain text.
+  // Disable graphMarkdownRender and confirm visual switch is disabled and persisted expanded cards degrade to plain text.
   await page.goto(appUrl + '/settings/appearance');
   await mdSwitch.click();
   await expect(mdSwitch).not.toBeChecked();
@@ -366,11 +365,10 @@ test('expands nodes inline as mind-map cards and respects Markdown and visual HT
 
   await page.goto(chatUrl);
   await openGraph.click();
-  await userNode.locator('.cg-node__body').dblclick();
   await expect(userNode).toHaveAttribute('data-expanded', 'true');
   await expect(userNode.locator('.cg-node__plain')).toBeVisible();
   await expect(userNode.locator('.cg-node__detail strong')).toHaveCount(0);
-  await assistantNode.locator('.cg-node__body').dblclick();
+  await expect(assistantNode).toHaveAttribute('data-expanded', 'true');
   await expect(assistantNode.locator('.cg-node__plain')).toBeVisible();
   await expect(assistantNode.locator('.cg-node__detail iframe')).toHaveCount(0);
 });

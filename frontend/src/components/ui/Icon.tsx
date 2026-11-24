@@ -81,7 +81,11 @@ export type IconName =
   | 'filePlus'
   | 'folderInput'
   | 'collapseAll'
-  | 'save';
+  | 'save'
+  | 'stickyNote'
+  | 'userSummary'
+  | 'botExpand'
+  | 'sideLink';
 
 const ICON_BODIES: Record<IconName, ReactNode> = {
   mindMap: <><rect x="9" y="3" width="6" height="5" rx="1" /><rect x="3" y="16" width="6" height="5" rx="1" /><rect x="15" y="16" width="6" height="5" rx="1" /><path d="M12 8v4m-6 4v-4h12v4" /></>,
@@ -547,6 +551,42 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
       <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
       <polyline points="17 21 17 13 7 13 7 21" />
       <polyline points="7 3 7 8 15 8" />
+    </>
+  ),
+  stickyNote: (
+    <>
+      <path d="M15.5 3H5a2 2 0 0 0-2 2v14c0 1.1.9 2 2 2h14a2 2 0 0 0 2-2V8.5L15.5 3Z" />
+      <path d="M15 3v6h6" />
+      <path d="M8 13h8" />
+      <path d="M8 17h5" />
+    </>
+  ),
+  userSummary: (
+    <>
+      <circle cx="9" cy="7.5" r="3" />
+      <path d="M3.5 18a5.5 5.5 0 0 1 11 0" />
+      <rect x="14.5" y="10" width="6.5" height="4" rx="2" />
+      <path d="M16.5 6.5 18 8l1.5-1.5" />
+      <path d="M16.5 17.5 18 16l1.5 1.5" />
+    </>
+  ),
+  botExpand: (
+    <>
+      <rect x="3" y="8" width="13" height="10" rx="2" />
+      <path d="M9.5 8V5H7" />
+      <path d="M7.5 12.5v1.5" />
+      <path d="M11.5 12.5v1.5" />
+      <path d="M17 4h4v4" />
+      <path d="m21 4-4.5 4.5" />
+    </>
+  ),
+  sideLink: (
+    <>
+      <circle cx="18" cy="18" r="2.5" />
+      <circle cx="6" cy="6" r="2.5" />
+      <path d="M6 8.5v9.5" />
+      <path d="M18 15.5v-1a4.5 4.5 0 0 0-4.5-4.5H6" />
+      <path d="m10 7.5-4 2.5 4 2.5" />
     </>
   ),
 };

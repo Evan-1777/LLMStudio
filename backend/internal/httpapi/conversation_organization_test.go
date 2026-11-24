@@ -227,3 +227,43 @@ func TestCleanupUngroupedDeletesOnlyCurrentUngroupedTopicsAndMessages(t *testing
 		t.Fatalf("repeat cleanup: %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestSearchConversationsRoute(t *testing.T) {
+	const token = "test-token"
+	ctx := context.Background()
+	db, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	convs := store.NewConversationStore(db)
+	msgs := store.NewMessageStore(db)
+	assistants := store.NewAssistantStore(db)
+	c1, err := convs.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "话题一"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := msgs.Create(ctx, domain.Message{
+		ID: "m1", ConversationID: c1.ID, Role: domain.RoleAssistant,
+		Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "核心结论：使用 SQLite json_each 检索正文"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter(RouterDeps{
+		Config:              config.Config{AccessToken: token},
+		ConversationService: service.NewConversationService(convs, msgs).WithAssistants(assistants),
+	})
+	rec := doJSONReq(t, router, http.MethodGet, "/api/v1/conversations/search?assistantId="+domain.DefaultAssistantID+"&q=json_each", token, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("search status %d: %s", rec.Code, rec.Body.String())
+	}
+	var res struct {
+		Hits []domain.ConversationSearchHit `json:"hits"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hits) != 1 || res.Hits[0].ConversationID != c1.ID || res.Hits[0].MessageID != "m1" || res.Hits[0].MatchType != "message" {
+		t.Fatalf("unexpected search hits: %+v", res.Hits)
+	}
+}

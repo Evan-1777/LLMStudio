@@ -208,3 +208,265 @@ func TestGraphBatchMutationsAndDeleteNodes(t *testing.T) {
 		t.Fatalf("deleting all nodes did not clear active state: %+v", conv)
 	}
 }
+
+func TestConversationSearchStore(t *testing.T) {
+	ctx := t.Context()
+	db, err := OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	cs, ms := NewConversationStore(db), NewMessageStore(db)
+	as := NewAssistantStore(db)
+	otherA, err := as.Create(ctx, domain.Assistant{Name: "Other"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	g1, err := cs.CreateGroup(ctx, domain.DefaultAssistantID, "G1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cTitle, err := cs.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "Alpha 架构设计", GroupID: &g1.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cBody, err := cs.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "普通话题", Pinned: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cSummary, err := cs.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "摘要测试"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cNoise, err := cs.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "噪声过滤"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cEph, err := cs.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "Alpha 临时", Ephemeral: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cOther, err := cs.Create(ctx, domain.Conversation{AssistantID: otherA.ID, Title: "Alpha 其他助手"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cEph
+	_ = cOther
+
+	if _, err := ms.Create(ctx, domain.Message{
+		ID: "m-body-old", ConversationID: cBody.ID, Role: domain.RoleUser,
+		Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "早期的 alpha 内容"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.Create(ctx, domain.Message{
+		ID: "m-body-new", ConversationID: cBody.ID, Role: domain.RoleAssistant,
+		Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "最新的 ALPHA 方案说明与细节"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.Create(ctx, domain.Message{
+		ID: "m-sum", ConversationID: cSummary.ID, Role: domain.RoleUser,
+		Blocks:    []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "正文不含关键词"}},
+		GraphMeta: &domain.MessageGraphMeta{Summary: "这是 alpha 摘要胶囊"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.Create(ctx, domain.Message{
+		ID: "m-noise", ConversationID: cNoise.ID, Role: domain.RoleAssistant,
+		Blocks: []domain.ContentBlock{
+			{Type: domain.BlockTypeThinking, Thinking: "alpha in thinking"},
+			{Type: domain.BlockTypeImage, MimeType: "image/png", Data: "YWxwaGEalphaBase64Data"},
+			{Type: domain.BlockTypeToolCall, ID: "tc1", Name: "alpha_tool"},
+			{Type: domain.BlockTypeToolResult, ToolCallID: "tc1", Content: "alpha tool output"},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := cs.Search(ctx, domain.DefaultAssistantID, "  ALPHA ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Expected canonical order: pinned cBody -> grouped cTitle -> ungrouped cSummary; excludes cNoise, cEph, cOther.
+	if len(hits) != 3 {
+		t.Fatalf("expected 3 hits, got %d: %+v", len(hits), hits)
+	}
+	if hits[0].ConversationID != cBody.ID || hits[0].MatchType != "message" || hits[0].MessageID != "m-body-new" || !strings.Contains(hits[0].Snippet, "ALPHA") {
+		t.Fatalf("unexpected hit[0]: %+v", hits[0])
+	}
+	if hits[1].ConversationID != cTitle.ID || hits[1].MatchType != "title" || hits[1].MessageID != "" {
+		t.Fatalf("unexpected hit[1]: %+v", hits[1])
+	}
+	if hits[2].ConversationID != cSummary.ID || hits[2].MatchType != "message" || hits[2].MessageID != "m-sum" || !strings.Contains(hits[2].Snippet, "alpha") {
+		t.Fatalf("unexpected hit[2]: %+v", hits[2])
+	}
+	// Empty query returns empty slice.
+	emptyHits, err := cs.Search(ctx, domain.DefaultAssistantID, "   ")
+	if err != nil || len(emptyHits) != 0 {
+		t.Fatalf("empty query: hits=%+v err=%v", emptyHits, err)
+	}
+}
+
+func TestGraphExpandedNotesEdgesSideRefsAndImport(t *testing.T) {
+	ctx := t.Context()
+	db, err := OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	cs, ms := NewConversationStore(db), NewMessageStore(db)
+	conv, err := cs.Create(ctx, domain.Conversation{ID: "g2", AssistantID: domain.DefaultAssistantID, Title: "Graph V2"})
+	must(err)
+	createMsg := func(id, role, text string) {
+		t.Helper()
+		_, err := ms.Create(ctx, domain.Message{
+			ID: id, ConversationID: conv.ID, Role: role,
+			Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: text}},
+		})
+		must(err)
+	}
+	createMsg("u1", domain.RoleUser, "q1")
+	createMsg("a1", domain.RoleAssistant, "ans1")
+	createMsg("u2", domain.RoleUser, "q2")
+	createMsg("a2", domain.RoleAssistant, "ans2")
+	createMsg("u3", domain.RoleUser, "q3")
+	createMsg("a3", domain.RoleAssistant, "ans3")
+	createMsg("cp1", domain.RoleCompaction, "summary")
+
+	get := func() domain.Conversation { t.Helper(); c, e := cs.Get(ctx, conv.ID); must(e); return c }
+	getMsg := func(id string) domain.Message { t.Helper(); m, e := ms.Get(ctx, id); must(e); return m }
+	mutate := func(in GraphMutationInput) { t.Helper(); must(cs.ApplyGraphMutation(ctx, conv.ID, in)) }
+
+	// Fork u3 under a1 so (u3->a3) is a sibling branch of (u2->a2).
+	forkParent := "a1"
+	mutate(GraphMutationInput{Op: "reparent", MessageID: "u3", ParentID: &forkParent})
+
+	// 1. Expanded persistence + collapsed:true auto-clears expanded.
+	tVal, fVal := true, false
+	mutate(GraphMutationInput{Op: "setNodeMeta", MessageIDs: []string{"u1", "a1"}, GraphMeta: &GraphMetaPatch{Expanded: &tVal}})
+	if !getMsg("u1").GraphMeta.Expanded || !getMsg("a1").GraphMeta.Expanded {
+		t.Fatalf("expanded not persisted")
+	}
+	mutate(GraphMutationInput{Op: "setNodeMeta", MessageID: "u1", GraphMeta: &GraphMetaPatch{Collapsed: &tVal}})
+	if m := getMsg("u1"); !m.GraphMeta.Collapsed || m.GraphMeta.Expanded {
+		t.Fatalf("collapsed:true did not clear expanded: %+v", m.GraphMeta)
+	}
+	mutate(GraphMutationInput{Op: "setNodeMeta", MessageID: "a1", GraphMeta: &GraphMetaPatch{Expanded: &fVal}})
+	if m := getMsg("a1"); m.GraphMeta != nil && m.GraphMeta.Expanded {
+		t.Fatalf("expanded=false not persisted")
+	}
+
+	// 2. Notes CRUD & position updates.
+	nx, ny := 120.0, 240.0
+	mutate(GraphMutationInput{Op: "createNote", Text: "  标注内容  ", X: &nx, Y: &ny})
+	notes := get().GraphState.Notes
+	if len(notes) != 1 || notes[0].Text != "标注内容" || *notes[0].X != nx {
+		t.Fatalf("createNote failed: %+v", notes)
+	}
+	noteID := notes[0].ID
+	mutate(GraphMutationInput{Op: "updateNote", NoteID: noteID, Text: "更新后标注"})
+	if get().GraphState.Notes[0].Text != "更新后标注" {
+		t.Fatalf("updateNote failed")
+	}
+	nx2, ny2 := 300.0, 400.0
+	mutate(GraphMutationInput{Op: "setNodeMeta", Positions: []GraphPosition{{NoteID: noteID, X: &nx2, Y: &ny2}}})
+	if *get().GraphState.Notes[0].X != nx2 || *get().GraphState.Notes[0].Y != ny2 {
+		t.Fatalf("note position update failed")
+	}
+
+	// 3. NoteEdges CRUD & validation (must involve at least one note).
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{
+		Op: "createNoteEdge", SourceID: "u1", SourcePort: "right", TargetID: "a1", TargetPort: "left",
+	}); err == nil {
+		t.Fatal("expected non-note edge to fail")
+	}
+	mutate(GraphMutationInput{Op: "createNoteEdge", SourceID: noteID, SourcePort: "right", TargetID: "a2", TargetPort: "left"})
+	// Idempotent port update on same endpoints.
+	mutate(GraphMutationInput{Op: "createNoteEdge", SourceID: noteID, SourcePort: "bottom", TargetID: "a2", TargetPort: "top"})
+	edges := get().GraphState.NoteEdges
+	if len(edges) != 1 || edges[0].SourcePort != "bottom" || edges[0].TargetPort != "top" {
+		t.Fatalf("createNoteEdge idempotent update failed: %+v", edges)
+	}
+	edgeID := edges[0].ID
+	mutate(GraphMutationInput{Op: "deleteNoteEdge", EdgeID: edgeID})
+	if len(get().GraphState.NoteEdges) != 0 {
+		t.Fatalf("deleteNoteEdge failed")
+	}
+	mutate(GraphMutationInput{Op: "createNoteEdge", SourceID: noteID, SourcePort: "left", TargetID: "a3", TargetPort: "right"})
+
+	// 4. SideRefs validation: reject compaction target, reject parent ancestor, reject joint DAG cycle.
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{Op: "addSideRef", MessageID: "cp1", SourceMessageID: "a3"}); err == nil {
+		t.Fatal("expected compaction target to be rejected")
+	}
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{Op: "addSideRef", MessageID: "a2", SourceMessageID: "a1"}); err == nil {
+		t.Fatal("expected direct ancestor sideRef to be rejected")
+	}
+	mutate(GraphMutationInput{Op: "addSideRef", MessageID: "a2", SourceMessageID: "a3", Side: "left"})
+	mutate(GraphMutationInput{Op: "addSideRef", MessageID: "a2", SourceMessageID: "a3", Side: "right"})
+	if refs := getMsg("a2").GraphMeta.SideRefs; len(refs) != 1 || refs[0].Side != "right" {
+		t.Fatalf("addSideRef idempotent side update failed: %+v", refs)
+	}
+	// Joint DAG cycle via addSideRef: a2 -> a3, now a3 -> a2 must fail.
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{Op: "addSideRef", MessageID: "a3", SourceMessageID: "a2"}); err == nil {
+		t.Fatal("expected sideRef cycle to be rejected")
+	}
+	// Joint DAG cycle via reparent: u3 is ancestor of a3, a2 side-refs a3, so reparenting u3 under a2 creates a cycle!
+	cycleParent := "a2"
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{Op: "reparent", MessageID: "u3", ParentID: &cycleParent}); err == nil {
+		t.Fatal("expected reparent joint cycle to be rejected")
+	}
+
+	// 5. ImportConversation round-trip preserves expanded, notes, noteEdges, sideRefs.
+	convSnap := get()
+	msgsSnap, err := ms.ListByConversation(ctx, conv.ID)
+	must(err)
+	convSnap.ID = "g2-imported"
+	for i := range msgsSnap {
+		msgsSnap[i].ID = "imp-" + msgsSnap[i].ID
+		msgsSnap[i].ConversationID = convSnap.ID
+		if msgsSnap[i].ParentID != "" {
+			msgsSnap[i].ParentID = "imp-" + msgsSnap[i].ParentID
+		}
+		if msgsSnap[i].GraphMeta != nil {
+			for j := range msgsSnap[i].GraphMeta.SideRefs {
+				msgsSnap[i].GraphMeta.SideRefs[j].SourceMessageID = "imp-" + msgsSnap[i].GraphMeta.SideRefs[j].SourceMessageID
+			}
+		}
+	}
+	if convSnap.ActiveLeafID != "" {
+		convSnap.ActiveLeafID = "imp-" + convSnap.ActiveLeafID
+	}
+	importedConv, _, err := cs.ImportConversation(ctx, convSnap, msgsSnap, true)
+	must(err)
+	if len(importedConv.GraphState.Notes) != 1 || len(importedConv.GraphState.NoteEdges) != 1 {
+		t.Fatalf("ImportConversation lost notes/edges: %+v", importedConv.GraphState)
+	}
+	impA2, err := ms.Get(ctx, "imp-a2")
+	must(err)
+	if impA2.GraphMeta == nil || len(impA2.GraphMeta.SideRefs) != 1 || impA2.GraphMeta.SideRefs[0].SourceMessageID != "imp-a3" {
+		t.Fatalf("ImportConversation lost sideRefs: %+v", impA2.GraphMeta)
+	}
+
+	// 6. Cascade cleanup: deleting a3 via DeleteByID clears a2's sideRef and noteEdge pointing to a3.
+	must(ms.DeleteByID(ctx, conv.ID, "a3"))
+	if m := getMsg("a2"); m.GraphMeta != nil && len(m.GraphMeta.SideRefs) != 0 {
+		t.Fatalf("DeleteByID did not cascade clean sideRefs: %+v", m.GraphMeta.SideRefs)
+	}
+	if len(get().GraphState.NoteEdges) != 0 {
+		t.Fatalf("DeleteByID did not cascade clean noteEdges: %+v", get().GraphState.NoteEdges)
+	}
+
+	// 7. Mixed deleteNodes removes note + message atomically.
+	mutate(GraphMutationInput{Op: "deleteNodes", MessageIDs: []string{"u3"}, NoteIDs: []string{noteID}})
+	if len(get().GraphState.Notes) != 0 {
+		t.Fatalf("deleteNodes did not remove note")
+	}
+}

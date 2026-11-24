@@ -28,6 +28,7 @@ import type {
   CloudConnectionState,
   Conversation,
   ConversationGroup,
+  ConversationSearchHit,
   TopicScope,
   WorkspaceEntry,
 } from '../../core/types';
@@ -47,6 +48,35 @@ function formatShortTime(iso: string): string {
   const dt = new Date(iso);
   if (Number.isNaN(dt.getTime())) return '';
   return dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function renderHighlightedSnippet(snippet: string, needle: string) {
+  if (!needle) return snippet;
+  const lower = snippet.toLowerCase();
+  const parts: Array<string | { key: number; text: string }> = [];
+  let cursor = 0;
+  let key = 0;
+  while (cursor < snippet.length) {
+    const idx = lower.indexOf(needle, cursor);
+    if (idx < 0) {
+      parts.push(snippet.slice(cursor));
+      break;
+    }
+    if (idx > cursor) {
+      parts.push(snippet.slice(cursor, idx));
+    }
+    parts.push({ key: key++, text: snippet.slice(idx, idx + needle.length) });
+    cursor = idx + needle.length;
+  }
+  return parts.map((part) =>
+    typeof part === 'string' ? (
+      part
+    ) : (
+      <mark key={part.key} className="wb-search-mark">
+        {part.text}
+      </mark>
+    ),
+  );
 }
 
 function cloudIconClass(state: CloudConnectionState): string {
@@ -145,7 +175,7 @@ export function ConversationSidebar({
   scope?: TopicScope;
   onScopeChange?: (next: TopicScope) => void;
   onManageModeChange: (next: boolean) => void;
-  onSelectConversation: (id: string) => void;
+  onSelectConversation: (id: string, targetMessageId?: string) => void;
   onNewConversation: () => void;
   onCloseInspector: () => void;
   onCloseDrawer: () => void;
@@ -187,6 +217,10 @@ export function ConversationSidebar({
   const [viewingEntry, setViewingEntry] = useState<WorkspaceEntry | null>(null);
   const [viewingInitialMode, setViewingInitialMode] = useState<'preview' | 'edit' | undefined>(undefined);
   const [searchQuery, setSearchQuery] = useState('');
+  const [remoteSearchHits, setRemoteSearchHits] = useState<
+    ReadonlyMap<string, ConversationSearchHit>
+  >(() => new Map());
+  const [remoteSearching, setRemoteSearching] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [expandedGroupIds, setExpandedGroupIds] = useState<Set<string>>(
     () => new Set(),
@@ -302,12 +336,55 @@ export function ConversationSidebar({
   const trimmedSearch = searchQuery.trim().toLowerCase();
   const isSearching = trimmedSearch.length > 0;
 
+  useEffect(() => {
+    const rawQuery = searchQuery.trim();
+    if (!rawQuery || cloudOffline) {
+      setRemoteSearchHits(new Map());
+      setRemoteSearching(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setRemoteSearching(true);
+      gateway
+        .searchConversations(
+          { assistantId, q: rawQuery },
+          controller.signal,
+          reqScope,
+        )
+        .then((hits) => {
+          if (controller.signal.aborted) return;
+          const next = new Map<string, ConversationSearchHit>();
+          for (const hit of hits) {
+            next.set(hit.conversationId, hit);
+          }
+          setRemoteSearchHits(next);
+        })
+        .catch(() => {
+          if (controller.signal.aborted) return;
+          setRemoteSearchHits(new Map());
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) {
+            setRemoteSearching(false);
+          }
+        });
+    }, 180);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+      setRemoteSearching(false);
+    };
+  }, [assistantId, cloudOffline, connectionEpoch, gateway, reqScope, searchQuery]);
+
   const filtered = useMemo(() => {
     if (!trimmedSearch) return conversations;
-    return conversations.filter((c) =>
-      c.title.toLowerCase().includes(trimmedSearch),
+    return conversations.filter(
+      (c) =>
+        c.title.toLowerCase().includes(trimmedSearch) ||
+        remoteSearchHits.has(c.id),
     );
-  }, [conversations, trimmedSearch]);
+  }, [conversations, remoteSearchHits, trimmedSearch]);
 
   const bucketItemsMap = useMemo(() => {
     const map = new Map<string, Conversation[]>();
@@ -1108,12 +1185,21 @@ export function ConversationSidebar({
                       <Icon name="search" size={14} className="wb-search-icon" />
                       <input
                         type="search"
-                        className="wb-search-input"
+                        className={`wb-search-input ${remoteSearching ? 'wb-search-input--searching' : ''}`.trim()}
                         aria-label="搜索话题"
                         placeholder="搜索话题"
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
                       />
+                      {remoteSearching ? (
+                        <span
+                          className="wb-search-spinner"
+                          role="status"
+                          aria-label="正在搜索"
+                        >
+                          <span className="ui-spinner ui-spinner--sm" aria-hidden="true" />
+                        </span>
+                      ) : null}
                     </div>
                   ) : null}
 
@@ -1388,6 +1474,9 @@ export function ConversationSidebar({
                                 draggingId !== null &&
                                 dropTarget?.bucketKey === section.key &&
                                 dropTarget?.beforeId === conv.id;
+                              const searchHit = isSearching
+                                ? remoteSearchHits.get(conv.id)
+                                : undefined;
 
                               return (
                                 <div
@@ -1434,13 +1523,27 @@ export function ConversationSidebar({
                                       if (manageMode) {
                                         toggleSelect(conv.id);
                                       } else {
-                                        onSelectConversation(conv.id);
+                                        onSelectConversation(
+                                          conv.id,
+                                          searchHit?.messageId,
+                                        );
                                       }
                                     }}
                                   >
                                     <span className="wb-topic-row__title">
                                       {conv.title}
                                     </span>
+                                    {searchHit?.snippet ? (
+                                      <span
+                                        className="wb-topic-row__snippet"
+                                        title={searchHit.snippet}
+                                      >
+                                        {renderHighlightedSnippet(
+                                          searchHit.snippet,
+                                          trimmedSearch,
+                                        )}
+                                      </span>
+                                    ) : null}
                                     <span className="wb-topic-row__sub">
                                       {conv.mode === 'agent' && <span className="wb-topic-agent" title="Agent"><Icon name="terminal" size={13} /><span className="sr-only">Agent</span></span>}
                                       {runningConversationIds.has(conv.id) ? (

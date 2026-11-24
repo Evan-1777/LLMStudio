@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"slices"
+	"strings"
 
 	"llmstudio/backend/internal/domain"
 
@@ -13,6 +14,99 @@ type GraphMutationInput = store.GraphMutationInput
 
 func graphEnabled(conv domain.Conversation) bool {
 	return conv.GraphState != nil && conv.GraphState.Enabled
+}
+
+// expandSideReferences injects single-level side-branch assistant replies immediately
+// after each target message in activePath as an independent User message wrapped in
+// <reference_materials>...</reference_materials>.
+func expandSideReferences(all []domain.Message, activePath []domain.Message) []domain.Message {
+	hasSideRefs := false
+	for _, m := range activePath {
+		if m.GraphMeta != nil && len(m.GraphMeta.SideRefs) > 0 {
+			hasSideRefs = true
+			break
+		}
+	}
+	if !hasSideRefs {
+		return activePath
+	}
+
+	byID := make(map[string]domain.Message, len(all))
+	for _, m := range all {
+		if m.ID != "" {
+			byID[m.ID] = m
+		}
+	}
+
+	mainAncestors := make(map[string]bool, len(activePath))
+	out := make([]domain.Message, 0, len(activePath)+2)
+	for _, m := range activePath {
+		if m.ID != "" {
+			mainAncestors[m.ID] = true
+		}
+		out = append(out, m)
+		if m.GraphMeta == nil || len(m.GraphMeta.SideRefs) == 0 {
+			continue
+		}
+
+		seenAssistant := make(map[string]bool)
+		var refParts []string
+		for _, ref := range m.GraphMeta.SideRefs {
+			if ref.SourceMessageID == "" {
+				continue
+			}
+			var branchMsgs []domain.Message
+			walkVisited := make(map[string]bool)
+			for curID := ref.SourceMessageID; curID != ""; {
+				if mainAncestors[curID] || walkVisited[curID] {
+					break
+				}
+				walkVisited[curID] = true
+				cur, ok := byID[curID]
+				if !ok {
+					break
+				}
+				branchMsgs = append(branchMsgs, cur)
+				curID = cur.ParentID
+			}
+			slices.Reverse(branchMsgs)
+			for _, bm := range branchMsgs {
+				if bm.Role != domain.RoleAssistant || seenAssistant[bm.ID] {
+					continue
+				}
+				seenAssistant[bm.ID] = true
+				if text := extractAssistantTextBlocks(bm.Blocks); text != "" {
+					refParts = append(refParts, text)
+				}
+			}
+		}
+
+		if len(refParts) > 0 {
+			wrapped := "<reference_materials>\n" + strings.Join(refParts, "\n\n---\n\n") + "\n</reference_materials>"
+			out = append(out, domain.Message{
+				ConversationID: m.ConversationID,
+				Role:           domain.RoleUser,
+				Blocks: []domain.ContentBlock{{
+					Type: domain.BlockTypeText,
+					Text: wrapped,
+				}},
+				CreatedAt: m.CreatedAt,
+			})
+		}
+	}
+	return out
+}
+
+func extractAssistantTextBlocks(blocks []domain.ContentBlock) string {
+	var parts []string
+	for _, b := range blocks {
+		if b.Type == domain.BlockTypeText {
+			if t := strings.TrimSpace(b.Text); t != "" {
+				parts = append(parts, t)
+			}
+		}
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 func resolveActiveBranchPath(conv domain.Conversation, all []domain.Message) []domain.Message {

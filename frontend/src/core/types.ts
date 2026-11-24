@@ -272,11 +272,18 @@ export interface TokenUsage {
 
 export type StopReason = 'stop' | 'length' | 'toolUse' | 'aborted' | 'error' | '';
 
+export interface MessageSideRef {
+  sourceMessageId: string;
+  side?: 'left' | 'right';
+}
+
 export interface MessageGraphMeta {
   collapsed?: boolean;
+  expanded?: boolean;
   summary?: string;
   x?: number;
   y?: number;
+  sideRefs?: MessageSideRef[];
 }
 
 export interface ConversationBranchSlot {
@@ -288,27 +295,62 @@ export interface ConversationBranchSlot {
   createdAt: string;
 }
 
+export interface ConversationGraphNote {
+  id: string;
+  text: string;
+  x?: number;
+  y?: number;
+  createdAt: string;
+}
+
+export type GraphNotePort = 'top' | 'bottom' | 'left' | 'right';
+
+export interface ConversationGraphNoteEdge {
+  id: string;
+  sourceId: string;
+  sourcePort: GraphNotePort;
+  targetId: string;
+  targetPort: GraphNotePort;
+}
+
 export interface ConversationGraphState {
   enabled: boolean;
   activeBranchId?: string;
   branches?: ConversationBranchSlot[];
+  notes?: ConversationGraphNote[];
+  noteEdges?: ConversationGraphNoteEdge[];
+}
+
+export interface ConversationSearchHit {
+  conversationId: string;
+  matchType: 'title' | 'message';
+  messageId?: string;
+  snippet?: string;
 }
 
 export type GraphPosition = { x: number; y: number } & (
-  { messageId: string; branchId?: never } | { branchId: string; messageId?: never }
+  | { messageId: string; branchId?: never; noteId?: never }
+  | { branchId: string; messageId?: never; noteId?: never }
+  | { noteId: string; messageId?: never; branchId?: never }
 );
 
 export type GraphMutationInput =
   | { op: 'reparent'; messageId: string; parentId: string }
   | { op: 'reparent'; messageIds: string[]; parentId: '' }
   | { op: 'setNodeMeta'; messageId: string; graphMeta: MessageGraphMeta }
-  | { op: 'setNodeMeta'; messageIds: string[]; graphMeta: Pick<MessageGraphMeta, 'collapsed'> }
+  | { op: 'setNodeMeta'; messageIds: string[]; graphMeta: Pick<MessageGraphMeta, 'collapsed' | 'expanded'> }
   | { op: 'setNodeMeta'; positions: GraphPosition[] }
-  | { op: 'deleteNodes'; messageIds?: string[]; branchIds?: string[] }
+  | { op: 'deleteNodes'; messageIds?: string[]; branchIds?: string[]; noteIds?: string[] }
   | { op: 'createBranch'; parentMessageId: string; x: number; y: number; activate?: boolean }
   | { op: 'deleteBranch'; branchId: string }
   | { op: 'activateBranch'; branchId: string }
-  | { op: 'activateBranch'; leafMessageId: string };
+  | { op: 'activateBranch'; leafMessageId: string }
+  | { op: 'createNote'; text: string; x?: number; y?: number }
+  | { op: 'updateNote'; noteId: string; text: string }
+  | { op: 'createNoteEdge'; sourceId: string; sourcePort: GraphNotePort; targetId: string; targetPort: GraphNotePort }
+  | { op: 'deleteNoteEdge'; edgeId: string }
+  | { op: 'addSideRef'; messageId: string; sourceMessageId: string; side?: 'left' | 'right' }
+  | { op: 'removeSideRef'; messageId: string; sourceMessageId?: string };
 
 export interface Message {
   parentId?: string;

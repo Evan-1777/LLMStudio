@@ -587,6 +587,23 @@ func (c *CloudClient) ListConversations(ctx context.Context, assistantID string)
 	return out, err
 }
 
+func (c *CloudClient) SearchConversations(ctx context.Context, assistantID, query string) (json.RawMessage, error) {
+	params := url.Values{}
+	if strings.TrimSpace(assistantID) != "" {
+		params.Set("assistantId", strings.TrimSpace(assistantID))
+	}
+	if query != "" {
+		params.Set("q", query)
+	}
+	path := "/api/v1/conversations/search"
+	if encoded := params.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out json.RawMessage
+	err := c.doJSON(ctx, http.MethodGet, path, nil, &out)
+	return out, err
+}
+
 func (c *CloudClient) CreateConversation(ctx context.Context, payload json.RawMessage) (json.RawMessage, error) {
 	var out json.RawMessage
 	err := c.doJSON(ctx, http.MethodPost, "/api/v1/conversations", payload, &out)

@@ -315,4 +315,65 @@ describe('contextUsage', () => {
     expect(restored.compactedCount).toBe(0);
     expect(restored.activeMessageCount).toBe(4);
   });
+
+  it('includes side-ref materials on anchor and trailing messages in hybrid mode and full active path in estimated mode', () => {
+    const u1 = msg('u1', 'user', 'main question');
+    const a1Base = msg('a1', 'assistant', 'main answer', {
+      inputTokens: 800,
+      outputTokens: 200,
+      totalTokens: 1000,
+      contextTokens: 1000,
+    });
+    const uSide: Message = { ...msg('uSide', 'user', 'side prompt'), parentId: '' };
+    const aSide: Message = {
+      ...msg('aSide', 'assistant', '这是一段非常详细的侧边分支助手参考资料，用于验证上下文用量统计增量。'),
+      parentId: 'uSide',
+    };
+
+    const a1WithSideRef: Message = {
+      ...a1Base,
+      graphMeta: { sideRefs: [{ sourceMessageId: 'aSide', side: 'right' }] },
+    };
+
+    const withAnchorSideRef = computeContextUsage({
+      messages: [u1, a1WithSideRef],
+      allMessages: [u1, a1WithSideRef, uSide, aSide],
+      draft: '',
+      attachments: [],
+      contextWindow: 10000,
+    });
+    expect(withAnchorSideRef.source).toBe('hybrid');
+    expect(withAnchorSideRef.usedTokens).toBeGreaterThan(1000);
+
+    // Removing sideRef drops usage right back to reported anchor.
+    const withoutSideRef = computeContextUsage({
+      messages: [u1, a1Base],
+      allMessages: [u1, a1Base, uSide, aSide],
+      draft: '',
+      attachments: [],
+      contextWindow: 10000,
+    });
+    expect(withoutSideRef.source).toBe('reported');
+    expect(withoutSideRef.usedTokens).toBe(1000);
+
+    // Estimated mode (no reported usage) includes sideRef tokens on active path.
+    const uEst = {
+      ...msg('uEst', 'user', 'question'),
+      graphMeta: { sideRefs: [{ sourceMessageId: 'aSide', side: 'left' as const }] },
+    };
+    const estWith = computeContextUsage({
+      messages: [uEst],
+      allMessages: [uEst, uSide, aSide],
+      draft: '',
+      attachments: [],
+    });
+    const estWithout = computeContextUsage({
+      messages: [msg('uEst', 'user', 'question')],
+      allMessages: [msg('uEst', 'user', 'question'), uSide, aSide],
+      draft: '',
+      attachments: [],
+    });
+    expect(estWith.source).toBe('estimated');
+    expect(estWith.usedTokens).toBeGreaterThan(estWithout.usedTokens);
+  });
 });

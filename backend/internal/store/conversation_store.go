@@ -93,6 +93,153 @@ func (s *ConversationStore) ListByAssistant(ctx context.Context, assistantID str
 	return convs, nil
 }
 
+// Search finds non-ephemeral conversations matching query in title or message text/compaction/summary.
+func (s *ConversationStore) Search(ctx context.Context, assistantID, query string) ([]domain.ConversationSearchHit, error) {
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		return []domain.ConversationSearchHit{}, nil
+	}
+	needle := strings.ToLower(trimmed)
+	assistantID = strings.TrimSpace(assistantID)
+
+	rows, err := s.db.QueryContext(ctx, `
+		WITH matched AS (
+			SELECT
+				c.id,
+				(
+					SELECT m.id
+					FROM messages m
+					WHERE m.conversation_id = c.id
+					  AND (
+						EXISTS (
+							SELECT 1
+							FROM json_each(m.blocks_json) b
+							WHERE json_extract(b.value, '$.type') IN ('text', 'compaction')
+							  AND instr(lower(COALESCE(json_extract(b.value, '$.text'), '')), ?) > 0
+						)
+						OR instr(lower(COALESCE(json_extract(m.graph_meta_json, '$.summary'), '')), ?) > 0
+					  )
+					ORDER BY m.created_at DESC, m.rowid DESC
+					LIMIT 1
+				) AS matched_msg_id,
+				instr(lower(c.title), ?) > 0 AS title_match
+			FROM conversations c
+			WHERE c.ephemeral = 0
+			  AND (? = '' OR c.assistant_id = ?)
+		)
+		SELECT
+			c.id,
+			COALESCE(matched.matched_msg_id, ''),
+			COALESCE(m.blocks_json, ''),
+			COALESCE(m.graph_meta_json, '')
+		FROM matched
+		JOIN conversations c ON c.id = matched.id
+		LEFT JOIN conversation_groups g ON c.group_id = g.id
+		LEFT JOIN messages m ON m.id = matched.matched_msg_id
+		WHERE matched.title_match OR matched.matched_msg_id IS NOT NULL
+	`+conversationOrderByClause, needle, needle, needle, assistantID, assistantID)
+	if err != nil {
+		return nil, fmt.Errorf("search conversations: %w", err)
+	}
+	defer rows.Close()
+
+	hits := make([]domain.ConversationSearchHit, 0)
+	for rows.Next() {
+		var convID, msgID, blocksJSON, graphMetaJSON string
+		if err := rows.Scan(&convID, &msgID, &blocksJSON, &graphMetaJSON); err != nil {
+			return nil, fmt.Errorf("scan conversation search hit: %w", err)
+		}
+		if msgID != "" {
+			hits = append(hits, domain.ConversationSearchHit{
+				ConversationID: convID,
+				MatchType:      "message",
+				MessageID:      msgID,
+				Snippet:        extractSearchSnippet(blocksJSON, graphMetaJSON, needle),
+			})
+		} else {
+			hits = append(hits, domain.ConversationSearchHit{
+				ConversationID: convID,
+				MatchType:      "title",
+			})
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate conversation search hits: %w", err)
+	}
+	return hits, nil
+}
+
+func extractSearchSnippet(blocksJSON, graphMetaJSON, needle string) string {
+	var blocks []domain.ContentBlock
+	if blocksJSON != "" && json.Unmarshal([]byte(blocksJSON), &blocks) == nil {
+		for _, b := range blocks {
+			if b.Type != domain.BlockTypeText && b.Type != domain.BlockTypeCompaction {
+				continue
+			}
+			if snippet := buildCompactSnippet(b.Text, needle); snippet != "" {
+				return snippet
+			}
+		}
+	}
+	var meta domain.MessageGraphMeta
+	if graphMetaJSON != "" && json.Unmarshal([]byte(graphMetaJSON), &meta) == nil && meta.Summary != "" {
+		if snippet := buildCompactSnippet(meta.Summary, needle); snippet != "" {
+			return snippet
+		}
+	}
+	return ""
+}
+
+func buildCompactSnippet(raw, needle string) string {
+	compact := strings.Join(strings.Fields(raw), " ")
+	if compact == "" {
+		return ""
+	}
+	origRunes := []rune(compact)
+	lowerRunes := []rune(strings.ToLower(compact))
+	needleRunes := []rune(needle)
+	if len(needleRunes) == 0 || len(lowerRunes) < len(needleRunes) {
+		return ""
+	}
+	matchIdx := -1
+	for i := 0; i <= len(lowerRunes)-len(needleRunes); i++ {
+		matched := true
+		for j := range needleRunes {
+			if lowerRunes[i+j] != needleRunes[j] {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			matchIdx = i
+			break
+		}
+	}
+	if matchIdx < 0 {
+		return ""
+	}
+	// Map safely if ToLower ever changed rune length.
+	if len(lowerRunes) != len(origRunes) {
+		origRunes = lowerRunes
+	}
+	const maxLen = 80
+	const leadContext = 22
+	start := max(0, matchIdx-leadContext)
+	end := min(len(origRunes), start+maxLen)
+	if end-start < maxLen && start > 0 {
+		start = max(0, end-maxLen)
+	}
+	var b strings.Builder
+	if start > 0 {
+		b.WriteString("…")
+	}
+	b.WriteString(string(origRunes[start:end]))
+	if end < len(origRunes) {
+		b.WriteString("…")
+	}
+	return b.String()
+}
+
 // Get fetches a conversation by ID.
 func (s *ConversationStore) Get(ctx context.Context, id string) (domain.Conversation, error) {
 	row := s.db.QueryRowContext(ctx, `

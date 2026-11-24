@@ -17,7 +17,9 @@ import {
 } from './attachments';
 import { WorkbenchPage } from './WorkbenchPage';
 import { MessageEditor } from './MessageEditor';
-import type { Message } from '../../core/types';
+import { ConversationGraphView } from './ConversationGraphView';
+import { MessageSideRefBadge } from './MessageSideRefBadge';
+import type { Conversation, GraphMutationInput, Message } from '../../core/types';
 import { AppearancePage } from '../settings/AppearancePage';
 import * as imageCompression from './imageCompression';
 
@@ -2450,5 +2452,318 @@ describe('Workbench flows and attachments', () => {
     } finally {
       window.matchMedia = originalMatchMedia;
     }
+  });
+
+  it('searches message content via backend, highlights snippet, and jumps to target message', async () => {
+    const user = userEvent.setup();
+    const scrollSpy = vi.fn();
+    Element.prototype.scrollIntoView = scrollSpy;
+    const origMatchMedia = window.matchMedia;
+    window.matchMedia = vi.fn().mockReturnValue({
+      matches: false,
+      media: '',
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+      onchange: null,
+    });
+    const convs = [
+      {
+        id: 'c1',
+        assistantId: 'default',
+        title: '日常闲聊',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: '',
+        params: {},
+        syncEnabled: false,
+        syncState: 'local_only',
+        syncVersion: 0,
+        createdAt: '2026-11-17T08:00:00Z',
+        updatedAt: '2026-11-17T08:00:00Z',
+      },
+      {
+        id: 'c2',
+        assistantId: 'default',
+        title: '后端方案',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: '',
+        params: {},
+        syncEnabled: false,
+        syncState: 'local_only',
+        syncVersion: 0,
+        createdAt: '2026-11-17T07:00:00Z',
+        updatedAt: '2026-11-17T07:00:00Z',
+      },
+    ];
+    const fetchMock = vi.fn<typeof fetch>(async (input) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', authRequired: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/settings')) {
+        return new Response(JSON.stringify({ preferences: defaultAppPreferences(), initialized: true }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(JSON.stringify({ providers: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return new Response(JSON.stringify({ assistants: [{ id: 'default', name: '默认助手', params: {}, isDefault: true }] }), { status: 200 });
+      }
+      if (url.includes('/api/v1/conversation-groups')) {
+        return new Response(JSON.stringify({ groups: [] }), { status: 200 });
+      }
+      if (url.includes('/api/v1/plugins/search')) {
+        return new Response(JSON.stringify({ engines: [] }), { status: 200 });
+      }
+      if (url.includes('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ servers: [] }), { status: 200 });
+      }
+      if (url.includes('/api/v1/agent/runs')) {
+        return new Response(JSON.stringify({ runs: [] }), { status: 200 });
+      }
+      if (url.includes('/api/v1/conversations/search')) {
+        return new Response(
+          JSON.stringify({
+            hits: [
+              {
+                conversationId: 'c2',
+                matchType: 'message',
+                messageId: 'm-hit',
+                snippet: '…建议采用 SQLite json_each 检索正文…',
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith('/api/v1/conversations/c1')) {
+        return new Response(JSON.stringify({ conversation: convs[0], messages: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c2')) {
+        return new Response(
+          JSON.stringify({
+            conversation: convs[1],
+            messages: [
+              {
+                id: 'm-hit',
+                conversationId: 'c2',
+                role: 'assistant',
+                blocks: [{ type: 'text', text: '建议采用 SQLite json_each 检索正文' }],
+                createdAt: '2026-11-17T07:05:00Z',
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.includes('/api/v1/conversations')) {
+        return new Response(JSON.stringify({ conversations: convs }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      render(
+        <MemoryRouter initialEntries={['/chat/c1']}>
+          <AppProvider>
+            <Routes>
+              <Route path="/chat/:conversationId?" element={<WorkbenchPage />} />
+            </Routes>
+          </AppProvider>
+        </MemoryRouter>,
+      );
+
+      const historyToggle = await screen.findByRole('button', { name: '切换话题栏' });
+      await user.click(historyToggle);
+      const searchInput = await screen.findByLabelText('搜索话题');
+      await user.type(searchInput, 'json_each');
+
+      const snippetMark = await screen.findByText('json_each', { selector: 'mark.wb-search-mark' });
+      expect(snippetMark).toBeInTheDocument();
+
+      const hitBtn = snippetMark.closest('button')!;
+      expect(hitBtn).not.toBeNull();
+      await user.click(hitBtn);
+
+      await waitFor(() => {
+        expect(screen.getByText('建议采用 SQLite json_each 检索正文')).toBeInTheDocument();
+      });
+      await waitFor(() => {
+        expect(scrollSpy).toHaveBeenCalled();
+      });
+    } finally {
+      window.matchMedia = origMatchMedia;
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('supports graph summary quick edit, bottom-bar one-click toggles, persisted expanded state, and text notes', async () => {
+    const user = userEvent.setup();
+    const mutations: GraphMutationInput[] = [];
+    const mutate = vi.fn(async (input: GraphMutationInput) => {
+      mutations.push(input);
+      return { conversation: conv, messages: msgs };
+    });
+
+    const conv: Conversation = {
+      id: 'c-graph',
+      assistantId: 'default',
+      title: '图谱测试',
+      providerId: 'openai',
+      modelId: 'gpt-4.1',
+      params: {},
+      activeLeafId: 'a1',
+      graphState: {
+        enabled: true,
+        notes: [
+          { id: 'n1', text: '旧标注', x: 320, y: 40, createdAt: '2026-11-24T00:00:00Z' },
+        ],
+        noteEdges: [
+          { id: 'e1', sourceId: 'n1', sourcePort: 'left', targetId: 'a1', targetPort: 'right' },
+        ],
+      },
+      syncEnabled: false,
+      syncState: 'local_only',
+      syncVersion: 0,
+      createdAt: '2026-11-24T00:00:00Z',
+      updatedAt: '2026-11-24T00:00:00Z',
+    };
+
+    const msgs: Message[] = [
+      {
+        id: 'u1',
+        conversationId: 'c-graph',
+        parentId: '',
+        role: 'user',
+        blocks: [{ type: 'text', text: '用户第一问' }],
+        graphMeta: { collapsed: true, summary: '简洁摘要' },
+        createdAt: '2026-11-24T00:00:00Z',
+      },
+      {
+        id: 'a1',
+        conversationId: 'c-graph',
+        parentId: 'u1',
+        role: 'assistant',
+        blocks: [{ type: 'text', text: '助手详细回答' }],
+        graphMeta: { expanded: true },
+        createdAt: '2026-11-24T00:00:01Z',
+      },
+    ];
+
+    render(
+      <AppProvider fetchImpl={makeWorkbenchFetch().fetchMock}>
+        <ConversationGraphView
+          conversation={conv}
+          messages={msgs}
+          activeMessages={msgs}
+          busy={false}
+          mutate={mutate}
+          onJump={vi.fn()}
+          onActivate={vi.fn()}
+        />
+      </AppProvider>,
+    );
+
+    // Persisted expanded assistant node renders expanded detail immediately.
+    const a1Node = document.querySelector('[data-graph-node="a1"]');
+    expect(a1Node).toHaveAttribute('data-expanded', 'true');
+
+    // Summary capsule renders quick edit icon button and opens summary modal.
+    const u1Node = document.querySelector('[data-graph-node="u1"]') as HTMLElement;
+    expect(u1Node).toHaveAttribute('data-kind', 'summary');
+    fireEvent.click(within(u1Node).getByRole('button', { name: '编辑摘要' }));
+    const summaryInput = await screen.findByLabelText('摘要');
+    await user.clear(summaryInput);
+    await user.type(summaryInput, '新摘要');
+    await user.click(screen.getByRole('button', { name: '保存' }));
+    expect(mutations.some((m) => m.op === 'setNodeMeta' && 'messageId' in m && m.messageId === 'u1' && m.graphMeta.summary === '新摘要')).toBe(true);
+
+    // Bottom-bar one-click user summary toggle (all users are collapsed -> restores).
+    await user.click(screen.getByRole('button', { name: '一键恢复用户消息' }));
+    expect(mutations.some((m) => m.op === 'setNodeMeta' && 'messageIds' in m && m.messageIds.includes('u1') && m.graphMeta.collapsed === false)).toBe(true);
+
+    // Bottom-bar one-click assistant expand toggle (all assistants are expanded -> collapses).
+    await user.click(screen.getByRole('button', { name: '一键收起助手信息' }));
+    expect(
+      mutations.some(
+        (m) =>
+          m.op === 'setNodeMeta' &&
+          (('messageId' in m && m.messageId === 'a1') || ('messageIds' in m && m.messageIds.includes('a1'))) &&
+          'graphMeta' in m &&
+          m.graphMeta.expanded === false,
+      ),
+    ).toBe(true);
+
+    // Create a new text note via bottom bar -> type -> Cmd/Ctrl+Enter commits createNote.
+    await user.click(screen.getByRole('button', { name: '新建文字标注' }));
+    const noteInput = await screen.findByLabelText('文字标注');
+    await user.type(noteInput, '关键设计决策{Control>}{Enter}{/Control}');
+    expect(mutations.some((m) => m.op === 'createNote' && m.text === '关键设计决策')).toBe(true);
+
+    // Disconnect note edge via midpoint button.
+    await user.click(screen.getByRole('button', { name: '断开标注连线' }));
+    expect(mutations.some((m) => m.op === 'deleteNoteEdge' && m.edgeId === 'e1')).toBe(true);
+  });
+
+  it('renders MessageSideRefBadge with merged assistant preview, graph jump, and disconnect actions', async () => {
+    const user = userEvent.setup();
+    const onOpenGraphNode = vi.fn();
+    const onRemoveSideRef = vi.fn(async () => {});
+
+    const uSide: Message = {
+      id: 'u-side',
+      conversationId: 'c1',
+      parentId: '',
+      role: 'user',
+      blocks: [{ type: 'text', text: '侧边提问（应被忽略）' }],
+      createdAt: '2026-11-24T00:00:00Z',
+    };
+    const aSide: Message = {
+      id: 'a-side',
+      conversationId: 'c1',
+      parentId: 'u-side',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: '侧边分支的核心结论' }],
+      createdAt: '2026-11-24T00:00:01Z',
+    };
+    const target: Message = {
+      id: 'u-main',
+      conversationId: 'c1',
+      parentId: '',
+      role: 'user',
+      blocks: [{ type: 'text', text: '主干问题' }],
+      graphMeta: { sideRefs: [{ sourceMessageId: 'a-side', side: 'left' }] },
+      createdAt: '2026-11-24T00:00:02Z',
+    };
+
+    render(
+      <MessageSideRefBadge
+        message={target}
+        allMessages={[uSide, aSide, target]}
+        align="end"
+        onOpenGraphNode={onOpenGraphNode}
+        onRemoveSideRef={onRemoveSideRef}
+      />,
+    );
+
+    const pill = screen.getByRole('button', { name: '参考分支' });
+    await user.click(pill);
+
+    expect(await screen.findByText('侧边分支的核心结论')).toBeInTheDocument();
+    expect(screen.queryByText('侧边提问（应被忽略）')).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '断开接入' }));
+    expect(onRemoveSideRef).toHaveBeenCalledWith('u-main', 'a-side');
+
+    await user.click(screen.getByRole('button', { name: '在缩略图中查看' }));
+    expect(onOpenGraphNode).toHaveBeenCalledWith('a-side');
   });
 });

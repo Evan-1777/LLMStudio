@@ -22,6 +22,7 @@ import type {
 import { CollapseStateProvider } from '../../rendering/CollapsibleBlock';
 import { ContentRenderer } from '../../rendering/ContentRenderer';
 import { formatCompactTokens, parseCompactionMeta } from './contextUsage';
+import { MessageSideRefBadge } from './MessageSideRefBadge';
 import { MessageActions } from '../chat/MessageActions';
 import { MessageEditor } from './MessageEditor';
 import {
@@ -286,12 +287,16 @@ function CompactionCheckpointCard({
 export function ChatCanvas({
   state,
   activeMessages = state.messages,
+  allMessages = state.messages,
   jumpTarget,
   assistant,
   providers = [],
   hasConversationId,
   scope,
   isTemporary = false,
+  graphReady = false,
+  onOpenGraphNode,
+  onRemoveSideRef,
   onUpdateMessage,
   onRetryMessage,
   onDeleteMessage,
@@ -301,12 +306,16 @@ export function ChatCanvas({
 }: {
   state: ChatState;
   activeMessages?: Message[];
+  allMessages?: readonly Message[];
   jumpTarget?: { messageId: string; seq: number } | null;
   assistant: Assistant;
   providers?: readonly ProviderConfig[];
   hasConversationId: boolean;
   scope?: TopicScope;
   isTemporary?: boolean;
+  graphReady?: boolean;
+  onOpenGraphNode?: (nodeId: string) => void;
+  onRemoveSideRef?: (targetMessageId: string, sourceMessageId: string) => Promise<void>;
   onUpdateMessage: (messageId: string, blocks: ContentBlock[]) => Promise<boolean>;
   onRetryMessage: (message: Message) => Promise<boolean>;
   onDeleteMessage: (message: Message) => Promise<boolean>;
@@ -609,6 +618,17 @@ export function ChatCanvas({
                         </div>
                       ) : null}
 
+                      {!isStreamingThis && !isEditingThis && msg.graphMeta?.sideRefs?.length ? (
+                        <MessageSideRefBadge
+                          message={msg}
+                          allMessages={allMessages}
+                          align="start"
+                          disabled={isBusy || !graphReady}
+                          onOpenGraphNode={onOpenGraphNode}
+                          onRemoveSideRef={onRemoveSideRef}
+                        />
+                      ) : null}
+
                       {!isStreamingThis && !isEditingThis ? (
                         <MessageActions
                           message={msg}
@@ -648,6 +668,16 @@ export function ChatCanvas({
                             size={32}
                           />
                         </div>
+                        {msg.graphMeta?.sideRefs?.length ? (
+                          <MessageSideRefBadge
+                            message={msg}
+                            allMessages={allMessages}
+                            align="end"
+                            disabled={isBusy || !graphReady}
+                            onOpenGraphNode={onOpenGraphNode}
+                            onRemoveSideRef={onRemoveSideRef}
+                          />
+                        ) : null}
                         <MessageActions
                           message={msg}
                           disabled={isBusy}
@@ -709,6 +739,17 @@ export function ChatCanvas({
                       <Icon name="warning" size={14} />
                       <span>{msg.errorMessage}</span>
                     </div>
+                  ) : null}
+
+                  {!isStreamingThis && !isEditingThis && msg.graphMeta?.sideRefs?.length ? (
+                    <MessageSideRefBadge
+                      message={msg}
+                      allMessages={allMessages}
+                      align="start"
+                      disabled={isBusy || !graphReady}
+                      onOpenGraphNode={onOpenGraphNode}
+                      onRemoveSideRef={onRemoveSideRef}
+                    />
                   ) : null}
 
                   {!isStreamingThis && !isEditingThis ? (

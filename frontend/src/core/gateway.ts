@@ -992,6 +992,23 @@ export class GatewayClient {
     );
   }
 
+  searchConversations(
+    params: { assistantId?: string; q: string },
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<import('./types').ConversationSearchHit[]> {
+    const sp = new URLSearchParams();
+    if (params.assistantId) {
+      sp.set('assistantId', params.assistantId);
+    }
+    sp.set('q', params.q);
+    return this.requestJson<{ hits?: import('./types').ConversationSearchHit[] }>(
+      'GET',
+      withScopeQuery(`/api/v1/conversations/search?${sp.toString()}`, scope),
+      { signal },
+    ).then((res) => res.hits ?? []);
+  }
+
   createConversation(
     input: CreateConversationInput = {},
     signal?: AbortSignal,

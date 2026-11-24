@@ -66,6 +66,7 @@ func NewRouter(deps RouterDeps) http.Handler {
 		mux.HandleFunc("PATCH /api/v1/conversation-groups/{id}", ch.RenameGroup)
 		mux.HandleFunc("DELETE /api/v1/conversation-groups/{id}", ch.DeleteGroup)
 		mux.HandleFunc("GET /api/v1/conversations", ch.List)
+		mux.HandleFunc("GET /api/v1/conversations/search", ch.Search)
 		mux.HandleFunc("POST /api/v1/conversations", ch.Create)
 		mux.HandleFunc("POST /api/v1/conversations/import", ch.Import)
 		mux.HandleFunc("POST /api/v1/conversations/batch", ch.Batch)

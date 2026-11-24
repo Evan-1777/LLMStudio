@@ -233,6 +233,7 @@ func (s *Server) buildHandler() http.Handler {
 	mux.HandleFunc("DELETE /api/v1/conversation-groups/{id}", s.handleDeleteGroup)
 
 	mux.HandleFunc("GET /api/v1/conversations", s.handleListConversations)
+	mux.HandleFunc("GET /api/v1/conversations/search", s.handleSearchConversations)
 	mux.HandleFunc("POST /api/v1/conversations", s.handleCreateConversation)
 	mux.HandleFunc("POST /api/v1/conversations/batch", s.handleBatchConversations)
 	mux.HandleFunc("POST /api/v1/conversations/cleanup-ungrouped", s.handleCleanupUngrouped)
@@ -1261,6 +1262,27 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	raw, err := s.cfg.Cloud.ListConversations(r.Context(), r.URL.Query().Get("assistantId"))
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	writeRawJSON(w, http.StatusOK, raw)
+}
+
+func (s *Server) handleSearchConversations(w http.ResponseWriter, r *http.Request) {
+	scope, err := scopeFromRequest(r)
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	if scope == plugin.ExecutionScopeLocal {
+		s.localConvHandler.Search(w, r)
+		return
+	}
+	if !s.requireCloud(w) {
+		return
+	}
+	raw, err := s.cfg.Cloud.SearchConversations(r.Context(), r.URL.Query().Get("assistantId"), r.URL.Query().Get("q"))
 	if err != nil {
 		writeDesktopError(w, err)
 		return

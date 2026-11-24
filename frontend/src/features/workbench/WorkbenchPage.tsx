@@ -367,22 +367,39 @@ function WorkbenchInner() {
   const draftKey = JSON.stringify([connectionEpoch, activeScope, activeAssistant.id, isTemporaryMode]);
   const modeKey = JSON.stringify([draftKey, activeId]);
   const [graphViewKey, setGraphViewKey] = useState<string | null>(null);
+  const [graphFocusNodeId, setGraphFocusNodeId] = useState<string | null>(null);
   const [jumpTarget, setJumpTarget] = useState<{ messageId: string; seq: number } | null>(null);
+  const [pendingSearchJump, setPendingSearchJump] = useState<{
+    conversationId: string;
+    messageId: string;
+    scope: TopicScope;
+    connectionEpoch: number;
+  } | null>(null);
+  const activatingSearchJumpRef = useRef<string | null>(null);
   const [graphBusy, setGraphBusy] = useState(false);
-  const graphLock = useRef(false);
+  const graphQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const graphBlockingCountRef = useRef(0);
   const graphToggleRef = useRef<HTMLButtonElement>(null);
   const graphConversation = !isTemporaryMode && sessionConversation?.id === conversationId ? sessionConversation : null;
   const graphOpen = graphViewKey === modeKey && Boolean(graphConversation);
   const graphReady = Boolean(graphConversation) && !isBusy && !isCompacting && !chatState.messages.some((msg) => isLocalMessageId(msg.id));
+  const graphReadyRef = useRef(graphReady);
+  graphReadyRef.current = graphReady;
   const branches = useMemo(() => graphConversation && resolveBranchSummaries(graphConversation, chatState.messages), [graphConversation, chatState.messages]);
   const activeBranch = branches?.find((branch) => branch.id === (graphConversation?.graphState?.activeBranchId || graphConversation?.activeLeafId));
   const showBranch = Boolean(graphConversation?.graphState?.activeBranchId || (branches && branches.length > 1));
 
   useEffect(() => {
     setGraphViewKey(null);
+    setGraphFocusNodeId(null);
     setJumpTarget(null);
     setToolbarMenuOpen(false);
   }, [modeKey]);
+
+  useEffect(() => {
+    setPendingSearchJump(null);
+    activatingSearchJumpRef.current = null;
+  }, [connectionEpoch, activeScope]);
 
   useEffect(() => {
     if (!isCompact || leftDrawerOpen || rightDrawerOpen) {
@@ -390,19 +407,51 @@ function WorkbenchInner() {
     }
   }, [isCompact, leftDrawerOpen, rightDrawerOpen]);
 
-  const submitGraphMutation = async (input: GraphMutationInput) => {
-    if (!graphReady || graphLock.current) return null;
-    graphLock.current = true;
-    setGraphBusy(true);
-    try {
-      const detail = await mutateGraph(input, reqScope);
-      if (detail && input.op === 'reparent' && !input.parentId) toast('已断开上下文');
-      return detail;
-    } finally { graphLock.current = false; setGraphBusy(false); }
+  const submitGraphMutation = (input: GraphMutationInput) => {
+    if (!graphReadyRef.current) return Promise.resolve(null);
+    const meta = input.op === 'setNodeMeta' && 'graphMeta' in input ? input.graphMeta : undefined;
+    const isExpandedOnly =
+      meta !== undefined &&
+      meta.expanded !== undefined &&
+      meta.collapsed === undefined &&
+      (!('summary' in meta) || meta.summary === undefined) &&
+      (!('x' in meta) || meta.x === undefined) &&
+      (!('y' in meta) || meta.y === undefined);
+    const targetModeKey = modeKeyRef.current;
+    const targetScope = reqScope;
+    const run = async () => {
+      if (!graphReadyRef.current || modeKeyRef.current !== targetModeKey) return null;
+      if (!isExpandedOnly) {
+        graphBlockingCountRef.current += 1;
+        setGraphBusy(true);
+      }
+      try {
+        const detail = await mutateGraph(input, targetScope);
+        if (detail && input.op === 'reparent' && !input.parentId) toast('已断开上下文');
+        return detail;
+      } finally {
+        if (!isExpandedOnly) {
+          graphBlockingCountRef.current = Math.max(0, graphBlockingCountRef.current - 1);
+          if (graphBlockingCountRef.current === 0) setGraphBusy(false);
+        }
+      }
+    };
+    const next = graphQueueRef.current.then(run, run);
+    graphQueueRef.current = next.then(() => undefined, () => undefined);
+    return next;
   };
   const closeGraph = () => {
     setGraphViewKey(null);
+    setGraphFocusNodeId(null);
     graphToggleRef.current?.focus({ preventScroll: true });
+  };
+  const openGraphAtNode = (nodeId: string) => {
+    if (!graphConversation) return;
+    setGraphFocusNodeId(nodeId);
+    setGraphViewKey(modeKey);
+  };
+  const removeSideRefFromChat = async (targetMessageId: string, sourceMessageId: string) => {
+    await submitGraphMutation({ op: 'removeSideRef', messageId: targetMessageId, sourceMessageId });
   };
   const activateGraphBranch = async (target: { leafMessageId: string } | { branchId: string }) => {
     const isCurrent = 'branchId' in target ? target.branchId === graphConversation?.graphState?.activeBranchId
@@ -703,8 +752,20 @@ function WorkbenchInner() {
     }
   };
 
-  const handleSelectConversation = (id: string) => {
+  const handleSelectConversation = (id: string, targetMessageId?: string) => {
     setDraftAgent(undefined);
+    if (targetMessageId) {
+      setPendingSearchJump({
+        conversationId: id,
+        messageId: targetMessageId,
+        scope: activeScope,
+        connectionEpoch,
+      });
+      setGraphViewKey(null);
+    } else {
+      setPendingSearchJump(null);
+      activatingSearchJumpRef.current = null;
+    }
     if (id !== conversationId || isTemporaryMode) {
       detachStream();
       discardTemporarySession();
@@ -715,6 +776,65 @@ function WorkbenchInner() {
       closeDrawers('right');
     }
   };
+
+  useEffect(() => {
+    if (!pendingSearchJump) return;
+    if (
+      pendingSearchJump.connectionEpoch !== connectionEpoch ||
+      pendingSearchJump.scope !== activeScope
+    ) {
+      setPendingSearchJump(null);
+      activatingSearchJumpRef.current = null;
+      return;
+    }
+    if (
+      chatState.runState === 'loading' ||
+      chatState.conversation?.id !== pendingSearchJump.conversationId
+    ) {
+      return;
+    }
+    const { conversationId: targetConvId, messageId: targetMsgId } = pendingSearchJump;
+    if (activeMessages.some((msg) => msg.id === targetMsgId)) {
+      setJumpTarget((prior) => ({
+        messageId: targetMsgId,
+        seq: (prior?.seq ?? 0) + 1,
+      }));
+      setGraphViewKey(null);
+      setPendingSearchJump(null);
+      activatingSearchJumpRef.current = null;
+      return;
+    }
+    if (!chatState.messages.some((msg) => msg.id === targetMsgId)) {
+      setPendingSearchJump(null);
+      activatingSearchJumpRef.current = null;
+      return;
+    }
+    if (!graphReady) return;
+    const jumpKey = `${targetConvId}:${targetMsgId}`;
+    if (activatingSearchJumpRef.current === jumpKey) return;
+    activatingSearchJumpRef.current = jumpKey;
+    const branch = branches?.find((item) => item.messageIds.includes(targetMsgId));
+    const target =
+      branch && 'branchId' in branch && branch.branchId
+        ? { branchId: branch.branchId }
+        : { leafMessageId: branch?.id ?? targetMsgId };
+    void submitGraphMutation({ op: 'activateBranch', ...target }).then((detail) => {
+      if (!detail && activatingSearchJumpRef.current === jumpKey) {
+        activatingSearchJumpRef.current = null;
+        setPendingSearchJump(null);
+      }
+    });
+  }, [
+    activeMessages,
+    activeScope,
+    branches,
+    chatState.conversation?.id,
+    chatState.runState,
+    chatState.messages,
+    connectionEpoch,
+    graphReady,
+    pendingSearchJump,
+  ]);
 
   const currentModelScopeKey = currentConversation
     ? `${connectionEpoch}:${currentConversation.id}`
@@ -1375,10 +1495,12 @@ function WorkbenchInner() {
             key={modeKey} conversation={graphConversation} messages={chatState.messages} activeMessages={activeMessages}
             busy={graphBusy || !graphReady} mutate={submitGraphMutation} onJump={(id) => void jumpToGraphMessage(id)}
             onActivate={(target) => void activateGraphBranch(target)} onDelete={handleDeleteMessage}
+            focusNodeId={graphFocusNodeId} onFocusHandled={() => setGraphFocusNodeId(null)}
           />}
           <div className="wb-chat-view" hidden={graphOpen}>
           <ChatCanvas
             activeMessages={activeMessages}
+            allMessages={sessionScope === reqScope ? chatState.messages : []}
             jumpTarget={jumpTarget}
             scope={reqScope}
             state={chatState}
@@ -1386,6 +1508,9 @@ function WorkbenchInner() {
             providers={resources.providers}
             hasConversationId={Boolean(conversationId)}
             isTemporary={isTemporaryMode}
+            graphReady={graphReady && !graphBusy}
+            onOpenGraphNode={graphConversation ? openGraphAtNode : undefined}
+            onRemoveSideRef={graphConversation ? removeSideRefFromChat : undefined}
             onUpdateMessage={handleUpdateMessage}
             onRetryMessage={handleRetryMessage}
             onDeleteMessage={handleDeleteMessage}
@@ -1406,6 +1531,7 @@ function WorkbenchInner() {
             isBusy={isBusy || isCompacting || savingMode}
             canStop={isGenerating}
             messages={sessionScope === reqScope ? activeMessages : []}
+            allMessages={sessionScope === reqScope ? chatState.messages : []}
             streaming={chatState.streaming}
             systemPrompt={currentConversation?.systemPrompt || activeAssistant.systemPrompt || ''}
             contextWindow={targetModel?.model.contextWindow}

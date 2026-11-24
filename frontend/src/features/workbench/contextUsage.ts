@@ -10,11 +10,13 @@ import {
   type StreamingDraft,
 } from '../chat/chatReducer';
 import type { PendingAttachment } from './attachments';
+import { resolveSideRefMaterials } from './conversationGraph';
 
 export type ContextUsageSource = 'reported' | 'hybrid' | 'estimated';
 
 export interface ContextUsageInput {
   messages: readonly Message[];
+  allMessages?: readonly Message[];
   streaming?: StreamingDraft | null;
   systemPrompt?: string;
   draft: string;
@@ -171,14 +173,26 @@ export function formatCompactTokens(n: number): string {
   return `${val}M`;
 }
 
+function estimateMessageSideRefTokens(
+  pool: readonly Message[],
+  msg: Message,
+): number {
+  if (!msg.graphMeta?.sideRefs?.length) return 0;
+  const { text } = resolveSideRefMaterials(pool, msg);
+  if (!text) return 0;
+  return 4 + estimateTextTokens(text);
+}
+
 export function computeContextUsage({
   messages,
+  allMessages,
   streaming,
   systemPrompt,
   draft,
   attachments,
   contextWindow,
 }: ContextUsageInput): ContextUsageSnapshot {
+  const sideRefPool = allMessages?.length ? allMessages : messages;
   const visible = streaming
     ? insertMessageAt(
         messages as Message[],
@@ -260,13 +274,20 @@ export function computeContextUsage({
         : u.inputTokens + u.outputTokens > 0
           ? u.inputTokens + u.outputTokens
           : u.totalTokens;
-    let trailingTokens = 0;
+    let trailingTokens = estimateMessageSideRefTokens(
+      sideRefPool,
+      activeVisible[anchorIdx],
+    );
     for (let i = anchorIdx + 1; i < activeVisible.length; i++) {
-      trailingTokens += estimateMessageTokens(activeVisible[i]);
+      trailingTokens +=
+        estimateMessageTokens(activeVisible[i]) +
+        estimateMessageSideRefTokens(sideRefPool, activeVisible[i]);
     }
     usedTokens = anchorTokens + trailingTokens + draftTokens;
     source =
-      anchorIdx === activeVisible.length - 1 && draftTokens === 0
+      anchorIdx === activeVisible.length - 1 &&
+      trailingTokens === 0 &&
+      draftTokens === 0
         ? 'reported'
         : 'hybrid';
   } else {
@@ -275,7 +296,9 @@ export function computeContextUsage({
       : 0;
     let historyTokens = 0;
     for (const msg of activeVisible) {
-      historyTokens += estimateMessageTokens(msg);
+      historyTokens +=
+        estimateMessageTokens(msg) +
+        estimateMessageSideRefTokens(sideRefPool, msg);
     }
     usedTokens = sysTokens + historyTokens + draftTokens;
     source = 'estimated';

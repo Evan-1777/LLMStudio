@@ -1,4 +1,10 @@
-import type { Conversation, ConversationBranchSlot, Message } from '../../core/types';
+import type {
+  Conversation,
+  ConversationBranchSlot,
+  ConversationGraphNote,
+  Message,
+  MessageSideRef,
+} from '../../core/types';
 
 export interface Point { x: number; y: number }
 export interface Rect { left: number; top: number; right: number; bottom: number }
@@ -9,6 +15,7 @@ export interface GraphNode extends Point {
   height: number;
   message?: Message;
   branch?: ConversationBranchSlot;
+  note?: ConversationGraphNote;
 }
 
 export function normalizeRect(a: Point, b: Point): Rect {
@@ -106,6 +113,122 @@ export function wouldCreateCycle(byId: ReadonlyMap<string, { parentId?: string }
   return childId === newParentId;
 }
 
+export function wouldCreateDependencyCycle(
+  messages: readonly Message[],
+  targetId: string,
+  sourceId: string,
+): boolean {
+  if (!targetId || !sourceId || targetId === sourceId) return true;
+  const byId = indexMessages(messages);
+  const target = byId.get(targetId);
+  const source = byId.get(sourceId);
+  if (!target || !source) return true;
+  if (target.role !== 'user' && target.role !== 'assistant') return true;
+  if (source.role !== 'user' && source.role !== 'assistant') return true;
+  // Reject if source is already on target's direct parent chain.
+  for (const { id } of ancestors(byId, targetId)) {
+    if (id === sourceId) return true;
+  }
+  // Joint DAG cycle check across parentId + sideRefs: adding targetId -> sourceId
+  // forms a cycle iff targetId is reachable from sourceId.
+  const visited = new Set<string>([sourceId]);
+  const queue: string[] = [sourceId];
+  for (let i = 0; i < queue.length; i++) {
+    const cur = byId.get(queue[i]);
+    if (!cur) continue;
+    const nextIds: string[] = [];
+    if (cur.parentId) nextIds.push(cur.parentId);
+    for (const ref of cur.graphMeta?.sideRefs ?? []) {
+      if (ref.sourceMessageId) nextIds.push(ref.sourceMessageId);
+    }
+    for (const nextId of nextIds) {
+      if (nextId === targetId) return true;
+      if (!visited.has(nextId)) {
+        visited.add(nextId);
+        queue.push(nextId);
+      }
+    }
+  }
+  return false;
+}
+
+export function extractSideRefMessageText(message: Message): string {
+  const parts: string[] = [];
+  for (const block of message.blocks) {
+    if ((block.type === 'text' || block.type === 'compaction') && typeof block.text === 'string') {
+      const trimmed = block.text.trim();
+      if (trimmed) parts.push(trimmed);
+    }
+  }
+  return parts.join('\n\n');
+}
+
+export function resolveSideRefBranchMessages(
+  allMessages: readonly Message[],
+  targetMessage: Message,
+  sourceMessageId: string,
+): Message[] {
+  const byId = indexMessages(allMessages);
+  const mainAncestors = new Set<string>();
+  for (const { id } of ancestors(byId, targetMessage.id)) {
+    mainAncestors.add(id);
+  }
+  const chain: Message[] = [];
+  const walked = new Set<string>();
+  for (let id = sourceMessageId; id && !walked.has(id); ) {
+    if (mainAncestors.has(id)) break;
+    const node = byId.get(id);
+    if (!node) break;
+    walked.add(id);
+    chain.push(node);
+    id = node.parentId ?? '';
+  }
+  chain.reverse();
+  return chain.filter((msg) => msg.role === 'assistant');
+}
+
+export interface ResolvedSideRefBranch {
+  ref: MessageSideRef;
+  assistantMessages: Message[];
+  preview: string;
+}
+
+export function resolveSideRefMaterials(
+  allMessages: readonly Message[],
+  targetMessage: Message,
+): { text: string; branches: ResolvedSideRefBranch[] } {
+  const refs = targetMessage.graphMeta?.sideRefs ?? [];
+  if (!refs.length) return { text: '', branches: [] };
+  const seenAssistant = new Set<string>();
+  const mergedParts: string[] = [];
+  const branches: ResolvedSideRefBranch[] = [];
+  for (const ref of refs) {
+    const assistantMessages = resolveSideRefBranchMessages(
+      allMessages,
+      targetMessage,
+      ref.sourceMessageId,
+    );
+    const branchParts: string[] = [];
+    for (const msg of assistantMessages) {
+      const content = extractSideRefMessageText(msg);
+      if (content) branchParts.push(content);
+      if (!seenAssistant.has(msg.id)) {
+        seenAssistant.add(msg.id);
+        if (content) mergedParts.push(content);
+      }
+    }
+    branches.push({
+      ref,
+      assistantMessages,
+      preview: branchParts.join('\n\n'),
+    });
+  }
+  const text = mergedParts.length
+    ? `<reference_materials>\n${mergedParts.join('\n\n')}\n</reference_materials>`
+    : '';
+  return { text, branches };
+}
+
 export function extractNodePreview(message: Message): string {
   return message.blocks.flatMap((block) =>
     (block.type === 'text' || block.type === 'compaction') && typeof block.text === 'string' ? [block.text] : [],
@@ -190,6 +313,18 @@ export function computeAutoLayout(
       node.x = saved?.x ?? node.x;
       node.y = saved?.y ?? node.y;
     }
+  }
+  for (const note of graph?.notes ?? []) {
+    const override = sizeOverrides?.get(note.id);
+    nodes.push({
+      note,
+      id: note.id,
+      parentId: '',
+      x: note.x ?? 0,
+      y: note.y ?? 0,
+      width: override?.width ?? 148,
+      height: override?.height ?? 44,
+    });
   }
   return nodes;
 }

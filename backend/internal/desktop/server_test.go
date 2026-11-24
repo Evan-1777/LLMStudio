@@ -417,3 +417,89 @@ func TestDesktopStatusProbeSingleRequestRetryAndUnauthorized(t *testing.T) {
 		t.Fatalf("expected auth-required without retry, got status=%+v settingsHits=%d", st, settingsHits.Load())
 	}
 }
+
+func TestDesktopSearchConversationsScopeDispatch(t *testing.T) {
+	ctx := context.Background()
+	cloudDB, err := store.OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cloudDB.Close()
+	cloudConvs := store.NewConversationStore(cloudDB)
+	cloudMsgs := store.NewMessageStore(cloudDB)
+	cloudConv, err := cloudConvs.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "Cloud Topic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cloudMsgs.Create(ctx, domain.Message{
+		ID: "cm1", ConversationID: cloudConv.ID, Role: domain.RoleAssistant,
+		Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "cloud-only-needle"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cloudRouter := httpapi.NewRouter(httpapi.RouterDeps{
+		Config:              config.Config{AccessToken: "remote-tok"},
+		ConversationService: service.NewConversationService(cloudConvs, cloudMsgs),
+	})
+	cloudSrv := httptest.NewServer(cloudRouter)
+	defer cloudSrv.Close()
+
+	tmpDir := t.TempDir()
+	paths := StoragePaths{Mode: DataModePortable, DataDir: tmpDir, DBPath: filepath.Join(tmpDir, "local.db")}
+	localStore, err := OpenDesktopStore(ctx, paths.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer localStore.Close()
+	localConv, err := localStore.Conversations.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "Local Topic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := localStore.Messages.Create(ctx, domain.Message{
+		ID: "lm1", ConversationID: localConv.ID, Role: domain.RoleAssistant,
+		Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "local-only-needle"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cloud := NewCloudClient("", "")
+	srv, err := NewServer(ServerConfig{Paths: paths, Store: localStore, Cloud: cloud})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	doSearch := func(rawURL string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+		req.Header.Set("Authorization", "Bearer "+srv.Token())
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+
+	// 1. Offline local search succeeds.
+	rec := doSearch("/api/v1/conversations/search?scope=local&q=local-only-needle")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("local search code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var out struct{ Hits []domain.ConversationSearchHit }
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Hits) != 1 || out.Hits[0].MessageID != "lm1" {
+		t.Fatalf("unexpected local hits: %+v err=%v", out.Hits, err)
+	}
+
+	// 2. Offline cloud search returns 401/error.
+	rec = doSearch("/api/v1/conversations/search?scope=cloud&q=cloud-only-needle")
+	if rec.Code == http.StatusOK {
+		t.Fatalf("expected offline cloud search to fail, got 200: %s", rec.Body.String())
+	}
+
+	// 3. Connected cloud search proxies to cloud gateway.
+	cloud.SetCredentials(cloudSrv.URL, "remote-tok")
+	rec = doSearch("/api/v1/conversations/search?scope=cloud&q=cloud-only-needle")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("online cloud search code=%d body=%s", rec.Code, rec.Body.String())
+	}
+	out.Hits = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil || len(out.Hits) != 1 || out.Hits[0].MessageID != "cm1" {
+		t.Fatalf("unexpected cloud hits: %+v err=%v", out.Hits, err)
+	}
+}

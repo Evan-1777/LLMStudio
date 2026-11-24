@@ -38,6 +38,19 @@ func (h *ConversationHandler) List(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *ConversationHandler) Search(w http.ResponseWriter, r *http.Request) {
+	assistantID := strings.TrimSpace(r.URL.Query().Get("assistantId"))
+	q := r.URL.Query().Get("q")
+	hits, err := h.svc.Search(r.Context(), assistantID, q)
+	if err != nil {
+		writeServiceError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, map[string]any{
+		"hits": hits,
+	})
+}
+
 func (h *ConversationHandler) Create(w http.ResponseWriter, r *http.Request) {
 	var in service.CreateConversationInput
 	if r.ContentLength != 0 {

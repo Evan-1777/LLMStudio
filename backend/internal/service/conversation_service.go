@@ -85,6 +85,11 @@ func NewConversationService(convs *store.ConversationStore, msgs *store.MessageS
 	}
 }
 
+// Search searches non-ephemeral conversations by title and message content.
+func (s *ConversationService) Search(ctx context.Context, assistantID, query string) ([]domain.ConversationSearchHit, error) {
+	return s.convs.Search(ctx, assistantID, query)
+}
+
 // WithAssistants injects an optional AssistantStore to inherit default model presets on creation.
 func (s *ConversationService) WithAssistants(assistants *store.AssistantStore) *ConversationService {
 	s.assistants = assistants

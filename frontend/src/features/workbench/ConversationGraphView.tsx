@@ -11,7 +11,7 @@ import {
 } from 'react';
 import { useApp } from '../../app/AppProvider';
 import { Button, ConfirmDialog, DropdownItem, DropdownSeparator, Icon, IconButton, Modal } from '../../components/ui';
-import type { Conversation, ConversationDetail, GraphMutationInput, Message } from '../../core/types';
+import type { Conversation, ConversationDetail, GraphMutationInput, GraphNotePort, Message } from '../../core/types';
 import { ContentRenderer, MarkdownDocument, imageBlockSource } from '../../rendering/ContentRenderer';
 import {
   collectSubtreeIds,
@@ -21,9 +21,21 @@ import {
   normalizeRect,
   rectIntersectsNode,
   wouldCreateCycle,
+  wouldCreateDependencyCycle,
   type GraphNode,
   type Point,
 } from './conversationGraph';
+import {
+  curve,
+  moveTo,
+  nearestNotePort,
+  noteEdgeCurve,
+  notePortPoint,
+  port,
+  sidePort,
+  sideRefCurve,
+} from './conversationGraphGeometry';
+import { GraphNoteEditor } from './GraphNoteEditor';
 import './conversation-graph.css';
 
 type View = Point & { scale: number };
@@ -34,9 +46,14 @@ type Gesture =
   | { kind: 'marquee'; id: number; start: Point; additive: boolean; baseIds: Set<string>; moved: boolean }
   | { kind: 'move'; id: number; start: Point; node: GraphNode; origins: DragOrigin[]; modifiers: boolean; moved: boolean }
   | { kind: 'link'; id: number; start: Point; node: GraphNode; end: 'in' | 'out'; moved: boolean }
+  | { kind: 'sideLink'; id: number; start: Point; node: GraphNode; side: 'left' | 'right'; moved: boolean }
+  | { kind: 'noteLink'; id: number; start: Point; node: GraphNode; fromPort: GraphNotePort; moved: boolean }
   | { kind: 'pinch'; start: Point; distance: number; view: View };
 type MarqueeState = { start: Point; current: Point; additive: boolean; baseIds: Set<string> };
-type LinkDrag = { node: GraphNode; end: 'in' | 'out'; pointer: Point; target?: GraphNode; valid: boolean; overNode: boolean };
+type LinkDrag =
+  | { mode: 'reparent'; node: GraphNode; end: 'in' | 'out'; pointer: Point; target?: GraphNode; valid: boolean; overNode: boolean }
+  | { mode: 'sideRef'; origin: 'out' | 'side'; node: GraphNode; side: 'left' | 'right'; pointer: Point; target?: GraphNode; valid: boolean }
+  | { mode: 'noteEdge'; node: GraphNode; fromPort: GraphNotePort; pointer: Point; target?: GraphNode; toPort?: GraphNotePort; valid: boolean };
 
 const initialView: View = { x: 0, y: 0, scale: 1 };
 const minZoom = 0.35;
@@ -45,17 +62,14 @@ const defaultExpandedSize: NodeSize = { width: 420, height: 220 };
 const clampZoom = (scale: number) => Math.min(maxZoom, Math.max(minZoom, scale));
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
 const midpoint = (a: Point, b: Point) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
-const port = (node: GraphNode, end: 'in' | 'out') => ({ x: node.x + node.width / 2, y: node.y + (end === 'out' ? node.height : 0) });
 const summary = (node: GraphNode) => node.message?.role === 'user' && node.message.graphMeta?.collapsed;
+const isSideRefEligible = (msg?: Message) => Boolean(msg && (msg.role === 'user' || msg.role === 'assistant'));
 const zoomAt = (view: View, from: Point, to: Point, scale: number): View => ({
   scale, x: to.x - (from.x - view.x) * scale / view.scale, y: to.y - (from.y - view.y) * scale / view.scale,
 });
 const toWorld = (point: Point, view: View): Point => ({ x: (point.x - view.x) / view.scale, y: (point.y - view.y) / view.scale });
-function curve(from: Point, to: Point) {
-  const bend = Math.max(24, Math.min(112, Math.abs(to.y - from.y) * 0.48));
-  return 'C ' + from.x + ' ' + (from.y + bend) + ', ' + to.x + ' ' + (to.y - bend) + ', ' + to.x + ' ' + to.y;
-}
-const moveTo = ({ x, y }: Point) => 'M ' + x + ' ' + y + ' ';
+
+const NOTE_PORTS: readonly GraphNotePort[] = ['top', 'bottom', 'left', 'right'];
 
 function isEditableElement(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
@@ -104,7 +118,17 @@ function PlainMessageDetail({ message }: { message: Message }) {
   );
 }
 
-export function ConversationGraphView({ conversation, messages, activeMessages, busy, mutate, onJump, onActivate }: {
+export function ConversationGraphView({
+  conversation,
+  messages,
+  activeMessages,
+  busy,
+  mutate,
+  onJump,
+  onActivate,
+  focusNodeId,
+  onFocusHandled,
+}: {
   conversation: Conversation;
   messages: Message[];
   activeMessages: Message[];
@@ -113,6 +137,8 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
   onJump: (messageId: string) => void;
   onActivate: (branch: { leafMessageId: string } | { branchId: string }) => void;
   onDelete?: (message: Message) => Promise<boolean>;
+  focusNodeId?: string | null;
+  onFocusHandled?: () => void;
 }) {
   const { settings } = useApp();
   const stage = useRef<HTMLDivElement>(null);
@@ -123,8 +149,9 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
   const viewRef = useRef(initialView);
   const spacePressedRef = useRef(false);
   const lastClickRef = useRef<{ id: string; time: number } | null>(null);
-  const expandedElements = useRef(new Map<string, HTMLDivElement>());
+  const observedElements = useRef(new Map<string, HTMLDivElement>());
   const resizeObserver = useRef<ResizeObserver | null>(null);
+  const expandSeqRef = useRef(new Map<string, number>());
 
   const [view, setView] = useState(initialView);
   const [panning, setPanning] = useState(false);
@@ -133,13 +160,16 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
   const [selectedIds, setSelectedIds] = useState<ReadonlySet<string>>(() => new Set());
   const [marquee, setMarquee] = useState<MarqueeState | null>(null);
   const [moving, setMoving] = useState<ReadonlyMap<string, Point> | null>(null);
-  const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [optimisticExpanded, setOptimisticExpanded] = useState<ReadonlyMap<string, boolean>>(() => new Map());
   const [measuredSizes, setMeasuredSizes] = useState<ReadonlyMap<string, NodeSize>>(() => new Map());
   const [link, setLink] = useState<LinkDrag | null>(null);
   const [pickParent, setPickParent] = useState<string | null>(null);
+  const [pickSideRef, setPickSideRef] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ id?: string; client: Point; world: Point } | null>(null);
   const menuOrigin = useRef<HTMLElement | null>(null);
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
+  const [draftNote, setDraftNote] = useState<{ x: number; y: number; text: string } | null>(null);
+  const [editingNote, setEditingNote] = useState<{ id: string; text: string } | null>(null);
   const [deletingNodes, setDeletingNodes] = useState<GraphNode[] | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -149,16 +179,25 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     () => new Set(nodes.filter((node) => Boolean(node.message)).map((node) => node.id)),
     [nodes],
   );
+  const validNoteIds = useMemo(
+    () => new Set(nodes.filter((node) => Boolean(node.note)).map((node) => node.id)),
+    [nodes],
+  );
   const effectiveSelectedIds = useMemo(() => {
     const next = new Set<string>();
     for (const id of selectedIds) if (validNodeIds.has(id)) next.add(id);
     return next;
   }, [selectedIds, validNodeIds]);
+
   const effectiveExpandedIds = useMemo(() => {
     const next = new Set<string>();
-    for (const id of expandedIds) if (validMessageIds.has(id)) next.add(id);
+    for (const msg of messages) {
+      const override = optimisticExpanded.get(msg.id);
+      const isExpanded = override !== undefined ? override : Boolean(msg.graphMeta?.expanded);
+      if (isExpanded && validMessageIds.has(msg.id)) next.add(msg.id);
+    }
     return next;
-  }, [expandedIds, validMessageIds]);
+  }, [messages, optimisticExpanded, validMessageIds]);
 
   const activeIds = useMemo(() => new Set([
     ...activeMessages.map((m) => m.id), conversation.graphState?.activeBranchId,
@@ -173,6 +212,11 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
         width: measured?.width ?? defaultExpandedSize.width,
         height: measured?.height ?? defaultExpandedSize.height,
       };
+    } else if (node.note) {
+      const measured = measuredSizes.get(node.id);
+      if (measured) {
+        next = { ...next, width: measured.width, height: measured.height };
+      }
     }
     const offset = moving?.get(node.id);
     return offset ? { ...next, x: offset.x, y: offset.y } : next;
@@ -182,6 +226,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
   const children = useMemo(() => {
     const result = new Map<string, GraphNode[]>();
     for (const node of display) {
+      if (!node.parentId) continue;
       const row = result.get(node.parentId) ?? [];
       row.push(node);
       result.set(node.parentId, row);
@@ -230,10 +275,28 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     () => selectedMessages.filter((node) => node.message?.role === 'user'),
     [selectedMessages],
   );
+  const userMessages = useMemo(
+    () => messages.filter((msg) => msg.role === 'user'),
+    [messages],
+  );
+  const assistantMessages = useMemo(
+    () => messages.filter((msg) => msg.role === 'assistant'),
+    [messages],
+  );
+  const allUsersCollapsed = useMemo(
+    () => userMessages.length > 0 && userMessages.every((msg) => Boolean(msg.graphMeta?.collapsed)),
+    [userMessages],
+  );
+  const allAssistantsExpanded = useMemo(
+    () => assistantMessages.length > 0 && assistantMessages.every((msg) => effectiveExpandedIds.has(msg.id)),
+    [assistantMessages, effectiveExpandedIds],
+  );
   const allMessagesExpanded = useMemo(
     () => validMessageIds.size > 0 && Array.from(validMessageIds).every((id) => effectiveExpandedIds.has(id)),
     [validMessageIds, effectiveExpandedIds],
   );
+
+  const noteEdges = conversation.graphState?.noteEdges ?? [];
 
   const activeId = conversation.graphState?.activeBranchId || conversation.activeLeafId || activeMessages.at(-1)?.id;
   const menuNode = menu?.id ? byId.get(menu.id) : undefined;
@@ -264,9 +327,42 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     setCamera({ scale, x: rect.width / 2 - focusX * scale, y: usableHeight / 2 + 16 - focusY * scale });
   }, [activeId]);
 
-  useLayoutEffect(() => { fit(nodes, true); }, []); // A topic change remounts the viewport; graph edits preserve the camera.
+  const centerOnNode = useCallback((target: GraphNode) => {
+    const rect = stage.current?.getBoundingClientRect();
+    if (!rect) return;
+    const scale = clampZoom(Math.max(viewRef.current.scale, 1));
+    const usableHeight = Math.max(1, rect.height - 76);
+    const focusX = target.x + target.width / 2;
+    const focusY = target.y + target.height / 2;
+    setCamera({
+      scale,
+      x: rect.width / 2 - focusX * scale,
+      y: usableHeight / 2 + 16 - focusY * scale,
+    });
+    setSelectedIds(new Set([target.id]));
+  }, []);
 
-  // Observe expanded card unscaled world dimensions so SVG edges & ports stay aligned.
+  useLayoutEffect(() => {
+    if (focusNodeId) {
+      const target = display.find((node) => node.id === focusNodeId);
+      if (target) {
+        centerOnNode(target);
+        onFocusHandled?.();
+        return;
+      }
+    }
+    fit(display, true);
+  }, []); // A topic change remounts the viewport; graph edits preserve the camera.
+
+  useEffect(() => {
+    if (!focusNodeId) return;
+    const target = byId.get(focusNodeId);
+    if (!target) return;
+    centerOnNode(target);
+    onFocusHandled?.();
+  }, [focusNodeId, byId, centerOnNode, onFocusHandled]);
+
+  // Observe dynamic-sized nodes (expanded message cards and adaptive text notes) so SVG edges & ports stay aligned.
   useEffect(() => {
     if (typeof ResizeObserver === 'undefined') return;
     const measureEl = (el: HTMLDivElement) => {
@@ -289,7 +385,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
       }
     });
     resizeObserver.current = obs;
-    for (const el of expandedElements.current.values()) {
+    for (const el of observedElements.current.values()) {
       obs.observe(el);
       measureEl(el);
     }
@@ -304,25 +400,25 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     setMeasuredSizes((prev) => {
       let changed = false;
       for (const id of prev.keys()) {
-        if (!effectiveExpandedIds.has(id)) { changed = true; break; }
+        if (!effectiveExpandedIds.has(id) && !validNoteIds.has(id)) { changed = true; break; }
       }
       if (!changed) return prev;
       const next = new Map<string, NodeSize>();
       for (const [id, size] of prev) {
-        if (effectiveExpandedIds.has(id)) next.set(id, size);
+        if (effectiveExpandedIds.has(id) || validNoteIds.has(id)) next.set(id, size);
       }
       return next;
     });
-  }, [effectiveExpandedIds]);
+  }, [effectiveExpandedIds, validNoteIds]);
 
-  const bindExpandedRef = useCallback((id: string, el: HTMLDivElement | null) => {
-    const prev = expandedElements.current.get(id);
+  const bindDynamicRef = useCallback((id: string, el: HTMLDivElement | null) => {
+    const prev = observedElements.current.get(id);
     if (prev && prev !== el) {
       resizeObserver.current?.unobserve(prev);
-      expandedElements.current.delete(id);
+      observedElements.current.delete(id);
     }
     if (el) {
-      expandedElements.current.set(id, el);
+      observedElements.current.set(id, el);
       resizeObserver.current?.observe(el);
       const width = Math.round(el.offsetWidth);
       const height = Math.round(el.offsetHeight);
@@ -361,7 +457,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
   // Keyboard shortcuts (capture phase so Escape unwinds graph state before WorkbenchPage closes the graph).
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (menu || editing || deletingNodes) return;
+      if (menu || editing || deletingNodes || draftNote || editingNote) return;
       if (document.querySelector('[role="dialog"], [role="menu"]')) return;
       if (isEditableElement(event.target) || isEditableElement(document.activeElement)) return;
 
@@ -370,6 +466,12 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
           event.preventDefault();
           event.stopPropagation();
           setPickParent(null);
+          return;
+        }
+        if (pickSideRef) {
+          event.preventDefault();
+          event.stopPropagation();
+          setPickSideRef(null);
           return;
         }
         if (effectiveSelectedIds.size > 0 || selectMode) {
@@ -428,7 +530,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
       window.removeEventListener('keyup', onKeyUp, true);
       window.removeEventListener('blur', onBlur);
     };
-  }, [busy, deletingNodes, display, editing, effectiveSelectedIds, menu, nodes, pickParent, selectMode]);
+  }, [busy, deletingNodes, display, draftNote, editing, editingNote, effectiveSelectedIds, menu, nodes, pickParent, pickSideRef, selectMode]);
 
   const changeZoom = (factor: number) => {
     const point = center();
@@ -456,45 +558,99 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     });
   };
 
+  const startDraftNote = (point: Point) => {
+    setMenu(null);
+    setEditingNote(null);
+    setDraftNote({ x: Math.round(point.x - 74), y: Math.round(point.y - 22), text: '' });
+  };
+
   const layout = async () => {
     const sizeOverrides = new Map<string, NodeSize>();
     for (const id of effectiveExpandedIds) {
       sizeOverrides.set(id, measuredSizes.get(id) ?? defaultExpandedSize);
     }
+    for (const id of validNoteIds) {
+      const measured = measuredSizes.get(id);
+      if (measured) sizeOverrides.set(id, measured);
+    }
     const arranged = computeAutoLayout(conversation, messages, false, sizeOverrides.size ? sizeOverrides : undefined);
-    if (!arranged.length) return;
+    const movable = arranged.filter((node) => !node.note);
+    if (!movable.length) return;
     const result = await mutate({
       op: 'setNodeMeta',
-      positions: arranged.map(({ id, branch, x, y }) => ({ ...(branch ? { branchId: id } : { messageId: id }), x, y })),
+      positions: movable.map(({ id, branch, x, y }) => ({ ...(branch ? { branchId: id } : { messageId: id }), x, y })),
     });
     if (result) fit(arranged);
   };
 
-  const isLeaf = (node: GraphNode) => !children.has(node.id);
+  const isLeaf = (node: GraphNode) => Boolean(!node.note && !children.has(node.id));
   const activate = (node: GraphNode) => onActivate(node.branch ? { branchId: node.id } : { leafMessageId: node.id });
   const canConnect = (child: string, parent: GraphNode) => Boolean(parent.message) && !wouldCreateCycle(byId, child, parent.id);
+  const canSideAttach = (targetId: string, sourceId: string) => !wouldCreateDependencyCycle(messages, targetId, sourceId);
 
-  const toggleExpandNode = (id: string) => {
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+  const persistExpanded = (ids: string[], expanded: boolean) => {
+    if (!ids.length) return;
+    const seqs = new Map<string, number>();
+    setOptimisticExpanded((prev) => {
+      const next = new Map(prev);
+      for (const id of ids) {
+        const seq = (expandSeqRef.current.get(id) ?? 0) + 1;
+        expandSeqRef.current.set(id, seq);
+        seqs.set(id, seq);
+        next.set(id, expanded);
+      }
       return next;
     });
+    const req: GraphMutationInput = ids.length === 1
+      ? { op: 'setNodeMeta', messageId: ids[0], graphMeta: { expanded } }
+      : { op: 'setNodeMeta', messageIds: ids, graphMeta: { expanded } };
+    void mutate(req).finally(() => {
+      setOptimisticExpanded((prev) => {
+        let changed = false;
+        const next = new Map(prev);
+        for (const [id, seq] of seqs) {
+          if (expandSeqRef.current.get(id) === seq && next.has(id)) {
+            next.delete(id);
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    });
+  };
+
+  const toggleExpandNode = (id: string) => {
+    persistExpanded([id], !effectiveExpandedIds.has(id));
   };
 
   const toggleExpandTargets = (targets: GraphNode[]) => {
     const msgIds = targets.filter((n) => Boolean(n.message)).map((n) => n.id);
     if (!msgIds.length) return;
     const shouldExpand = msgIds.some((id) => !effectiveExpandedIds.has(id));
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      for (const id of msgIds) {
-        if (shouldExpand) next.add(id);
-        else next.delete(id);
-      }
-      return next;
+    persistExpanded(msgIds, shouldExpand);
+  };
+
+  const toggleAllUsersSummary = () => {
+    if (!userMessages.length || busy) return;
+    const ids = userMessages.map((m) => m.id);
+    const shouldCollapse = !allUsersCollapsed;
+    if (shouldCollapse) {
+      setOptimisticExpanded((prev) => {
+        const next = new Map(prev);
+        for (const id of ids) next.delete(id);
+        return next;
+      });
+    }
+    void mutate({
+      op: 'setNodeMeta',
+      messageIds: ids,
+      graphMeta: shouldCollapse ? { collapsed: true, expanded: false } : { collapsed: false },
     });
+  };
+
+  const toggleAllAssistantsExpand = () => {
+    if (!assistantMessages.length) return;
+    persistExpanded(assistantMessages.map((m) => m.id), !allAssistantsExpanded);
   };
 
   const disconnectIds = (ids: string[]) => {
@@ -512,6 +668,15 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
       if (canConnect(pickParent, node)) {
         void mutate({ op: 'reparent', messageId: pickParent, parentId: node.id });
         setPickParent(null);
+      }
+      return;
+    }
+    if (pickSideRef) {
+      if (isSideRefEligible(node.message) && canSideAttach(node.id, pickSideRef)) {
+        const sourceNode = byId.get(pickSideRef);
+        const side: 'left' | 'right' = sourceNode && sourceNode.x + sourceNode.width / 2 > node.x + node.width / 2 ? 'right' : 'left';
+        void mutate({ op: 'addSideRef', messageId: node.id, sourceMessageId: pickSideRef, side });
+        setPickSideRef(null);
       }
       return;
     }
@@ -533,10 +698,12 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     spec:
       | { kind: 'move'; node: GraphNode }
       | { kind: 'link'; node: GraphNode; end: 'in' | 'out' }
+      | { kind: 'sideLink'; node: GraphNode; side: 'left' | 'right' }
+      | { kind: 'noteLink'; node: GraphNode; fromPort: GraphNotePort }
       | { kind: 'pan' }
       | { kind: 'marquee'; additive: boolean },
   ) {
-    if (menu || editing || deletingNodes) return;
+    if (menu || editing || deletingNodes || draftNote || editingNote) return;
     const isMiddle = event.button === 1;
     if (spec.kind === 'pan') {
       if (event.button !== 0 && !isMiddle) return;
@@ -582,20 +749,51 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
         kind: 'move', id: event.pointerId, start: point,
         node: spec.node, origins, modifiers, moved: false,
       };
-    } else {
+    } else if (spec.kind === 'link') {
       gesture.current = { kind: 'link', id: event.pointerId, start: point, node: spec.node, end: spec.end, moved: false };
+    } else if (spec.kind === 'sideLink') {
+      gesture.current = { kind: 'sideLink', id: event.pointerId, start: point, node: spec.node, side: spec.side, moved: false };
+    } else {
+      gesture.current = { kind: 'noteLink', id: event.pointerId, start: point, node: spec.node, fromPort: spec.fromPort, moved: false };
     }
   }
 
-  function linkAt(event: PointerEvent, drag: Extract<Gesture, { kind: 'link' }>): LinkDrag {
-    const el = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-graph-node]');
-    const target = el?.dataset.graphNode ? byId.get(el.dataset.graphNode) : undefined;
+  function linkAt(
+    event: PointerEvent,
+    drag: Extract<Gesture, { kind: 'link' | 'sideLink' | 'noteLink' }>,
+  ): LinkDrag {
+    const pointer = toWorld(origin(event.clientX, event.clientY), viewRef.current);
+    const hitEl = document.elementFromPoint(event.clientX, event.clientY);
+    const nodeEl = hitEl?.closest<HTMLElement>('[data-graph-node]');
+    const target = nodeEl?.dataset.graphNode ? byId.get(nodeEl.dataset.graphNode) : undefined;
+
+    if (drag.kind === 'noteLink') {
+      const valid = Boolean(target && target.id !== drag.node.id);
+      const toPort = valid && target ? nearestNotePort(target, pointer).port : undefined;
+      return { mode: 'noteEdge', node: drag.node, fromPort: drag.fromPort, pointer, target, toPort, valid };
+    }
+
+    if (drag.kind === 'sideLink') {
+      const valid = Boolean(target && isSideRefEligible(target.message) && canSideAttach(drag.node.id, target.id));
+      return { mode: 'sideRef', origin: 'side', node: drag.node, side: drag.side, pointer, target, valid };
+    }
+
+    // Orthogonal gesture boundary: out -> explicit side-left/side-right port hotzone => addSideRef;
+    // otherwise out -> node body/in => reparent.
+    if (drag.end === 'out' && isSideRefEligible(drag.node.message)) {
+      const sidePortEl = hitEl?.closest<HTMLElement>('[data-port="side-left"], [data-port="side-right"]');
+      if (sidePortEl && target && isSideRefEligible(target.message)) {
+        const side: 'left' | 'right' = sidePortEl.dataset.port === 'side-left' ? 'left' : 'right';
+        const valid = canSideAttach(target.id, drag.node.id);
+        return { mode: 'sideRef', origin: 'out', node: drag.node, side, pointer, target, valid };
+      }
+    }
+
     const valid = !!target && (drag.end === 'in'
       ? canConnect(drag.node.id, target)
       : !!target.message && canConnect(target.id, drag.node));
     return {
-      node: drag.node, end: drag.end, target, valid, overNode: !!target,
-      pointer: toWorld(origin(event.clientX, event.clientY), viewRef.current),
+      mode: 'reparent', node: drag.node, end: drag.end, target, valid, overNode: !!target, pointer,
     };
   }
 
@@ -619,7 +817,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
       setCamera({ ...drag.view, x: drag.view.x + dx, y: drag.view.y + dy });
     } else if (drag.kind === 'marquee') {
       setMarquee({ start: drag.start, current, additive: drag.additive, baseIds: drag.baseIds });
-    } else if (!busy && !pickParent) {
+    } else if (!busy && !pickParent && !pickSideRef) {
       if (drag.kind === 'move') {
         const wdx = dx / viewRef.current.scale;
         const wdy = dy / viewRef.current.scale;
@@ -670,16 +868,17 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     if (drag.kind === 'move') {
       if (!moved) {
         const now = performance.now();
-        const isDouble = !drag.modifiers && !pickParent && lastClickRef.current?.id === drag.node.id && now - lastClickRef.current.time < 360;
+        const isDouble = !drag.modifiers && !pickParent && !pickSideRef && lastClickRef.current?.id === drag.node.id && now - lastClickRef.current.time < 360;
         if (isDouble) {
           lastClickRef.current = null;
-          if (drag.node.branch) activate(drag.node);
+          if (drag.node.note) setEditingNote({ id: drag.node.id, text: drag.node.note.text });
+          else if (drag.node.branch) activate(drag.node);
           else if (drag.node.message) toggleExpandNode(drag.node.id);
         } else {
-          lastClickRef.current = drag.modifiers || pickParent ? null : { id: drag.node.id, time: now };
+          lastClickRef.current = drag.modifiers || pickParent || pickSideRef ? null : { id: drag.node.id, time: now };
           handleNodeSelect(drag.node, drag.modifiers);
         }
-      } else if (!pickParent) {
+      } else if (!pickParent && !pickSideRef) {
         lastClickRef.current = null;
         const wdx = (point.x - drag.start.x) / viewRef.current.scale;
         const wdy = (point.y - drag.start.y) / viewRef.current.scale;
@@ -688,18 +887,44 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
           const x = Math.round(item.x + wdx);
           const y = Math.round(item.y + wdy);
           next.set(item.node.id, { x, y });
-          return { ...(item.node.branch ? { branchId: item.node.id } : { messageId: item.node.id }), x, y };
+          return {
+            ...(item.node.note
+              ? { noteId: item.node.id }
+              : item.node.branch
+                ? { branchId: item.node.id }
+                : { messageId: item.node.id }),
+            x,
+            y,
+          };
         });
         setMoving(next);
         void mutate({ op: 'setNodeMeta', positions }).finally(() => setMoving(null));
       }
-    } else if (drag.kind === 'link' && moved) {
+    } else if ((drag.kind === 'link' || drag.kind === 'sideLink' || drag.kind === 'noteLink') && moved) {
       const drop = linkAt(event, drag);
-      if (drop.valid && drop.target) {
-        const [child, parent] = drag.end === 'in' ? [drag.node, drop.target] : [drop.target, drag.node];
-        if (child.parentId !== parent.id) void mutate({ op: 'reparent', messageId: child.id, parentId: parent.id });
-      } else if (!drop.overNode && drag.end === 'in' && drag.node.parentId && distance(point, drag.start) > 32) {
-        void mutate({ op: 'reparent', messageId: drag.node.id, parentId: '' });
+      if (drop.mode === 'noteEdge') {
+        if (drop.valid && drop.target && drop.toPort) {
+          void mutate({
+            op: 'createNoteEdge',
+            sourceId: drop.node.id,
+            sourcePort: drop.fromPort,
+            targetId: drop.target.id,
+            targetPort: drop.toPort,
+          });
+        }
+      } else if (drop.mode === 'sideRef') {
+        if (drop.valid && drop.target) {
+          const targetId = drop.origin === 'side' ? drop.node.id : drop.target.id;
+          const sourceId = drop.origin === 'side' ? drop.target.id : drop.node.id;
+          void mutate({ op: 'addSideRef', messageId: targetId, sourceMessageId: sourceId, side: drop.side });
+        }
+      } else if (drop.mode === 'reparent') {
+        if (drop.valid && drop.target) {
+          const [child, parent] = drop.end === 'in' ? [drop.node, drop.target] : [drop.target, drop.node];
+          if (child.parentId !== parent.id) void mutate({ op: 'reparent', messageId: child.id, parentId: parent.id });
+        } else if (!drop.overNode && drop.end === 'in' && drop.node.parentId && distance(point, drag.start) > 32) {
+          void mutate({ op: 'reparent', messageId: drop.node.id, parentId: '' });
+        }
       }
     }
   }
@@ -710,6 +935,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
   }
 
   const renderEdge = (node: GraphNode) => {
+    if (node.note) return null;
     const parent = byId.get(node.parentId);
     const active = activeIds.has(node.id) && (!parent || activeIds.has(parent.id));
     const endPt = port(node, 'in');
@@ -725,25 +951,65 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     );
   };
 
+  const renderedNoteEdges = useMemo(() => {
+    const items: Array<{ id: string; d: string; mid: Point }> = [];
+    for (const edge of noteEdges) {
+      const from = byId.get(edge.sourceId);
+      const to = byId.get(edge.targetId);
+      if (!from || !to) continue;
+      const fromPt = notePortPoint(from, edge.sourcePort);
+      const toPt = notePortPoint(to, edge.targetPort);
+      const geom = noteEdgeCurve(fromPt, edge.sourcePort, toPt, edge.targetPort);
+      items.push({ id: edge.id, ...geom });
+    }
+    return items;
+  }, [byId, noteEdges]);
+
+  const renderedSideRefEdges = useMemo(() => {
+    const items: Array<{ key: string; targetId: string; sourceId: string; d: string; mid: Point }> = [];
+    for (const node of display) {
+      const refs = node.message?.graphMeta?.sideRefs;
+      if (!refs?.length) continue;
+      for (const ref of refs) {
+        const src = byId.get(ref.sourceMessageId);
+        if (!src) continue;
+        const side = ref.side ?? 'left';
+        const fromPt = port(src, 'out');
+        const toPt = sidePort(node, side);
+        const geom = sideRefCurve(fromPt, toPt, side);
+        items.push({
+          key: `${node.id}:${ref.sourceMessageId}`,
+          targetId: node.id,
+          sourceId: ref.sourceMessageId,
+          ...geom,
+        });
+      }
+    }
+    return items;
+  }, [byId, display]);
+
   const marqueeBox = marquee ? normalizeRect(marquee.start, marquee.current) : null;
 
   const deleteSummary = useMemo(() => {
     if (!deletingNodes?.length) return { title: '', message: '' };
     if (deletingNodes.length === 1) {
       const single = deletingNodes[0];
+      if (single.note) return { title: '删除标注', message: '将删除该文字标注及其视觉连线。' };
       return {
         title: single.branch ? '删除分支' : '删除消息',
         message: single.branch ? '将删除该空白分支。' : '将删除该消息并重接后续上下文。',
       };
     }
     const msgCount = deletingNodes.filter((n) => Boolean(n.message)).length;
-    const branchCount = deletingNodes.length - msgCount;
+    const branchCount = deletingNodes.filter((n) => Boolean(n.branch)).length;
+    const noteCount = deletingNodes.filter((n) => Boolean(n.note)).length;
     const parts: string[] = [];
     if (msgCount > 0) parts.push(`${msgCount} 条消息`);
     if (branchCount > 0) parts.push(`${branchCount} 个空白分支`);
+    if (noteCount > 0) parts.push(`${noteCount} 条标注`);
     return {
       title: `删除选中的 ${deletingNodes.length} 个节点`,
-      message: `将删除 ${parts.join('与 ')}，存活节点的后续上下文将自动重接。`,
+      message: `将删除 ${parts.join('、')}，存活节点的后续上下文将自动重接。`,
     };
   }, [deletingNodes]);
 
@@ -752,8 +1018,37 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
     panning && 'cg-stage--panning',
     spacePressed && !panning && 'cg-stage--space-pan',
     selectMode && !spacePressed && !panning && 'cg-stage--selecting',
-    (link || pickParent) && 'cg-stage--linking',
+    (link || pickParent || pickSideRef) && 'cg-stage--linking',
   ].filter(Boolean).join(' ');
+
+  const renderDraftLink = () => {
+    if (!link) return null;
+    if (link.mode === 'noteEdge') {
+      const fromPt = notePortPoint(link.node, link.fromPort);
+      const toPt = link.valid && link.target && link.toPort
+        ? notePortPoint(link.target, link.toPort)
+        : link.pointer;
+      const toPort = link.toPort ?? (link.fromPort === 'left' ? 'right' : link.fromPort === 'right' ? 'left' : link.fromPort === 'top' ? 'bottom' : 'top');
+      return <path className="cg-edge-draft cg-edge-draft--note" d={noteEdgeCurve(fromPt, link.fromPort, toPt, toPort).d} />;
+    }
+    if (link.mode === 'sideRef') {
+      if (link.origin === 'side') {
+        const toPt = sidePort(link.node, link.side);
+        return <path className="cg-edge-draft cg-edge-draft--side" d={sideRefCurve(link.pointer, toPt, link.side).d} />;
+      }
+      const fromPt = port(link.node, 'out');
+      const toPt = link.target ? sidePort(link.target, link.side) : link.pointer;
+      return <path className="cg-edge-draft cg-edge-draft--side" d={sideRefCurve(fromPt, toPt, link.side).d} />;
+    }
+    return (
+      <path
+        className="cg-edge-draft"
+        d={link.end === 'in'
+          ? moveTo(link.pointer) + curve(link.pointer, port(link.node, 'in'))
+          : moveTo(port(link.node, 'out')) + curve(port(link.node, 'out'), link.pointer)}
+      />
+    );
+  };
 
   return (
     <div
@@ -807,29 +1102,154 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
       <div className="cg-world" style={{ transform: 'translate(' + view.x + 'px,' + view.y + 'px) scale(' + view.scale + ')' }}>
         <svg className="cg-edges" aria-hidden="true" width="1" height="1">
           <defs>
-            {['', '-active'].map((suffix) => (
+            {['', '-active', '-sideref'].map((suffix) => (
               <marker key={suffix} id={marker + suffix} viewBox="0 0 7 8" refX="6.5" refY="4" markerWidth="7" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
-                <path d="m0 0 7 4-7 4 1.4-4Z" className={suffix ? 'cg-marker cg-marker--active' : 'cg-marker'} />
+                <path
+                  d="m0 0 7 4-7 4 1.4-4Z"
+                  className={suffix === '-active' ? 'cg-marker cg-marker--active' : suffix === '-sideref' ? 'cg-marker cg-marker--sideref' : 'cg-marker'}
+                />
               </marker>
             ))}
           </defs>
           {display.map(renderEdge)}
-          {link && (
-            <path
-              className="cg-edge-draft"
-              d={link.end === 'in'
-                ? moveTo(link.pointer) + curve(link.pointer, port(link.node, 'in'))
-                : moveTo(port(link.node, 'out')) + curve(port(link.node, 'out'), link.pointer)}
-            />
-          )}
+          {renderedNoteEdges.map((edge) => (
+            <g key={'note-' + edge.id} className="cg-edge cg-edge--note" data-note-edge={edge.id}>
+              <path d={edge.d} />
+            </g>
+          ))}
+          {renderedSideRefEdges.map((edge) => (
+            <g key={'side-' + edge.key} className="cg-edge cg-edge--sideref" data-sideref-edge={edge.key}>
+              <path d={edge.d} markerEnd={'url(#' + marker + '-sideref)'} />
+            </g>
+          ))}
+          {renderDraftLink()}
         </svg>
 
+        {renderedNoteEdges.map((edge) => (
+          <button
+            key={'detach-note-' + edge.id}
+            type="button"
+            className="cg-edge-detach"
+            style={{ left: edge.mid.x, top: edge.mid.y }}
+            aria-label="断开标注连线"
+            title="断开标注连线"
+            disabled={busy}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => void mutate({ op: 'deleteNoteEdge', edgeId: edge.id })}
+          >
+            <Icon name="unlink" size={12} />
+          </button>
+        ))}
+
+        {renderedSideRefEdges.map((edge) => (
+          <button
+            key={'detach-side-' + edge.key}
+            type="button"
+            className="cg-edge-detach"
+            style={{ left: edge.mid.x, top: edge.mid.y }}
+            aria-label="断开侧边接入"
+            title="断开侧边接入"
+            disabled={busy}
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => void mutate({ op: 'removeSideRef', messageId: edge.targetId, sourceMessageId: edge.sourceId })}
+          >
+            <Icon name="unlink" size={12} />
+          </button>
+        ))}
+
         {display.map((node) => {
+          if (node.note) {
+            if (editingNote?.id === node.id) {
+              return (
+                <GraphNoteEditor
+                  key={node.id}
+                  position={{ x: node.x, y: node.y }}
+                  text={editingNote.text}
+                  onChange={(text) => setEditingNote((cur) => cur && { ...cur, text })}
+                  onCancel={() => setEditingNote(null)}
+                  onCommit={(text) => {
+                    setEditingNote(null);
+                    if (text !== node.note!.text) {
+                      void mutate({ op: 'updateNote', noteId: node.id, text });
+                    }
+                  }}
+                />
+              );
+            }
+            const selected = visualSelectedIds.has(node.id);
+            const valid = link?.mode === 'noteEdge' && link.target?.id === node.id ? link.valid : undefined;
+            const nodeClasses = [
+              'cg-node',
+              selected && 'cg-node--selected',
+              valid !== undefined && (valid ? 'cg-node--valid' : 'cg-node--invalid'),
+            ].filter(Boolean).join(' ');
+            return (
+              <div
+                key={node.id}
+                ref={(el) => bindDynamicRef(node.id, el)}
+                data-graph-node={node.id}
+                data-kind="note"
+                data-selected={selected || undefined}
+                className={nodeClasses}
+                style={{ left: node.x, top: node.y }}
+              >
+                <button
+                  type="button"
+                  className="cg-note__body"
+                  aria-selected={selected || undefined}
+                  aria-disabled={busy || undefined}
+                  onPointerDown={(event) => {
+                    if (event.button === 1 || (event.button === 0 && spacePressedRef.current)) {
+                      start(event, { kind: 'pan' });
+                      return;
+                    }
+                    if (event.pointerType !== 'touch') event.currentTarget.focus({ preventScroll: true });
+                    start(event, { kind: 'move', node });
+                  }}
+                  onClick={(event) => {
+                    if (event.detail === 0) handleNodeSelect(node, event.ctrlKey || event.metaKey || event.shiftKey);
+                  }}
+                >
+                  {node.note.text}
+                </button>
+                <div className="cg-node__actions">
+                  <IconButton
+                    icon="edit"
+                    label="编辑标注"
+                    size="sm"
+                    disabled={busy}
+                    onClick={() => setEditingNote({ id: node.id, text: node.note!.text })}
+                  />
+                  <IconButton
+                    icon="ellipsis"
+                    label="节点操作"
+                    size="sm"
+                    onClick={(event) => {
+                      const rect = event.currentTarget.getBoundingClientRect();
+                      openMenu({ x: rect.right, y: rect.bottom }, node.id, event.currentTarget);
+                    }}
+                  />
+                </div>
+                {NOTE_PORTS.map((side) => (
+                  <span
+                    key={side}
+                    aria-hidden="true"
+                    data-port={'note-' + side}
+                    className={'cg-port cg-port--note-' + side}
+                    onPointerDown={(event) => { if (!busy) start(event, { kind: 'noteLink', node, fromPort: side }); }}
+                  />
+                ))}
+              </div>
+            );
+          }
+
           const msg = node.message;
           const expanded = Boolean(msg && effectiveExpandedIds.has(node.id));
           const collapsed = !expanded && summary(node);
           const compact = msg?.role === 'compaction';
           const isUser = msg?.role === 'user';
+          const sideEligible = isSideRefEligible(msg);
+          const sideRefCount = msg?.graphMeta?.sideRefs?.length ?? 0;
           const selected = visualSelectedIds.has(node.id);
           const title = node.branch?.label || (compact ? '上下文检查点' : isUser ? '用户' : msg?.modelId || '助手');
           const preview = msg ? extractNodePreview(msg) : '';
@@ -837,7 +1257,13 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
           const tools = msg?.blocks.filter((block) => block.type === 'toolCall').length ?? 0;
           const thinking = msg?.blocks.some((block) => block.type === 'thinking');
           const status = msg?.stopReason === 'aborted' ? '已停止' : msg?.stopReason === 'error' ? '生成失败' : '';
-          const valid = link?.target?.id === node.id ? link.valid : pickParent ? canConnect(pickParent, node) : undefined;
+          const valid = link?.target?.id === node.id
+            ? link.valid
+            : pickParent
+              ? canConnect(pickParent, node)
+              : pickSideRef
+                ? sideEligible && canSideAttach(node.id, pickSideRef)
+                : undefined;
           const time = msg && new Date(msg.createdAt);
           const compactionText = compact
             ? msg.blocks.filter((b): b is Extract<Message['blocks'][number], { type: 'compaction' | 'text' }> =>
@@ -856,7 +1282,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
           return (
             <div
               key={node.id}
-              ref={expanded ? (el) => bindExpandedRef(node.id, el) : undefined}
+              ref={expanded ? (el) => bindDynamicRef(node.id, el) : undefined}
               data-graph-node={node.id}
               data-kind={collapsed ? 'summary' : node.branch ? 'branch' : compact ? 'checkpoint' : msg?.role}
               data-selected={selected || undefined}
@@ -885,6 +1311,11 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                     <span className="cg-node__header">
                       <Icon name={compact ? 'compress' : isUser ? 'user' : 'bot'} size={14} />
                       <strong>{title}</strong>
+                      {sideRefCount > 0 && (
+                        <span className="cg-node__sideref-badge" aria-label={`已接入 ${sideRefCount} 条参考分支`}>
+                          <Icon name="sideLink" size={12} />{sideRefCount}
+                        </span>
+                      )}
                       {time && !Number.isNaN(time.getTime()) && (
                         <time dateTime={msg.createdAt}>
                           {time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false })}
@@ -955,7 +1386,15 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                     }}
                   >
                     {collapsed && msg ? (
-                      <><Icon name="user" size={13} /><span>{extractUserSummary(msg)}</span></>
+                      <>
+                        <Icon name="user" size={13} />
+                        <span>{extractUserSummary(msg)}</span>
+                        {sideRefCount > 0 && (
+                          <span className="cg-node__sideref-badge" aria-label={`已接入 ${sideRefCount} 条参考分支`}>
+                            <Icon name="sideLink" size={11} />{sideRefCount}
+                          </span>
+                        )}
+                      </>
                     ) : compact ? (
                       <><Icon name="compress" size={15} /><span>{title}</span></>
                     ) : (
@@ -972,8 +1411,13 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                         <span className="cg-node__preview">
                           {node.branch ? (node.parentId ? '话题内分支' : '独立上下文') : preview || (images ? '图片' : tools ? '工具调用' : status || '—')}
                         </span>
-                        {(images > 0 || tools > 0 || thinking || status) && (
+                        {(images > 0 || tools > 0 || thinking || status || sideRefCount > 0) && (
                           <span className="cg-node__meta">
+                            {sideRefCount > 0 && (
+                              <span className="cg-node__sideref-badge" aria-label={`已接入 ${sideRefCount} 条参考分支`}>
+                                <Icon name="sideLink" size={12} />{sideRefCount}
+                              </span>
+                            )}
                             {images > 0 && <span aria-label={images + ' 张图片'}><Icon name="image" size={13} />{images}</span>}
                             {thinking && <span aria-label="思考"><Icon name="brain" size={13} /></span>}
                             {tools > 0 && <span aria-label={tools + ' 次工具调用'}><Icon name="wrench" size={13} />{tools}</span>}
@@ -984,9 +1428,30 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                     )}
                   </button>
                   <div className="cg-node__actions">
-                    {msg && <IconButton icon="expand" label="展开信息" size="sm" onClick={() => toggleExpandNode(node.id)} />}
-                    {msg && <IconButton icon="messageSquare" label="跳转至此消息" size="sm" disabled={busy} onClick={() => onJump(node.id)} />}
-                    {isLeaf(node) && <IconButton icon="arrowUp" label="在此分支继续" size="sm" disabled={busy} onClick={() => activate(node)} />}
+                    {collapsed && msg ? (
+                      <>
+                        <IconButton
+                          icon="edit"
+                          label="编辑摘要"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => setEditing({ id: node.id, text: msg.graphMeta?.summary ?? '' })}
+                        />
+                        <IconButton
+                          icon="expand"
+                          label="展开为完整节点"
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => void mutate({ op: 'setNodeMeta', messageId: node.id, graphMeta: { collapsed: false } })}
+                        />
+                      </>
+                    ) : (
+                      <>
+                        {msg && <IconButton icon="expand" label="展开信息" size="sm" onClick={() => toggleExpandNode(node.id)} />}
+                        {msg && <IconButton icon="messageSquare" label="跳转至此消息" size="sm" disabled={busy} onClick={() => onJump(node.id)} />}
+                        {isLeaf(node) && <IconButton icon="arrowUp" label="在此分支继续" size="sm" disabled={busy} onClick={() => activate(node)} />}
+                      </>
+                    )}
                     <IconButton
                       icon="ellipsis"
                       label="节点操作"
@@ -1009,9 +1474,36 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                   onPointerDown={(event) => { if (!busy) start(event, { kind: 'link', node, end: side }); }}
                 />
               ))}
+
+              {sideEligible && (['left', 'right'] as const).map((side) => {
+                const isHot = link?.mode === 'sideRef' && link.target?.id === node.id && link.side === side;
+                return (
+                  <span
+                    key={'side-' + side}
+                    aria-hidden="true"
+                    data-port={'side-' + side}
+                    className={'cg-port cg-port--side-' + side + (isHot ? ' cg-port--side-hot' : '')}
+                    onPointerDown={(event) => { if (!busy) start(event, { kind: 'sideLink', node, side }); }}
+                  />
+                );
+              })}
             </div>
           );
         })}
+
+        {draftNote && (
+          <GraphNoteEditor
+            position={{ x: draftNote.x, y: draftNote.y }}
+            text={draftNote.text}
+            onChange={(text) => setDraftNote((cur) => cur && { ...cur, text })}
+            onCancel={() => setDraftNote(null)}
+            onCommit={(text) => {
+              const { x, y } = draftNote;
+              setDraftNote(null);
+              void mutate({ op: 'createNote', text, x, y });
+            }}
+          />
+        )}
       </div>
 
       {marqueeBox && (
@@ -1079,7 +1571,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
         </div>
       )}
 
-      {!nodes.length && <div className="cg-empty"><Icon name="mindMap" size={30} /><span>暂无节点</span></div>}
+      {!nodes.length && !draftNote && <div className="cg-empty"><Icon name="mindMap" size={30} /><span>暂无节点</span></div>}
 
       <div className="cg-controls" role="group" aria-label="图谱控制">
         <IconButton
@@ -1097,7 +1589,27 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
         </button>
         <IconButton icon="zoomIn" label="放大" size="sm" disabled={view.scale >= maxZoom} onClick={() => changeZoom(1.2)} />
         <span className="cg-controls__divider" aria-hidden="true" />
+        <IconButton
+          icon="userSummary"
+          label={allUsersCollapsed ? '一键恢复用户消息' : '一键缩放用户信息为摘要'}
+          size="sm"
+          active={allUsersCollapsed}
+          aria-pressed={allUsersCollapsed}
+          disabled={busy || !userMessages.length}
+          onClick={toggleAllUsersSummary}
+        />
+        <IconButton
+          icon="botExpand"
+          label={allAssistantsExpanded ? '一键收起助手信息' : '一键展开助手信息'}
+          size="sm"
+          active={allAssistantsExpanded}
+          aria-pressed={allAssistantsExpanded}
+          disabled={!assistantMessages.length}
+          onClick={toggleAllAssistantsExpand}
+        />
+        <span className="cg-controls__divider" aria-hidden="true" />
         <IconButton icon="autoLayout" label="自动整理布局" size="sm" disabled={busy || !nodes.length} onClick={() => void layout()} />
+        <IconButton icon="stickyNote" label="新建文字标注" size="sm" disabled={busy} onClick={() => startDraftNote(toWorld(center(), viewRef.current))} />
         <IconButton icon="plus" label="新建空白分支" size="sm" disabled={busy} onClick={() => makeBranch(toWorld(center(), viewRef.current))} />
       </div>
 
@@ -1118,10 +1630,23 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                 <DropdownItem disabled={busy} onSelect={() => menu && makeBranch(menu.world)}>
                   <Icon name="plus" size={15} />新建空白分支
                 </DropdownItem>
+                <DropdownItem disabled={busy} onSelect={() => menu && startDraftNote(menu.world)}>
+                  <Icon name="stickyNote" size={15} />新建文字标注
+                </DropdownItem>
+                {userMessages.length > 0 && (
+                  <DropdownItem disabled={busy} onSelect={toggleAllUsersSummary}>
+                    <Icon name="userSummary" size={15} />
+                    {allUsersCollapsed ? '一键恢复用户消息' : '一键缩放用户信息为摘要'}
+                  </DropdownItem>
+                )}
+                {assistantMessages.length > 0 && (
+                  <DropdownItem onSelect={toggleAllAssistantsExpand}>
+                    <Icon name="botExpand" size={15} />
+                    {allAssistantsExpanded ? '一键收起助手信息' : '一键展开助手信息'}
+                  </DropdownItem>
+                )}
                 {validMessageIds.size > 0 && (
-                  <DropdownItem onSelect={() => {
-                    setExpandedIds(allMessagesExpanded ? new Set() : new Set(validMessageIds));
-                  }}>
+                  <DropdownItem onSelect={() => persistExpanded(Array.from(validMessageIds), !allMessagesExpanded)}>
                     <Icon name={allMessagesExpanded ? 'compress' : 'expand'} size={15} />
                     {allMessagesExpanded ? '全部收起信息' : '全部展开信息'}
                   </DropdownItem>
@@ -1154,7 +1679,7 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                       onSelect={() => void mutate({
                         op: 'setNodeMeta',
                         messageIds: selectedUserMessages.map((n) => n.id),
-                        graphMeta: { collapsed: hasUncollapsed },
+                        graphMeta: hasUncollapsed ? { collapsed: true, expanded: false } : { collapsed: false },
                       })}
                     >
                       <Icon name={hasUncollapsed ? 'compress' : 'expand'} size={15} />
@@ -1172,6 +1697,28 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                   <Icon name="trash" size={15} />删除所选 {selectedNodes.length} 个节点
                 </DropdownItem>
               </>
+            ) : menuNode.note ? (
+              <>
+                <DropdownItem
+                  disabled={busy}
+                  onSelect={() => requestAnimationFrame(() => setEditingNote({ id: menuNode.id, text: menuNode.note!.text }))}
+                >
+                  <Icon name="edit" size={15} />编辑标注
+                </DropdownItem>
+                {noteEdges.filter((e) => e.sourceId === menuNode.id || e.targetId === menuNode.id).map((edge) => (
+                  <DropdownItem
+                    key={edge.id}
+                    disabled={busy}
+                    onSelect={() => void mutate({ op: 'deleteNoteEdge', edgeId: edge.id })}
+                  >
+                    <Icon name="unlink" size={15} />断开标注连线
+                  </DropdownItem>
+                ))}
+                <DropdownSeparator />
+                <DropdownItem danger disabled={busy} onSelect={() => requestAnimationFrame(() => setDeletingNodes([menuNode]))}>
+                  <Icon name="trash" size={15} />删除标注
+                </DropdownItem>
+              </>
             ) : (
               <>
                 {menuNode.message && (
@@ -1186,21 +1733,25 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                   </DropdownItem>
                 )}
                 {menuNode.message?.role === 'user' && (
-                  <DropdownItem
-                    disabled={busy}
-                    onSelect={() => void mutate({ op: 'setNodeMeta', messageId: menuNode.id, graphMeta: { collapsed: !summary(menuNode) } })}
-                  >
-                    <Icon name={summary(menuNode) ? 'expand' : 'compress'} size={15} />
-                    {summary(menuNode) ? '展开为完整节点' : '缩略为箭头摘要'}
-                  </DropdownItem>
-                )}
-                {summary(menuNode) && (
-                  <DropdownItem
-                    disabled={busy}
-                    onSelect={() => requestAnimationFrame(() => setEditing({ id: menuNode.id, text: menuNode.message?.graphMeta?.summary ?? '' }))}
-                  >
-                    <Icon name="edit" size={15} />编辑摘要
-                  </DropdownItem>
+                  <>
+                    <DropdownItem
+                      disabled={busy}
+                      onSelect={() => void mutate({
+                        op: 'setNodeMeta',
+                        messageId: menuNode.id,
+                        graphMeta: summary(menuNode) ? { collapsed: false } : { collapsed: true, expanded: false },
+                      })}
+                    >
+                      <Icon name={summary(menuNode) ? 'expand' : 'compress'} size={15} />
+                      {summary(menuNode) ? '展开为完整节点' : '缩略为箭头摘要'}
+                    </DropdownItem>
+                    <DropdownItem
+                      disabled={busy}
+                      onSelect={() => requestAnimationFrame(() => setEditing({ id: menuNode.id, text: menuNode.message?.graphMeta?.summary ?? '' }))}
+                    >
+                      <Icon name="edit" size={15} />编辑摘要
+                    </DropdownItem>
+                  </>
                 )}
                 {isLeaf(menuNode) && (
                   <DropdownItem disabled={busy} onSelect={() => activate(menuNode)}>
@@ -1221,6 +1772,21 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
                     <DropdownItem disabled={busy || messages.length < 2} onSelect={() => setPickParent(menuNode.id)}>
                       <Icon name="link" size={15} />更改上游节点
                     </DropdownItem>
+                    {isSideRefEligible(menuNode.message) && (
+                      <DropdownItem disabled={busy || messages.length < 2} onSelect={() => setPickSideRef(menuNode.id)}>
+                        <Icon name="sideLink" size={15} />侧边接入至…
+                      </DropdownItem>
+                    )}
+                    {menuNode.message.graphMeta?.sideRefs?.map((ref, idx) => (
+                      <DropdownItem
+                        key={ref.sourceMessageId}
+                        disabled={busy}
+                        onSelect={() => void mutate({ op: 'removeSideRef', messageId: menuNode.id, sourceMessageId: ref.sourceMessageId })}
+                      >
+                        <Icon name="unlink" size={15} />
+                        {(menuNode.message!.graphMeta!.sideRefs!.length > 1) ? `断开侧边接入 ${idx + 1}` : '断开侧边接入'}
+                      </DropdownItem>
+                    ))}
                     {menuNode.parentId && (
                       <DropdownItem disabled={busy} onSelect={() => void mutate({ op: 'reparent', messageId: menuNode.id, parentId: '' })}>
                         <Icon name="unlink" size={15} />断开上下文
@@ -1280,8 +1846,9 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
           setSubmitting(true);
           const messageIds = deletingNodes.filter((n) => Boolean(n.message)).map((n) => n.id);
           const branchIds = deletingNodes.filter((n) => Boolean(n.branch)).map((n) => n.id);
+          const noteIds = deletingNodes.filter((n) => Boolean(n.note)).map((n) => n.id);
           const deletedSet = new Set(deletingNodes.map((n) => n.id));
-          const result = await mutate({ op: 'deleteNodes', messageIds, branchIds });
+          const result = await mutate({ op: 'deleteNodes', messageIds, branchIds, noteIds });
           setSubmitting(false);
           if (result) {
             setDeletingNodes(null);
@@ -1290,8 +1857,8 @@ export function ConversationGraphView({ conversation, messages, activeMessages, 
               for (const id of deletedSet) next.delete(id);
               return next;
             });
-            setExpandedIds((prev) => {
-              const next = new Set(prev);
+            setOptimisticExpanded((prev) => {
+              const next = new Map(prev);
               for (const id of deletedSet) next.delete(id);
               return next;
             });

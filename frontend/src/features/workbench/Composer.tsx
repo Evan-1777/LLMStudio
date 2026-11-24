@@ -48,6 +48,7 @@ export function Composer({
   isBusy,
   canStop,
   messages = [],
+  allMessages,
   streaming = null,
   systemPrompt = '',
   contextWindow,
@@ -70,6 +71,7 @@ export function Composer({
   isBusy: boolean;
   canStop?: boolean;
   messages?: readonly Message[];
+  allMessages?: readonly Message[];
   streaming?: StreamingDraft | null;
   systemPrompt?: string;
   contextWindow?: number;
@@ -145,13 +147,14 @@ export function Composer({
     () =>
       computeContextUsage({
         messages,
+        allMessages,
         streaming,
         systemPrompt,
         draft,
         attachments,
         contextWindow,
       }),
-    [attachments, contextWindow, draft, messages, streaming, systemPrompt],
+    [allMessages, attachments, contextWindow, draft, messages, streaming, systemPrompt],
   );
 
   const readyAttachments = attachments.filter((a) => a.status === 'ready');
