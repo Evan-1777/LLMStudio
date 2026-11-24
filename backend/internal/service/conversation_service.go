@@ -64,13 +64,17 @@ type PatchConversationInput struct {
 type ConversationDetail struct {
 	Conversation domain.Conversation `json:"conversation"`
 	Messages     []domain.Message    `json:"messages"`
+	ActiveRun    *ActiveRunInfo      `json:"activeRun,omitempty"`
 }
 
 // ConversationService manages conversations and inline message history loading.
 type ConversationService struct {
-	convs      *store.ConversationStore
-	msgs       *store.MessageStore
-	assistants *store.AssistantStore
+	convs             *store.ConversationStore
+	msgs              *store.MessageStore
+	assistants        *store.AssistantStore
+	activeRunFn       func(string) *ActiveRunInfo
+	activeRunIDsFn    func() []string
+	cancelRunsAndWait func(context.Context, ...string)
 }
 
 // NewConversationService constructs a ConversationService.
@@ -87,14 +91,56 @@ func (s *ConversationService) WithAssistants(assistants *store.AssistantStore) *
 	return s
 }
 
+// WithRunTracker injects runtime callbacks so conversation listing, detail, and deletion
+// reflect and coordinate with in-memory background Agent runs.
+func (s *ConversationService) WithRunTracker(
+	activeRun func(string) *ActiveRunInfo,
+	activeIDs func() []string,
+	cancelRunsAndWait func(context.Context, ...string),
+) *ConversationService {
+	s.activeRunFn = activeRun
+	s.activeRunIDsFn = activeIDs
+	s.cancelRunsAndWait = cancelRunsAndWait
+	return s
+}
+
+func (s *ConversationService) annotateRunning(convs []domain.Conversation) {
+	if s.activeRunIDsFn == nil || len(convs) == 0 {
+		return
+	}
+	ids := s.activeRunIDsFn()
+	if len(ids) == 0 {
+		return
+	}
+	set := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		set[id] = struct{}{}
+	}
+	for i := range convs {
+		if _, ok := set[convs[i].ID]; ok {
+			convs[i].Running = true
+		}
+	}
+}
+
 // List returns all conversations sorted by organization order.
 func (s *ConversationService) List(ctx context.Context) ([]domain.Conversation, error) {
-	return s.convs.List(ctx)
+	convs, err := s.convs.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	s.annotateRunning(convs)
+	return convs, nil
 }
 
 // ListByAssistant returns conversations scoped to assistantID in canonical organization order.
 func (s *ConversationService) ListByAssistant(ctx context.Context, assistantID string) ([]domain.Conversation, error) {
-	return s.convs.ListByAssistant(ctx, assistantID)
+	convs, err := s.convs.ListByAssistant(ctx, assistantID)
+	if err != nil {
+		return nil, err
+	}
+	s.annotateRunning(convs)
+	return convs, nil
 }
 
 // Create persists a new conversation, inheriting default provider/model from its assistant when omitted.
@@ -196,9 +242,17 @@ func (s *ConversationService) GetDetail(ctx context.Context, id string) (Convers
 	if err != nil {
 		return ConversationDetail{}, err
 	}
+	var activeRun *ActiveRunInfo
+	if s.activeRunFn != nil {
+		activeRun = s.activeRunFn(id)
+		if activeRun != nil {
+			conv.Running = true
+		}
+	}
 	return ConversationDetail{
 		Conversation: conv,
 		Messages:     msgs,
+		ActiveRun:    activeRun,
 	}, nil
 }
 
@@ -309,6 +363,9 @@ func applyPatchParams(dst *domain.GenerationParams, patch PatchParamsInput) {
 
 // Delete deletes a conversation and cascades to its messages.
 func (s *ConversationService) Delete(ctx context.Context, id string) error {
+	if s.cancelRunsAndWait != nil {
+		s.cancelRunsAndWait(ctx, id)
+	}
 	return s.convs.Delete(ctx, id)
 }
 
@@ -741,6 +798,21 @@ func (s *ConversationService) DeleteGroup(ctx context.Context, id string) (Group
 
 // CleanupUngrouped removes only the current ungrouped, unpinned bucket.
 func (s *ConversationService) CleanupUngrouped(ctx context.Context) ([]domain.DeletedConversation, error) {
+	if s.cancelRunsAndWait != nil && s.activeRunIDsFn != nil {
+		activeIDs := s.activeRunIDsFn()
+		if len(activeIDs) > 0 {
+			toCancel := make([]string, 0, len(activeIDs))
+			for _, id := range activeIDs {
+				conv, err := s.convs.Get(ctx, id)
+				if err == nil && conv.GroupID == nil && !conv.Pinned && !conv.Ephemeral {
+					toCancel = append(toCancel, id)
+				}
+			}
+			if len(toCancel) > 0 {
+				s.cancelRunsAndWait(ctx, toCancel...)
+			}
+		}
+	}
 	return s.convs.CleanupUngrouped(ctx)
 }
 
@@ -757,6 +829,9 @@ func (s *ConversationService) BatchConversations(ctx context.Context, in BatchCo
 
 	switch strings.TrimSpace(in.Operation) {
 	case "delete":
+		if s.cancelRunsAndWait != nil {
+			s.cancelRunsAndWait(ctx, ids...)
+		}
 		if err := s.convs.BatchDelete(ctx, aid, ids); err != nil {
 			return OrganizationSnapshot{}, err
 		}

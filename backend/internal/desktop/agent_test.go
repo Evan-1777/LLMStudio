@@ -2,6 +2,7 @@ package desktop
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -113,8 +114,14 @@ func TestAgentExecutionScopeAndTransfer(t *testing.T) {
 		}
 	}
 	chat := service.NewChatService(prov, convs, msgs, formats, adapters, nil).WithAgent(cloudRuntime)
+	t.Cleanup(func() {
+		shutCtx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+		_ = chat.Shutdown(shutCtx)
+	})
 	makeRouter := func(token string, runtime *agent.Runtime, chat *service.ChatService) http.Handler {
-		return httpapi.NewRouter(httpapi.RouterDeps{Config: config.Config{AccessToken: token, DevMode: token == ""}, ConversationService: service.NewConversationService(convs, msgs), ChatService: chat, AgentRuntime: runtime})
+		convSvc := service.NewConversationService(convs, msgs).WithRunTracker(chat.ActiveRun, chat.ActiveRunConversationIDs, chat.CancelRunsAndWait)
+		return httpapi.NewRouter(httpapi.RouterDeps{Config: config.Config{AccessToken: token, DevMode: token == ""}, ConversationService: convSvc, ChatService: chat, AgentRuntime: runtime})
 	}
 	cloudSrv := httptest.NewServer(makeRouter("gateway-token", cloudRuntime, chat))
 	defer cloudSrv.Close()
@@ -249,13 +256,21 @@ func TestAgentExecutionScopeAndTransfer(t *testing.T) {
 	case <-time.After(4 * time.Second):
 		t.Fatal("gateway did not open the continuation")
 	}
-	cloud.SetCredentials("", "")
+	// Closing client stream must keep background Agent running on cloud gateway.
 	resp.Body.Close()
+	check(read(request(desktopSrv.URL, facade.Token(), "GET", "/api/v1/agent/runs?scope=cloud", ""), 200), "cancel")
+	check(read(request(desktopSrv.URL, facade.Token(), "GET", "/api/v1/conversations/cancel?scope=cloud", ""), 200), `"running":true`, `"activeRun"`)
+	// Explicit cancel through desktop cloud proxy terminates the cloud Agent run.
+	check(read(request(desktopSrv.URL, facade.Token(), "POST", "/api/v1/conversations/cancel/run/cancel?scope=cloud", ""), 200), `"cancelled":true`)
 	select {
 	case <-canceled:
 	case <-time.After(4 * time.Second):
-		t.Fatal("connection change did not cancel gateway upstream")
+		t.Fatal("explicit run cancel did not cancel gateway upstream")
 	}
+	// Idle run stream returns 204 across both scopes, and cloud offline /agent/runs degrades to [].
+	read(request(desktopSrv.URL, facade.Token(), "GET", "/api/v1/conversations/same/run/stream?scope=local", ""), 204)
+	cloud.SetCredentials("", "")
+	check(read(request(desktopSrv.URL, facade.Token(), "GET", "/api/v1/agent/runs?scope=cloud", ""), 200), `"conversationIds":[]`)
 	deadline := time.Now().Add(4 * time.Second)
 	for {
 		items, err := msgs.ListByConversation(ctx, "cancel")

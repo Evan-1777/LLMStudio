@@ -38,6 +38,54 @@ export function CollapseStateProvider({ children }: { children: ReactNode }) {
   );
 }
 
+export function useCollapsibleState({
+  collapseKey,
+  defaultCollapsed,
+  completion,
+}: {
+  collapseKey: string;
+  defaultCollapsed: boolean;
+  completion?: 'pending' | 'collapse' | 'keep';
+}) {
+  const ctx = useContext(CollapseContext);
+  const [localOverride, setLocalOverride] = useState<boolean | undefined>(
+    undefined,
+  );
+
+  const [autoCollapsed, setAutoCollapsed] = useState(defaultCollapsed);
+  const manual = ctx ? ctx.getManual(collapseKey) : localOverride;
+  const collapsed = manual ?? (completion === undefined ? defaultCollapsed : autoCollapsed);
+
+  const completed = useRef(completion !== 'pending');
+  const containerRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+
+  const setCollapsed = useCallback(
+    (next: boolean) => {
+      if (ctx) {
+        ctx.setManual(collapseKey, next);
+      } else {
+        setLocalOverride(next);
+      }
+    },
+    [collapseKey, ctx],
+  );
+
+  useLayoutEffect(() => {
+    if (!completion || completion === 'pending' || completed.current) return;
+    completed.current = true;
+    if (completion !== 'collapse' || manual !== undefined || collapsed) return;
+    if (containerRef.current?.contains(document.activeElement)) {
+      triggerRef.current?.focus();
+    }
+    setAutoCollapsed(true);
+  });
+
+  const toggle = () => setCollapsed(!collapsed);
+
+  return { collapsed, setCollapsed, toggle, containerRef, triggerRef };
+}
+
 export function CollapsibleBlock({
   collapseKey,
   title,
@@ -57,44 +105,20 @@ export function CollapsibleBlock({
   actions?: ReactNode;
   children: ReactNode;
 }) {
-  const ctx = useContext(CollapseContext);
-  const [localOverride, setLocalOverride] = useState<boolean | undefined>(
-    undefined,
-  );
-
-  const [autoCollapsed, setAutoCollapsed] = useState(defaultCollapsed);
-  const manual = ctx ? ctx.getManual(collapseKey) : localOverride;
-  const collapsed = manual ?? (completion === undefined ? defaultCollapsed : autoCollapsed);
-
-  const completed = useRef(completion !== 'pending');
-  const card = useRef<HTMLDivElement>(null);
-  const trigger = useRef<HTMLButtonElement>(null);
-  const setCollapsed = (next: boolean) => {
-    if (ctx) {
-      ctx.setManual(collapseKey, next);
-    } else {
-      setLocalOverride(next);
-    }
-  };
-
-  useLayoutEffect(() => {
-    if (!completion || completion === 'pending' || completed.current) return;
-    completed.current = true;
-    if (completion !== 'collapse' || manual !== undefined || collapsed) return;
-    if (card.current?.contains(document.activeElement)) trigger.current?.focus();
-    setAutoCollapsed(true);
+  const { collapsed, toggle, containerRef, triggerRef } = useCollapsibleState({
+    collapseKey,
+    defaultCollapsed,
+    completion,
   });
 
-  const toggle = () => setCollapsed(!collapsed);
-
   return (
-    <div ref={card} className={`block-card ${subtle ? 'block-card--subtle' : ''}`.trim()}>
+    <div ref={containerRef} className={`block-card ${subtle ? 'block-card--subtle' : ''}`.trim()}>
       <div
         className={`block-card__head ${collapsed ? 'block-card__head--collapsed' : ''}`.trim()}
       >
         <button
           type="button"
-          ref={trigger}
+          ref={triggerRef}
           className="block-card__toggle"
           aria-expanded={!collapsed}
           onClick={toggle}

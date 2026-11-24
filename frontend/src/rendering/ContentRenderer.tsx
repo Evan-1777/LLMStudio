@@ -5,12 +5,20 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { useApp } from '../app/AppProvider';
 import { Icon, IconButton, Modal } from '../components/ui';
-import type { ContentBlock, ToolCallBlock, ToolResultBlock, WebSearchExtra } from '../core/types';
+import type { ContentBlock, WebSearchExtra } from '../core/types';
 import { CodeBlock } from './CodeBlock';
-import { CollapsibleBlock } from './CollapsibleBlock';
+import { CollapsibleBlock, useCollapsibleState } from './CollapsibleBlock';
 import { SandboxedIframe } from './HtmlPreview';
 import { buildRemarkPlugins } from './markdownPlugins';
 import { shouldAutoCollapseText, splitMarkdownAndRawHtml } from './segments';
+import {
+  buildPairedToolEntries,
+  buildProcessTrace,
+  firstNonEmptyLine,
+  summarizeToolArgs,
+  toolIconName,
+  type PairedToolCallEntry,
+} from './toolTrace';
 import './rendering.css';
 
 function RawHtmlCodeCard({
@@ -428,67 +436,206 @@ interface ToolResultExtraPayload {
   structuredContent?: unknown;
 }
 
-interface PairedToolCallEntry {
-  index: number;
-  call?: ToolCallBlock;
-  result?: ToolResultBlock;
-  resultIndex?: number;
-}
-
-interface ToolExecutionRound {
-  roundNumber?: number;
-  entries: PairedToolCallEntry[];
-}
-
 function parseToolResultExtra(extra: unknown): ToolResultExtraPayload {
   if (!extra || typeof extra !== 'object' || Array.isArray(extra)) return {};
   return extra as ToolResultExtraPayload;
 }
 
-function buildToolExecutionTrace(blocks: ContentBlock[]) {
-  const rounds = new Map<number, ToolExecutionRound>();
-  let round: ToolExecutionRound | undefined;
-  let roundNumber = 0;
-  let sawResult = false;
-  const calls = new Map<string, PairedToolCallEntry>();
-  blocks.forEach((block, index) => {
-    if (block.type === 'toolCall') {
-      if (!round || sawResult) {
-        round = { roundNumber: ++roundNumber, entries: [] };
-        rounds.set(index, round);
-        calls.clear();
-        sawResult = false;
-      }
-      const call = block as ToolCallBlock;
-      const entry = { index, call };
-      round.entries.push(entry);
-      if (call.id) calls.set(call.id, entry);
-    } else if (block.type === 'toolResult') {
-      sawResult = true;
-      const result = block as ToolResultBlock;
-      const entry = result.toolCallId ? calls.get(result.toolCallId) : undefined;
-      if (entry && !entry.result) {
-        entry.result = result;
-        entry.resultIndex = index;
-      } else {
-        rounds.set(index, { entries: [{ index, result, resultIndex: index }] });
-      }
-    }
+function ToolStepDisclosure({
+  entry,
+  collapseKey,
+  isEnded,
+  isStreaming,
+  inTrace,
+  autoCollapseTools,
+  onZoomImage,
+}: {
+  entry: PairedToolCallEntry;
+  collapseKey: string;
+  isEnded: boolean;
+  isStreaming: boolean;
+  inTrace: boolean;
+  autoCollapseTools: boolean;
+  onZoomImage: (src: string) => void;
+}) {
+  const toolName = entry.call?.name || entry.result?.toolName || 'tool';
+  const source = entry.call?.toolSource ?? entry.result?.toolSource;
+  const sourceLabel = source === 'native' ? '原生' : source === 'mcp' ? 'MCP' : null;
+  const argSummary = entry.call ? summarizeToolArgs(toolName, entry.call.arguments) : '';
+  const isErr = Boolean(entry.result?.isError);
+  const entryState = isEnded
+    ? isErr ? 'error' : 'success'
+    : isStreaming ? 'running' : 'pending';
+  const statusLabel = {
+    running: '运行中',
+    success: '完成',
+    error: '失败',
+    pending: '未完成',
+  }[entryState];
+
+  const defaultCollapsed = inTrace ? true : isEnded && autoCollapseTools;
+  const completion = inTrace
+    ? undefined
+    : isEnded
+      ? autoCollapseTools ? 'collapse' : 'keep'
+      : isStreaming ? 'pending' : 'keep';
+
+  const { collapsed, toggle, containerRef, triggerRef } = useCollapsibleState({
+    collapseKey,
+    defaultCollapsed,
+    completion,
   });
-  return rounds;
-}
 
-function buildAssistantRenderItems(blocks: ContentBlock[]) {
-  const toolTrace = buildToolExecutionTrace(blocks);
-  if (toolTrace.size === 0) return { toolTrace };
+  const extra = entry.result ? parseToolResultExtra(entry.result.extra) : {};
+  const mcpItems = Array.isArray(extra.content) ? extra.content : [];
+  const hasStructured = extra.structuredContent !== undefined;
 
-  const isTool = (block: ContentBlock) => block.type === 'toolCall' || block.type === 'toolResult';
-  const start = blocks.findIndex((block) => block.type === 'thinking' || isTool(block));
-  let end = blocks.findLastIndex(isTool);
-  while (blocks[end + 1]?.type === 'thinking') end++;
-  const thinkingCount = blocks.slice(start, end + 1).filter((block) => block.type === 'thinking').length;
-  const trace = thinkingCount + toolTrace.size >= 2 ? { start, end, thinkingCount } : undefined;
-  return { toolTrace, trace };
+  return (
+    <div
+      ref={containerRef}
+      className={`tool-step ${inTrace ? 'tool-step--inline' : 'tool-step--standalone'} ${isErr ? 'tool-step--error' : ''}`.trim()}
+      data-state={collapsed ? 'closed' : 'open'}
+    >
+      <button
+        type="button"
+        ref={triggerRef}
+        className="tool-step__summary"
+        aria-expanded={!collapsed}
+        onClick={toggle}
+      >
+        <Icon name="chevronRight" size={14} className="tool-step__chevron" />
+        <Icon name={toolIconName(toolName)} size={14} className="tool-step__icon" />
+        <span className="tool-step__name">{toolName}</span>
+        {argSummary ? (
+          <span className="tool-step__arg" title={argSummary}>
+            {argSummary}
+          </span>
+        ) : null}
+        {sourceLabel ? <span className="tool-step__source">{sourceLabel}</span> : null}
+        <span
+          role="img"
+          aria-label={statusLabel}
+          title={statusLabel}
+          className={`tool-step__status tool-step__status--${entryState}`}
+        >
+          {entryState === 'running' ? (
+            <span className="ui-spinner ui-spinner--sm" aria-hidden="true" />
+          ) : entryState === 'success' ? (
+            <Icon name="check" size={12} />
+          ) : entryState === 'error' ? (
+            <Icon name="warning" size={12} />
+          ) : (
+            <Icon name="minus" size={12} />
+          )}
+        </span>
+      </button>
+
+      {!collapsed ? (
+        <div className="tool-step__body" tabIndex={0} aria-label={`${toolName} 详情`}>
+          {entry.call ? (
+            <div className="tool-step__section">
+              <span className="tool-trace-section-label">调用参数</span>
+              <pre className="tool-trace-pre">
+                <code>{formatJsonValue(entry.call.arguments ?? {})}</code>
+              </pre>
+            </div>
+          ) : null}
+
+          {entry.result ? (
+            <div className="tool-step__section">
+              <span className="tool-trace-section-label">
+                {isErr ? '错误结果' : '返回结果'}
+              </span>
+              {mcpItems.length > 0 ? (
+                mcpItems.map((item, itemIdx) => {
+                  if (item.type === 'image') {
+                    const src =
+                      item.data && item.mimeType
+                        ? `data:${item.mimeType};base64,${item.data}`
+                        : item.data
+                          ? `data:image/png;base64,${item.data}`
+                          : sanitizeLinkUrl(item.uri);
+                    return src ? (
+                      <img
+                        key={`mcp-img-${itemIdx}`}
+                        src={src}
+                        alt={toolName}
+                        className="msg-image-thumb"
+                        onClick={() => onZoomImage(src)}
+                      />
+                    ) : null;
+                  }
+                  if (item.type === 'resource' && item.resource) {
+                    return (
+                      <div key={`mcp-res-${itemIdx}`} className="tool-trace-resource">
+                        <div className="tool-trace-resource__meta">
+                          嵌入资源：{item.resource.uri || '(未命名)'}
+                          {item.resource.mimeType ? ` (${item.resource.mimeType})` : ''}
+                        </div>
+                        {item.resource.text !== undefined ? (
+                          <pre className="tool-trace-pre">
+                            <code>{item.resource.text}</code>
+                          </pre>
+                        ) : item.resource.blob ? (
+                          <span className="tool-trace-resource__meta">[二进制资源]</span>
+                        ) : null}
+                      </div>
+                    );
+                  }
+                  if (item.type === 'resource_link') {
+                    const safe = sanitizeLinkUrl(item.uri);
+                    return (
+                      <div key={`mcp-link-${itemIdx}`} className="tool-trace-resource">
+                        <div className="tool-trace-resource__meta">
+                          资源链接：{item.name || item.uri}
+                          {item.mimeType ? ` (${item.mimeType})` : ''}
+                        </div>
+                        {safe ? (
+                          <a href={safe} target="_blank" rel="noopener noreferrer">
+                            {safe}
+                          </a>
+                        ) : item.uri ? (
+                          <pre className="tool-trace-pre">
+                            <code>{item.uri}</code>
+                          </pre>
+                        ) : null}
+                      </div>
+                    );
+                  }
+                  return (
+                    <pre
+                      key={`mcp-txt-${itemIdx}`}
+                      className={`tool-trace-pre ${isErr ? 'tool-trace-pre--error' : ''}`.trim()}
+                    >
+                      <code>
+                        {item.text ??
+                          (item.type === 'audio'
+                            ? `[音频 ${item.mimeType ?? ''}]`
+                            : formatJsonValue(item))}
+                      </code>
+                    </pre>
+                  );
+                })
+              ) : (
+                <pre className={`tool-trace-pre ${isErr ? 'tool-trace-pre--error' : ''}`.trim()}>
+                  <code>{entry.result.content ?? ''}</code>
+                </pre>
+              )}
+
+              {hasStructured ? (
+                <>
+                  <span className="tool-trace-section-label">结构化数据</span>
+                  <pre className="tool-trace-pre">
+                    <code>{formatJsonValue(extra.structuredContent)}</code>
+                  </pre>
+                </>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 export const ContentRenderer = memo(function ContentRenderer({
@@ -522,10 +669,13 @@ export const ContentRenderer = memo(function ContentRenderer({
     [blocks],
   );
 
-  const { toolTrace, trace } = useMemo(() => buildAssistantRenderItems(blocks), [blocks]);
-  const ended = (entry: PairedToolCallEntry) => entry.resultIndex !== undefined &&
-    (!isStreaming || blockCompleted?.[entry.resultIndex] === true);
+  const paired = useMemo(() => buildPairedToolEntries(blocks), [blocks]);
+  const trace = useMemo(() => buildProcessTrace(blocks, paired), [blocks, paired]);
+  const ended = (entry: PairedToolCallEntry) =>
+    entry.resultIndex !== undefined && (!isStreaming || blockCompleted?.[entry.resultIndex] === true);
+
   const renderBlock = (block: ContentBlock, blockIndex: number, nodes: ReactNode[], inTrace = false) => {
+    if (paired.pairedResultIndexes.has(blockIndex)) return;
     const baseKey = `${effectivePrefix}:${blockIndex}`;
 
     if (block.type === 'text') {
@@ -566,26 +716,25 @@ export const ContentRenderer = memo(function ContentRenderer({
     }
 
     if (block.type === 'thinking') {
-      const thinking =
-        typeof block.thinking === 'string' ? block.thinking : '';
-      const isBlockStreaming =
-        isStreaming && blockCompleted?.[blockIndex] !== true;
+      const thinking = typeof block.thinking === 'string' ? block.thinking : '';
+      const isBlockStreaming = isStreaming && blockCompleted?.[blockIndex] !== true;
       const interrupted = !isStreaming && stopReason === 'aborted' && blockIndex === blocks.length - 1;
       const defaultCollapsed = !isBlockStreaming && !interrupted && settings.autoCollapseThinkingOnComplete;
+      const preview = !isBlockStreaming && inTrace ? firstNonEmptyLine(thinking, 64) : '';
+      const title = isBlockStreaming
+        ? inTrace ? '思考中…' : '思考过程 · 输出中'
+        : preview ? `思考过程 · ${preview}` : '思考过程';
       nodes.push(
         <CollapsibleBlock
           key={`${baseKey}:0`}
           collapseKey={`${baseKey}:0`}
-          title={isBlockStreaming ? '思考过程 · 输出中' : '思考过程'}
+          title={title}
           icon="lightbulb"
           subtle
           defaultCollapsed={defaultCollapsed}
           completion={isBlockStreaming ? 'pending' : defaultCollapsed ? 'collapse' : 'keep'}
         >
-          <ThinkingScrollBody
-            thinking={thinking}
-            isStreaming={isBlockStreaming}
-          />
+          <ThinkingScrollBody thinking={thinking} isStreaming={isBlockStreaming} />
         </CollapsibleBlock>,
       );
       return;
@@ -613,9 +762,7 @@ export const ContentRenderer = memo(function ContentRenderer({
         >
           <div className="search-sources">
             {ws.error ? (
-              <div style={{ fontSize: 12, color: 'var(--danger)' }}>
-                {ws.error}
-              </div>
+              <div style={{ fontSize: 12, color: 'var(--danger)' }}>{ws.error}</div>
             ) : null}
             {Array.isArray(ws.results) && ws.results.length > 0
               ? ws.results.map((item, idx) => {
@@ -637,9 +784,7 @@ export const ContentRenderer = memo(function ContentRenderer({
                         </span>
                       )}
                       {item.snippet ? (
-                        <span className="search-source-item__snippet">
-                          {item.snippet}
-                        </span>
+                        <span className="search-source-item__snippet">{item.snippet}</span>
                       ) : null}
                     </div>
                   );
@@ -656,184 +801,20 @@ export const ContentRenderer = memo(function ContentRenderer({
     }
 
     if (block.type === 'toolCall' || block.type === 'toolResult') {
-      const round = toolTrace.get(blockIndex);
-      if (!round) return;
-      const { entries, roundNumber } = round;
-      const done = entries.filter(ended).length;
-      const failed = entries.filter((entry) => ended(entry) && entry.result?.isError).length;
-      const roundCompleted = done === entries.length;
-      const status = done < entries.length
-        ? isStreaming ? `执行中 (${done}/${entries.length})` : '未完成'
-        : failed ? `${failed} 个失败` : '完成';
-      const title = roundNumber ? `工具调用 · 第 ${roundNumber} 轮` : '工具结果';
-
+      const entry = paired.entries.get(blockIndex);
+      if (!entry) return;
+      const stepKey = `${effectivePrefix}:tool:${entry.index}`;
       nodes.push(
-        <CollapsibleBlock
-          key={`${baseKey}:tools`}
-          collapseKey={`${baseKey}:tools`}
-          title={`${title} · ${entries.length} 次 · ${status}`}
-          icon={failed ? 'warning' : 'wrench'}
-          subtle
-          defaultCollapsed={roundCompleted && settings.autoCollapseToolsOnComplete}
-          completion={
-            roundCompleted
-              ? settings.autoCollapseToolsOnComplete ? 'collapse' : 'keep'
-              : isStreaming ? 'pending' : 'keep'
-          }
-        >
-          <div className="tool-trace-body" tabIndex={0} aria-label={`${title}详情`}>
-            {entries.map((entry) => {
-                  const toolName = entry.call?.name || entry.result?.toolName || 'tool';
-                  const source = entry.call?.toolSource ?? entry.result?.toolSource;
-                  const sourceLabel = source === 'native' ? '原生' : source === 'mcp' ? 'MCP' : null;
-                  const isErr = Boolean(entry.result?.isError);
-                  const entryState = ended(entry)
-                    ? isErr ? 'error' : 'success'
-                    : isStreaming ? 'running' : 'pending';
-                  const statusLabel = { running: '运行中', success: '完成', error: '失败', pending: '未完成' }[entryState];
-                  const extra = entry.result
-                    ? parseToolResultExtra(entry.result.extra)
-                    : {};
-                  const mcpItems = Array.isArray(extra.content)
-                    ? extra.content
-                    : [];
-                  const hasStructured = extra.structuredContent !== undefined;
-
-                  return (
-                    <details
-                      key={entry.index}
-                      className={`tool-trace-entry ${isErr ? 'tool-trace-entry--error' : ''}`.trim()}
-                    >
-                      <summary className="tool-trace-entry__head">
-                        <span className="tool-trace-entry__name">{sourceLabel && <small className="tool-trace-entry__source">{sourceLabel} · </small>}{toolName}</span>
-                        <span
-                          className={`tool-trace-entry__status tool-trace-entry__status--${entryState}`}
-                        >
-                          {statusLabel}
-                        </span>
-                      </summary>
-
-                      {entry.call ? (
-                        <>
-                          <span className="tool-trace-section-label">调用参数</span>
-                          <pre className="tool-trace-pre">
-                            <code>{formatJsonValue(entry.call.arguments ?? {})}</code>
-                          </pre>
-                        </>
-                      ) : null}
-
-                      {entry.result ? (
-                        <>
-                          <span className="tool-trace-section-label">
-                            {isErr ? '错误结果' : '返回结果'}
-                          </span>
-                          {mcpItems.length > 0 ? (
-                            mcpItems.map((item, itemIdx) => {
-                              if (item.type === 'image') {
-                                const src =
-                                  item.data && item.mimeType
-                                    ? `data:${item.mimeType};base64,${item.data}`
-                                    : item.data
-                                      ? `data:image/png;base64,${item.data}`
-                                      : sanitizeLinkUrl(item.uri);
-                                return src ? (
-                                  <img
-                                    key={`mcp-img-${itemIdx}`}
-                                    src={src}
-                                    alt={toolName}
-                                    className="msg-image-thumb"
-                                    onClick={() => setZoomedSrc(src)}
-                                  />
-                                ) : null;
-                              }
-                              if (item.type === 'resource' && item.resource) {
-                                return (
-                                  <div
-                                    key={`mcp-res-${itemIdx}`}
-                                    className="tool-trace-resource"
-                                  >
-                                    <div className="tool-trace-resource__meta">
-                                      嵌入资源：{item.resource.uri || '(未命名)'}
-                                      {item.resource.mimeType
-                                        ? ` (${item.resource.mimeType})`
-                                        : ''}
-                                    </div>
-                                    {item.resource.text !== undefined ? (
-                                      <pre className="tool-trace-pre">
-                                        <code>{item.resource.text}</code>
-                                      </pre>
-                                    ) : item.resource.blob ? (
-                                      <span className="tool-trace-resource__meta">
-                                        [二进制资源]
-                                      </span>
-                                    ) : null}
-                                  </div>
-                                );
-                              }
-                              if (item.type === 'resource_link') {
-                                const safe = sanitizeLinkUrl(item.uri);
-                                return (
-                                  <div
-                                    key={`mcp-link-${itemIdx}`}
-                                    className="tool-trace-resource"
-                                  >
-                                    <div className="tool-trace-resource__meta">
-                                      资源链接：{item.name || item.uri}
-                                      {item.mimeType ? ` (${item.mimeType})` : ''}
-                                    </div>
-                                    {safe ? (
-                                      <a
-                                        href={safe}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                      >
-                                        {safe}
-                                      </a>
-                                    ) : item.uri ? (
-                                      <pre className="tool-trace-pre">
-                                        <code>{item.uri}</code>
-                                      </pre>
-                                    ) : null}
-                                  </div>
-                                );
-                              }
-                              return (
-                                <pre
-                                  key={`mcp-txt-${itemIdx}`}
-                                  className={`tool-trace-pre ${isErr ? 'tool-trace-pre--error' : ''}`.trim()}
-                                >
-                                  <code>
-                                    {item.text ??
-                                      (item.type === 'audio'
-                                        ? `[音频 ${item.mimeType ?? ''}]`
-                                        : formatJsonValue(item))}
-                                  </code>
-                                </pre>
-                              );
-                            })
-                          ) : (
-                            <pre
-                              className={`tool-trace-pre ${isErr ? 'tool-trace-pre--error' : ''}`.trim()}
-                            >
-                              <code>{entry.result.content ?? ''}</code>
-                            </pre>
-                          )}
-
-                          {hasStructured ? (
-                            <>
-                              <span className="tool-trace-section-label">结构化数据</span>
-                              <pre className="tool-trace-pre">
-                                <code>{formatJsonValue(extra.structuredContent)}</code>
-                              </pre>
-                            </>
-                          ) : null}
-                        </>
-                      ) : null}
-                    </details>
-                  );
-                })}
-          </div>
-        </CollapsibleBlock>,
+        <ToolStepDisclosure
+          key={stepKey}
+          collapseKey={stepKey}
+          entry={entry}
+          isEnded={ended(entry)}
+          isStreaming={isStreaming}
+          inTrace={inTrace}
+          autoCollapseTools={settings.autoCollapseToolsOnComplete}
+          onZoomImage={setZoomedSrc}
+        />,
       );
       return;
     }
@@ -863,35 +844,69 @@ export const ContentRenderer = memo(function ContentRenderer({
     }
 
     const steps: ReactNode[] = [];
+    const traceEntries: PairedToolCallEntry[] = [];
     let thinking = false;
     for (let step = trace.start; step <= trace.end; step++) {
       const block = blocks[step];
+      const entry = paired.entries.get(step);
+      if (entry) traceEntries.push(entry);
       const stepNodes: ReactNode[] = [];
       renderBlock(block, step, stepNodes, true);
       if (stepNodes.length) {
-        steps.push(<li className="trace-step" key={step}>{stepNodes}</li>);
+        steps.push(
+          <li className="trace-step" key={step}>
+            {stepNodes}
+          </li>,
+        );
       }
       thinking ||= block.type === 'thinking' && isStreaming && blockCompleted?.[step] !== true;
     }
 
-    const rounds = Array.from(toolTrace.values());
-    const entries = rounds.flatMap((round) => round.entries);
-    const failed = entries.filter((entry) => ended(entry) && entry.result?.isError).length;
-    const pendingRound = rounds.findLast((round) => round.entries.some((entry) => !ended(entry)));
+    const failed = traceEntries.filter((entry) => ended(entry) && entry.result?.isError).length;
+    const activeEntry = traceEntries.findLast((entry) => !ended(entry));
     const interruptedThinking = stopReason === 'aborted' && blocks.at(-1)?.type === 'thinking';
     const label = trace.thinkingCount ? '思考与工具' : '工具调用';
-    const title = isStreaming
-      ? pendingRound ? `工具调用中 · 第 ${pendingRound.roundNumber ?? rounds.length} 轮` : thinking ? '思考中…' : `${label} · 生成中…`
-      : `${label} · ${rounds.length} 轮 (${entries.length} 次) · ${failed ? `${failed} 个失败` : pendingRound || interruptedThinking ? '未完成' : '完成'}`;
-    const autoCollapse = settings.autoCollapseToolsOnComplete &&
+    let title: string;
+    if (isStreaming) {
+      if (activeEntry) {
+        const activeName = activeEntry.call?.name || activeEntry.result?.toolName || 'tool';
+        const activeArg = activeEntry.call
+          ? summarizeToolArgs(activeName, activeEntry.call.arguments, 48)
+          : '';
+        title = activeArg
+          ? `正在执行 · ${activeName} (${activeArg})`
+          : `正在执行 · ${activeName}`;
+      } else if (thinking) {
+        title = '思考中…';
+      } else {
+        title = `${label} · 生成中…`;
+      }
+    } else {
+      const suffix = failed
+        ? `${failed} 个失败`
+        : activeEntry || interruptedThinking
+          ? '未完成'
+          : '完成';
+      title = `${label} · ${traceEntries.length} 次 · ${suffix}`;
+    }
+
+    const autoCollapse =
+      settings.autoCollapseToolsOnComplete &&
       (!trace.thinkingCount || settings.autoCollapseThinkingOnComplete) &&
-      !interruptedThinking && (!pendingRound || stopReason === 'error');
+      !interruptedThinking &&
+      (!activeEntry || stopReason === 'error');
     const completion = isStreaming ? 'pending' : autoCollapse ? 'collapse' : 'keep';
     const traceKey = `${effectivePrefix}:process-trace`;
     nodes.push(
-      <CollapsibleBlock key={traceKey} collapseKey={traceKey} title={title}
+      <CollapsibleBlock
+        key={traceKey}
+        collapseKey={traceKey}
+        title={title}
         icon={failed ? 'warning' : trace.thinkingCount ? 'lightbulb' : 'wrench'}
-        defaultCollapsed={completion === 'collapse'} completion={completion} subtle>
+        defaultCollapsed={completion === 'collapse'}
+        completion={completion}
+        subtle
+      >
         <ol className="trace-timeline">{steps}</ol>
       </CollapsibleBlock>,
     );

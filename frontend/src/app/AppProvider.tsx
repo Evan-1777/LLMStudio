@@ -171,6 +171,12 @@ export interface AppContextValue {
   }>;
   lastSyncedAt: string | null;
   syncingServer: boolean;
+  runningConversationIds: ReadonlySet<string>;
+  markConversationRunning: (
+    conversationId: string,
+    running: boolean,
+    scope?: TopicScope,
+  ) => void;
   upsertLocalConversation: (conv: Conversation, scope?: TopicScope) => void;
   removeLocalConversation: (id: string, scope?: TopicScope) => void;
   cleanupUngroupedConversations: (
@@ -1076,6 +1082,55 @@ export function AppProvider({
     }
   }, [gateway, handleAuthFailureIf401, trackSignal]);
 
+  const [runningByScope, setRunningByScope] = useState<{
+    local: ReadonlySet<string>;
+    cloud: ReadonlySet<string>;
+  }>(() => ({
+    local: new Set(),
+    cloud: new Set(),
+  }));
+
+  const runningConversationIds = useMemo<ReadonlySet<string>>(
+    () => (isDesktop && topicScope === 'local' ? runningByScope.local : runningByScope.cloud),
+    [isDesktop, runningByScope, topicScope],
+  );
+
+  const replaceRunningScope = useCallback(
+    (bucket: TopicScope, ids: Iterable<string>) => {
+      const next = new Set(ids);
+      setRunningByScope((prev) => {
+        const cur = prev[bucket];
+        if (cur.size === next.size && Array.from(next).every((id) => cur.has(id))) {
+          return prev;
+        }
+        return { ...prev, [bucket]: next };
+      });
+    },
+    [],
+  );
+
+  const markConversationRunning = useCallback(
+    (conversationId: string, running: boolean, explicitScope?: TopicScope) => {
+      if (!conversationId) return;
+      const bucket: TopicScope = isDesktop
+        ? (explicitScope ?? topicScopeRef.current)
+        : 'cloud';
+      setRunningByScope((prev) => {
+        const cur = prev[bucket];
+        const has = cur.has(conversationId);
+        if (has === running) return prev;
+        const next = new Set(cur);
+        if (running) {
+          next.add(conversationId);
+        } else {
+          next.delete(conversationId);
+        }
+        return { ...prev, [bucket]: next };
+      });
+    },
+    [isDesktop],
+  );
+
   const conversationCleanupRevision = useRef(0);
   const refreshConversations = useCallback(
     async (explicitScope?: TopicScope): Promise<Conversation[] | null> => {
@@ -1128,6 +1183,12 @@ export function AppProvider({
               : prev.loading,
           };
         });
+        if (!preserveList) {
+          replaceRunningScope(
+            targetBucket,
+            conversations.filter((c) => Boolean(c.running)).map((c) => c.id),
+          );
+        }
         return conversations;
       } catch (err) {
         if (epoch !== epochRef.current) return null;
@@ -1754,7 +1815,7 @@ export function AppProvider({
         };
       });
     },
-    [isDesktop],
+    [isDesktop, markConversationRunning],
   );
 
   const removeLocalConversation = useCallback(
@@ -1762,6 +1823,7 @@ export function AppProvider({
       const targetBucket: TopicScope = isDesktop
         ? (explicitScope ?? topicScopeRef.current)
         : 'cloud';
+      markConversationRunning(id, false, targetBucket);
       setResources((prev) => {
         const nextLocalConvs =
           targetBucket === 'local'
@@ -1781,7 +1843,7 @@ export function AppProvider({
         };
       });
     },
-    [isDesktop],
+    [isDesktop, markConversationRunning],
   );
 
   const cleanupUngroupedConversations = useCallback(
@@ -1856,6 +1918,104 @@ export function AppProvider({
     }
   }, [gateway, isDesktop, trackSignal]);
 
+  useEffect(() => {
+    if (skipInitialBootstrap) return;
+    if (connectionState !== 'connected') return;
+    if (isDesktop && desktopStatus === null) return;
+    const effectiveScope: TopicScope | undefined = isDesktop ? topicScope : undefined;
+    const bucket: TopicScope = effectiveScope ?? 'cloud';
+    if (isDesktop && bucket === 'cloud' && cloudConnectionState !== 'connected') {
+      replaceRunningScope('cloud', []);
+      return;
+    }
+
+    let cancelled = false;
+    let inFlight: AbortController | null = null;
+
+    const syncOnce = () => {
+      if (cancelled) return;
+      inFlight?.abort();
+      const ctrl = new AbortController();
+      inFlight = ctrl;
+      void gateway
+        .listActiveAgentRuns(ctrl.signal, effectiveScope)
+        .then((ids) => {
+          if (cancelled || ctrl.signal.aborted) return;
+          replaceRunningScope(bucket, ids);
+        })
+        .catch(() => {});
+    };
+
+    // Unconditional initial sync on mount / scope / connection change to discover runs from other clients.
+    syncOnce();
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        syncOnce();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      inFlight?.abort();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [
+    cloudConnectionState,
+    connectionEpoch,
+    connectionState,
+    desktopStatus,
+    gateway,
+    isDesktop,
+    replaceRunningScope,
+    skipInitialBootstrap,
+    topicScope,
+  ]);
+
+  useEffect(() => {
+    if (skipInitialBootstrap) return;
+    if (runningConversationIds.size === 0) return;
+    if (connectionState !== 'connected') return;
+    if (isDesktop && desktopStatus === null) return;
+    const effectiveScope: TopicScope | undefined = isDesktop ? topicScope : undefined;
+    const bucket: TopicScope = effectiveScope ?? 'cloud';
+    if (isDesktop && bucket === 'cloud' && cloudConnectionState !== 'connected') return;
+
+    let cancelled = false;
+    let inFlight: AbortController | null = null;
+    const timer = window.setInterval(() => {
+      if (cancelled || document.visibilityState !== 'visible') return;
+      inFlight?.abort();
+      const ctrl = new AbortController();
+      inFlight = ctrl;
+      void gateway
+        .listActiveAgentRuns(ctrl.signal, effectiveScope)
+        .then((ids) => {
+          if (cancelled || ctrl.signal.aborted) return;
+          replaceRunningScope(bucket, ids);
+        })
+        .catch(() => {});
+    }, 4000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      inFlight?.abort();
+    };
+  }, [
+    cloudConnectionState,
+    connectionEpoch,
+    connectionState,
+    desktopStatus,
+    gateway,
+    isDesktop,
+    replaceRunningScope,
+    runningConversationIds.size,
+    skipInitialBootstrap,
+    topicScope,
+  ]);
+
   const applyConversationOrganizationSnapshot = useCallback(
     (
       assistantId: string,
@@ -1909,7 +2069,7 @@ export function AppProvider({
         };
       });
     },
-    [isDesktop],
+    [isDesktop, markConversationRunning],
   );
 
   const uploadConversations = useCallback(
@@ -2090,7 +2250,7 @@ export function AppProvider({
         };
       });
     },
-    [isDesktop],
+    [isDesktop, markConversationRunning],
   );
 
   const removeLocalMcpServer = useCallback(
@@ -2115,7 +2275,7 @@ export function AppProvider({
         };
       });
     },
-    [isDesktop],
+    [isDesktop, markConversationRunning],
   );
 
   const registerDirtyGuard = useCallback((guard: (() => boolean) | null) => {
@@ -2176,6 +2336,8 @@ export function AppProvider({
       syncFromServer,
       lastSyncedAt,
       syncingServer,
+      runningConversationIds,
+      markConversationRunning,
       upsertLocalConversation,
       removeLocalConversation,
       cleanupUngroupedConversations,
@@ -2233,6 +2395,8 @@ export function AppProvider({
       syncFromServer,
       lastSyncedAt,
       syncingServer,
+      runningConversationIds,
+      markConversationRunning,
       upsertLocalConversation,
       removeLocalConversation,
       cleanupUngroupedConversations,

@@ -505,6 +505,7 @@ export interface Conversation {
   pinned?: boolean;
   sortOrder?: number;
   ephemeral?: boolean;
+  running?: boolean;
   scope?: TopicScope;
   syncEnabled: boolean;
   syncState: string;
@@ -587,9 +588,19 @@ export interface PatchConversationInput {
   syncEnabled?: boolean | null;
 }
 
+export interface ActiveRunInfo {
+  conversationId: string;
+  messageId: string;
+  providerId: string;
+  modelId: string;
+  replaceMessageId?: string;
+  insertAfterMessageId?: string;
+}
+
 export interface ConversationDetail {
   conversation: Conversation;
   messages: Message[];
+  activeRun?: ActiveRunInfo;
 }
 
 export interface SearchEngineView {

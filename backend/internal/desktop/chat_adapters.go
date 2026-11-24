@@ -617,6 +617,59 @@ func (e *DesktopChatEngine) ExecuteTools(ctx context.Context, scope plugin.Execu
 	return svc.ExecuteTools(ctx, in, emit)
 }
 
+// SubscribeLocalRun attaches to an active local background Agent run.
+func (e *DesktopChatEngine) SubscribeLocalRun(
+	ctx context.Context,
+	conversationID string,
+	onReady func(),
+	emit func(domain.StreamEvent) error,
+) (bool, error) {
+	if e == nil || e.localChat == nil {
+		return false, nil
+	}
+	return e.localChat.SubscribeRun(ctx, conversationID, onReady, emit)
+}
+
+// CancelLocalRun cancels the active local background Agent run for conversationID.
+func (e *DesktopChatEngine) CancelLocalRun(conversationID string) bool {
+	if e == nil || e.localChat == nil {
+		return false
+	}
+	return e.localChat.CancelRun(conversationID)
+}
+
+// CancelLocalRunsAndWait cancels matching local background Agent runs and waits for persistence convergence.
+func (e *DesktopChatEngine) CancelLocalRunsAndWait(ctx context.Context, conversationIDs ...string) {
+	if e == nil || e.localChat == nil {
+		return
+	}
+	e.localChat.CancelRunsAndWait(ctx, conversationIDs...)
+}
+
+// ActiveLocalRun returns metadata for an active local background Agent run.
+func (e *DesktopChatEngine) ActiveLocalRun(conversationID string) *service.ActiveRunInfo {
+	if e == nil || e.localChat == nil {
+		return nil
+	}
+	return e.localChat.ActiveRun(conversationID)
+}
+
+// ActiveLocalRunIDs returns conversation IDs with active local background Agent runs.
+func (e *DesktopChatEngine) ActiveLocalRunIDs() []string {
+	if e == nil || e.localChat == nil {
+		return []string{}
+	}
+	return e.localChat.ActiveRunConversationIDs()
+}
+
+// Shutdown cancels all local background Agent runs and waits for persistence convergence.
+func (e *DesktopChatEngine) Shutdown(ctx context.Context) error {
+	if e == nil || e.localChat == nil {
+		return nil
+	}
+	return e.localChat.Shutdown(ctx)
+}
+
 func (e *DesktopChatEngine) refreshProvider(ctx context.Context, scope plugin.ExecutionScope, convID, providerID string) error {
 	if err := checkCloudConnection(ctx); err != nil {
 		return err

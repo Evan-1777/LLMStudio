@@ -77,6 +77,7 @@ func main() {
 		WithPreferences(prefSvc).
 		WithMCP(mcpStore, mcpRuntime).
 		WithAgent(agentRuntime)
+	convSvc.WithRunTracker(chatSvc.ActiveRun, chatSvc.ActiveRunConversationIDs, chatSvc.CancelRunsAndWait)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Config:              cfg,
@@ -115,6 +116,11 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("server shutdown error: %v", err)
 	}
+	chatShutdownCtx, chatCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	if err := chatSvc.Shutdown(chatShutdownCtx); err != nil {
+		log.Printf("chat service shutdown error: %v", err)
+	}
+	chatCancel()
 	if err := mcpRuntime.Close(); err != nil {
 		log.Printf("mcp runtime shutdown error: %v", err)
 	}

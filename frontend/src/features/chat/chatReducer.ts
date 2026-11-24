@@ -1,4 +1,5 @@
 import type {
+  ActiveRunInfo,
   ContentBlock,
   Conversation,
   Message,
@@ -237,6 +238,7 @@ export type ChatAction =
     }
   | { type: 'REGEN_PREPARE_CONFIRMED'; targetMessageId: string }
   | { type: 'REGEN_PREPARE_FAILED'; code: string; message: string }
+  | { type: 'ATTACH_RUN_START'; run: ActiveRunInfo }
   | { type: 'STREAM_EVENT'; event: StreamEvent; fallbackProviderId: string; fallbackModelId: string }
   | { type: 'STREAM_EOF_INCOMPLETE' }
   | { type: 'STREAM_NETWORK_ERROR'; code: string; message: string }
@@ -450,6 +452,56 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         pendingRollback: null,
         streaming: null,
       };
+
+    case 'ATTACH_RUN_START': {
+      const { run } = action;
+      let nextMessages = state.messages;
+      let insertIndex: number | undefined;
+      let graphTarget: { afterId: string; replaceId?: string } | undefined;
+
+      if (state.conversation?.graphState?.enabled) {
+        if (run.replaceMessageId || run.insertAfterMessageId) {
+          graphTarget = {
+            afterId: run.insertAfterMessageId || run.replaceMessageId || '',
+            replaceId: run.replaceMessageId,
+          };
+        }
+      } else if (run.replaceMessageId) {
+        const idx = state.messages.findIndex((m) => m.id === run.replaceMessageId);
+        if (idx >= 0) {
+          insertIndex = idx;
+          nextMessages = [
+            ...state.messages.slice(0, idx),
+            ...state.messages.slice(idx + 1),
+          ];
+        }
+      } else if (run.insertAfterMessageId) {
+        const idx = state.messages.findIndex((m) => m.id === run.insertAfterMessageId);
+        if (idx >= 0) {
+          insertIndex = idx + 1;
+        }
+      }
+
+      return {
+        ...state,
+        messages: nextMessages,
+        runState: 'streaming',
+        errorCode: null,
+        errorMessage: null,
+        needsReloadAfterAbort: false,
+        pendingInsertIndex: insertIndex ?? null,
+        pendingRollback: null,
+        streaming: {
+          messageId: run.messageId,
+          providerId: run.providerId,
+          modelId: run.modelId,
+          insertIndex,
+          graphTarget,
+          blockOrder: [],
+          blocksByIndex: {},
+        },
+      };
+    }
 
     case 'STREAM_EVENT': {
       const ev = action.event;

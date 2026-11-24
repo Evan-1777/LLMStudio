@@ -417,6 +417,7 @@ a {
   box-shadow: var(--shadow-md), inset 0 1px 0 var(--glass-highlight);
   padding: 4px;
   z-index: var(--z-popover);
+  pointer-events: auto;
   transform-origin: var(--radix-popover-content-transform-origin, top center);
 }
 
@@ -438,6 +439,7 @@ a {
 .ui-popover-content[data-state='closed'],
 .ui-menu-content[data-state='closed'] {
   animation: popoverOut var(--duration-fast) var(--ease-apple) forwards;
+  pointer-events: none;
 }
 
 .ui-menu-item {

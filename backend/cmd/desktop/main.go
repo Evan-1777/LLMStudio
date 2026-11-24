@@ -136,10 +136,11 @@ func (b *DesktopBridge) GetRuntimeInfo() DesktopRuntimeInfo {
 }
 
 type desktopRuntime struct {
-	Store     *desktop.DesktopStore
-	MCPRun    *mcp.Runtime
-	CredCache *desktop.MemoryCredentialCache
-	Server    *desktop.Server
+	Store      *desktop.DesktopStore
+	MCPRun     *mcp.Runtime
+	CredCache  *desktop.MemoryCredentialCache
+	ChatEngine *desktop.DesktopChatEngine
+	Server     *desktop.Server
 }
 
 func (r *desktopRuntime) Close() {
@@ -150,6 +151,11 @@ func (r *desktopRuntime) Close() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_ = r.Server.Shutdown(ctx)
 		cancel()
+	}
+	if r.ChatEngine != nil {
+		chatCtx, chatCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_ = r.ChatEngine.Shutdown(chatCtx)
+		chatCancel()
 	}
 	if r.CredCache != nil {
 		r.CredCache.ClearAll()
@@ -239,10 +245,11 @@ func startDesktopRuntime(paths desktop.StoragePaths) (*desktopRuntime, error) {
 	}
 
 	return &desktopRuntime{
-		Store:     store,
-		MCPRun:    mcpRuntime,
-		CredCache: credCache,
-		Server:    srv,
+		Store:      store,
+		MCPRun:     mcpRuntime,
+		CredCache:  credCache,
+		ChatEngine: chatEngine,
+		Server:     srv,
 	}, nil
 }
 

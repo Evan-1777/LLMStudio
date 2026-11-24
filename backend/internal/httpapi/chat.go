@@ -54,6 +54,46 @@ func (h *ChatHandler) Stream(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (h *ChatHandler) AttachRunStream(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	rc := http.NewResponseController(w)
+	onReady := func() {
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		w.WriteHeader(http.StatusOK)
+		_ = rc.Flush()
+	}
+	attached, _ := h.svc.SubscribeRun(r.Context(), id, onReady, func(ev domain.StreamEvent) error {
+		payload, err := json.Marshal(ev)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, payload); err != nil {
+			return err
+		}
+		return rc.Flush()
+	})
+	if !attached {
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (h *ChatHandler) CancelRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	cancelled := h.svc.CancelRun(id)
+	WriteJSON(w, http.StatusOK, map[string]bool{"cancelled": cancelled})
+}
+
+func (h *ChatHandler) ListActiveRuns(w http.ResponseWriter, _ *http.Request) {
+	ids := h.svc.ActiveRunConversationIDs()
+	if ids == nil {
+		ids = []string{}
+	}
+	WriteJSON(w, http.StatusOK, map[string][]string{"conversationIds": ids})
+}
+
 func (h *ChatHandler) PrepareLocal(w http.ResponseWriter, r *http.Request) {
 	var in service.StreamChatInput
 	if err := decodeJSONBody(r, &in); err != nil {

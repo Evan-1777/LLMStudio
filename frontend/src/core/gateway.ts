@@ -1592,4 +1592,73 @@ export class GatewayClient {
     }
     return response;
   }
+
+  async openRunStream(
+    conversationId: string,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<Response> {
+    const url = resolveGatewayUrl(
+      this.baseUrl,
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/run/stream`,
+        scope,
+      ),
+    );
+
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, {
+        method: 'GET',
+        headers: this.buildHeaders(false, true, { Accept: 'text/event-stream' }),
+        signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw err;
+      }
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw err;
+      }
+      throw new GatewayError(
+        'NETWORK_ERROR',
+        err instanceof Error ? err.message : '重连运行流失败',
+      );
+    }
+
+    if (response.status === 204) {
+      return response;
+    }
+    if (!response.ok) {
+      const rawText = await response.text();
+      const env = parseErrorEnvelope(rawText, response.status);
+      throw new GatewayError(env.code, env.message, response.status);
+    }
+    return response;
+  }
+
+  cancelConversationRun(
+    conversationId: string,
+    scope?: TopicScope,
+  ): Promise<{ cancelled: boolean }> {
+    return this.requestJson<{ cancelled: boolean }>(
+      'POST',
+      withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/run/cancel`,
+        scope,
+      ),
+      { body: {} },
+    );
+  }
+
+  listActiveAgentRuns(
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<string[]> {
+    return this.requestJson<{ conversationIds?: string[] }>(
+      'GET',
+      withScopeQuery('/api/v1/agent/runs', scope),
+      { signal },
+    ).then((res) => res.conversationIds ?? []);
+  }
 }

@@ -414,6 +414,32 @@
 .wb-agent-context__scope { color: var(--text-primary); font-weight: 600; flex: none; }
 .wb-topic-agent { display: inline-flex; color: var(--wb-panel-muted); }
 
+.wb-topic-running {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+  flex: none;
+}
+
+.wb-topic-running__dot {
+  display: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wb-topic-running__spinner {
+    display: none;
+  }
+
+  .wb-topic-running__dot {
+    display: inline-block;
+  }
+}
+
 .wb-crumb {
   display: inline-flex;
   align-items: center;

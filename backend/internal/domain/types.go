@@ -437,6 +437,7 @@ type Conversation struct {
 	SortOrder    int                     `json:"sortOrder"`
 	Ephemeral    bool                    `json:"ephemeral,omitempty"`
 	Mode         string                  `json:"mode"`
+	Running      bool                    `json:"running,omitempty"`
 	SyncEnabled  bool                    `json:"syncEnabled"`
 	SyncState    string                  `json:"syncState"`
 	SyncVersion  int64                   `json:"syncVersion"`

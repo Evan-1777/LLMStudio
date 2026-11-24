@@ -84,8 +84,8 @@
   --z-chrome: 20;
   --z-scrim: 30;
   --z-drawer: 40;
-  --z-popover: 50;
   --z-modal: 60;
+  --z-popover: 65;
   --z-toast: 70;
 }
 

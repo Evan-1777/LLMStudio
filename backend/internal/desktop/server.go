@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"sync"
@@ -91,6 +92,13 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 	localConvSvc := service.NewConversationService(cfg.Store.Conversations, cfg.Store.Messages).
 		WithAssistants(cfg.Store.Assistants)
+	if cfg.ChatEngine != nil {
+		localConvSvc.WithRunTracker(
+			cfg.ChatEngine.ActiveLocalRun,
+			cfg.ChatEngine.ActiveLocalRunIDs,
+			cfg.ChatEngine.CancelLocalRunsAndWait,
+		)
+	}
 	localPluginSvc := service.NewPluginService(cfg.SearchReg, cfg.Store.Searches, cfg.Store.MCPs).
 		WithMCPClient(cfg.LocalMCPClient)
 	localPrefSvc := service.NewPreferenceService(cfg.Store.Preferences)
@@ -242,6 +250,9 @@ func (s *Server) buildHandler() http.Handler {
 
 	// Local-first chat streaming, compaction, and MCP tool execution for both domains.
 	mux.HandleFunc("POST /api/v1/conversations/{id}/messages/stream", s.handleChatStream)
+	mux.HandleFunc("GET /api/v1/conversations/{id}/run/stream", s.handleAttachRunStream)
+	mux.HandleFunc("POST /api/v1/conversations/{id}/run/cancel", s.handleCancelRun)
+	mux.HandleFunc("GET /api/v1/agent/runs", s.handleListActiveRuns)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/compact", s.handleChatCompact)
 	mux.HandleFunc("POST /api/v1/conversations/{id}/tools/execute", s.handleChatExecuteTools)
 
@@ -1607,6 +1618,113 @@ func (s *Server) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		}
 		return rc.Flush()
 	})
+}
+
+func (s *Server) handleAttachRunStream(w http.ResponseWriter, r *http.Request) {
+	scope, err := scopeFromRequest(r)
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	id := r.PathValue("id")
+	if scope == plugin.ExecutionScopeLocal {
+		if s.cfg.ChatEngine == nil {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		rc := http.NewResponseController(w)
+		onReady := func() {
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.WriteHeader(http.StatusOK)
+			_ = rc.Flush()
+		}
+		attached, _ := s.cfg.ChatEngine.SubscribeLocalRun(r.Context(), id, onReady, func(ev domain.StreamEvent) error {
+			payload, err := json.Marshal(ev)
+			if err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, payload); err != nil {
+				return err
+			}
+			return rc.Flush()
+		})
+		if !attached {
+			w.WriteHeader(http.StatusNoContent)
+		}
+		return
+	}
+	if !s.requireCloud(w) {
+		return
+	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
+	target := "/api/v1/conversations/" + url.PathEscape(id) + "/run/stream"
+	resp, proxyErr := s.cfg.Cloud.proxyRequest(ctx, http.MethodGet, target, http.Header{"Accept": {"text/event-stream"}}, nil, 0)
+	if proxyErr != nil {
+		writeDesktopError(w, proxyErr)
+		return
+	}
+	copyAgentResponse(w, resp, true)
+}
+
+func (s *Server) handleCancelRun(w http.ResponseWriter, r *http.Request) {
+	scope, err := scopeFromRequest(r)
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	id := r.PathValue("id")
+	if scope == plugin.ExecutionScopeLocal {
+		cancelled := s.cfg.ChatEngine != nil && s.cfg.ChatEngine.CancelLocalRun(id)
+		httpapi.WriteJSON(w, http.StatusOK, map[string]bool{"cancelled": cancelled})
+		return
+	}
+	if !s.requireCloud(w) {
+		return
+	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
+	target := "/api/v1/conversations/" + url.PathEscape(id) + "/run/cancel"
+	resp, proxyErr := s.cfg.Cloud.proxyRequest(ctx, http.MethodPost, target, http.Header{"Content-Type": {"application/json"}}, nil, 0)
+	if proxyErr != nil {
+		writeDesktopError(w, proxyErr)
+		return
+	}
+	copyAgentResponse(w, resp, false)
+}
+
+func (s *Server) handleListActiveRuns(w http.ResponseWriter, r *http.Request) {
+	scope, err := scopeFromRequest(r)
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	if scope == plugin.ExecutionScopeLocal {
+		ids := []string{}
+		if s.cfg.ChatEngine != nil {
+			ids = s.cfg.ChatEngine.ActiveLocalRunIDs()
+			if ids == nil {
+				ids = []string{}
+			}
+		}
+		httpapi.WriteJSON(w, http.StatusOK, map[string][]string{"conversationIds": ids})
+		return
+	}
+	if s.cfg.Cloud == nil || !s.cfg.Cloud.IsConfigured() {
+		httpapi.WriteJSON(w, http.StatusOK, map[string][]string{"conversationIds": {}})
+		return
+	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
+	resp, proxyErr := s.cfg.Cloud.proxyRequest(ctx, http.MethodGet, "/api/v1/agent/runs", nil, nil, 0)
+	if proxyErr != nil {
+		httpapi.WriteJSON(w, http.StatusOK, map[string][]string{"conversationIds": {}})
+		return
+	}
+	copyAgentResponse(w, resp, false)
 }
 
 func (s *Server) handleChatCompact(w http.ResponseWriter, r *http.Request) {

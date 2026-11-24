@@ -650,31 +650,32 @@ test.describe('MCP End-to-End Integration', () => {
       await page.getByLabel('消息输入框').fill('[FORWARD_MULTI]');
       await page.getByLabel('发送消息').click();
 
-      const trace1 = page.getByRole('button', { name: /工具调用 · 第 1 轮/ });
-      const trace2 = page.getByRole('button', { name: /工具调用 · 第 2 轮/ });
-      await expect(trace1).toHaveAttribute('aria-expanded', 'false');
+      const firstToolStep = page.locator('.tool-step__summary').first();
+      await expect(firstToolStep).toBeVisible();
+      await expect(firstToolStep).toHaveAttribute('aria-expanded', 'false');
       await expect(page.getByRole('button', { name: '停止生成' })).toBeVisible();
       await expect(page.getByText('MCP Final Reply (count=2)', { exact: true })).toHaveCount(0);
-      await trace1.click();
+      await firstToolStep.click();
+      await expect(firstToolStep).toHaveAttribute('aria-expanded', 'true');
       mockSrv.releaseRound();
       await expect(page.getByText('MCP Final Reply (count=2)', { exact: true })).toBeVisible();
-      const timeline = page.getByRole('button', { name: /思考与工具 · 2 轮.*完成/ });
+      const timeline = page.getByRole('button', { name: /思考与工具 · 3 次 · 完成/ });
       await expect(timeline).toHaveAttribute('aria-expanded', 'false');
       await expect(page.getByText('Checking the next step.')).toBeHidden();
       await timeline.click();
       await expect(page.getByText('Checking the next step.')).toBeVisible();
-      await expect(trace1).toHaveAttribute('aria-expanded', 'true');
-      await expect(trace2).toHaveAttribute('aria-expanded', 'false');
-      const toolDetails = page.locator('.tool-trace-entry > summary');
-      await expect(toolDetails).toHaveCount(2);
-      const successBadge = page.locator('.tool-trace-entry__status--success').first();
+      const toolSteps = page.locator('.tool-step__summary');
+      await expect(toolSteps).toHaveCount(3);
+      await expect(toolSteps.nth(0)).toHaveAttribute('aria-expanded', 'true');
+      await expect(toolSteps.nth(1)).toHaveAttribute('aria-expanded', 'false');
+      const successBadge = page.locator('.tool-step__status--success').first();
       await page.emulateMedia({ colorScheme: 'dark' });
       await expect(page.locator('html')).toHaveAttribute('data-theme', 'dark');
       expect(await badgeContrast(successBadge)).toBeGreaterThanOrEqual(4.5);
       await page.emulateMedia({ colorScheme: 'light' });
       await expect(page.locator('html')).toHaveAttribute('data-theme', 'light');
       expect(await badgeContrast(successBadge)).toBeGreaterThanOrEqual(4.5);
-      for (const tool of await toolDetails.all()) await tool.click();
+      await toolSteps.nth(1).click();
       await expect(page.getByText('count=1', { exact: true })).toBeVisible();
       await expect(page.getByText(/doc:\/\/guide/)).toBeVisible();
       await expect(
@@ -752,15 +753,14 @@ test.describe('MCP End-to-End Integration', () => {
       mockSrv.holdRound();
       await page.getByLabel('消息输入框').fill('[LONG_TOOL]');
       await page.getByLabel('发送消息').click();
-      const longRound = page.getByRole('button', { name: '工具调用 · 第 1 轮 · 1 次 · 完成' }).last();
-      await expect(longRound).toHaveAttribute('aria-expanded', 'true');
+      const longStep = page.locator('.tool-step__summary').last();
+      await expect(longStep).toHaveAttribute('aria-expanded', 'true');
       mockSrv.releaseRound();
       const longReply = page.locator('article').filter({ hasText: 'Long tool complete' });
       await expect(longReply).toBeVisible();
-      await expect(longReply.getByRole('button', { name: /工具调用/ })).toHaveAttribute('aria-expanded', 'true');
+      await expect(longReply.locator('.tool-step__summary')).toHaveAttribute('aria-expanded', 'true');
 
-      const traceBody = longReply.locator('.tool-trace-body');
-      await traceBody.locator('summary').click();
+      const traceBody = longReply.locator('.tool-step__body');
       const scrollMetrics = await traceBody.evaluate((el) => ({
         scrollHeight: el.scrollHeight,
         clientHeight: el.clientHeight,
@@ -889,33 +889,33 @@ test.describe('MCP End-to-End Integration', () => {
         if (saved) expect((await saved).ok()).toBe(true);
         expect(mockSrv.mcpCalls.length - beforeTools).toBe(1);
         expect(mockSrv.llmCalls.length - beforeLlm).toBe(2);
-        const errorTrace = page.getByRole('button', { name: /思考与工具 · 2 轮.*未完成/ });
+        const errorTrace = page.getByRole('button', { name: /思考与工具 · 2 次 · 未完成/ });
         await expect(errorTrace).toHaveAttribute('aria-expanded', 'false');
         await page.reload({ waitUntil: 'networkidle' });
         await expect(errorTrace).toHaveAttribute('aria-expanded', 'false');
         await errorTrace.click();
-        await expect(page.getByRole('button', { name: '思考过程' })).toHaveCount(2);
-        for (const thought of await page.getByRole('button', { name: '思考过程' }).all()) {
+        await expect(page.getByRole('button', { name: /^思考过程/ })).toHaveCount(2);
+        for (const thought of await page.getByRole('button', { name: /^思考过程/ }).all()) {
           await expect(thought).toHaveAttribute('aria-expanded', 'false');
         }
-        await expect(page.getByRole('button', { name: /第 1 轮.*完成/ })).toHaveAttribute('aria-expanded', 'false');
+        await expect(page.locator('.tool-step__summary')).toHaveCount(2);
+        await expect(page.locator('.tool-step__summary').first()).toHaveAttribute('aria-expanded', 'false');
       }
 
-      // Failed tool call round auto-collapses when complete and stays collapsed across reload.
+      // Failed tool call auto-collapses when complete and stays collapsed across reload.
       await page.getByRole('button', { name: '新建话题' }).click();
       await page.getByRole('button', { name: '选择模型' }).click();
       await page.getByRole('option', { name: 'Fwd Chat' }).click();
       await page.getByLabel('消息输入框').fill('[FAILED_TOOL]');
       await page.getByLabel('发送消息').click();
       await expect(page.getByText('Handled tool failure')).toBeVisible();
-      const failedRound = page.getByRole('button', { name: /工具调用 · 第 1 轮 · 1 次 · 1 个失败/ }).last();
-      await expect(failedRound).toHaveAttribute('aria-expanded', 'false');
+      const failedStep = page.locator('.tool-step--error > .tool-step__summary').last();
+      await expect(failedStep).toHaveAttribute('aria-expanded', 'false');
       await page.reload({ waitUntil: 'networkidle' });
       await expect(page.getByText('Handled tool failure')).toBeVisible();
-      await expect(failedRound).toHaveAttribute('aria-expanded', 'false');
-      await failedRound.click();
-      await expect(failedRound).toHaveAttribute('aria-expanded', 'true');
-      await page.locator('.tool-trace-entry > summary').last().click();
+      await expect(failedStep).toHaveAttribute('aria-expanded', 'false');
+      await failedStep.click();
+      await expect(failedStep).toHaveAttribute('aria-expanded', 'true');
       await expect(page.getByText('tool execution failed intentionally')).toBeVisible();
     } finally {
       await mockSrv.close();

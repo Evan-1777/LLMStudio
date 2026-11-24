@@ -30,12 +30,21 @@ import type {
 } from '../../core/types';
 import { MarkdownDocument } from '../../rendering/ContentRenderer';
 import {
+  WorkspaceMoveDialog,
   WorkspaceNameDialog,
+  nextCopyName,
   parentDirOf,
   triggerBlobDownload,
   useWorkspaceMenuDialog,
 } from './WorkspaceDialogs';
 import './workspace.css';
+
+function isInsidePopoverLayer(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    Boolean(target.closest('[data-radix-popper-content-wrapper], .ui-menu-content, .ui-popover-content'))
+  );
+}
 
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return '0 B';
@@ -59,6 +68,7 @@ export function WorkspaceFileViewer({
   onClose,
   onSaved,
   onRenamed,
+  onCopied,
   onDeleted,
 }: {
   entry: WorkspaceEntry | null;
@@ -68,6 +78,7 @@ export function WorkspaceFileViewer({
   onClose: () => void;
   onSaved?: (res: WorkspaceFileWriteResult) => void;
   onRenamed?: (oldPath: string, nextEntry: WorkspaceEntry) => void;
+  onCopied?: (parentDir: string) => void;
   onDeleted?: (deletedPath: string) => void;
 }) {
   const { toast } = useApp();
@@ -81,29 +92,32 @@ export function WorkspaceFileViewer({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<{ message: string; conflict: boolean } | null>(null);
-  const [copied, setCopied] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [downloading, setDownloading] = useState(false);
+  const [copying, setCopying] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   const [pendingAction, setPendingAction] = useState<'close' | 'reload' | null>(null);
 
-  // Rename & delete modals inside viewer
+  // Rename, move & delete modals inside viewer
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameBusy, setRenameBusy] = useState(false);
   const [renameError, setRenameError] = useState<string | null>(null);
+  const [moveOpen, setMoveOpen] = useState(false);
+  const [moveBusy, setMoveBusy] = useState(false);
+  const [moveError, setMoveError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
 
   const loadAbortRef = useRef<AbortController | null>(null);
   const saveAbortRef = useRef<AbortController | null>(null);
-  const copyTimerRef = useRef<number | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const wasOpenRef = useRef(false);
 
   const open = entry !== null;
   const unsupported = entry?.previewKind === 'unsupported';
   const isDirty = Boolean(doc && draftContent !== doc.content);
-  const subDialogOpen = discardConfirmOpen || renameOpen || deleteOpen;
+  const subDialogOpen = discardConfirmOpen || renameOpen || moveOpen || deleteOpen;
 
   useEffect(() => {
     if (open && !wasOpenRef.current) {
@@ -115,7 +129,6 @@ export function WorkspaceFileViewer({
 
   useEffect(() => {
     return () => {
-      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
       loadAbortRef.current?.abort();
       saveAbortRef.current?.abort();
     };
@@ -173,11 +186,14 @@ export function WorkspaceFileViewer({
     setLoadError(null);
     setSaveError(null);
     setSaving(false);
-    setCopied(false);
+    setCopying(false);
+    setMenuOpen(false);
     setDiscardConfirmOpen(false);
     setPendingAction(null);
     setRenameOpen(false);
     setRenameError(null);
+    setMoveOpen(false);
+    setMoveError(null);
     setDeleteOpen(false);
 
     if (!entry) {
@@ -244,9 +260,7 @@ export function WorkspaceFileViewer({
     if (!doc) return;
     try {
       await navigator.clipboard.writeText(draftContent);
-      setCopied(true);
-      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
-      copyTimerRef.current = window.setTimeout(() => setCopied(false), 1600);
+      toast('已复制内容');
     } catch {
       toast('无法写入剪贴板', 'error');
     }
@@ -272,6 +286,55 @@ export function WorkspaceFileViewer({
       toast('已复制路径');
     } catch {
       toast('无法写入剪贴板', 'error');
+    }
+  };
+
+  const handleDuplicate = async () => {
+    if (!entry || copying || isDirty || saving) return;
+    setCopying(true);
+    const parent = parentDirOf(entry.path);
+    try {
+      let siblings: WorkspaceEntry[] = [];
+      try {
+        const res = await gateway.listWorkspaceEntries(parent, scope);
+        siblings = res.entries ?? [];
+      } catch {
+        siblings = [];
+      }
+      const existingNames = new Set(siblings.map((item) => item.name));
+      const copyBase = nextCopyName(entry, existingNames);
+      const toPath = parent ? `${parent}/${copyBase}` : copyBase;
+      await gateway.copyWorkspaceEntry({ fromPath: entry.path, toPath }, scope);
+      onCopied?.(parent);
+      toast('已创建副本');
+    } catch (err) {
+      toast(err instanceof GatewayError ? err.message : '创建副本失败', 'error');
+    } finally {
+      setCopying(false);
+    }
+  };
+
+  const handleMoveSubmit = async (targetDir: string) => {
+    if (!entry) return;
+    const toPath = targetDir ? `${targetDir}/${entry.name}` : entry.name;
+    if (toPath === entry.path) {
+      setMoveOpen(false);
+      return;
+    }
+    setMoveBusy(true);
+    setMoveError(null);
+    try {
+      const moved = await gateway.moveWorkspaceEntry(
+        { fromPath: entry.path, toPath },
+        scope,
+      );
+      setMoveOpen(false);
+      toast('已移动');
+      onRenamed?.(entry.path, moved);
+    } catch (err) {
+      setMoveError(err instanceof GatewayError ? err.message : '移动失败');
+    } finally {
+      setMoveBusy(false);
     }
   };
 
@@ -311,14 +374,14 @@ export function WorkspaceFileViewer({
   };
 
   const requestClose = useCallback(() => {
-    if (saving || renameBusy || deleteBusy) return;
+    if (saving || renameBusy || moveBusy || deleteBusy || copying) return;
     if (isDirty) {
       setPendingAction('close');
       setDiscardConfirmOpen(true);
       return;
     }
     onClose();
-  }, [deleteBusy, isDirty, onClose, renameBusy, saving]);
+  }, [copying, deleteBusy, isDirty, moveBusy, onClose, renameBusy, saving]);
 
   const requestReload = useCallback(() => {
     if (!entry || loading || saving) return;
@@ -378,7 +441,7 @@ export function WorkspaceFileViewer({
             aria-describedby={undefined}
             onKeyDown={handleKeyDown}
             onEscapeKeyDown={(e) => {
-              if (saving || subDialogOpen) {
+              if (menuOpen || saving || subDialogOpen) {
                 e.preventDefault();
                 return;
               }
@@ -388,13 +451,18 @@ export function WorkspaceFileViewer({
               }
             }}
             onPointerDownOutside={(e) => {
-              if (saving || subDialogOpen) {
+              if (menuOpen || saving || subDialogOpen || isInsidePopoverLayer(e.target)) {
                 e.preventDefault();
                 return;
               }
               if (isDirty) {
                 e.preventDefault();
                 requestClose();
+              }
+            }}
+            onInteractOutside={(e) => {
+              if (menuOpen || saving || subDialogOpen || isInsidePopoverLayer(e.target)) {
+                e.preventDefault();
               }
             }}
             onCloseAutoFocus={(e) => {
@@ -454,19 +522,6 @@ export function WorkspaceFileViewer({
                   <>
                     <IconButton
                       size="sm"
-                      icon={copied ? 'check' : 'copy'}
-                      label="复制内容"
-                      onClick={() => void handleCopy()}
-                    />
-                    <IconButton
-                      size="sm"
-                      icon="refresh"
-                      label="重新加载"
-                      disabled={loading || saving}
-                      onClick={requestReload}
-                    />
-                    <IconButton
-                      size="sm"
                       icon="undo"
                       label="撤销修改"
                       disabled={!isDirty || saving}
@@ -485,53 +540,88 @@ export function WorkspaceFileViewer({
                 ) : null}
 
                 {entry ? (
-                  <>
-                    <IconButton
-                      size="sm"
-                      icon="download"
-                      label="下载文件"
-                      loading={downloading}
+                  <Dropdown
+                    open={menuOpen}
+                    onOpenChange={setMenuOpen}
+                    align="end"
+                    onCloseAutoFocus={onCloseAutoFocus}
+                    trigger={
+                      <IconButton
+                        size="sm"
+                        icon="ellipsis"
+                        label="文件操作"
+                        disabled={saving}
+                      />
+                    }
+                  >
+                    {!unsupported && doc ? (
+                      <>
+                        <DropdownItem onSelect={() => void handleCopy()}>
+                          <Icon name="copy" size={14} />
+                          <span>复制内容</span>
+                        </DropdownItem>
+                        <DropdownItem
+                          disabled={loading || saving}
+                          onSelect={requestReload}
+                        >
+                          <Icon name="refresh" size={14} />
+                          <span>重新加载</span>
+                        </DropdownItem>
+                        <DropdownSeparator />
+                      </>
+                    ) : null}
+                    <DropdownItem
                       disabled={downloading}
-                      onClick={() => void handleDownload()}
-                    />
-                    <Dropdown
-                      align="end"
-                      modal={false}
-                      onCloseAutoFocus={onCloseAutoFocus}
-                      trigger={
-                        <IconButton
-                          size="sm"
-                          icon="ellipsis"
-                          label="文件操作"
-                          disabled={saving}
-                        />
-                      }
+                      onSelect={() => void handleDownload()}
                     >
-                      <DropdownItem
-                        disabled={isDirty || saving}
-                        onSelect={() => openAfterMenu(() => {
+                      <Icon name="download" size={14} />
+                      <span>下载</span>
+                    </DropdownItem>
+                    <DropdownItem
+                      disabled={isDirty || saving}
+                      onSelect={() =>
+                        openAfterMenu(() => {
                           setRenameError(null);
                           setRenameOpen(true);
-                        })}
-                      >
-                        <Icon name="edit" size={14} />
-                        <span>重命名</span>
-                      </DropdownItem>
-                      <DropdownItem onSelect={() => void handleCopyPath()}>
-                        <Icon name="link" size={14} />
-                        <span>复制路径</span>
-                      </DropdownItem>
-                      <DropdownSeparator />
-                      <DropdownItem
-                        danger
-                        disabled={saving}
-                        onSelect={() => openAfterMenu(() => setDeleteOpen(true))}
-                      >
-                        <Icon name="trash" size={14} />
-                        <span>删除</span>
-                      </DropdownItem>
-                    </Dropdown>
-                  </>
+                        })
+                      }
+                    >
+                      <Icon name="edit" size={14} />
+                      <span>重命名</span>
+                    </DropdownItem>
+                    <DropdownItem
+                      disabled={isDirty || saving}
+                      onSelect={() =>
+                        openAfterMenu(() => {
+                          setMoveError(null);
+                          setMoveOpen(true);
+                        })
+                      }
+                    >
+                      <Icon name="folderInput" size={14} />
+                      <span>移动到</span>
+                    </DropdownItem>
+                    <DropdownItem
+                      disabled={isDirty || saving || copying}
+                      onSelect={() => void handleDuplicate()}
+                    >
+                      <Icon name="filePlus" size={14} />
+                      <span>创建副本</span>
+                    </DropdownItem>
+                    <DropdownItem onSelect={() => void handleCopyPath()}>
+                      <Icon name="link" size={14} />
+                      <span>复制路径</span>
+                    </DropdownItem>
+                    <DropdownSeparator />
+                    <DropdownItem
+                      danger
+                      disabled={saving}
+                      onSelect={() => openAfterMenu(() => setDeleteOpen(true))}
+                    >
+                      <Icon name="trash" size={14} />
+                      <span>删除</span>
+                    </DropdownItem>
+                  </Dropdown>
                 ) : null}
 
                 <span className="ws-viewer__divider" aria-hidden="true" />
@@ -686,6 +776,23 @@ export function WorkspaceFileViewer({
           }
         }}
         onSubmit={handleRenameSubmit}
+      />
+
+      <WorkspaceMoveDialog
+        open={moveOpen && entry !== null}
+        gateway={gateway}
+        scope={scope}
+        sourcePaths={entry ? [entry.path] : []}
+        sourceLabel={entry?.name ?? ''}
+        busy={moveBusy}
+        error={moveError}
+        onOpenChange={(next) => {
+          if (!next && !moveBusy) {
+            setMoveOpen(false);
+            setMoveError(null);
+          }
+        }}
+        onConfirm={handleMoveSubmit}
       />
 
       <ConfirmDialog

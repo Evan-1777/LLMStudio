@@ -59,14 +59,15 @@ test('selects a workspace with the keyboard, reads the first turn and retains po
   await composer.fill('[AGENT_READ]');
   await page.getByRole('button', { name: '发送消息' }).click();
   await expect(page.getByText(/Agent verified: .*browser-agent-sentinel/)).toBeVisible();
-  const openTrace = () => page.getByRole('button', { name: /工具调用 · 第 1 轮.*完成/ }).click();
-  await openTrace();
-  await expect(page.getByText('原生 ·', { exact: true })).toBeVisible();
+  const readStep = page.getByRole('button', { name: /read.*note\.txt.*原生/ });
+  await expect(readStep).toBeVisible();
+  await expect(readStep).toHaveAttribute('aria-expanded', 'false');
+  await readStep.click();
+  await expect(readStep).toHaveAttribute('aria-expanded', 'true');
   const topicUrl = page.url();
   await page.reload();
   await expect(page.getByRole('radio', { name: 'Agent', exact: true })).toBeChecked();
-  await openTrace();
-  await expect(page.getByText('原生 ·', { exact: true })).toBeVisible();
+  await expect(readStep).toBeVisible();
   await expect(page.getByText('project', { exact: true })).toBeVisible();
 
   await page.getByRole('link', { name: '设置' }).click();
@@ -97,4 +98,79 @@ test('selects a gateway folder by touch on a phone viewport', async ({ browser, 
   } finally {
     await context.close();
   }
+});
+
+test('continues running Agent conversation in background across navigation, reconnects on reload, and stops only on explicit stop', async ({
+  page,
+  appUrl,
+  upstream,
+}) => {
+  await seedMockProviderViaApi(appUrl, upstream.url);
+  await connectWithToken(page, appUrl);
+
+  // Enable read tool and select project directory.
+  await page.getByRole('link', { name: '设置' }).click();
+  await page.getByRole('button', { name: 'Agent', exact: true }).click();
+  const readSwitch = page.getByRole('switch', { name: '读取文件' });
+  if (!(await readSwitch.isChecked())) {
+    await readSwitch.click();
+    await expect(readSwitch).toBeChecked();
+  }
+  await page.getByRole('button', { name: '选择工作目录' }).click();
+  const dirDialog = page.getByRole('dialog', { name: '选择工作目录' });
+  await dirDialog.getByRole('button', { name: 'project' }).click();
+  await dirDialog.getByRole('button', { name: '选择', exact: true }).click();
+  await expect(dirDialog).toBeHidden();
+  await page.getByRole('button', { name: '返回工作台' }).click();
+
+  // Case A: Start background Agent run, switch to new topic and Settings while running, release gate, and verify completion.
+  await page.getByRole('radio', { name: 'Agent', exact: true }).click();
+  const gateEnteredA = upstream.armFirstByteGate();
+  await page.getByLabel('消息输入框').fill('[AGENT_BG_RUN] case A');
+  await page.getByRole('button', { name: '发送消息' }).click();
+  await gateEnteredA;
+
+  const agentTopicUrl = page.url();
+  await expect(page.locator('.wb-topic-running')).toBeVisible();
+
+  // Leave topic -> start new topic -> visit Settings: backend run must NOT be canceled.
+  await page.getByRole('button', { name: '新建话题' }).click();
+  await expect(page.locator('.wb-topic-running')).toBeVisible();
+  await page.getByRole('link', { name: '设置' }).click();
+  await expect(page.getByRole('button', { name: '返回工作台' })).toBeVisible();
+  expect(upstream.abortedCount).toBe(0);
+
+  // Release gate while away on Settings page so Agent finishes in background.
+  upstream.releaseFirstByteGate();
+  await page.getByRole('button', { name: '返回工作台' }).click();
+  await page.goto(agentTopicUrl);
+
+  await expect(page.getByText(/Background Agent verified: .*browser-agent-sentinel/)).toBeVisible();
+  const timelineBtn = page.getByRole('button', { name: /思考与工具 · 1 次 · 完成/ });
+  await expect(timelineBtn).toBeVisible();
+  await timelineBtn.click();
+  await expect(page.getByRole('button', { name: /read.*note\.txt.*原生/ })).toBeVisible();
+
+  // Case B: Start second background Agent run -> reload page -> auto-reconnects -> explicit stop aborts backend run.
+  await page.getByRole('button', { name: '新建话题' }).click();
+  await page.getByRole('radio', { name: 'Agent', exact: true }).click();
+  const gateEnteredB = upstream.armFirstByteGate();
+  await page.getByLabel('消息输入框').fill('[AGENT_BG_RUN] case B');
+  await page.getByRole('button', { name: '发送消息' }).click();
+  await gateEnteredB;
+
+  // Reload page while Agent is mid-run.
+  await page.reload();
+  const stopBtn = page.getByRole('button', { name: '停止生成' });
+  await expect(stopBtn).toBeVisible();
+  await expect(page.getByRole('button', { name: /read.*note\.txt.*原生/ })).toBeVisible();
+
+  // Explicit stop terminates backend upstream and persists aborted status.
+  await stopBtn.click();
+  await expect.poll(() => upstream.abortedCount).toBeGreaterThanOrEqual(1);
+  await expect(stopBtn).toBeHidden();
+  await expect(page.getByText('已停止')).toBeVisible();
+
+  await page.reload();
+  await expect(page.getByText('已停止')).toBeVisible();
 });

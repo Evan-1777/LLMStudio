@@ -237,7 +237,7 @@ async function startMockUpstream(): Promise<{
           gateEnteredResolve = null;
         });
 
-      if (gateActive && !prompt.includes('[GATE_AFTER_HEADERS]')) {
+      if (gateActive && !prompt.includes('[GATE_AFTER_HEADERS]') && !prompt.includes('[AGENT_BG_RUN]')) {
         const aborted = await waitOnGate();
         if (aborted || res.writableEnded) return;
       }
@@ -289,6 +289,45 @@ async function startMockUpstream(): Promise<{
           writeChunk({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'agent-read', function: {
             name: 'read', arguments: JSON.stringify({ path: 'note.txt' }),
           } }] }, finish_reason: 'tool_calls' }] });
+        }
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+
+      if (prompt.includes('[AGENT_BG_RUN]')) {
+        const messages = Array.isArray(body.messages) ? body.messages : [];
+        const last = messages.at(-1);
+        if (last?.role === 'tool') {
+          res.flushHeaders();
+          writeChunk({ choices: [{ delta: { reasoning_content: 'Synthesizing background reply...' } }] });
+          if (gateActive) {
+            const aborted = await waitOnGate();
+            if (aborted || res.writableEnded) return;
+          }
+          writeChunk({
+            choices: [{ delta: { content: 'Background Agent verified: ' + last.content }, finish_reason: 'stop' }],
+          });
+        } else {
+          writeChunk({ choices: [{ delta: { reasoning_content: 'Inspecting workspace note...' } }] });
+          writeChunk({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'agent-bg-read',
+                      function: {
+                        name: 'read',
+                        arguments: JSON.stringify({ path: 'note.txt' }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              },
+            ],
+          });
         }
         res.end('data: [DONE]\n\n');
         return;

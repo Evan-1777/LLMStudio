@@ -31,6 +31,7 @@ import type {
 import {
   WorkspaceMoveDialog,
   WorkspaceNameDialog,
+  nextCopyName,
   parentDirOf,
   triggerBlobDownload,
   useWorkspaceMenuDialog,
@@ -74,21 +75,6 @@ function isWorkspaceUnsetError(err: unknown): boolean {
 
 function isConflictError(err: unknown): boolean {
   return err instanceof GatewayError && (err.statusCode === 409 || err.code === 'CONFLICT');
-}
-
-function nextCopyName(entry: WorkspaceEntry, existingNames: Set<string>): string {
-  const isFile = entry.kind === 'file';
-  const dotIdx = isFile ? entry.name.lastIndexOf('.') : -1;
-  const stem = dotIdx > 0 ? entry.name.slice(0, dotIdx) : entry.name;
-  const ext = dotIdx > 0 ? entry.name.slice(dotIdx) : '';
-
-  const first = `${stem} copy${ext}`;
-  if (!existingNames.has(first)) return first;
-  for (let i = 2; i <= 999; i++) {
-    const candidate = `${stem} copy ${i}${ext}`;
-    if (!existingNames.has(candidate)) return candidate;
-  }
-  return `${stem} copy ${Date.now()}${ext}`;
 }
 
 function hasFileDragPayload(dt: DataTransfer | null): boolean {

@@ -148,6 +148,9 @@ type ChatService struct {
 	cacheStore  *promptCacheStore
 	preferences PreferenceLookup
 	agent       *agent.Runtime
+	baseCtx     context.Context
+	baseCancel  context.CancelFunc
+	runs        *chatRunManager
 }
 
 // ErrAgentExecutor identifies an Agent topic that must run on its owning gateway.
@@ -179,6 +182,7 @@ func NewChatService(
 	if httpClient == nil {
 		httpClient = &http.Client{}
 	}
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 	return &ChatService{
 		providers:  providers,
 		convs:      convs,
@@ -187,6 +191,9 @@ func NewChatService(
 		adapters:   adapters,
 		httpClient: httpClient,
 		cacheStore: newPromptCacheStore(defaultPromptCacheMaxEntries),
+		baseCtx:    baseCtx,
+		baseCancel: baseCancel,
+		runs:       newChatRunManager(),
 	}
 }
 
@@ -269,6 +276,8 @@ type PreparedStream struct {
 	insertAfterMessageID string
 	autoCreateCache      bool
 	cacheScope           plugin.PromptCacheScope
+	assistantID          string
+	detachedRun          *detachedRun
 }
 
 // PreparedLocalHTTPRequest describes a pre-encoded HTTP request without server-stored secrets.
@@ -336,15 +345,55 @@ type preparedUpstream struct {
 // Prepare validates inputs, runs optional cache planning, encodes the upstream payload,
 // opens the upstream HTTP connection, and persists any new user prompt BEFORE SSE headers are sent.
 func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*PreparedStream, error) {
-	prep, err := s.prepareUpstream(ctx, in, false)
+	workCtx := ctx
+	var (
+		detached        *detachedRun
+		detachedStarted bool
+	)
+	if s.agent != nil && s.convs != nil && s.runs != nil && strings.TrimSpace(in.ConversationID) != "" {
+		if conv, getErr := s.convs.Get(ctx, in.ConversationID); getErr == nil &&
+			conv.Mode == domain.ConversationModeAgent && !conv.Ephemeral {
+			run, runCtx, resErr := s.runs.reserve(conv.ID, s.baseCtx)
+			if resErr != nil {
+				return nil, resErr
+			}
+			detached = run
+			workCtx = runCtx
+			defer func() {
+				if !detachedStarted {
+					detached.cancel()
+					s.runs.release(conv.ID, detached)
+				}
+			}()
+		}
+	}
+
+	prep, err := s.prepareUpstream(workCtx, in, false)
 	if err != nil {
 		return nil, err
+	}
+
+	assistantID := domain.NewUUID()
+	if detached != nil {
+		assistantID = detached.snapshotInfo().MessageID
+	}
+	if graphEnabled(prep.conversation) && prep.replaceMessageID != "" {
+		assistantID = prep.replaceMessageID
+	}
+	if detached != nil {
+		detached.updateInfo(func(info *ActiveRunInfo) {
+			info.MessageID = assistantID
+			info.ProviderID = prep.provider.ID
+			info.ModelID = prep.model.ID
+			info.ReplaceMessageID = prep.replaceMessageID
+			info.InsertAfterMessageID = prep.insertAfterMessageID
+		})
 	}
 
 	chatInput := prep.chatInput
 	currentCache := s.cacheStore.Get(prep.cacheScope)
 	activeCache, plan, planErr := s.executeCachePlan(
-		ctx,
+		workCtx,
 		chatInput,
 		prep.apiFormat,
 		prep.adapter,
@@ -358,7 +407,7 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	usedInlineCache := plan.InlineCache
 
 	resp, _, err := s.encodeAndOpenMainRequest(
-		ctx,
+		workCtx,
 		chatInput,
 		prep.apiFormat,
 		prep.adapter,
@@ -373,7 +422,7 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	conv := prep.conversation
 	var assistantWrite *domain.MessageGraphWrite
 	if !prep.isRegen {
-		saved, err := s.msgs.Create(ctx, domain.Message{
+		saved, err := s.msgs.Create(workCtx, domain.Message{
 			GraphWrite:     prep.graphWrite,
 			ConversationID: conv.ID,
 			Role:           domain.RoleUser,
@@ -391,14 +440,14 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		if (conv.Title == "" || conv.Title == "New Chat") && prep.historyLen == 1 {
 			if derived := deriveTitleFromBlocks(prep.userBlocks); derived != "" {
 				conv.Title = derived
-				if updated, uErr := s.convs.Update(ctx, conv); uErr == nil {
+				if updated, uErr := s.convs.Update(workCtx, conv); uErr == nil {
 					conv = updated
 				}
 			}
 		}
 	}
 
-	return &PreparedStream{
+	ps := &PreparedStream{
 		graphWrite:           assistantWrite,
 		maxToolRounds:        prep.mcpMaxToolRounds,
 		service:              s,
@@ -419,7 +468,22 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		insertAfterMessageID: prep.insertAfterMessageID,
 		autoCreateCache:      prep.autoCreateCache,
 		cacheScope:           prep.cacheScope,
-	}, nil
+		assistantID:          assistantID,
+		detachedRun:          detached,
+	}
+
+	if detached != nil {
+		detachedStarted = true
+		go func() {
+			defer func() {
+				detached.cancel()
+				s.runs.release(ps.conversation.ID, detached)
+			}()
+			_ = ps.runStream(workCtx, detached.publish, detached.setUsage, detached.snapshotState, true)
+		}()
+	}
+
+	return ps, nil
 }
 
 // PrepareLocal validates inputs, runs optional web search, plans stateless explicit cache steps,
@@ -1039,11 +1103,52 @@ func mergeRequestHeaders(encodedHeaders, endpointHeaders http.Header) http.Heade
 // Stream consumes upstream response bodies across tool-use rounds, translates events via emit,
 // handles cancellation, and persists the single resulting assistant message.
 func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEvent) error) error {
-	assistantID := domain.NewUUID()
-	if graphEnabled(p.conversation) && p.replaceMessageID != "" {
-		assistantID = p.replaceMessageID
+	if p.detachedRun != nil {
+		return p.detachedRun.subscribe(ctx, nil, emit)
 	}
 	acc := newStreamAccumulator()
+	applyAndEmit := func(ev domain.StreamEvent) error {
+		acc.apply(ev)
+		return emit(ev)
+	}
+	setUsage := func(u *domain.Usage) {
+		acc.usage = u
+	}
+	snapshotState := func() ([]domain.ContentBlock, *domain.Usage) {
+		return acc.blocksSlice(), acc.usage
+	}
+	return p.runStream(ctx, applyAndEmit, setUsage, snapshotState, false)
+}
+
+func (p *PreparedStream) runStream(
+	ctx context.Context,
+	applyAndEmit func(domain.StreamEvent) error,
+	setUsage func(*domain.Usage),
+	snapshotState func() ([]domain.ContentBlock, *domain.Usage),
+	emitAbortedEnd bool,
+) error {
+	assistantID := p.assistantID
+	if assistantID == "" {
+		assistantID = domain.NewUUID()
+		if graphEnabled(p.conversation) && p.replaceMessageID != "" {
+			assistantID = p.replaceMessageID
+		}
+	}
+
+	persistAndMaybeNotifyAbort := func() {
+		blocks, usage := snapshotState()
+		saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonAborted, "")
+		if emitAbortedEnd && persistErr == nil {
+			_ = applyAndEmit(domain.StreamEvent{
+				Type:           domain.StreamEventMessageEnd,
+				ConversationID: p.conversation.ID,
+				MessageID:      assistantID,
+				ProviderID:     p.provider.ID,
+				ModelID:        p.model.ID,
+				Message:        &saved,
+			})
+		}
+	}
 
 	startEvent := domain.StreamEvent{
 		Type:           domain.StreamEventMessageStart,
@@ -1052,9 +1157,9 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		ProviderID:     p.provider.ID,
 		ModelID:        p.model.ID,
 	}
-	if err := emit(startEvent); err != nil {
+	if err := applyAndEmit(startEvent); err != nil {
 		_ = p.resp.Body.Close()
-		_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+		persistAndMaybeNotifyAbort()
 		return err
 	}
 
@@ -1071,10 +1176,9 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 			BlockType:      domain.BlockTypeWebSearch,
 			Block:          p.webSearchBlock,
 		}
-		acc.apply(wsStart)
-		if err := emit(wsStart); err != nil {
+		if err := applyAndEmit(wsStart); err != nil {
 			_ = p.resp.Body.Close()
-			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			persistAndMaybeNotifyAbort()
 			return err
 		}
 
@@ -1088,10 +1192,9 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 			BlockType:      domain.BlockTypeWebSearch,
 			Block:          p.webSearchBlock,
 		}
-		acc.apply(wsEnd)
-		if err := emit(wsEnd); err != nil {
+		if err := applyAndEmit(wsEnd); err != nil {
 			_ = p.resp.Body.Close()
-			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			persistAndMaybeNotifyAbort()
 			return err
 		}
 		indexOffset = 1
@@ -1190,16 +1293,15 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 				}
 			}
 
-			acc.apply(ev)
 			if ev.Type == domain.StreamEventError && ev.Error != nil {
 				streamErrMsg = ev.Error.Message
 			}
-			return emit(ev)
+			return applyAndEmit(ev)
 		})
 		_ = resp.Body.Close()
 
 		if ctx.Err() != nil || errors.Is(decodeErr, context.Canceled) {
-			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			persistAndMaybeNotifyAbort()
 			return nil
 		}
 
@@ -1208,9 +1310,10 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 			if errMsg == "" && decodeErr != nil {
 				errMsg = decodeErr.Error()
 			}
-			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, errMsg)
+			blocks, usage := snapshotState()
+			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
 			if streamErrMsg == "" {
-				_ = emit(domain.StreamEvent{
+				_ = applyAndEmit(domain.StreamEvent{
 					Type:           domain.StreamEventError,
 					ConversationID: p.conversation.ID,
 					MessageID:      assistantID,
@@ -1226,7 +1329,7 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		}
 
 		cumulativeUsage = addUsage(cumulativeUsage, roundUsage)
-		acc.usage = cumulativeUsage
+		setUsage(cumulativeUsage)
 		indexOffset = maxSeenIdx + 1
 
 		effectiveStop := roundStop
@@ -1249,8 +1352,9 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 
 		if round >= maxRounds {
 			limitMsg := fmt.Sprintf("达到最大工具调用轮数上限（%d 轮）", maxRounds)
-			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, limitMsg)
-			_ = emit(domain.StreamEvent{
+			blocks, usage := snapshotState()
+			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, limitMsg)
+			_ = applyAndEmit(domain.StreamEvent{
 				Type:           domain.StreamEventError,
 				ConversationID: p.conversation.ID,
 				MessageID:      assistantID,
@@ -1266,12 +1370,12 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 
 		for _, tc := range roundCalls {
 			if ctx.Err() != nil {
-				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+				persistAndMaybeNotifyAbort()
 				return nil
 			}
 			trBlock, execErr := p.service.executeToolCall(ctx, p.toolBindings, tc)
 			if execErr != nil || ctx.Err() != nil {
-				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+				persistAndMaybeNotifyAbort()
 				return nil
 			}
 			resIdx := indexOffset
@@ -1287,9 +1391,8 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 				BlockType:      domain.BlockTypeToolResult,
 				Block:          &trCopy,
 			}
-			acc.apply(evStart)
-			if err := emit(evStart); err != nil {
-				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			if err := applyAndEmit(evStart); err != nil {
+				persistAndMaybeNotifyAbort()
 				return err
 			}
 			evEnd := domain.StreamEvent{
@@ -1302,24 +1405,24 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 				BlockType:      domain.BlockTypeToolResult,
 				Block:          &trCopy,
 			}
-			acc.apply(evEnd)
-			if err := emit(evEnd); err != nil {
-				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			if err := applyAndEmit(evEnd); err != nil {
+				persistAndMaybeNotifyAbort()
 				return err
 			}
 		}
 
 		if ctx.Err() != nil {
-			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+			persistAndMaybeNotifyAbort()
 			return nil
 		}
 
+		currentBlocks, _ := snapshotState()
 		nextHistory := make([]domain.Message, len(p.history)+1)
 		copy(nextHistory, p.history)
 		nextHistory[len(p.history)] = domain.Message{
 			ConversationID: p.conversation.ID,
 			Role:           domain.RoleAssistant,
-			Blocks:         filterBlocksForModelHistory(acc.blocksSlice()),
+			Blocks:         filterBlocksForModelHistory(currentBlocks),
 			ProviderID:     p.provider.ID,
 			ModelID:        p.model.ID,
 		}
@@ -1348,12 +1451,13 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 			)
 			if planErr != nil {
 				if ctx.Err() != nil {
-					_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+					persistAndMaybeNotifyAbort()
 					return nil
 				}
 				errMsg := planErr.Error()
-				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, errMsg)
-				_ = emit(domain.StreamEvent{
+				blocks, usage := snapshotState()
+				_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
+				_ = applyAndEmit(domain.StreamEvent{
 					Type:           domain.StreamEventError,
 					ConversationID: p.conversation.ID,
 					MessageID:      assistantID,
@@ -1377,12 +1481,13 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		)
 		if openErr != nil {
 			if ctx.Err() != nil {
-				_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonAborted, "")
+				persistAndMaybeNotifyAbort()
 				return nil
 			}
 			errMsg := openErr.Error()
-			_, _ = p.persistResult(ctx, assistantID, acc, domain.StopReasonError, errMsg)
-			_ = emit(domain.StreamEvent{
+			blocks, usage := snapshotState()
+			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
+			_ = applyAndEmit(domain.StreamEvent{
 				Type:           domain.StreamEventError,
 				ConversationID: p.conversation.ID,
 				MessageID:      assistantID,
@@ -1395,9 +1500,10 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		resp = nextResp
 	}
 
-	saved, persistErr := p.persistResult(ctx, assistantID, acc, finalStopReason, "")
+	blocks, usage := snapshotState()
+	saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, finalStopReason, "")
 	if persistErr != nil {
-		_ = emit(domain.StreamEvent{
+		_ = applyAndEmit(domain.StreamEvent{
 			Type:           domain.StreamEventError,
 			ConversationID: p.conversation.ID,
 			MessageID:      assistantID,
@@ -1410,7 +1516,7 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 		})
 		return nil
 	}
-	return emit(domain.StreamEvent{
+	return applyAndEmit(domain.StreamEvent{
 		Type:           domain.StreamEventMessageEnd,
 		ConversationID: p.conversation.ID,
 		MessageID:      assistantID,
@@ -1423,7 +1529,8 @@ func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEven
 func (p *PreparedStream) persistResult(
 	ctx context.Context,
 	assistantID string,
-	acc *streamAccumulator,
+	blocks []domain.ContentBlock,
+	usage *domain.Usage,
 	stopReason string,
 	errMsg string,
 ) (domain.Message, error) {
@@ -1431,7 +1538,6 @@ func (p *PreparedStream) persistResult(
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 
-	blocks := acc.blocksSlice()
 	msg := domain.Message{
 		ID:             assistantID,
 		GraphWrite:     p.graphWrite,
@@ -1440,7 +1546,7 @@ func (p *PreparedStream) persistResult(
 		Blocks:         blocks,
 		ProviderID:     p.provider.ID,
 		ModelID:        p.model.ID,
-		Usage:          acc.usage,
+		Usage:          usage,
 		StopReason:     stopReason,
 		ErrorMessage:   errMsg,
 		CreatedAt:      time.Now().UTC(),
@@ -1465,12 +1571,14 @@ func (p *PreparedStream) persistResult(
 }
 
 type blockAccum struct {
-	blockType string
-	id        string
-	name      string
-	text      strings.Builder
-	signature strings.Builder
-	finalized *domain.ContentBlock
+	blockType  string
+	id         string
+	name       string
+	startBlock *domain.ContentBlock
+	completed  bool
+	text       strings.Builder
+	signature  strings.Builder
+	finalized  *domain.ContentBlock
 }
 
 type streamAccumulator struct {
@@ -1497,8 +1605,13 @@ func (a *streamAccumulator) apply(ev domain.StreamEvent) {
 			a.order = append(a.order, idx)
 			b := &blockAccum{blockType: ev.BlockType}
 			if ev.Block != nil {
+				cp := *ev.Block
+				b.startBlock = &cp
 				b.id = ev.Block.ID
 				b.name = ev.Block.Name
+				if b.blockType == "" {
+					b.blockType = ev.Block.Type
+				}
 			}
 			a.blocks[idx] = b
 		}
@@ -1519,17 +1632,24 @@ func (a *streamAccumulator) apply(ev domain.StreamEvent) {
 			b.text.WriteString(ev.Delta)
 		}
 	case domain.StreamEventBlockEnd:
-		if ev.Index == nil || ev.Block == nil {
+		if ev.Index == nil {
 			return
 		}
 		b, ok := a.blocks[*ev.Index]
 		if !ok {
-			b = &blockAccum{blockType: ev.Block.Type}
+			bt := ev.BlockType
+			if bt == "" && ev.Block != nil {
+				bt = ev.Block.Type
+			}
+			b = &blockAccum{blockType: bt}
 			a.order = append(a.order, *ev.Index)
 			a.blocks[*ev.Index] = b
 		}
-		cp := *ev.Block
-		b.finalized = &cp
+		b.completed = true
+		if ev.Block != nil {
+			cp := *ev.Block
+			b.finalized = &cp
+		}
 	case domain.StreamEventMessageDelta:
 		if ev.Usage != nil {
 			a.usage = ev.Usage
@@ -1564,13 +1684,22 @@ func (a *streamAccumulator) blocksSlice() []domain.ContentBlock {
 					args = json.RawMessage(encoded)
 				}
 			}
+			var source string
+			if b.startBlock != nil {
+				source = b.startBlock.ToolSource
+			}
 			out = append(out, domain.ContentBlock{
-				Type:      domain.BlockTypeToolCall,
-				ID:        b.id,
-				Name:      b.name,
-				Arguments: args,
+				Type:       domain.BlockTypeToolCall,
+				ID:         b.id,
+				Name:       b.name,
+				ToolSource: source,
+				Arguments:  args,
 			})
 		default:
+			if b.startBlock != nil && b.blockType != domain.BlockTypeText {
+				out = append(out, *b.startBlock)
+				continue
+			}
 			out = append(out, domain.ContentBlock{
 				Type: domain.BlockTypeText,
 				Text: b.text.String(),

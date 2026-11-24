@@ -14,6 +14,7 @@ import { GatewayError } from '../../core/gateway';
 import { decodeUpstreamSseStream } from '../../core/localStreamDecoders';
 import { decodeSseByteStream, parseStreamEventFrame } from '../../core/sse';
 import type {
+  ActiveRunInfo,
   CompactionMeta,
   ContentBlock,
   Conversation,
@@ -114,6 +115,7 @@ export interface ChatContextValue {
     scope?: TopicScope,
   ) => Promise<ConversationDetail | null>;
   applyBranchedDetail: (detail: ConversationDetail, scope?: TopicScope) => void;
+  detachStream: () => void;
   stopStreaming: () => void;
 }
 
@@ -188,6 +190,8 @@ interface GenerationRun {
   conversationId: string;
   scope: TopicScope | undefined;
   ctrl: AbortController;
+  detachedAgent: boolean;
+  detached: boolean;
   aborted: boolean;
   released: boolean;
 }
@@ -200,6 +204,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     resources,
     settings: { mcpMaxToolRounds },
     connectionEpoch,
+    markConversationRunning,
     upsertLocalConversation,
     toast,
   } = useApp();
@@ -251,13 +256,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const cancelActiveStream = useCallback((_quiet: boolean) => {
+  const detachStream = useCallback(() => {
     epochRef.current += 1;
     if (activeGenRef.current) {
       const run = activeGenRef.current;
       activeGenRef.current = null;
       run.released = true;
-      run.aborted = true;
+      if (run.detachedAgent) {
+        run.detached = true;
+      } else {
+        run.aborted = true;
+      }
       run.ctrl.abort();
       setIsGenerating(false);
     }
@@ -286,7 +295,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         const run = activeGenRef.current;
         activeGenRef.current = null;
         run.released = true;
-        run.aborted = true;
+        if (run.detachedAgent) {
+          run.detached = true;
+        } else {
+          run.aborted = true;
+        }
         run.ctrl.abort();
         setIsGenerating(false);
       }
@@ -296,15 +309,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       }
       return;
     }
-    cancelActiveStream(true);
+    detachStream();
     dispatch({ type: 'CLEAR_SESSION' });
-  }, [connectionEpoch, cancelActiveStream]);
+  }, [connectionEpoch, detachStream]);
 
   useEffect(() => {
     return () => {
-      cancelActiveStream(true);
+      detachStream();
     };
-  }, [cancelActiveStream]);
+  }, [detachStream]);
 
   const isBusy =
     state.runState === 'loading' || state.runState === 'streaming' || isGenerating;
@@ -317,52 +330,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const clearSession = useCallback(() => {
-    cancelActiveStream(true);
+    detachStream();
     dispatch({ type: 'CLEAR_SESSION' });
-  }, [cancelActiveStream]);
-
-  const loadConversation = useCallback(
-    async (
-      conversationId: string,
-      explicitScope?: TopicScope,
-    ): Promise<ConversationDetail | null> => {
-      cancelActiveStream(true);
-      const reqScope = isDesktop ? (explicitScope ?? topicScopeRef.current) : undefined;
-      if (sessionScopeRef.current !== reqScope) dispatch({ type: 'CLEAR_SESSION' });
-      sessionScopeRef.current = reqScope;
-      const epoch = ++epochRef.current;
-      const ctrl = new AbortController();
-      loadAbortRef.current = ctrl;
-      loadConnectionEpochRef.current = connectionEpochRef.current;
-      dispatch({ type: 'LOAD_START', conversationId });
-      try {
-        const detail = await gateway.getConversationDetail(
-          conversationId,
-          ctrl.signal,
-          reqScope,
-        );
-        if (epoch !== epochRef.current) return null;
-        dispatch({
-          type: 'LOAD_SUCCESS',
-          conversation: detail.conversation,
-          messages: detail.messages,
-        });
-        upsertLocalConversation(detail.conversation, reqScope);
-        return detail;
-      } catch (err) {
-        if (epoch !== epochRef.current || isAbortError(err)) return null;
-        const e = formatError(err);
-        dispatch({ type: 'LOAD_ERROR', code: e.code, message: e.message });
-        return null;
-      } finally {
-        if (loadAbortRef.current === ctrl) {
-          loadAbortRef.current = null;
-          loadConnectionEpochRef.current = null;
-        }
-      }
-    },
-    [cancelActiveStream, gateway, isDesktop, upsertLocalConversation],
-  );
+  }, [detachStream]);
 
   const reconcileAfterStream = useCallback(
     async (
@@ -419,6 +389,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           conversation: detail.conversation,
           messages: detail.messages,
         });
+        markConversationRunning(
+          detail.conversation.id,
+          Boolean(detail.activeRun || detail.conversation.running),
+          reqScope,
+        );
         upsertLocalConversation(detail.conversation, reqScope);
       } catch {
         if (!isCurrent()) return;
@@ -427,7 +402,211 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
       }
     },
-    [gateway, resolveScope, upsertLocalConversation],
+    [gateway, markConversationRunning, resolveScope, upsertLocalConversation],
+  );
+
+  const attachActiveRun = useCallback(
+    async (activeRun: ActiveRunInfo, reqScope?: TopicScope): Promise<void> => {
+      const epoch = epochRef.current;
+      const ctrl = new AbortController();
+      const run: GenerationRun = {
+        id: ++runSeqRef.current,
+        epoch,
+        connectionEpoch: connectionEpochRef.current,
+        conversationId: activeRun.conversationId,
+        scope: reqScope,
+        ctrl,
+        detachedAgent: true,
+        detached: false,
+        aborted: false,
+        released: false,
+      };
+      activeGenRef.current = run;
+      setIsGenerating(true);
+      markConversationRunning(activeRun.conversationId, true, reqScope);
+      dispatch({ type: 'ATTACH_RUN_START', run: activeRun });
+
+      let response: Response;
+      try {
+        response = await gateway.openRunStream(
+          activeRun.conversationId,
+          ctrl.signal,
+          reqScope,
+        );
+      } catch (err) {
+        releaseGeneration(run);
+        if (!isRunCurrent(run) || run.detached) return;
+        if (isAbortError(err) || run.aborted) {
+          markConversationRunning(activeRun.conversationId, false, reqScope);
+          dispatch({ type: 'ABORT_LOCAL' });
+          void reconcileAfterStream(
+            activeRun.conversationId,
+            run.epoch,
+            run.connectionEpoch,
+            { isAbort: true, minExpectedMessages: 0 },
+            reqScope,
+          );
+          return;
+        }
+        const e = formatError(err);
+        dispatch({ type: 'STREAM_NETWORK_ERROR', code: e.code, message: e.message });
+        return;
+      }
+
+      if (!isRunCurrent(run) || run.detached) {
+        await response.body?.cancel().catch(() => {});
+        releaseGeneration(run);
+        return;
+      }
+
+      if (response.status === 204) {
+        releaseGeneration(run);
+        markConversationRunning(activeRun.conversationId, false, reqScope);
+        void reconcileAfterStream(
+          activeRun.conversationId,
+          run.epoch,
+          run.connectionEpoch,
+          { isAbort: false, minExpectedMessages: 0 },
+          reqScope,
+        );
+        return;
+      }
+
+      let receivedMessageEnd = false;
+      let receivedStreamError = false;
+      try {
+        if (!response.body) {
+          throw new GatewayError('STREAM_EMPTY', '服务端未返回事件流');
+        }
+        for await (const frame of decodeSseByteStream(response.body)) {
+          if (!isRunCurrent(run) || run.detached) break;
+          let ev;
+          try {
+            ev = parseStreamEventFrame(frame);
+          } catch {
+            continue;
+          }
+          if (!ev) continue;
+
+          if (ev.type === 'message_end') {
+            receivedMessageEnd = true;
+          }
+          if (ev.type === 'error') {
+            receivedStreamError = true;
+          }
+
+          dispatch({
+            type: 'STREAM_EVENT',
+            event: ev,
+            fallbackProviderId: activeRun.providerId,
+            fallbackModelId: activeRun.modelId,
+          });
+
+          if (ev.type === 'error' || ev.type === 'message_end') {
+            break;
+          }
+        }
+
+        releaseGeneration(run);
+        if (!isRunCurrent(run) || run.detached) return;
+
+        markConversationRunning(activeRun.conversationId, false, reqScope);
+        if (receivedMessageEnd) {
+          void reconcileAfterStream(
+            activeRun.conversationId,
+            run.epoch,
+            run.connectionEpoch,
+            { isAbort: false, minExpectedMessages: 0 },
+            reqScope,
+          );
+          return;
+        }
+        if (run.aborted) {
+          dispatch({ type: 'ABORT_LOCAL' });
+          void reconcileAfterStream(
+            activeRun.conversationId,
+            run.epoch,
+            run.connectionEpoch,
+            { isAbort: true, minExpectedMessages: 0 },
+            reqScope,
+          );
+          return;
+        }
+        if (receivedStreamError) return;
+        dispatch({ type: 'STREAM_EOF_INCOMPLETE' });
+      } catch (err) {
+        releaseGeneration(run);
+        if (!isRunCurrent(run) || run.detached) return;
+        if (isAbortError(err) || run.aborted) {
+          markConversationRunning(activeRun.conversationId, false, reqScope);
+          dispatch({ type: 'ABORT_LOCAL' });
+          void reconcileAfterStream(
+            activeRun.conversationId,
+            run.epoch,
+            run.connectionEpoch,
+            { isAbort: true, minExpectedMessages: 0 },
+            reqScope,
+          );
+          return;
+        }
+        const e = formatError(err);
+        dispatch({ type: 'STREAM_NETWORK_ERROR', code: e.code, message: e.message });
+      } finally {
+        releaseGeneration(run);
+      }
+    },
+    [gateway, isRunCurrent, markConversationRunning, reconcileAfterStream, releaseGeneration],
+  );
+
+  const loadConversation = useCallback(
+    async (
+      conversationId: string,
+      explicitScope?: TopicScope,
+    ): Promise<ConversationDetail | null> => {
+      detachStream();
+      const reqScope = isDesktop ? (explicitScope ?? topicScopeRef.current) : undefined;
+      if (sessionScopeRef.current !== reqScope) dispatch({ type: 'CLEAR_SESSION' });
+      sessionScopeRef.current = reqScope;
+      const epoch = ++epochRef.current;
+      const ctrl = new AbortController();
+      loadAbortRef.current = ctrl;
+      loadConnectionEpochRef.current = connectionEpochRef.current;
+      dispatch({ type: 'LOAD_START', conversationId });
+      try {
+        const detail = await gateway.getConversationDetail(
+          conversationId,
+          ctrl.signal,
+          reqScope,
+        );
+        if (epoch !== epochRef.current) return null;
+        dispatch({
+          type: 'LOAD_SUCCESS',
+          conversation: detail.conversation,
+          messages: detail.messages,
+        });
+        markConversationRunning(
+          detail.conversation.id,
+          Boolean(detail.activeRun || detail.conversation.running),
+          reqScope,
+        );
+        upsertLocalConversation(detail.conversation, reqScope);
+        if (detail.activeRun && epoch === epochRef.current) {
+          void attachActiveRun(detail.activeRun, reqScope);
+        }
+        return detail;
+      } catch (err) {
+        if (epoch !== epochRef.current || isAbortError(err)) return null;
+        const e = formatError(err);
+        dispatch({ type: 'LOAD_ERROR', code: e.code, message: e.message });
+        return null;
+      } finally {
+        if (loadAbortRef.current === ctrl) {
+          loadAbortRef.current = null;
+          loadConnectionEpochRef.current = null;
+        }
+      }
+    },
+    [attachActiveRun, detachStream, gateway, isDesktop, markConversationRunning, upsertLocalConversation],
   );
 
   const executeStream = useCallback(
@@ -457,6 +636,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const reqScope = opts.scope;
 
       let response: Response;
+      if (run.detachedAgent) {
+        markConversationRunning(opts.conversationId, true, reqScope);
+      }
       try {
         response = await gateway.openChatStream(
           opts.conversationId,
@@ -466,7 +648,27 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         );
       } catch (err) {
         releaseGeneration(run);
-        if (!isRunCurrent(run)) return false;
+        if (!isRunCurrent(run) || run.detached) return false;
+
+        if (
+          run.detachedAgent &&
+          err instanceof GatewayError &&
+          (err.code === 'CONFLICT' || err.statusCode === 409)
+        ) {
+          if (opts.optimisticUserId) {
+            dispatch({
+              type: 'SEND_PREPARE_ABORTED',
+              optimisticUserId: opts.optimisticUserId,
+            });
+            opts.onPrepareRollback?.();
+          }
+          void loadConversation(opts.conversationId, reqScope);
+          return false;
+        }
+
+        if (run.detachedAgent) {
+          markConversationRunning(opts.conversationId, false, reqScope);
+        }
 
         if (isAbortError(err) && run.aborted) {
           if (opts.optimisticUserId) {
@@ -500,10 +702,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return false;
       }
 
-      if (!isRunCurrent(run) || run.aborted || run.ctrl.signal.aborted) {
+      if (!isRunCurrent(run) || run.detached || (!run.detachedAgent && (run.aborted || run.ctrl.signal.aborted))) {
         await response.body?.cancel().catch(() => {});
         releaseGeneration(run);
-        if (isRunCurrent(run) && run.aborted) {
+        if (isRunCurrent(run) && !run.detached && run.aborted) {
           if (opts.optimisticUserId) {
             dispatch({
               type: 'SEND_PREPARE_ABORTED',
@@ -534,7 +736,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           throw new GatewayError('STREAM_EMPTY', '服务端未返回事件流');
         }
         for await (const frame of decodeSseByteStream(response.body)) {
-          if (!isRunCurrent(run) || run.aborted) break;
+          if (!isRunCurrent(run) || run.detached || (!run.detachedAgent && run.aborted)) break;
           let ev;
           try {
             ev = parseStreamEventFrame(frame);
@@ -557,15 +759,19 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             fallbackModelId: opts.input.modelId,
           });
 
-          if (ev.type === 'error') {
+          if (ev.type === 'error' || (run.detachedAgent && ev.type === 'message_end')) {
             break;
           }
         }
 
         releaseGeneration(run);
-        if (!isRunCurrent(run)) return false;
+        if (!isRunCurrent(run) || run.detached) return false;
 
-        if (run.aborted) {
+        if (run.detachedAgent) {
+          markConversationRunning(opts.conversationId, false, reqScope);
+        }
+
+        if (run.aborted && !receivedMessageEnd) {
           dispatch({ type: 'ABORT_LOCAL' });
           void reconcileAfterStream(
             opts.conversationId,
@@ -600,10 +806,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           },
           reqScope,
         );
-        return true;
+        return !run.aborted;
       } catch (err) {
         releaseGeneration(run);
-        if (!isRunCurrent(run)) return false;
+        if (!isRunCurrent(run) || run.detached) return false;
+        if (run.detachedAgent) {
+          markConversationRunning(opts.conversationId, false, reqScope);
+        }
         if (isAbortError(err) || run.aborted) {
           dispatch({ type: 'ABORT_LOCAL' });
           void reconcileAfterStream(
@@ -629,7 +838,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         releaseGeneration(run);
       }
     },
-    [gateway, isRunCurrent, reconcileAfterStream, releaseGeneration],
+    [gateway, isRunCurrent, loadConversation, markConversationRunning, reconcileAfterStream, releaseGeneration],
   );
 
   const sendLocalHttpFetch = useCallback(
@@ -1452,6 +1661,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         conversationId: opts.conversationId ?? '',
         scope: reqScope,
         ctrl,
+        detachedAgent: false,
+        detached: false,
         aborted: false,
         released: false,
       };
@@ -1485,6 +1696,9 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       opts.onOptimisticStart?.();
 
       let mode = opts.conversationMode ?? stateRef.current.conversation?.mode;
+      let ephemeral = Boolean(
+        opts.conversation?.ephemeral ?? stateRef.current.conversation?.ephemeral,
+      );
       let targetConvId = opts.conversationId ?? '';
       if (!targetConvId) {
         if (!opts.ensureConversation) {
@@ -1515,6 +1729,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           }
           targetConvId = created.id;
           mode = created.mode ?? mode;
+          ephemeral = Boolean(created.ephemeral);
           run.conversationId = targetConvId;
           dispatch({
             type: 'UPDATE_CONVERSATION_META',
@@ -1549,6 +1764,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         Boolean(
           resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
         );
+      run.detachedAgent = !useBrowserLocalRequest && mode === 'agent' && !ephemeral;
       const streamRunner = useBrowserLocalRequest ? executeLocalStream : executeStream;
       return streamRunner({
         conversationId: targetConvId,
@@ -1602,6 +1818,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const ctrl = new AbortController();
       const reqScope = resolveScope(opts.scope);
       sessionScopeRef.current = reqScope;
+      const useBrowserLocalRequest =
+        !isDesktop &&
+        conv.mode !== 'agent' &&
+        Boolean(
+          resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
+        );
       const run: GenerationRun = {
         id: ++runSeqRef.current,
         epoch,
@@ -1609,6 +1831,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         conversationId: conv.id,
         scope: reqScope,
         ctrl,
+        detachedAgent: !useBrowserLocalRequest && conv.mode === 'agent' && !conv.ephemeral,
+        detached: false,
         aborted: false,
         released: false,
       };
@@ -1624,12 +1848,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         placeholderAssistantId,
       });
 
-      const useBrowserLocalRequest =
-        !isDesktop &&
-        conv.mode !== 'agent' &&
-        Boolean(
-          resources.providers.find((p) => p.id === opts.providerId)?.localRequest,
-        );
       const streamRunner = useBrowserLocalRequest ? executeLocalStream : executeStream;
       return streamRunner({
         conversationId: conv.id,
@@ -1662,9 +1880,20 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const stopStreaming = useCallback(() => {
     const run = activeGenRef.current;
     if (!run) return;
+    if (run.detachedAgent && run.conversationId) {
+      if (run.aborted) return;
+      run.aborted = true;
+      void gateway.cancelConversationRun(run.conversationId, run.scope).catch(() => {});
+      window.setTimeout(() => {
+        if (activeGenRef.current === run && !run.ctrl.signal.aborted) {
+          run.ctrl.abort();
+        }
+      }, 2500);
+      return;
+    }
     run.aborted = true;
     run.ctrl.abort();
-  }, []);
+  }, [gateway]);
 
   const reloadCurrentConversation = useCallback(async () => {
     const convId = stateRef.current.conversation?.id;
@@ -2036,7 +2265,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   const applyBranchedDetail = useCallback(
     (detail: ConversationDetail, scope?: TopicScope) => {
-      cancelActiveStream(true);
+      detachStream();
       const reqScope = resolveScope(scope);
       sessionScopeRef.current = reqScope;
       upsertLocalConversation(detail.conversation, reqScope);
@@ -2046,7 +2275,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         messages: detail.messages,
       });
     },
-    [cancelActiveStream, resolveScope, upsertLocalConversation],
+    [detachStream, resolveScope, upsertLocalConversation],
   );
 
   const mutateGraph = useCallback(async (input: GraphMutationInput, scope?: TopicScope) => {
@@ -2092,6 +2321,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       deleteMessage,
       branchFromMessage,
       applyBranchedDetail,
+      detachStream,
       stopStreaming,
     }),
     [
@@ -2113,6 +2343,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       deleteMessage,
       branchFromMessage,
       applyBranchedDetail,
+      detachStream,
       stopStreaming,
     ],
   );

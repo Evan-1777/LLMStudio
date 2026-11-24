@@ -170,6 +170,7 @@ export function ConversationSidebar({
     applyConversationOrganizationSnapshot,
     uploadConversations,
     pullConversations,
+    runningConversationIds,
     toast,
   } = useApp();
 
@@ -1442,6 +1443,23 @@ export function ConversationSidebar({
                                     </span>
                                     <span className="wb-topic-row__sub">
                                       {conv.mode === 'agent' && <span className="wb-topic-agent" title="Agent"><Icon name="terminal" size={13} /><span className="sr-only">Agent</span></span>}
+                                      {runningConversationIds.has(conv.id) ? (
+                                        <span
+                                          className="wb-topic-running"
+                                          role="status"
+                                          aria-label="运行中"
+                                          title="后台运行中"
+                                        >
+                                          <span
+                                            className="ui-spinner ui-spinner--sm wb-topic-running__spinner"
+                                            aria-hidden="true"
+                                          />
+                                          <span
+                                            className="wb-topic-running__dot"
+                                            aria-hidden="true"
+                                          />
+                                        </span>
+                                      ) : null}
                                       <span className="wb-topic-row__time">
                                         {formatShortTime(
                                           conv.updatedAt || conv.createdAt,
@@ -1898,6 +1916,12 @@ export function ConversationSidebar({
           setViewingEntry(nextEntry);
           setFileDirsRefreshTrigger((prev) => ({
             dirs: [parentDirOf(oldPath), parentDirOf(nextEntry.path)],
+            seq: (prev?.seq ?? 0) + 1,
+          }));
+        }}
+        onCopied={(dir) => {
+          setFileDirsRefreshTrigger((prev) => ({
+            dirs: [dir],
             seq: (prev?.seq ?? 0) + 1,
           }));
         }}

@@ -165,6 +165,7 @@ function WorkbenchInner() {
     updateMessage,
     deleteMessage,
     branchFromMessage,
+    detachStream,
     stopStreaming,
   } = useChat();
 
@@ -538,7 +539,7 @@ function WorkbenchInner() {
   const handleChangeScope = useCallback(
     (nextScope: TopicScope) => {
       if (!isDesktop || nextScope === activeScope) return;
-      stopStreaming();
+      detachStream();
       discardRef.current();
       setIsTemporaryMode(false);
       clearSession();
@@ -561,11 +562,11 @@ function WorkbenchInner() {
       buildChatUrl,
       clearSession,
       conversationId,
+      detachStream,
       isDesktop,
       navigate,
       setSearchParams,
       setTopicScope,
-      stopStreaming,
     ],
   );
 
@@ -582,7 +583,7 @@ function WorkbenchInner() {
 
   const handleStartNewTopic = useCallback(() => {
     setDraftAgent(undefined);
-    stopStreaming();
+    detachStream();
     discardTemporarySession();
     setIsTemporaryMode(false);
     clearSession();
@@ -594,13 +595,13 @@ function WorkbenchInner() {
     buildChatUrl,
     clearSession,
     closeDrawers,
+    detachStream,
     discardTemporarySession,
     navigate,
-    stopStreaming,
   ]);
 
   const handleToggleTemporaryMode = useCallback(() => {
-    stopStreaming();
+    detachStream();
     discardTemporarySession();
     clearSession();
     setDraftSessionParams({ systemPrompt: '', params: {} });
@@ -616,10 +617,10 @@ function WorkbenchInner() {
     buildChatUrl,
     clearSession,
     conversationId,
+    detachStream,
     discardTemporarySession,
     isTemporaryMode,
     navigate,
-    stopStreaming,
   ]);
 
   useEffect(() => {
@@ -681,7 +682,7 @@ function WorkbenchInner() {
 
   const handleSelectAssistant = (assistantId: string) => {
     if (assistantId !== activeAssistant.id) {
-      stopStreaming();
+      detachStream();
       discardTemporarySession();
       setIsTemporaryMode(false);
       setSelectedAssistantId(assistantId);
@@ -705,7 +706,7 @@ function WorkbenchInner() {
   const handleSelectConversation = (id: string) => {
     setDraftAgent(undefined);
     if (id !== conversationId || isTemporaryMode) {
-      stopStreaming();
+      detachStream();
       discardTemporarySession();
       setIsTemporaryMode(false);
       navigate(buildChatUrl(id));

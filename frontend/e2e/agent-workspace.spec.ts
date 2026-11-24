@@ -388,3 +388,113 @@ test('hands off workspace menus to dialogs and reveals created and moved entries
     await touchContext.close();
   }
 });
+
+test('operates file viewer ellipsis menu above modal dialog across viewports, dirty state, and full file actions', async ({
+  page,
+  appUrl,
+  agentWorkspaceDir,
+}) => {
+  fs.mkdirSync(path.join(agentWorkspaceDir, 'archive'), { recursive: true });
+  fs.writeFileSync(path.join(agentWorkspaceDir, 'readme.md'), '# Original\n\nBody text.');
+  await connectWithToken(page, appUrl);
+
+  await page.getByRole('radio', { name: '工作区文件' }).click();
+  await page.getByRole('treeitem', { name: 'readme.md' }).click();
+  const viewer = page.getByRole('dialog');
+  await expect(viewer).toBeVisible();
+
+  const moreBtn = viewer.getByRole('button', { name: '文件操作' });
+
+  // Verify ellipsis menu sits above modal dialog and receives pointer hit-testing across viewports & themes.
+  for (const width of [1280, 375]) {
+    await page.setViewportSize({ width, height: 800 });
+    for (const colorScheme of ['light', 'dark'] as const) {
+      await page.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
+      await moreBtn.click();
+      const menu = page.getByRole('menu');
+      await expect(menu).toBeVisible();
+      const copyPathItem = menu.getByRole('menuitem', { name: '复制路径' });
+      const box = await copyPathItem.boundingBox();
+      expect(box).not.toBeNull();
+      const topHit = await page.evaluate(
+        ({ x, y }) => {
+          const el = document.elementFromPoint(x, y);
+          return Boolean(el?.closest('[role="menu"]'));
+        },
+        { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 },
+      );
+      expect(topHit).toBe(true);
+      expect(
+        await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth),
+      ).toBe(true);
+      // Escape closes only the menu, never the viewer.
+      await page.keyboard.press('Escape');
+      await expect(menu).toBeHidden();
+      await expect(viewer).toBeVisible();
+    }
+  }
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'no-preference' });
+
+  // Edit to dirty state: clicking 复制路径 must not close viewer or open discard confirm.
+  await viewer.getByRole('radio', { name: '编辑' }).click();
+  const editor = viewer.getByLabel('文件内容编辑');
+  await editor.fill('# Modified Unsaved');
+  await moreBtn.click();
+  await page.getByRole('menuitem', { name: '复制路径' }).click();
+  await expect(viewer).toBeVisible();
+  await expect(page.getByRole('dialog', { name: '放弃未保存的更改？' })).toHaveCount(0);
+
+  // Undo dirty state so copy/move/rename are enabled.
+  await viewer.getByRole('button', { name: '撤销修改' }).click();
+  await expect(editor).toHaveValue('# Original\n\nBody text.');
+
+  // Duplicate via menu.
+  await moreBtn.click();
+  await page.getByRole('menuitem', { name: '创建副本' }).click();
+  await expect.poll(() => fs.existsSync(path.join(agentWorkspaceDir, 'readme copy.md'))).toBe(true);
+
+  // Move to archive/ via menu.
+  await moreBtn.click();
+  await page.getByRole('menuitem', { name: '移动到' }).click();
+  const moveDialog = page.getByRole('dialog', { name: '移动「readme.md」' });
+  await expect(moveDialog).toBeVisible();
+  await moveDialog.getByRole('listitem', { name: 'archive' }).click();
+  await moveDialog.getByRole('button', { name: '移至此处' }).click();
+  await expect(moveDialog).toBeHidden();
+  await expect.poll(() => fs.existsSync(path.join(agentWorkspaceDir, 'archive', 'readme.md'))).toBe(true);
+  await expect(viewer.getByRole('heading', { name: 'archive/readme.md' })).toBeVisible();
+
+  // Rename via menu.
+  await moreBtn.click();
+  await page.getByRole('menuitem', { name: '重命名' }).click();
+  const renameDialog = page.getByRole('dialog', { name: '重命名' });
+  await expect(renameDialog).toBeVisible();
+  await renameDialog.getByLabel('名称').fill('guide.md');
+  await renameDialog.getByRole('button', { name: '重命名' }).click();
+  await expect(renameDialog).toBeHidden();
+  await expect.poll(() => fs.existsSync(path.join(agentWorkspaceDir, 'archive', 'guide.md'))).toBe(true);
+  await expect(viewer.getByRole('heading', { name: 'archive/guide.md' })).toBeVisible();
+
+  // Download via menu.
+  const dlRespPromise = page.waitForResponse(
+    (r) => r.url().includes('/api/v1/agent/workspace/download') && r.request().method() === 'GET',
+  );
+  const downloadPromise = page.waitForEvent('download');
+  await moreBtn.click();
+  await page.getByRole('menuitem', { name: '下载' }).click();
+  const [dlResp, download] = await Promise.all([dlRespPromise, downloadPromise]);
+  expect(dlResp.status()).toBe(200);
+  expect(download.suggestedFilename()).toBe('guide.md');
+
+  // Delete via menu -> closes viewer and removes file from disk.
+  await moreBtn.click();
+  await page.getByRole('menuitem', { name: '删除' }).click();
+  const delConfirm = page.getByRole('dialog', { name: '删除文件？' });
+  await expect(delConfirm).toBeVisible();
+  await delConfirm.getByRole('button', { name: '删除' }).click();
+  await expect(delConfirm).toBeHidden();
+  await expect(viewer).toBeHidden();
+  await expect.poll(() => fs.existsSync(path.join(agentWorkspaceDir, 'archive', 'guide.md'))).toBe(false);
+  await expect(page.getByRole('treeitem', { name: 'readme copy.md' })).toBeVisible();
+});

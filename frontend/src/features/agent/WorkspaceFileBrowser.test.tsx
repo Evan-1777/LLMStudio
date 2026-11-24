@@ -539,7 +539,8 @@ describe('WorkspaceFileBrowser', () => {
     });
     await user.click(screen.getByRole('treeitem', { name: 'pic.png' }));
     await screen.findByText('图片暂不支持预览');
-    await user.click(screen.getByRole('button', { name: '下载文件' }));
+    await user.click(screen.getByRole('button', { name: '文件操作' }));
+    await user.click(await screen.findByRole('menuitem', { name: '下载' }));
     await waitFor(() => {
       expect(appState.gateway.downloadWorkspaceFile).toHaveBeenCalledWith('pic.png', undefined);
     });

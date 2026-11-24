@@ -2082,4 +2082,248 @@ describe('chatReducer and ChatProvider', () => {
     expect(screen.getByTestId('msg-ids')).toHaveTextContent('u-next-3');
     expect(screen.getByTestId('msg-ids')).toHaveTextContent('a-next-3');
   });
+
+  it('detaches Agent runs without canceling, auto-attaches activeRun on load, handles 204 and 409, and explicitly cancels on stopStreaming', async () => {
+    localStorage.clear();
+    const encoder = new TextEncoder();
+    const cancelCalls: string[] = [];
+    const runStreamCalls: string[] = [];
+    let nextRunStreamMode: 'live' | '204' = 'live';
+    let conflictOnNextSend = false;
+    let openStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+    let attachStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+
+    const agentConv: Conversation = {
+      ...makeConv('agent-1'),
+      mode: 'agent',
+      providerId: 'p1',
+      modelId: 'm1',
+    };
+    const otherConv: Conversation = {
+      ...makeConv('chat-2'),
+      mode: 'chat',
+      providerId: 'p1',
+      modelId: 'm1',
+    };
+    let persistedAgentMsgs: Message[] = [
+      {
+        id: 'u1',
+        conversationId: 'agent-1',
+        role: 'user',
+        blocks: [{ type: 'text', text: 'run task' }],
+        createdAt: '2026-11-24T00:00:00Z',
+      },
+    ];
+    let activeRunPayload: {
+      conversationId: string;
+      messageId: string;
+      providerId: string;
+      modelId: string;
+    } | undefined;
+
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+
+      if (url.endsWith('/api/v1/conversations/agent-1/messages/stream') && method === 'POST') {
+        if (conflictOnNextSend) {
+          conflictOnNextSend = false;
+          return new Response(
+            JSON.stringify({ code: 'CONFLICT', message: '该 Agent 话题正在运行中' }),
+            { status: 409, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            openStreamController = controller;
+            controller.enqueue(
+              encoder.encode(
+                `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', conversationId: 'agent-1', messageId: 'asst-live', providerId: 'p1', modelId: 'm1' })}\n\n`,
+              ),
+            );
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+
+      if (url.endsWith('/api/v1/conversations/agent-1/run/stream') && method === 'GET') {
+        runStreamCalls.push(url);
+        if (nextRunStreamMode === '204') {
+          return new Response(null, { status: 204 });
+        }
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            attachStreamController = controller;
+            controller.enqueue(
+              encoder.encode(
+                `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', conversationId: 'agent-1', messageId: 'asst-live', providerId: 'p1', modelId: 'm1' })}\n\n` +
+                  `event: block_start\ndata: ${JSON.stringify({ type: 'block_start', index: 0, blockType: 'text' })}\n\n` +
+                  `event: block_delta\ndata: ${JSON.stringify({ type: 'block_delta', index: 0, blockType: 'text', deltaType: 'text_delta', delta: 'reconnected-progress' })}\n\n`,
+              ),
+            );
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+
+      if (url.endsWith('/api/v1/conversations/agent-1/run/cancel') && method === 'POST') {
+        cancelCalls.push(url);
+        const abortedMsg: Message = {
+          id: 'asst-live',
+          conversationId: 'agent-1',
+          role: 'assistant',
+          blocks: [{ type: 'text', text: 'reconnected-progress' }],
+          stopReason: 'aborted',
+          createdAt: '2026-11-24T00:00:01Z',
+        };
+        persistedAgentMsgs = [persistedAgentMsgs[0], abortedMsg];
+        activeRunPayload = undefined;
+        attachStreamController?.enqueue(
+          encoder.encode(
+            `event: message_end\ndata: ${JSON.stringify({ type: 'message_end', conversationId: 'agent-1', messageId: 'asst-live', message: abortedMsg })}\n\n`,
+          ),
+        );
+        attachStreamController?.close();
+        return Response.json({ cancelled: true });
+      }
+
+      if (url.endsWith('/api/v1/conversations/agent-1') && method === 'GET') {
+        return Response.json({
+          conversation: { ...agentConv, running: Boolean(activeRunPayload) },
+          messages: persistedAgentMsgs,
+          ...(activeRunPayload ? { activeRun: activeRunPayload } : {}),
+        });
+      }
+
+      if (url.endsWith('/api/v1/conversations/chat-2') && method === 'GET') {
+        return Response.json({ conversation: otherConv, messages: [] });
+      }
+
+      if (url.endsWith('/api/v1/agent/runs')) {
+        return Response.json({ conversationIds: activeRunPayload ? ['agent-1'] : [] });
+      }
+
+      return Response.json({});
+    });
+
+    function AgentRunHarness() {
+      const chat = useChat();
+      return (
+        <div>
+          <span data-testid="run-state">{chat.state.runState}</span>
+          <span data-testid="is-gen">{String(chat.isGenerating)}</span>
+          <span data-testid="msg-count">{chat.state.messages.length}</span>
+          <span data-testid="draft-text">
+            {chat.state.streaming
+              ? chat.state.streaming.blockOrder
+                  .map((i) => chat.state.streaming?.blocksByIndex[i]?.text ?? '')
+                  .join('')
+              : ''}
+          </span>
+          <button type="button" onClick={() => void chat.loadConversation('agent-1')}>
+            load-agent
+          </button>
+          <button type="button" onClick={() => void chat.loadConversation('chat-2')}>
+            load-other
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              void chat.sendMessage({
+                conversationId: 'agent-1',
+                conversationMode: 'agent',
+                blocks: [{ type: 'text', text: 'start agent' }],
+                text: 'start agent',
+                providerId: 'p1',
+                modelId: 'm1',
+              })
+            }
+          >
+            send-agent
+          </button>
+          <button type="button" onClick={() => chat.detachStream()}>
+            detach
+          </button>
+          <button type="button" onClick={() => chat.stopStreaming()}>
+            stop
+          </button>
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock} skipInitialBootstrap>
+        <MemoryRouter>
+          <ChatProvider>
+            <AgentRunHarness />
+          </ChatProvider>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    // 1. Start Agent stream -> switch to another topic -> MUST NOT call /run/cancel and clears isGenerating.
+    await user.click(screen.getByRole('button', { name: 'load-agent' }));
+    await waitFor(() => expect(screen.getByTestId('msg-count')).toHaveTextContent('1'));
+
+    await user.click(screen.getByRole('button', { name: 'send-agent' }));
+    await waitFor(() => expect(screen.getByTestId('is-gen')).toHaveTextContent('true'));
+    expect(openStreamController).not.toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'load-other' }));
+    await waitFor(() => expect(screen.getByTestId('is-gen')).toHaveTextContent('false'));
+    expect(cancelCalls).toHaveLength(0);
+
+    // 2. Reload Agent topic with activeRun -> auto-attaches to /run/stream with isGenerating=true -> explicit stop cancels backend.
+    activeRunPayload = {
+      conversationId: 'agent-1',
+      messageId: 'asst-live',
+      providerId: 'p1',
+      modelId: 'm1',
+    };
+    await user.click(screen.getByRole('button', { name: 'load-agent' }));
+    await waitFor(() => expect(runStreamCalls).toHaveLength(1));
+    await waitFor(() => expect(screen.getByTestId('is-gen')).toHaveTextContent('true'));
+    await waitFor(() => expect(screen.getByTestId('draft-text')).toHaveTextContent('reconnected-progress'));
+
+    await user.click(screen.getByRole('button', { name: 'stop' }));
+    await waitFor(() => expect(cancelCalls).toHaveLength(1));
+    await waitFor(() => expect(screen.getByTestId('run-state')).toHaveTextContent('aborted'));
+    expect(screen.getByTestId('is-gen')).toHaveTextContent('false');
+
+    // 3. When /run/stream returns 204 (finished right before attach), falls back to persisted detail silently.
+    nextRunStreamMode = '204';
+    activeRunPayload = {
+      conversationId: 'agent-1',
+      messageId: 'asst-live',
+      providerId: 'p1',
+      modelId: 'm1',
+    };
+    await user.click(screen.getByRole('button', { name: 'load-agent' }));
+    await waitFor(() => expect(runStreamCalls).toHaveLength(2));
+    await waitFor(() => expect(screen.getByTestId('is-gen')).toHaveTextContent('false'));
+    expect(screen.getByTestId('msg-count')).toHaveTextContent('2');
+
+    // 4. 409 CONFLICT on send rolls back optimistic user message and auto-attaches to activeRun.
+    conflictOnNextSend = true;
+    nextRunStreamMode = 'live';
+    activeRunPayload = {
+      conversationId: 'agent-1',
+      messageId: 'asst-live',
+      providerId: 'p1',
+      modelId: 'm1',
+    };
+    await user.click(screen.getByRole('button', { name: 'send-agent' }));
+    await waitFor(() => expect(runStreamCalls).toHaveLength(3));
+    await waitFor(() => expect(screen.getByTestId('is-gen')).toHaveTextContent('true'));
+    expect(screen.getByTestId('msg-count')).toHaveTextContent('2');
+    await user.click(screen.getByRole('button', { name: 'detach' }));
+    expect(cancelCalls).toHaveLength(1);
+  });
 });
