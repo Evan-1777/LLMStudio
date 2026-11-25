@@ -8,7 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -99,7 +99,7 @@ func RunMigrations(ctx context.Context, db *sql.DB) error {
 			files = append(files, entry.Name())
 		}
 	}
-	sort.Strings(files)
+	slices.Sort(files)
 
 	for _, name := range files {
 		var exists int

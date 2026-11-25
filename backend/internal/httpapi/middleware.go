@@ -76,7 +76,7 @@ func AuthMiddleware(accessToken string, devMode bool, next http.Handler) http.Ha
 			return
 		}
 
-		token, ok := extractBearerToken(r.Header.Get("Authorization"))
+		token, ok := ExtractBearerToken(r.Header.Get("Authorization"))
 		if !ok {
 			WriteError(w, http.StatusUnauthorized, "UNAUTHORIZED", "missing or invalid bearer token")
 			return
@@ -94,7 +94,8 @@ func requiresAuth(path string) bool {
 	return path == "/api" || strings.HasPrefix(path, "/api/")
 }
 
-func extractBearerToken(header string) (string, bool) {
+// ExtractBearerToken parses an HTTP Authorization Bearer header value.
+func ExtractBearerToken(header string) (string, bool) {
 	if len(header) < 7 || !strings.EqualFold(header[:7], "Bearer ") {
 		return "", false
 	}

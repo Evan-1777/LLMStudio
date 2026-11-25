@@ -1,8 +1,6 @@
 package httpapi
 
 import (
-	"encoding/json"
-	"fmt"
 	"net/http"
 
 	"llmstudio/backend/internal/domain"
@@ -33,48 +31,15 @@ func (h *ChatHandler) Stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-
-	rc := http.NewResponseController(w)
-	_ = rc.Flush()
-
-	_ = prepared.Stream(r.Context(), func(ev domain.StreamEvent) error {
-		payload, err := json.Marshal(ev)
-		if err != nil {
-			return err
-		}
-		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, payload); err != nil {
-			return err
-		}
-		return rc.Flush()
-	})
+	sse := NewSSEWriter(w)
+	sse.Start()
+	_ = prepared.Stream(r.Context(), sse.WriteEvent)
 }
 
 func (h *ChatHandler) AttachRunStream(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	rc := http.NewResponseController(w)
-	onReady := func() {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("X-Accel-Buffering", "no")
-		w.WriteHeader(http.StatusOK)
-		_ = rc.Flush()
-	}
-	attached, _ := h.svc.SubscribeRun(r.Context(), id, onReady, func(ev domain.StreamEvent) error {
-		payload, err := json.Marshal(ev)
-		if err != nil {
-			return err
-		}
-		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, payload); err != nil {
-			return err
-		}
-		return rc.Flush()
-	})
+	sse := NewSSEWriter(w)
+	attached, _ := h.svc.SubscribeRun(r.Context(), id, sse.Start, sse.WriteEvent)
 	if !attached {
 		w.WriteHeader(http.StatusNoContent)
 	}
@@ -161,54 +126,7 @@ func (h *ChatHandler) ExecuteTools(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	in.ConversationID = r.PathValue("id")
-	streamSSEToolEvents(w, in.ConversationID, func(emit func(domain.StreamEvent) error) error {
+	StreamSSEToolEvents(w, in.ConversationID, writeServiceError, func(emit func(domain.StreamEvent) error) error {
 		return h.svc.ExecuteTools(r.Context(), in, emit)
 	})
-}
-
-func streamSSEToolEvents(
-	w http.ResponseWriter,
-	conversationID string,
-	run func(emit func(domain.StreamEvent) error) error,
-) {
-	rc := http.NewResponseController(w)
-	headersSent := false
-	sendEvent := func(ev domain.StreamEvent) error {
-		if !headersSent {
-			headersSent = true
-			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-			w.Header().Set("X-Accel-Buffering", "no")
-			w.WriteHeader(http.StatusOK)
-			_ = rc.Flush()
-		}
-		payload, err := json.Marshal(ev)
-		if err != nil {
-			return err
-		}
-		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Type, payload); err != nil {
-			return err
-		}
-		return rc.Flush()
-	}
-
-	if err := run(sendEvent); err != nil {
-		if !headersSent {
-			writeServiceError(w, err)
-			return
-		}
-		_ = sendEvent(domain.StreamEvent{
-			Type:           domain.StreamEventError,
-			ConversationID: conversationID,
-			Error: &domain.StreamError{
-				Code:    domain.ErrCodeInternalError,
-				Message: err.Error(),
-			},
-		})
-	} else if !headersSent {
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		_ = rc.Flush()
-	}
 }

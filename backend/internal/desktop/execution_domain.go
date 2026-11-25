@@ -1,10 +1,10 @@
 package desktop
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -212,11 +212,8 @@ func (r *CompositeToolRuntime) ListScoped(ctx context.Context) ([]service.Scoped
 			}
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Scope != out[j].Scope {
-			return out[i].Scope < out[j].Scope
-		}
-		return out[i].Server.ID < out[j].Server.ID
+	slices.SortFunc(out, func(a, b service.ScopedMCPServer) int {
+		return cmp.Or(cmp.Compare(a.Scope, b.Scope), cmp.Compare(a.Server.ID, b.Server.ID))
 	})
 	return out, nil
 }

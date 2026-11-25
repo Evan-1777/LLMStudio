@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,7 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -267,8 +268,8 @@ func (r *FormatRegistry) List() []FormatInfo {
 			DefaultCompat: f.DefaultCompat(),
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].ID < out[j].ID
+	slices.SortFunc(out, func(a, b FormatInfo) int {
+		return cmp.Compare(a.ID, b.ID)
 	})
 	return out
 }

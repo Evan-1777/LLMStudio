@@ -1,8 +1,69 @@
 import remarkCjkFriendly from 'remark-cjk-friendly';
 import remarkMath from 'remark-math';
-import type { PluggableList } from 'unified';
+import type { PluggableList, Processor } from 'unified';
 
 type TokenizerState = (code: number | null) => TokenizerState | void;
+type MicromarkCallback = (code: number | null) => TokenizerState | void;
+
+interface MicromarkToken {
+  type: string;
+  start: unknown;
+  end: unknown;
+}
+
+interface MicromarkTokenizeContext {
+  events: MicromarkEvent[];
+  interrupt?: boolean;
+  now(): { line: number };
+  sliceSerialize(token: MicromarkToken, expandTabs?: boolean): string;
+  parser: {
+    lazy: Record<number, boolean | undefined>;
+    constructs: {
+      disable: {
+        null: string[];
+      };
+    };
+  };
+}
+
+type MicromarkEvent = ['enter' | 'exit', MicromarkToken, MicromarkTokenizeContext];
+
+interface MicromarkPartialConstruct {
+  partial: true;
+  tokenize(
+    this: MicromarkTokenizeContext,
+    effects: MicromarkEffects,
+    ok: MicromarkCallback,
+    nok: MicromarkCallback,
+  ): TokenizerState;
+}
+
+interface MicromarkEffects {
+  enter(type: string): MicromarkToken;
+  exit(type: string): MicromarkToken;
+  consume(code: number | null): void;
+  attempt(
+    construct: MicromarkPartialConstruct,
+    ok: MicromarkCallback,
+    nok: MicromarkCallback,
+  ): TokenizerState;
+}
+
+interface MdastCompileContext {
+  stack: NodeLike[];
+  enter(node: NodeLike, token: MicromarkToken): void;
+  exit(token: MicromarkToken): void;
+  buffer(): void;
+  resume(): string;
+}
+
+interface RemarkDataContainer {
+  micromarkExtensions?: Array<{
+    flow?: Record<number, unknown>;
+    text?: Record<number, unknown>;
+  }>;
+  fromMarkdownExtensions?: unknown[];
+}
 
 type NodeLike = {
   type: string;
@@ -46,10 +107,10 @@ const currencySafeDollarMathText = {
   previous(this: { events: Array<[string, { type: string }]> }, code: number | null) {
     return code !== 36 || this.events[this.events.length - 1]?.[1].type === 'characterEscape';
   },
-  tokenize(effects: any, ok: any, nok: any) {
+  tokenize(effects: MicromarkEffects, ok: MicromarkCallback, nok: MicromarkCallback) {
     let sizeOpen = 0;
     let size = 0;
-    let token: any;
+    let token: MicromarkToken | undefined;
     let lastNonSeqCode: number | null = null;
     let consecutiveNewlines = 0;
 
@@ -144,7 +205,7 @@ const currencySafeDollarMathText = {
             isLineEnding(lastNonSeqCode) ||
             isDigit(code)
           ) {
-            token.type = 'mathTextData';
+            if (token) token.type = 'mathTextData';
             lastNonSeqCode = 36;
             return data(code);
           }
@@ -153,12 +214,12 @@ const currencySafeDollarMathText = {
         effects.exit('mathText');
         return ok(code);
       }
-      token.type = 'mathTextData';
+      if (token) token.type = 'mathTextData';
       lastNonSeqCode = 36;
       return data(code);
     }
   },
-  resolve(events: any[]) {
+  resolve(events: MicromarkEvent[]) {
     let tailExitIndex = events.length - 4;
     let headEnterIndex = 3;
     if (
@@ -206,7 +267,7 @@ const currencySafeDollarMathText = {
 function createLatexBracketText() {
   return {
     name: 'latexBracketText',
-    tokenize(effects: any, ok: any, nok: any) {
+    tokenize(effects: MicromarkEffects, ok: MicromarkCallback, nok: MicromarkCallback) {
       let closeCode = 41;
       let outerType = 'mathText';
       let consecutiveNewlines = 0;
@@ -241,7 +302,7 @@ function createLatexBracketText() {
           return effects.attempt(
             {
               partial: true,
-              tokenize(eff: any, okClose: any, nokClose: any) {
+              tokenize(eff: MicromarkEffects, okClose: MicromarkCallback, nokClose: MicromarkCallback) {
                 return (c: number | null) => {
                   eff.enter('mathTextSequence');
                   eff.consume(c);
@@ -307,15 +368,20 @@ function createLatexBracketText() {
         return ok(code);
       }
     },
-    resolve(events: any[]) {
+    resolve(events: MicromarkEvent[]) {
       // Rename the probe token to the resolved math node and wrap the sequence.
       if (events.length < 2) return events;
       const openProbe = events[0][1];
       const isDisplay = events[0][2].sliceSerialize(openProbe) === '\\[';
       const outer = isDisplay ? 'latexDisplayText' : 'mathText';
       openProbe.type = 'mathTextSequence';
-      const wrapperEnter = ['enter', { type: outer, start: openProbe.start, end: events[events.length - 1][1].end }, events[0][2]];
-      const wrapperExit = ['exit', wrapperEnter[1], events[0][2]];
+      const wrapperToken: MicromarkToken = {
+        type: outer,
+        start: openProbe.start,
+        end: events[events.length - 1][1].end,
+      };
+      const wrapperEnter: MicromarkEvent = ['enter', wrapperToken, events[0][2]];
+      const wrapperExit: MicromarkEvent = ['exit', wrapperToken, events[0][2]];
       events.unshift(wrapperEnter);
       events.push(wrapperExit);
       return events;
@@ -327,9 +393,9 @@ function createLatexBracketText() {
  * Micromark flow construct for standalone \[ ... \] display math blocks (single-line or multi-line).
  */
 function createLatexBracketFlow() {
-  const nonLazyContinuation = {
+  const nonLazyContinuation: MicromarkPartialConstruct = {
     partial: true,
-    tokenize(this: any, effects: any, ok: any, nok: any) {
+    tokenize(this: MicromarkTokenizeContext, effects: MicromarkEffects, ok: MicromarkCallback, nok: MicromarkCallback) {
       const self = this;
       return (code: number | null) => {
         if (code === null) return ok(code);
@@ -345,7 +411,7 @@ function createLatexBracketFlow() {
   return {
     name: 'latexBracketFlow',
     concrete: true,
-    tokenize(this: any, effects: any, ok: any, nok: any) {
+    tokenize(this: MicromarkTokenizeContext, effects: MicromarkEffects, ok: MicromarkCallback, nok: MicromarkCallback) {
       const self = this;
       const tail = self.events[self.events.length - 1];
       const initialSize =
@@ -388,7 +454,7 @@ function createLatexBracketFlow() {
           return effects.attempt(
             {
               partial: true,
-              tokenize(eff: any, okClose: any, nokClose: any) {
+              tokenize(eff: MicromarkEffects, okClose: MicromarkCallback, nokClose: MicromarkCallback) {
                 return (c: number | null) => {
                   eff.enter('mathFlowFence');
                   eff.enter('mathFlowFenceSequence');
@@ -438,8 +504,12 @@ function createLatexBracketFlow() {
         return singleLineData;
       }
 
-      function skipTrailingSpaces(eff: any, okClose: any, nokClose: any) {
-        return function loop(c: number | null): any {
+      function skipTrailingSpaces(
+        eff: MicromarkEffects,
+        okClose: MicromarkCallback,
+        nokClose: MicromarkCallback,
+      ): TokenizerState {
+        return function loop(c: number | null): TokenizerState | void {
           if (c === 32 || c === 9) {
             eff.enter('whitespace');
             eff.consume(c);
@@ -468,7 +538,7 @@ function createLatexBracketFlow() {
       function contentStart(code: number | null) {
         if (initialSize > 0) {
           let skipped = 0;
-          const skipIndent = (c: number | null): any => {
+          const skipIndent: TokenizerState = (c: number | null) => {
             if (skipped < initialSize && c === 32) {
               skipped++;
               effects.enter('linePrefix');
@@ -506,12 +576,16 @@ function createLatexBracketFlow() {
         return ok(code);
       }
 
-      function tokenizeClosingLine(eff: any, okClose: any, nokClose: any) {
+      function tokenizeClosingLine(
+        eff: MicromarkEffects,
+        okClose: MicromarkCallback,
+        nokClose: MicromarkCallback,
+      ): TokenizerState {
         let indent = 0;
         const maxIndent = self.parser.constructs.disable.null.includes('codeIndented') ? Infinity : 3;
         return leadSpace;
 
-        function leadSpace(c: number | null): any {
+        function leadSpace(c: number | null): TokenizerState | void {
           if (c === 32 && indent < maxIndent) {
             indent++;
             eff.enter('linePrefix');
@@ -526,7 +600,7 @@ function createLatexBracketFlow() {
           return closeBracket;
         }
 
-        function closeBracket(c: number | null) {
+        function closeBracket(c: number | null): TokenizerState | void {
           if (c !== 93) return nokClose(c);
           eff.consume(c);
           eff.exit('mathFlowFenceSequence');
@@ -540,7 +614,7 @@ function createLatexBracketFlow() {
 function latexDisplayFromMarkdown() {
   return {
     enter: {
-      latexDisplayText(this: any, token: any) {
+      latexDisplayText(this: MdastCompileContext, token: MicromarkToken) {
         this.enter(
           {
             type: 'inlineMath',
@@ -553,7 +627,7 @@ function latexDisplayFromMarkdown() {
       },
     },
     exit: {
-      latexDisplayText(this: any, token: any) {
+      latexDisplayText(this: MdastCompileContext, token: MicromarkToken) {
         const data = this.resume();
         const node = this.stack[this.stack.length - 1];
         this.exit(token);
@@ -563,9 +637,9 @@ function latexDisplayFromMarkdown() {
   };
 }
 
-function remarkLatexExtensions(this: any) {
-  remarkMath.call(this);
-  const data = this.data();
+function remarkLatexExtensions(this: Processor) {
+  (remarkMath as (this: Processor) => void).call(this);
+  const data = this.data() as RemarkDataContainer;
   const micromarkExtensions = data.micromarkExtensions || (data.micromarkExtensions = []);
   const ext = micromarkExtensions[micromarkExtensions.length - 1];
   if (ext?.text) {

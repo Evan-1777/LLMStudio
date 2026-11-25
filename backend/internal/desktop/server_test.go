@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -133,6 +134,10 @@ func TestDesktopLoopbackServerAuthCORSAndRoutes(t *testing.T) {
 	optGood := doReq(http.MethodOptions, "/api/v1/desktop/status", "", "mygo://localhost", nil)
 	if optGood.Code != http.StatusNoContent || optGood.Header().Get("Access-Control-Allow-Origin") != "mygo://localhost" {
 		t.Fatalf("unexpected allowed CORS preflight: code=%d allow=%q", optGood.Code, optGood.Header().Get("Access-Control-Allow-Origin"))
+	}
+	exposeHeaders := optGood.Header().Get("Access-Control-Expose-Headers")
+	if !strings.Contains(exposeHeaders, "ETag") || !strings.Contains(exposeHeaders, "Content-Disposition") {
+		t.Fatalf("expected Access-Control-Expose-Headers to contain ETag and Content-Disposition, got %q", exposeHeaders)
 	}
 	optBad := doReq(http.MethodOptions, "/api/v1/desktop/status", "", "https://evil.example", nil)
 	if optBad.Header().Get("Access-Control-Allow-Origin") != "" {

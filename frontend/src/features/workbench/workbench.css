@@ -211,26 +211,6 @@
   gap: 6px;
 }
 
-.wb-settings-link {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 8px;
-  border-radius: var(--radius-md);
-  font-size: 13px;
-  font-weight: 500;
-  color: var(--text-secondary);
-  transition: background-color var(--duration-fast) var(--ease-apple),
-    color var(--duration-fast) var(--ease-apple);
-}
-
-.wb-settings-link:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-}
-
 /* Main Workspace (Layer 1) */
 .wb-main {
   display: flex;
@@ -2345,7 +2325,6 @@
 
 /* Readable secondary labels over the translucent material in either theme. */
 .wb-rail .wb-eyebrow,
-.wb-rail .wb-settings-link,
 .wb-history .wb-topic-group__toggle,
 .wb-history .wb-topic-group__count,
 .wb-history .wb-topic-group__label,
@@ -2360,7 +2339,6 @@
   .wb-nav-row__btn,
   .wb-topic-row__btn,
   .wb-topic-group__toggle,
-  .wb-settings-link,
   .wb-search-input { min-height: 44px; }
 
   .wb-rail .ui-icon-btn,
@@ -2423,10 +2401,6 @@
 
   .wb-mobile-only {
     display: inline-flex;
-  }
-
-  .wb-desktop-only {
-    display: none;
   }
 
   .wb-toolbar {
@@ -2552,7 +2526,6 @@
   .wb-scrim--open,
   .wb-nav-row,
   .wb-nav-row__actions,
-  .wb-rail__link,
   .wb-assistant-pill,
   .wb-assistant-pill:active,
   .wb-branch-badge,

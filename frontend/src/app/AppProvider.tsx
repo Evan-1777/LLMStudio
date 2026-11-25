@@ -8,37 +8,12 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import {
-  CUSTOM_FONT_FAMILY,
-  decodeCustomFontBuffer,
-  deleteCachedCloudFont,
-  deleteCustomFont as deleteStoredCustomFont,
-  downloadVerifiedCloudFont,
-  importCustomFont,
-  loadStoredCustomFontFace,
-  normalizeFontGatewayKey,
-  readCachedCloudFont,
-  readCustomFont,
-  setStoredCustomFontEnabled,
-  syncCloudCustomFont,
-  validateAndDecodeCustomFontFile,
-  writeCachedCloudFont,
-} from '../core/customFont';
 import { getDesktopBootstrap } from '../core/desktop';
 import { GatewayClient, GatewayError, validateGatewayUrl } from '../core/gateway';
 import {
-  clearLegacyPreferences,
-  defaultAppPreferences,
   loadConnectionSettings,
   loadSettings,
   normalizeServerPreferences,
-  normalizeSettings,
-  pickAppPreferences,
-  readLegacyPreferences,
-  resolveAccentColors,
-  saveConnectionSettings,
-  writeThemeHint,
-  type AppPreferenceKey,
   type AppPreferences,
   type AppSettings,
   type SettingsSaveResult,
@@ -58,19 +33,19 @@ import type {
   ProviderAdapterInfo,
   ProviderConfig,
   SearchEngineView,
-  ServerPreferences,
   TopicScope,
 } from '../core/types';
 import { ConfirmDialog } from '../components/ui/Modal';
+import {
+  useCustomFontManager,
+  type CustomFontInfo,
+} from './useCustomFontManager';
+import { usePreferencesManager } from './usePreferencesManager';
+import { useToastAndDirtyGuard } from './useToastAndDirtyGuard';
+
+export type { CustomFontInfo } from './useCustomFontManager';
 
 export type ConnectionState = 'checking' | 'connected' | 'auth-required' | 'error';
-
-export interface CustomFontInfo {
-  name: string;
-  enabled: boolean;
-  sha256?: string;
-  source?: 'cloud' | 'local';
-}
 
 export interface AppResources {
   providers: ProviderConfig[];
@@ -283,11 +258,11 @@ export function sortConversationsByOrg(
     return 0;
   });
 }
-function getSystemPrefersDark(): boolean {
-  if (typeof window === 'undefined' || !window.matchMedia) {
-    return false;
-  }
-  return window.matchMedia('(prefers-color-scheme: dark)').matches;
+function isAbortError(err: unknown): boolean {
+  return (
+    (err instanceof DOMException && err.name === 'AbortError') ||
+    (err instanceof Error && err.name === 'AbortError')
+  );
 }
 
 function errorMessageOf(err: unknown): string {
@@ -328,23 +303,6 @@ export function AppProvider({
       settings: { ...loaded.settings, ...connection },
     };
   }, [desktopBootstrap]);
-  const [settings, setSettings] = useState<AppSettings>(initialLoad.settings);
-  const settingsRef = useRef<AppSettings>(initialLoad.settings);
-  const [settingsNotice, setSettingsNotice] = useState<string | null>(
-    initialLoad.notice,
-  );
-  const [systemDark, setSystemDark] = useState<boolean>(getSystemPrefersDark);
-  // Latest values confirmed by the gateway; failed writes roll back to this
-  // snapshot. Each write applies and rolls back only the fields it patched, so a
-  // slow avatar save cannot revert a newer theme change.
-  const serverPreferencesRef = useRef<AppPreferences>(defaultAppPreferences());
-  const [customFont, setCustomFont] = useState<CustomFontInfo | null>(null);
-  const [legacyCustomFont, setLegacyCustomFont] = useState<{ name: string } | null>(null);
-  const [customFontBusy, setCustomFontBusy] = useState(false);
-  const customFontFaceRef = useRef<FontFace | null>(null);
-  const customFontRevisionRef = useRef(0);
-  const customFontAbortRef = useRef<AbortController | null>(null);
-  const cloudFontGatewayKeyRef = useRef<string | null>(null);
 
   const [connectionEpoch, setConnectionEpoch] = useState(1);
   const epochRef = useRef(1);
@@ -382,17 +340,6 @@ export function AppProvider({
   const lastRefreshErrorRef = useRef<string | null>(null);
   const [resources, setResources] = useState<AppResources>(emptyResources);
 
-  const [toastState, setToastState] = useState<{
-    message: string;
-    tone: 'default' | 'error';
-  } | null>(null);
-  const toastTimerRef = useRef<number | null>(null);
-
-  const dirtyGuardRef = useRef<(() => boolean) | null>(null);
-  const [discardPromptResolver, setDiscardPromptResolver] = useState<
-    ((allowed: boolean) => void) | null
-  >(null);
-
   const gatewayRef = useRef<GatewayClient | null>(null);
   if (!gatewayRef.current) {
     gatewayRef.current = new GatewayClient({
@@ -402,6 +349,48 @@ export function AppProvider({
     });
   }
   const gateway = gatewayRef.current;
+
+  const {
+    settings,
+    settingsRef,
+    settingsNotice,
+    dismissSettingsNotice,
+    resolvedTheme,
+    updateSettings,
+    applyConfirmedPreferences,
+    hydratePreferences,
+    updatePreferences,
+  } = usePreferencesManager({
+    initialSettings: initialLoad.settings,
+    initialNotice: initialLoad.notice,
+    isDesktop,
+    gateway,
+    epochRef,
+  });
+
+  const {
+    customFont,
+    legacyCustomFont,
+    customFontBusy,
+    resetCustomFontRuntime,
+    syncCustomFontForTarget,
+    uploadCustomFont,
+    toggleCustomFont,
+    removeCustomFont,
+    importLegacyCustomFont,
+  } = useCustomFontManager({
+    gateway,
+    skipInitialBootstrap,
+  });
+
+  const {
+    toastState,
+    toast,
+    discardPromptResolver,
+    setDiscardPromptResolver,
+    registerDirtyGuard,
+    confirmLeaveIfDirty,
+  } = useToastAndDirtyGuard();
 
   useEffect(() => {
     if (desktopBootstrap) {
@@ -415,565 +404,13 @@ export function AppProvider({
   }, [desktopBootstrap]);
 
   useEffect(() => {
-    if (typeof window === 'undefined' || !window.matchMedia) return;
-    const mq = window.matchMedia('(prefers-color-scheme: dark)');
-    const onChange = (e: MediaQueryListEvent) => setSystemDark(e.matches);
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
-
-  const resolvedTheme: 'light' | 'dark' =
-    settings.themeMode === 'dark'
-      ? 'dark'
-      : settings.themeMode === 'light'
-        ? 'light'
-        : systemDark
-          ? 'dark'
-          : 'light';
-
-  useEffect(() => {
-    const root = document.documentElement;
-    root.dataset.theme = resolvedTheme;
-    const accent = resolveAccentColors(settings.seedColorValue)[resolvedTheme];
-    root.style.setProperty('--accent', accent);
-    root.dataset.fontFamily = settings.fontFamily;
-    root.style.setProperty('--font-size-base', `${settings.fontSize}px`);
-  }, [
-    resolvedTheme,
-    settings.fontFamily,
-    settings.fontSize,
-    settings.seedColorValue,
-  ]);
-
-  const detachCustomFontFace = useCallback(() => {
-    const face = customFontFaceRef.current;
-    if (face) {
-      document.fonts.delete(face);
-      customFontFaceRef.current = null;
-    }
-    document.documentElement.style.removeProperty('--font-custom');
-  }, []);
-
-  const attachCustomFontFace = useCallback(
-    (face: FontFace) => {
-      detachCustomFontFace();
-      document.fonts.add(face);
-      customFontFaceRef.current = face;
-      document.documentElement.style.setProperty(
-        '--font-custom',
-        `"${CUSTOM_FONT_FAMILY}", `,
-      );
-    },
-    [detachCustomFontFace],
-  );
-
-  const resetCustomFontRuntime = useCallback(() => {
-    customFontAbortRef.current?.abort();
-    customFontAbortRef.current = null;
-    customFontRevisionRef.current += 1;
-    detachCustomFontFace();
-    setCustomFont(null);
-    setLegacyCustomFont(null);
-  }, [detachCustomFontFace]);
-
-  const loadDeviceLegacyFont = useCallback(
-    async (revision: number) => {
-      const stored = await readCustomFont();
-      if (revision !== customFontRevisionRef.current) return;
-      if (!stored) {
-        detachCustomFontFace();
-        setCustomFont(null);
-        return;
-      }
-      if (stored.enabled) {
-        try {
-          const face = await loadStoredCustomFontFace(stored);
-          if (revision !== customFontRevisionRef.current) return;
-          attachCustomFontFace(face);
-        } catch {
-          detachCustomFontFace();
-        }
-      } else {
-        detachCustomFontFace();
-      }
-      if (revision === customFontRevisionRef.current) {
-        setCustomFont({
-          name: stored.name,
-          enabled: stored.enabled,
-          source: 'local',
-        });
-      }
-    },
-    [attachCustomFontFace, detachCustomFontFace],
-  );
-
-  const syncCustomFontForTarget = useCallback(
-    async (
-      targetGatewayUrl: string | null,
-      cloudState: CloudConnectionState | 'connected',
-    ): Promise<void> => {
-      customFontAbortRef.current?.abort();
-      const ctrl = new AbortController();
-      customFontAbortRef.current = ctrl;
-      const revision = ++customFontRevisionRef.current;
-
-      const nextKey = targetGatewayUrl
-        ? normalizeFontGatewayKey(targetGatewayUrl)
-        : null;
-      if (nextKey !== cloudFontGatewayKeyRef.current) {
-        cloudFontGatewayKeyRef.current = nextKey;
-        detachCustomFontFace();
-        setCustomFont(null);
-        setLegacyCustomFont(null);
-      }
-
-      if (!nextKey) {
-        await loadDeviceLegacyFont(revision);
-        return;
-      }
-
-      if (cloudState === 'auth-required') {
-        detachCustomFontFace();
-        setCustomFont(null);
-        setLegacyCustomFont(null);
-        return;
-      }
-
-      const result = await syncCloudCustomFont({
-        gateway,
-        gatewayKey: nextKey,
-        signal: ctrl.signal,
-        isCurrent: () => revision === customFontRevisionRef.current,
-      });
-      if (revision !== customFontRevisionRef.current) return;
-
-      switch (result.kind) {
-        case 'stale':
-          return;
-        case 'ready':
-          if (result.face) {
-            attachCustomFontFace(result.face);
-          } else {
-            detachCustomFontFace();
-          }
-          setCustomFont({
-            name: result.font.name,
-            enabled: result.font.enabled,
-            sha256: result.font.sha256,
-            source: 'cloud',
-          });
-          setLegacyCustomFont(null);
-          return;
-        case 'empty':
-          detachCustomFontFace();
-          setCustomFont(null);
-          setLegacyCustomFont(result.legacyFont);
-          return;
-        case 'offline-cached':
-          if (result.face) {
-            attachCustomFontFace(result.face);
-          } else {
-            detachCustomFontFace();
-          }
-          setCustomFont({
-            name: result.font.name,
-            enabled: result.font.enabled,
-            sha256: result.font.sha256,
-            source: 'cloud',
-          });
-          setLegacyCustomFont(null);
-          return;
-        case 'auth-error':
-          detachCustomFontFace();
-          setCustomFont(null);
-          setLegacyCustomFont(null);
-          return;
-        case 'disconnected':
-          cloudFontGatewayKeyRef.current = null;
-          detachCustomFontFace();
-          setCustomFont(null);
-          setLegacyCustomFont(null);
-          await loadDeviceLegacyFont(revision);
-          return;
-        case 'error':
-          return;
-      }
-    },
-    [attachCustomFontFace, detachCustomFontFace, gateway, loadDeviceLegacyFont],
-  );
-
-  useEffect(() => {
-    if (skipInitialBootstrap) {
-      const revision = ++customFontRevisionRef.current;
-      void loadDeviceLegacyFont(revision);
-    }
     return () => {
-      customFontAbortRef.current?.abort();
-      customFontAbortRef.current = null;
-      customFontRevisionRef.current += 1;
-      detachCustomFontFace();
-    };
-  }, [detachCustomFontFace, loadDeviceLegacyFont, skipInitialBootstrap]);
-
-  const uploadCustomFont = useCallback(
-    async (file: File): Promise<{ ok: boolean; error?: string }> => {
-      customFontAbortRef.current?.abort();
-      customFontAbortRef.current = null;
-      const revision = ++customFontRevisionRef.current;
-      const gatewayKey = cloudFontGatewayKeyRef.current;
-      setCustomFontBusy(true);
-      try {
-        if (!gatewayKey) {
-          const { font, face } = await importCustomFont(file);
-          if (revision !== customFontRevisionRef.current) return { ok: true };
-          attachCustomFontFace(face);
-          setCustomFont({ name: font.name, enabled: true, source: 'local' });
-          setLegacyCustomFont(null);
-          return { ok: true };
-        }
-        const decoded = await validateAndDecodeCustomFontFile(file);
-        const meta = await gateway.uploadCustomFont(decoded.name, decoded.buffer);
-        if (revision !== customFontRevisionRef.current) return { ok: true };
-        attachCustomFontFace(decoded.face);
-        setCustomFont({
-          name: meta.name,
-          enabled: meta.enabled,
-          sha256: meta.sha256,
-          source: 'cloud',
-        });
-        setLegacyCustomFont(null);
-        await writeCachedCloudFont({
-          gatewayKey,
-          ...meta,
-          blob: new Blob([decoded.buffer], { type: 'font/ttf' }),
-        }).catch(() => {});
-        return { ok: true };
-      } catch (err) {
-        return { ok: false, error: errorMessageOf(err) };
-      } finally {
-        if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
-      }
-    },
-    [attachCustomFontFace, gateway],
-  );
-
-  const toggleCustomFont = useCallback(
-    async (enabled: boolean): Promise<{ ok: boolean; error?: string }> => {
-      customFontAbortRef.current?.abort();
-      customFontAbortRef.current = null;
-      const revision = ++customFontRevisionRef.current;
-      const gatewayKey = cloudFontGatewayKeyRef.current;
-      setCustomFontBusy(true);
-      try {
-        if (!gatewayKey) {
-          if (enabled) {
-            const stored = await readCustomFont();
-            if (!stored) throw new Error('没有可用的自定义字体');
-            const face = await loadStoredCustomFontFace(stored);
-            const saved = await setStoredCustomFontEnabled(true);
-            if (revision !== customFontRevisionRef.current) return { ok: true };
-            attachCustomFontFace(face);
-            setCustomFont({ name: saved.name, enabled: true, source: 'local' });
-          } else {
-            const saved = await setStoredCustomFontEnabled(false);
-            if (revision !== customFontRevisionRef.current) return { ok: true };
-            detachCustomFontFace();
-            setCustomFont({ name: saved.name, enabled: false, source: 'local' });
-          }
-          return { ok: true };
-        }
-
-        const meta = await gateway.setCustomFontEnabled(enabled);
-        if (revision !== customFontRevisionRef.current) return { ok: true };
-        if (meta.enabled) {
-          const cached = await readCachedCloudFont(gatewayKey);
-          if (revision !== customFontRevisionRef.current) return { ok: true };
-          let face: FontFace;
-          if (cached && cached.sha256 === meta.sha256) {
-            face = await loadStoredCustomFontFace(cached);
-            await writeCachedCloudFont({
-              ...cached,
-              name: meta.name,
-              enabled: true,
-              updatedAt: meta.updatedAt,
-            }).catch(() => {});
-          } else {
-            const downloaded = await downloadVerifiedCloudFont(gateway, meta);
-            if (!downloaded) throw new Error('云端字体已被移除');
-            face = downloaded.face;
-            await writeCachedCloudFont({
-              gatewayKey,
-              ...downloaded.meta,
-              blob: new Blob([downloaded.buffer], { type: 'font/ttf' }),
-            }).catch(() => {});
-          }
-          if (revision !== customFontRevisionRef.current) return { ok: true };
-          attachCustomFontFace(face);
-        } else {
-          detachCustomFontFace();
-          const cached = await readCachedCloudFont(gatewayKey);
-          if (cached && cached.sha256 === meta.sha256) {
-            await writeCachedCloudFont({
-              ...cached,
-              name: meta.name,
-              enabled: false,
-              updatedAt: meta.updatedAt,
-            }).catch(() => {});
-          }
-        }
-        setCustomFont({
-          name: meta.name,
-          enabled: meta.enabled,
-          sha256: meta.sha256,
-          source: 'cloud',
-        });
-        return { ok: true };
-      } catch (err) {
-        return { ok: false, error: errorMessageOf(err) };
-      } finally {
-        if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
-      }
-    },
-    [attachCustomFontFace, detachCustomFontFace, gateway],
-  );
-
-  const removeCustomFont = useCallback(async (): Promise<{
-    ok: boolean;
-    error?: string;
-  }> => {
-    customFontAbortRef.current?.abort();
-    customFontAbortRef.current = null;
-    const revision = ++customFontRevisionRef.current;
-    const gatewayKey = cloudFontGatewayKeyRef.current;
-    setCustomFontBusy(true);
-    try {
-      if (!gatewayKey) {
-        await deleteStoredCustomFont();
-        if (revision !== customFontRevisionRef.current) return { ok: true };
-        detachCustomFontFace();
-        setCustomFont(null);
-        return { ok: true };
-      }
-      await gateway.deleteCustomFont();
-      if (revision !== customFontRevisionRef.current) return { ok: true };
-      detachCustomFontFace();
-      setCustomFont(null);
-      await deleteCachedCloudFont(gatewayKey).catch(() => {});
-      const legacy = await readCustomFont();
-      if (revision === customFontRevisionRef.current) {
-        setLegacyCustomFont(legacy ? { name: legacy.name } : null);
-      }
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: errorMessageOf(err) };
-    } finally {
-      if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
-    }
-  }, [detachCustomFontFace, gateway]);
-
-  const importLegacyCustomFont = useCallback(async (): Promise<{
-    ok: boolean;
-    error?: string;
-  }> => {
-    const gatewayKey = cloudFontGatewayKeyRef.current;
-    if (!gatewayKey) {
-      return { ok: false, error: '当前未连接云端网关' };
-    }
-    customFontAbortRef.current?.abort();
-    customFontAbortRef.current = null;
-    const revision = ++customFontRevisionRef.current;
-    setCustomFontBusy(true);
-    try {
-      const legacy = await readCustomFont();
-      if (!legacy) {
-        throw new Error('没有可导入的旧字体');
-      }
-      const buffer = await legacy.blob.arrayBuffer();
-      const face = await decodeCustomFontBuffer(buffer);
-      const meta = await gateway.uploadCustomFont(legacy.name, buffer);
-      if (revision !== customFontRevisionRef.current) return { ok: true };
-      attachCustomFontFace(face);
-      setCustomFont({
-        name: meta.name,
-        enabled: meta.enabled,
-        sha256: meta.sha256,
-        source: 'cloud',
-      });
-      setLegacyCustomFont(null);
-      await writeCachedCloudFont({
-        gatewayKey,
-        ...meta,
-        blob: new Blob([buffer], { type: 'font/ttf' }),
-      }).catch(() => {});
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, error: errorMessageOf(err) };
-    } finally {
-      if (revision === customFontRevisionRef.current) setCustomFontBusy(false);
-    }
-  }, [attachCustomFontFace, gateway]);
-
-  const toast = useCallback(
-    (message: string, tone: 'default' | 'error' = 'default') => {
-      if (toastTimerRef.current !== null) {
-        window.clearTimeout(toastTimerRef.current);
-      }
-      setToastState({ message, tone });
-      toastTimerRef.current = window.setTimeout(() => {
-        setToastState(null);
-        toastTimerRef.current = null;
-      }, 2800);
-    },
-    [],
-  );
-
-  useEffect(() => {
-    return () => {
-      if (toastTimerRef.current !== null) {
-        window.clearTimeout(toastTimerRef.current);
-      }
       for (const ctrl of activeControllersRef.current) {
         ctrl.abort();
       }
       activeControllersRef.current.clear();
     };
   }, []);
-
-  const updateSettings = useCallback(
-    (
-      patchOrUpdater:
-        | Partial<AppSettings>
-        | ((prev: AppSettings) => AppSettings),
-    ): SettingsSaveResult => {
-      const nextRaw =
-        typeof patchOrUpdater === 'function'
-          ? patchOrUpdater(settingsRef.current)
-          : { ...settingsRef.current, ...patchOrUpdater };
-      const normalized = normalizeSettings(nextRaw);
-      settingsRef.current = normalized;
-      setSettings(normalized);
-      // Only browser-owned connection info is persisted locally; preferences live
-      // in the gateway and are written through updatePreferences.
-      if (!isDesktop) {
-        saveConnectionSettings({
-          gatewayBaseUrl: normalized.gatewayBaseUrl,
-          accessToken: normalized.accessToken,
-        });
-      }
-      return { settings: normalized, persisted: true, notice: null };
-    },
-    [isDesktop],
-  );
-
-  const applyConfirmedPreferences = useCallback((next: AppPreferences) => {
-    settingsRef.current = { ...settingsRef.current, ...next };
-    serverPreferencesRef.current = next;
-    setSettings(settingsRef.current);
-    writeThemeHint(settingsRef.current.gatewayBaseUrl, {
-      themeMode: next.themeMode,
-      seedColorValue: next.seedColorValue,
-      fontFamily: next.fontFamily,
-      fontSize: next.fontSize,
-    });
-  }, []);
-
-  // The gateway owns preference values once its row is initialized. Until then
-  // the browser snapshot is the only source, so it seeds the server on first write
-  // while still rendering correctly.
-  const hydratePreferences = useCallback(
-    async (signal: AbortSignal, epoch: number): Promise<void> => {
-      // Legacy browser preferences are imported at most once; the gateway refuses
-      // to overwrite values another browser already committed.
-      const connectionGateway = settingsRef.current.gatewayBaseUrl;
-      const legacy = readLegacyPreferences();
-      const envelope = await gateway.getPreferences(signal);
-      if (epoch !== epochRef.current) return;
-      // A gateway switch while the request was in flight must not apply stale values.
-      if (connectionGateway !== settingsRef.current.gatewayBaseUrl) return;
-
-      const {
-        composerReasoningEffort: _c,
-        mcpMaxToolRounds: _m,
-        chatWidthMode: _w,
-        chatManualWidth: _mw,
-        fontFamily: _ff,
-        fontSize: _fs,
-        builtinTimeToolEnabled: _bt,
-        mathRenderEnabled: _mr,
-        ...fallback
-      } = pickAppPreferences(settingsRef.current);
-      const seed = legacy ?? fallback;
-      let resolved = envelope;
-      if (!envelope.initialized) {
-        try {
-          resolved = await gateway.importLegacyPreferences(seed, signal);
-        } catch {
-          // An older gateway without the import route still accepts a full PATCH.
-          resolved = await gateway.updatePreferences(seed, signal);
-        }
-        if (epoch !== epochRef.current) return;
-      }
-
-      const next = resolved.initialized
-        ? normalizeServerPreferences(resolved.preferences)
-        : normalizeServerPreferences(seed);
-      applyConfirmedPreferences(next);
-      if (resolved.initialized) {
-        clearLegacyPreferences();
-      }
-    },
-    [applyConfirmedPreferences, gateway],
-  );
-
-  const applyPreferenceFields = useCallback((values: Partial<AppPreferences>) => {
-    settingsRef.current = { ...settingsRef.current, ...values };
-    setSettings(settingsRef.current);
-  }, []);
-
-  const updatePreferences = useCallback(
-    async (
-      patch: Partial<AppPreferences>,
-    ): Promise<{ ok: boolean; error?: string }> => {
-      const epoch = epochRef.current;
-      const confirmedBefore = serverPreferencesRef.current;
-      const patchedKeys = Object.keys(patch) as AppPreferenceKey[];
-      applyPreferenceFields(patch);
-      try {
-        const envelope = await gateway.updatePreferences(
-          patch as Partial<ServerPreferences>,
-        );
-        if (epoch !== epochRef.current) return { ok: true };
-        const confirmed = envelope.initialized
-          ? normalizeServerPreferences(envelope.preferences)
-          : { ...confirmedBefore, ...patch };
-        // Responses may settle out of order: only the fields this call patched
-        // move forward, so a slower request cannot revert a newer value.
-        const applied = Object.fromEntries(
-          patchedKeys.map((key) => [key, confirmed[key]]),
-        ) as Partial<AppPreferences>;
-        serverPreferencesRef.current = { ...serverPreferencesRef.current, ...applied };
-        applyPreferenceFields(applied);
-        writeThemeHint(settingsRef.current.gatewayBaseUrl, {
-          themeMode: settingsRef.current.themeMode,
-          seedColorValue: settingsRef.current.seedColorValue,
-          fontFamily: settingsRef.current.fontFamily,
-          fontSize: settingsRef.current.fontSize,
-        });
-        setSettingsNotice(null);
-        return { ok: true };
-      } catch (err) {
-        if (epoch !== epochRef.current) return { ok: true };
-        const rollback = Object.fromEntries(
-          patchedKeys.map((key) => [key, confirmedBefore[key]]),
-        ) as Partial<AppPreferences>;
-        applyPreferenceFields(rollback);
-        const message = errorMessageOf(err);
-        setSettingsNotice(`设置保存失败：${message}`);
-        return { ok: false, error: message };
-      }
-    },
-    [applyPreferenceFields, gateway],
-  );
 
   const trackSignal = useCallback((): {
     epoch: number;
@@ -1032,8 +469,7 @@ export function AppProvider({
       return true;
     } catch (err) {
       if (epoch !== epochRef.current) return false;
-      if (err instanceof DOMException && err.name === 'AbortError') return false;
-      if (err instanceof Error && err.name === 'AbortError') return false;
+      if (isAbortError(err)) return false;
       handleAuthFailureIf401(err, epoch);
       const message = errorMessageOf(err);
       lastRefreshErrorRef.current = message;
@@ -1066,8 +502,7 @@ export function AppProvider({
       return true;
     } catch (err) {
       if (epoch !== epochRef.current) return false;
-      if (err instanceof DOMException && err.name === 'AbortError') return false;
-      if (err instanceof Error && err.name === 'AbortError') return false;
+      if (isAbortError(err)) return false;
       handleAuthFailureIf401(err, epoch);
       const message = errorMessageOf(err);
       lastRefreshErrorRef.current = message;
@@ -1192,8 +627,7 @@ export function AppProvider({
         return conversations;
       } catch (err) {
         if (epoch !== epochRef.current) return null;
-        if (err instanceof DOMException && err.name === 'AbortError') return null;
-        if (err instanceof Error && err.name === 'AbortError') return null;
+        if (isAbortError(err)) return null;
         handleAuthFailureIf401(err, epoch);
         const message = errorMessageOf(err);
         lastRefreshErrorRef.current = message;
@@ -1294,8 +728,7 @@ export function AppProvider({
       return true;
     } catch (err) {
       if (epoch !== epochRef.current) return false;
-      if (err instanceof DOMException && err.name === 'AbortError') return false;
-      if (err instanceof Error && err.name === 'AbortError') return false;
+      if (isAbortError(err)) return false;
       handleAuthFailureIf401(err, epoch);
       lastRefreshErrorRef.current = errorMessageOf(err);
       return false;
@@ -1443,7 +876,6 @@ export function AppProvider({
       }
       activeControllersRef.current.clear();
       resetCustomFontRuntime();
-      cloudFontGatewayKeyRef.current = null;
 
       const nextEpoch = epochRef.current + 1;
       epochRef.current = nextEpoch;
@@ -1467,8 +899,7 @@ export function AppProvider({
             status = await gateway.getDesktopStatus(signal);
           } catch (err) {
             if (nextEpoch !== epochRef.current) return;
-            if (err instanceof DOMException && err.name === 'AbortError') return;
-            if (err instanceof Error && err.name === 'AbortError') return;
+            if (isAbortError(err)) return;
             statusFailed = true;
           }
           if (nextEpoch !== epochRef.current) return;
@@ -1564,8 +995,7 @@ export function AppProvider({
         }
       } catch (err) {
         if (nextEpoch !== epochRef.current) return;
-        if (err instanceof DOMException && err.name === 'AbortError') return;
-        if (err instanceof Error && err.name === 'AbortError') return;
+        if (isAbortError(err)) return;
         // Any 401 during the handshake (preferences included) means the token is rejected.
         if (handleAuthFailureIf401(err, nextEpoch)) return;
         setGatewayHealth(null);
@@ -2278,20 +1708,6 @@ export function AppProvider({
     [isDesktop, markConversationRunning],
   );
 
-  const registerDirtyGuard = useCallback((guard: (() => boolean) | null) => {
-    dirtyGuardRef.current = guard;
-  }, []);
-
-  const confirmLeaveIfDirty = useCallback((): Promise<boolean> => {
-    const guard = dirtyGuardRef.current;
-    if (!guard || !guard()) {
-      return Promise.resolve(true);
-    }
-    return new Promise<boolean>((resolve) => {
-      setDiscardPromptResolver(() => resolve);
-    });
-  }, []);
-
   const value: AppContextValue = useMemo(
     () => ({
       gateway,
@@ -2316,7 +1732,7 @@ export function AppProvider({
       importLegacyCustomFont,
       resolvedTheme,
       settingsNotice,
-      dismissSettingsNotice: () => setSettingsNotice(null),
+      dismissSettingsNotice,
       updateSettings,
       updatePreferences,
       connectionState,
@@ -2354,63 +1770,19 @@ export function AppProvider({
       confirmLeaveIfDirty,
     }),
     [
-      gateway,
-      isDesktop,
-      desktopStatus,
-      cloudConnectionState,
-      topicScope,
-      setTopicScope,
-      refreshDesktopStatus,
-      disconnectDesktopCloud,
-      uploadConversations,
-      pullConversations,
-      cleanupLocalUngrouped,
-      connectionEpoch,
-      settings,
-      customFont,
-      legacyCustomFont,
-      customFontBusy,
-      uploadCustomFont,
-      toggleCustomFont,
-      removeCustomFont,
-      importLegacyCustomFont,
-      resolvedTheme,
-      settingsNotice,
-      updateSettings,
-      updatePreferences,
-      connectionState,
-      connectionError,
-      gatewayHealth,
-      saveConnection,
-      testGatewayConnection,
-      retryConnection,
-      resources,
-      refreshProviders,
-      reorderProviders,
-      refreshAssistants,
-      refreshConversations,
-      refreshPlugins,
-      refreshPreferences,
-      refreshAll,
-      syncFromServer,
-      lastSyncedAt,
-      syncingServer,
-      runningConversationIds,
-      markConversationRunning,
-      upsertLocalConversation,
-      removeLocalConversation,
-      cleanupUngroupedConversations,
-      applyConversationOrganizationSnapshot,
-      upsertLocalAssistant,
-      removeLocalAssistant,
-      upsertLocalProvider,
-      removeLocalProvider,
-      upsertLocalSearchEngine,
-      upsertLocalMcpServer,
-      removeLocalMcpServer,
-      toast,
-      registerDirtyGuard,
-      confirmLeaveIfDirty,
+      gateway, isDesktop, desktopStatus, cloudConnectionState, topicScope, setTopicScope,
+      refreshDesktopStatus, disconnectDesktopCloud, uploadConversations, pullConversations,
+      cleanupLocalUngrouped, connectionEpoch, settings, customFont, legacyCustomFont,
+      customFontBusy, uploadCustomFont, toggleCustomFont, removeCustomFont, importLegacyCustomFont,
+      resolvedTheme, settingsNotice, dismissSettingsNotice, updateSettings, updatePreferences,
+      connectionState, connectionError, gatewayHealth, saveConnection, testGatewayConnection,
+      retryConnection, resources, refreshProviders, reorderProviders, refreshAssistants,
+      refreshConversations, refreshPlugins, refreshPreferences, refreshAll, syncFromServer,
+      lastSyncedAt, syncingServer, runningConversationIds, markConversationRunning,
+      upsertLocalConversation, removeLocalConversation, cleanupUngroupedConversations,
+      applyConversationOrganizationSnapshot, upsertLocalAssistant, removeLocalAssistant,
+      upsertLocalProvider, removeLocalProvider, upsertLocalSearchEngine, upsertLocalMcpServer,
+      removeLocalMcpServer, toast, registerDirtyGuard, confirmLeaveIfDirty,
     ],
   );
 

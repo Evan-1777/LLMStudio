@@ -4,22 +4,16 @@ import {
   useMemo,
   useRef,
   useState,
-  type FormEvent,
 } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
 import {
   Button,
-  ConfirmDialog,
   Dropdown,
   DropdownItem,
   EmptyState,
-  ErrorBanner,
-  Field,
   Icon,
   IconButton,
-  Input,
-  Modal,
   SegmentedControl,
 } from '../../components/ui';
 import { useRowDrag } from '../../components/ui/useRowDrag';
@@ -43,6 +37,11 @@ import {
   SessionInspector,
   type DraftSessionParams,
 } from './SessionInspector';
+import {
+  ConversationSidebarDialogs,
+  type SidebarGroupModalMode,
+  type SidebarMoveTarget,
+} from './ConversationSidebarDialogs';
 
 function formatShortTime(iso: string): string {
   const dt = new Date(iso);
@@ -236,38 +235,12 @@ export function ConversationSidebar({
   } | null>(null);
   const [forcingConflict, setForcingConflict] = useState(false);
 
-  // Conversation rename modal
+  // Dialog target states (internal form & submit logic live in ConversationSidebarDialogs)
   const [renamingConv, setRenamingConv] = useState<Conversation | null>(null);
-  const [renameTitle, setRenameTitle] = useState('');
-  const [renameError, setRenameError] = useState<string | null>(null);
-  const [renaming, setRenaming] = useState(false);
-
-  // Group create / rename modal
-  const [groupModalMode, setGroupModalMode] = useState<
-    { kind: 'create' } | { kind: 'rename'; group: ConversationGroup } | null
-  >(null);
-  const [groupNameInput, setGroupNameInput] = useState('');
-  const [groupFormError, setGroupFormError] = useState<string | null>(null);
-  const [savingGroup, setSavingGroup] = useState(false);
-
-  // Delete conversation(s) confirm
-  const [deletingConvs, setDeletingConvs] = useState<Conversation[] | null>(
-    null,
-  );
-  const [deleting, setDeleting] = useState(false);
-
-  // Delete group confirm
-  const [deletingGroup, setDeletingGroup] = useState<ConversationGroup | null>(
-    null,
-  );
-  const [deletingGroupBusy, setDeletingGroupBusy] = useState(false);
-
-  // Shared move-to-group modal (used by both row menu and manage mode)
-  const [moveTargetIds, setMoveTargetIds] = useState<string[] | null>(null);
-  const [selectedMoveGroupId, setSelectedMoveGroupId] = useState<string | null>(
-    null,
-  );
-  const [movingBusy, setMovingBusy] = useState(false);
+  const [groupModalMode, setGroupModalMode] = useState<SidebarGroupModalMode>(null);
+  const [deletingConvs, setDeletingConvs] = useState<Conversation[] | null>(null);
+  const [deletingGroup, setDeletingGroup] = useState<ConversationGroup | null>(null);
+  const [moveTarget, setMoveTarget] = useState<SidebarMoveTarget | null>(null);
 
   const listContainerRef = useRef<HTMLDivElement>(null);
   const currentEpoch = useRef(connectionEpoch);
@@ -448,140 +421,6 @@ export function ConversationSidebar({
     });
   };
 
-  const openRename = (conv: Conversation) => {
-    setRenamingConv(conv);
-    setRenameTitle(conv.title);
-    setRenameError(null);
-  };
-
-  const handleRenameSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!renamingConv) return;
-    const trimmed = renameTitle.trim();
-    if (!trimmed) {
-      setRenameError('话题标题不能为空');
-      return;
-    }
-    setRenaming(true);
-    setRenameError(null);
-    try {
-      const updated = await gateway.patchConversation(
-        renamingConv.id,
-        { title: trimmed },
-        undefined,
-        reqScope,
-      );
-      upsertLocalConversation(updated, reqScope);
-      onConversationPatched(updated);
-      setRenamingConv(null);
-    } catch (err) {
-      setRenameError(
-        err instanceof GatewayError ? err.message : '重命名失败，请重试',
-      );
-    } finally {
-      setRenaming(false);
-    }
-  };
-
-  const handleGroupFormSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!groupModalMode) return;
-    const trimmed = groupNameInput.trim();
-    if (!trimmed) {
-      setGroupFormError('分组名称不能为空');
-      return;
-    }
-    setSavingGroup(true);
-    setGroupFormError(null);
-    try {
-      const res =
-        groupModalMode.kind === 'create'
-          ? await gateway.createConversationGroup(
-              { assistantId, name: trimmed },
-              undefined,
-              reqScope,
-            )
-          : await gateway.renameConversationGroup(
-              groupModalMode.group.id,
-              { name: trimmed },
-              undefined,
-              reqScope,
-            );
-      applyConversationOrganizationSnapshot(
-        assistantId,
-        { conversations: res.conversations, groups: res.groups },
-        undefined,
-        reqScope,
-      );
-      setGroupModalMode(null);
-    } catch (err) {
-      setGroupFormError(
-        err instanceof GatewayError ? err.message : '保存分组失败',
-      );
-    } finally {
-      setSavingGroup(false);
-    }
-  };
-
-  const handleDeleteGroupConfirm = async () => {
-    if (!deletingGroup) return;
-    setDeletingGroupBusy(true);
-    try {
-      const res = await gateway.deleteConversationGroup(
-        deletingGroup.id,
-        undefined,
-        reqScope,
-      );
-      applyConversationOrganizationSnapshot(
-        assistantId,
-        { conversations: res.conversations, groups: res.groups },
-        undefined,
-        reqScope,
-      );
-      setDeletingGroup(null);
-      toast('分组已删除，话题已移至未分组');
-    } catch (err) {
-      toast(err instanceof GatewayError ? err.message : '删除分组失败', 'error');
-    } finally {
-      setDeletingGroupBusy(false);
-    }
-  };
-
-  const handleDeleteConvsConfirm = async () => {
-    if (!deletingConvs || deletingConvs.length === 0) return;
-    const ids = deletingConvs.map((c) => c.id);
-    setDeleting(true);
-    try {
-      const snap = await gateway.batchConversations(
-        {
-          assistantId,
-          ids,
-          operation: 'delete',
-        },
-        undefined,
-        reqScope,
-      );
-      applyConversationOrganizationSnapshot(
-        assistantId,
-        { conversations: snap.conversations, groups: snap.groups },
-        undefined,
-        reqScope,
-      );
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        for (const id of ids) next.delete(id);
-        return next;
-      });
-      setDeletingConvs(null);
-      onConversationsDeleted(snap.deletedIds ?? ids, snap.conversations);
-      toast(ids.length > 1 ? `已删除 ${ids.length} 个话题` : '话题已删除');
-    } catch (err) {
-      toast(err instanceof GatewayError ? err.message : '删除失败', 'error');
-    } finally {
-      setDeleting(false);
-    }
-  };
-
   const handleBatchPin = async (ids: string[], pinned: boolean) => {
     if (ids.length === 0 || mutating) return;
     setMutating(true);
@@ -609,42 +448,8 @@ export function ConversationSidebar({
     }
   };
 
-  const openMoveModal = (ids: string[], initialGroupId: string | null) => {
-    setMoveTargetIds(ids);
-    setSelectedMoveGroupId(initialGroupId);
-  };
-
-  const handleMoveSubmit = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!moveTargetIds || moveTargetIds.length === 0) return;
-    setMovingBusy(true);
-    try {
-      const snap = await gateway.batchConversations(
-        {
-          assistantId,
-          ids: moveTargetIds,
-          operation: 'move',
-          groupId: selectedMoveGroupId ?? null,
-        },
-        undefined,
-        reqScope,
-      );
-      applyConversationOrganizationSnapshot(
-        assistantId,
-        { conversations: snap.conversations, groups: snap.groups },
-        undefined,
-        reqScope,
-      );
-      setMoveTargetIds(null);
-    } catch (err) {
-      toast(err instanceof GatewayError ? err.message : '移动分组失败', 'error');
-    } finally {
-      setMovingBusy(false);
-    }
-  };
-
   const canReorder = !isSearching && !manageMode && !mutating && !inspectorOpen &&
-    !renamingConv && !groupModalMode && !moveTargetIds && !deletingConvs && !deletingGroup;
+    !renamingConv && !groupModalMode && !moveTarget && !deletingConvs && !deletingGroup;
 
   const runReorder = async (request: () => Promise<{ conversations: Conversation[]; groups: ConversationGroup[] }>) => {
     if (!canReorder) return;
@@ -1052,11 +857,7 @@ export function ConversationSidebar({
                       icon="folderPlus"
                       label="新建分组"
                       disabled={mutating || cloudOffline}
-                      onClick={() => {
-                        setGroupNameInput('');
-                        setGroupFormError(null);
-                        setGroupModalMode({ kind: 'create' });
-                      }}
+                      onClick={() => setGroupModalMode({ kind: 'create' })}
                     />
                     <IconButton
                       size="sm"
@@ -1238,10 +1039,10 @@ export function ConversationSidebar({
                     label="移至分组"
                     disabled={selectedIds.size === 0 || mutating}
                     onClick={() =>
-                      openMoveModal(
-                        Array.from(selectedIds),
-                        selectedConvs[0]?.groupId ?? null,
-                      )
+                      setMoveTarget({
+                        ids: Array.from(selectedIds),
+                        initialGroupId: selectedConvs[0]?.groupId ?? null,
+                      })
                     }
                   />
                   <IconButton
@@ -1408,14 +1209,12 @@ export function ConversationSidebar({
                               </>
                             ) : null}
                             <DropdownItem
-                              onSelect={() => {
-                                setGroupNameInput(section.group!.name);
-                                setGroupFormError(null);
+                              onSelect={() =>
                                 setGroupModalMode({
                                   kind: 'rename',
                                   group: section.group!,
-                                });
-                              }}
+                                })
+                              }
                             >
                               <Icon name="edit" size={14} />
                               <span>重命名分组</span>
@@ -1656,7 +1455,7 @@ export function ConversationSidebar({
                                           </DropdownItem>
                                         ) : null}
                                         <DropdownItem
-                                          onSelect={() => openRename(conv)}
+                                          onSelect={() => setRenamingConv(conv)}
                                         >
                                           <Icon name="edit" size={14} />
                                           <span>重命名</span>
@@ -1676,10 +1475,10 @@ export function ConversationSidebar({
                                         </DropdownItem>
                                         <DropdownItem
                                           onSelect={() =>
-                                            openMoveModal(
-                                              [conv.id],
-                                              conv.groupId ?? null,
-                                            )
+                                            setMoveTarget({
+                                              ids: [conv.id],
+                                              initialGroupId: conv.groupId ?? null,
+                                            })
                                           }
                                         >
                                           <Icon name="folder" size={14} />
@@ -1790,213 +1589,33 @@ export function ConversationSidebar({
         )}
       </aside>
 
-      {/* Rename Conversation Modal */}
-      <Modal
-        open={renamingConv !== null}
-        onOpenChange={(open) => {
-          if (!open && !renaming) setRenamingConv(null);
+      <ConversationSidebarDialogs
+        assistantId={assistantId}
+        reqScope={reqScope}
+        sortedGroups={sortedGroups}
+        renamingConv={renamingConv}
+        onCloseRename={() => setRenamingConv(null)}
+        onConversationPatched={onConversationPatched}
+        groupModalMode={groupModalMode}
+        onCloseGroupModal={() => setGroupModalMode(null)}
+        moveTarget={moveTarget}
+        onCloseMoveModal={() => setMoveTarget(null)}
+        deletingConvs={deletingConvs}
+        onCloseDeleteConvs={() => setDeletingConvs(null)}
+        onConversationsDeleted={(deletedIds, remaining) => {
+          setSelectedIds((prev) => {
+            const next = new Set(prev);
+            for (const id of deletedIds) next.delete(id);
+            return next;
+          });
+          onConversationsDeleted(deletedIds, remaining);
         }}
-        title="重命名话题"
-        footer={
-          <>
-            <Button
-              variant="secondary"
-              disabled={renaming}
-              onClick={() => setRenamingConv(null)}
-            >
-              取消
-            </Button>
-            <Button
-              type="submit"
-              form="rename-topic-form"
-              variant="primary"
-              disabled={renaming}
-            >
-              {renaming ? '保存中...' : '保存'}
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="rename-topic-form"
-          noValidate
-          onSubmit={(e) => void handleRenameSubmit(e)}
-          style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
-        >
-          {renameError ? <ErrorBanner message={renameError} /> : null}
-          <Field label="标题" htmlFor="rename-topic-input">
-            <Input
-              id="rename-topic-input"
-              value={renameTitle}
-              onChange={(e) => setRenameTitle(e.target.value)}
-              maxLength={120}
-              required
-              autoFocus
-            />
-          </Field>
-        </form>
-      </Modal>
-
-      {/* Create / Rename Group Modal */}
-      <Modal
-        open={groupModalMode !== null}
-        busy={savingGroup}
-        onOpenChange={(open) => {
-          if (!open && !savingGroup) setGroupModalMode(null);
-        }}
-        title={groupModalMode?.kind === 'rename' ? '重命名分组' : '新建分组'}
-        footer={
-          <>
-            <Button
-              variant="secondary"
-              disabled={savingGroup}
-              onClick={() => setGroupModalMode(null)}
-            >
-              取消
-            </Button>
-            <Button
-              type="submit"
-              form="group-name-form"
-              variant="primary"
-              loading={savingGroup}
-            >
-              {savingGroup ? '保存中...' : '保存'}
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="group-name-form"
-          noValidate
-          onSubmit={(e) => void handleGroupFormSubmit(e)}
-          style={{ display: 'flex', flexDirection: 'column', gap: 10 }}
-        >
-          {groupFormError ? <ErrorBanner message={groupFormError} /> : null}
-          <Field label="分组名称" htmlFor="group-name-input">
-            <Input
-              id="group-name-input"
-              value={groupNameInput}
-              onChange={(e) => setGroupNameInput(e.target.value)}
-              maxLength={60}
-              required
-              autoFocus
-            />
-          </Field>
-        </form>
-      </Modal>
-
-      {/* Move to Group Modal */}
-      <Modal
-        open={moveTargetIds !== null}
-        busy={movingBusy}
-        onOpenChange={(open) => {
-          if (!open && !movingBusy) setMoveTargetIds(null);
-        }}
-        title={
-          moveTargetIds && moveTargetIds.length > 1
-            ? `移动 ${moveTargetIds.length} 个话题到分组`
-            : '移动到分组'
-        }
-        footer={
-          <>
-            <Button
-              variant="secondary"
-              disabled={movingBusy}
-              onClick={() => setMoveTargetIds(null)}
-            >
-              取消
-            </Button>
-            <Button
-              type="submit"
-              form="move-group-form"
-              variant="primary"
-              loading={movingBusy}
-            >
-              {movingBusy ? '移动中...' : '确定'}
-            </Button>
-          </>
-        }
-      >
-        <form
-          id="move-group-form"
-          onSubmit={(e) => void handleMoveSubmit(e)}
-          style={{ display: 'flex', flexDirection: 'column', gap: 6 }}
-        >
-          <div role="radiogroup" aria-label="目标分组" className="wb-move-options">
-            <label className="wb-move-option">
-              <input
-                type="radio"
-                name="target-group"
-                checked={selectedMoveGroupId === null}
-                onChange={() => setSelectedMoveGroupId(null)}
-              />
-              <span>未分组</span>
-            </label>
-            {sortedGroups.map((g) => (
-              <label key={g.id} className="wb-move-option">
-                <input
-                  type="radio"
-                  name="target-group"
-                  checked={selectedMoveGroupId === g.id}
-                  onChange={() => setSelectedMoveGroupId(g.id)}
-                />
-                <span>{g.name}</span>
-              </label>
-            ))}
-          </div>
-        </form>
-      </Modal>
-
-      {/* Delete Conversation(s) Confirm */}
-      <ConfirmDialog
-        open={deletingConvs !== null && deletingConvs.length > 0}
-        onOpenChange={(open) => {
-          if (!open && !deleting) setDeletingConvs(null);
-        }}
-        title={
-          deletingConvs && deletingConvs.length > 1
-            ? `删除 ${deletingConvs.length} 个话题？`
-            : '删除话题？'
-        }
-        message={
-          deletingConvs && deletingConvs.length > 1
-            ? `确认删除选中的 ${deletingConvs.length} 个话题及其中的全部消息？此操作无法撤销。`
-            : `确认删除「${deletingConvs?.[0]?.title ?? ''}」及其中的全部消息？此操作无法撤销。`
-        }
-        confirmLabel="删除"
-        busy={deleting}
-        onConfirm={handleDeleteConvsConfirm}
-      />
-
-      {/* Delete Group Confirm */}
-      <ConfirmDialog
-        open={deletingGroup !== null}
-        onOpenChange={(open) => {
-          if (!open && !deletingGroupBusy) setDeletingGroup(null);
-        }}
-        title="删除分组？"
-        message={`确认删除分组「${deletingGroup?.name ?? ''}」？组内话题与消息将被保留并移回未分组。`}
-        confirmLabel="删除"
-        busy={deletingGroupBusy}
-        onConfirm={handleDeleteGroupConfirm}
-      />
-
-      {/* Conflict Transfer Confirm */}
-      <ConfirmDialog
-        open={conflictPrompt !== null}
-        onOpenChange={(open) => {
-          if (!open && !forcingConflict) setConflictPrompt(null);
-        }}
-        title={
-          conflictPrompt?.direction === 'upload'
-            ? '覆盖云端话题？'
-            : '覆盖本地话题？'
-        }
-        message="目标端存在较新未同步更改。确认覆盖将继续传输；话题分组不跨端迁移，覆盖后将落入目标端未分组（保留置顶状态）。"
-        confirmLabel="覆盖"
-        danger={false}
-        busy={forcingConflict}
-        onConfirm={handleConfirmConflictForce}
+        deletingGroup={deletingGroup}
+        onCloseDeleteGroup={() => setDeletingGroup(null)}
+        conflictPrompt={conflictPrompt}
+        forcingConflict={forcingConflict}
+        onCloseConflict={() => setConflictPrompt(null)}
+        onConfirmConflictForce={handleConfirmConflictForce}
       />
 
       <WorkspaceFileViewer

@@ -72,9 +72,6 @@
   border-color: color-mix(in srgb, var(--danger) 48%, var(--border-strong));
   background: var(--bg-surface);
 }
-.cg-edge-detach--visible {
-  opacity: 0.92;
-}
 
 .cg-marquee {
   position: absolute;

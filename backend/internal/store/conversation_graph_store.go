@@ -317,240 +317,274 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 	if err != nil {
 		return err
 	}
-	state := c.GraphState
 	switch in.Op {
 	case "reparent":
-		if in.ParentID == nil {
-			return invalidGraph("缺少 parentId")
+		err = applyGraphReparentTx(ctx, tx, id, in)
+	case "setNodeMeta":
+		err = applyGraphSetNodeMetaTx(ctx, tx, id, c.GraphState, in)
+	case "deleteNodes":
+		err = applyGraphDeleteNodesTx(ctx, tx, id, &c, in)
+	case "createBranch", "deleteBranch", "activateBranch":
+		err = applyGraphBranchMutationTx(ctx, tx, id, &c, in)
+	case "createNote", "updateNote", "createNoteEdge", "deleteNoteEdge":
+		err = applyGraphNoteMutationTx(ctx, tx, id, c.GraphState, in)
+	case "addSideRef", "removeSideRef":
+		err = applyGraphSideRefMutationTx(ctx, tx, id, in)
+	default:
+		return invalidGraph("不支持的图谱操作")
+	}
+	if err != nil {
+		return err
+	}
+	if err := saveGraphStateTx(ctx, tx, c); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func applyGraphReparentTx(ctx context.Context, tx *sql.Tx, id string, in GraphMutationInput) error {
+	if in.ParentID == nil {
+		return invalidGraph("缺少 parentId")
+	}
+	if len(in.MessageIDs) > 0 {
+		if *in.ParentID != "" {
+			return invalidGraph("批量重连仅支持断开上下文")
 		}
-		if len(in.MessageIDs) > 0 {
-			if *in.ParentID != "" {
-				return invalidGraph("批量重连仅支持断开上下文")
+		msgIDs := dedupeNonEmpty(in.MessageIDs)
+		if len(msgIDs) == 0 {
+			return invalidGraph("请选择要操作的节点")
+		}
+		for _, mid := range msgIDs {
+			if _, err := graphMessageTx(ctx, tx, id, mid); err != nil {
+				return err
 			}
+		}
+		for _, mid := range msgIDs {
+			if _, err := tx.ExecContext(ctx, `UPDATE messages SET parent_id = '' WHERE conversation_id = ? AND id = ?`, id, mid); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if _, err := graphMessageTx(ctx, tx, id, in.MessageID); err != nil {
+		return err
+	}
+	if *in.ParentID != "" {
+		parentOf, sideRefsOf, err := loadGraphDependenciesTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		if _, ok := parentOf[*in.ParentID]; !ok {
+			return invalidGraph("父消息不在当前话题中")
+		}
+		if *in.ParentID == in.MessageID || isReachableInDepGraph(parentOf, sideRefsOf, *in.ParentID, in.MessageID) {
+			return invalidGraph("不能形成循环上下文连接")
+		}
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE messages SET parent_id = ? WHERE id = ?`, *in.ParentID, in.MessageID)
+	return err
+}
+
+func applyGraphSetNodeMetaTx(ctx context.Context, tx *sql.Tx, id string, state *domain.ConversationGraphState, in GraphMutationInput) error {
+	if in.GraphMeta == nil && (in.Collapsed != nil || in.Expanded != nil || in.Summary != nil || in.X != nil || in.Y != nil) {
+		in.GraphMeta = &GraphMetaPatch{Collapsed: in.Collapsed, Expanded: in.Expanded, Summary: in.Summary, X: in.X, Y: in.Y}
+	}
+	if in.GraphMeta == nil && len(in.Positions) == 0 {
+		return invalidGraph("缺少节点元数据或坐标")
+	}
+	if in.GraphMeta != nil {
+		if len(in.MessageIDs) > 0 {
 			msgIDs := dedupeNonEmpty(in.MessageIDs)
 			if len(msgIDs) == 0 {
 				return invalidGraph("请选择要操作的节点")
 			}
 			for _, mid := range msgIDs {
-				if _, err := graphMessageTx(ctx, tx, id, mid); err != nil {
+				if err := updateGraphMetaTx(ctx, tx, id, mid, *in.GraphMeta); err != nil {
 					return err
 				}
 			}
-			for _, mid := range msgIDs {
-				if _, err := tx.ExecContext(ctx, `UPDATE messages SET parent_id = '' WHERE conversation_id = ? AND id = ?`, id, mid); err != nil {
-					return err
-				}
+		} else {
+			if err := updateGraphMetaTx(ctx, tx, id, in.MessageID, *in.GraphMeta); err != nil {
+				return err
 			}
-			break
 		}
-		if _, err := graphMessageTx(ctx, tx, id, in.MessageID); err != nil {
+	}
+	for _, pos := range in.Positions {
+		targets := 0
+		if pos.MessageID != "" {
+			targets++
+		}
+		if pos.BranchID != "" {
+			targets++
+		}
+		if pos.NoteID != "" {
+			targets++
+		}
+		if targets != 1 || pos.X == nil || pos.Y == nil {
+			return invalidGraph("节点坐标缺少目标或坐标")
+		}
+		if pos.MessageID != "" {
+			if err := updateGraphMetaTx(ctx, tx, id, pos.MessageID, GraphMetaPatch{X: pos.X, Y: pos.Y}); err != nil {
+				return err
+			}
+		} else if pos.BranchID != "" {
+			if i := branchIndex(state, pos.BranchID); i >= 0 {
+				state.Branches[i].X, state.Branches[i].Y = pos.X, pos.Y
+			} else {
+				return invalidGraph("话题内分支不存在")
+			}
+		} else if i := noteIndex(state, pos.NoteID); i >= 0 {
+			state.Notes[i].X, state.Notes[i].Y = pos.X, pos.Y
+		} else {
+			return invalidGraph("文字标注不存在")
+		}
+	}
+	return nil
+}
+
+func applyGraphDeleteNodesTx(ctx context.Context, tx *sql.Tx, id string, c *domain.Conversation, in GraphMutationInput) error {
+	state := c.GraphState
+	msgIDs := dedupeNonEmpty(in.MessageIDs)
+	branchIDs := dedupeNonEmpty(in.BranchIDs)
+	noteIDs := dedupeNonEmpty(in.NoteIDs)
+	if len(msgIDs) == 0 && len(branchIDs) == 0 && len(noteIDs) == 0 {
+		return invalidGraph("请选择要删除的节点")
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, parent_id FROM messages WHERE conversation_id = ?`, id)
+	if err != nil {
+		return err
+	}
+	parentOf := make(map[string]string)
+	allMsgIDs := make([]string, 0)
+	for rows.Next() {
+		var mid, pid string
+		if err := rows.Scan(&mid, &pid); err != nil {
+			rows.Close()
 			return err
 		}
-		if *in.ParentID != "" {
-			parentOf, sideRefsOf, err := loadGraphDependenciesTx(ctx, tx, id)
+		parentOf[mid] = pid
+		allMsgIDs = append(allMsgIDs, mid)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	deleteMsgSet := make(map[string]bool, len(msgIDs))
+	for _, mid := range msgIDs {
+		if _, ok := parentOf[mid]; !ok {
+			return invalidGraph("消息不在当前话题中")
+		}
+		deleteMsgSet[mid] = true
+	}
+	deleteBranchSet := make(map[string]bool, len(branchIDs))
+	for _, bid := range branchIDs {
+		if branchIndex(state, bid) < 0 {
+			return invalidGraph("话题内分支不存在")
+		}
+		deleteBranchSet[bid] = true
+	}
+	deleteNoteSet := make(map[string]bool, len(noteIDs))
+	for _, nid := range noteIDs {
+		if noteIndex(state, nid) < 0 {
+			return invalidGraph("文字标注不存在")
+		}
+		deleteNoteSet[nid] = true
+	}
+	survivingAncestor := func(start string) string {
+		seen := make(map[string]bool)
+		for cur := start; cur != ""; {
+			if !deleteMsgSet[cur] {
+				return cur
+			}
+			if seen[cur] {
+				return ""
+			}
+			seen[cur] = true
+			cur = parentOf[cur]
+		}
+		return ""
+	}
+	for _, mid := range allMsgIDs {
+		if deleteMsgSet[mid] {
+			continue
+		}
+		if parent := parentOf[mid]; parent != "" && deleteMsgSet[parent] {
+			if _, err := tx.ExecContext(ctx, `UPDATE messages SET parent_id = ? WHERE conversation_id = ? AND id = ?`, survivingAncestor(parent), id, mid); err != nil {
+				return err
+			}
+		}
+	}
+	for _, mid := range msgIDs {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ? AND id = ?`, id, mid); err != nil {
+			return err
+		}
+	}
+	if err := pruneSideRefsTx(ctx, tx, id, deleteMsgSet); err != nil {
+		return err
+	}
+	remaining := make([]domain.ConversationBranchSlot, 0, len(state.Branches))
+	for _, slot := range state.Branches {
+		if deleteBranchSet[slot.ID] {
+			continue
+		}
+		if slot.ParentMessageID != "" && deleteMsgSet[slot.ParentMessageID] {
+			slot.ParentMessageID = survivingAncestor(slot.ParentMessageID)
+		}
+		remaining = append(remaining, slot)
+	}
+	state.Branches = remaining
+	if len(deleteNoteSet) > 0 {
+		keptNotes := make([]domain.ConversationGraphNote, 0, len(state.Notes))
+		for _, note := range state.Notes {
+			if !deleteNoteSet[note.ID] {
+				keptNotes = append(keptNotes, note)
+			}
+		}
+		if len(keptNotes) == 0 {
+			state.Notes = nil
+		} else {
+			state.Notes = keptNotes
+		}
+	}
+	deletedAll := make(map[string]bool, len(deleteMsgSet)+len(deleteBranchSet)+len(deleteNoteSet))
+	for k := range deleteMsgSet {
+		deletedAll[k] = true
+	}
+	for k := range deleteBranchSet {
+		deletedAll[k] = true
+	}
+	for k := range deleteNoteSet {
+		deletedAll[k] = true
+	}
+	pruneNoteEdges(state, deletedAll)
+	if state.ActiveBranchID != "" {
+		if deleteBranchSet[state.ActiveBranchID] {
+			state.ActiveBranchID = ""
+			c.ActiveLeafID, err = fallbackGraphLeafTx(ctx, tx, id)
 			if err != nil {
 				return err
 			}
-			if _, ok := parentOf[*in.ParentID]; !ok {
-				return invalidGraph("父消息不在当前话题中")
-			}
-			if *in.ParentID == in.MessageID || isReachableInDepGraph(parentOf, sideRefsOf, *in.ParentID, in.MessageID) {
-				return invalidGraph("不能形成循环上下文连接")
-			}
+		} else if i := branchIndex(state, state.ActiveBranchID); i >= 0 {
+			c.ActiveLeafID = state.Branches[i].ParentMessageID
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET parent_id = ? WHERE id = ?`, *in.ParentID, in.MessageID); err != nil {
-			return err
-		}
-	case "setNodeMeta":
-		if in.GraphMeta == nil && (in.Collapsed != nil || in.Expanded != nil || in.Summary != nil || in.X != nil || in.Y != nil) {
-			in.GraphMeta = &GraphMetaPatch{Collapsed: in.Collapsed, Expanded: in.Expanded, Summary: in.Summary, X: in.X, Y: in.Y}
-		}
-		if in.GraphMeta == nil && len(in.Positions) == 0 {
-			return invalidGraph("缺少节点元数据或坐标")
-		}
-		if in.GraphMeta != nil {
-			if len(in.MessageIDs) > 0 {
-				msgIDs := dedupeNonEmpty(in.MessageIDs)
-				if len(msgIDs) == 0 {
-					return invalidGraph("请选择要操作的节点")
-				}
-				for _, mid := range msgIDs {
-					if err := updateGraphMetaTx(ctx, tx, id, mid, *in.GraphMeta); err != nil {
-						return err
-					}
-				}
-			} else {
-				if err := updateGraphMetaTx(ctx, tx, id, in.MessageID, *in.GraphMeta); err != nil {
-					return err
-				}
-			}
-		}
-		for _, pos := range in.Positions {
-			targets := 0
-			if pos.MessageID != "" {
-				targets++
-			}
-			if pos.BranchID != "" {
-				targets++
-			}
-			if pos.NoteID != "" {
-				targets++
-			}
-			if targets != 1 || pos.X == nil || pos.Y == nil {
-				return invalidGraph("节点坐标缺少目标或坐标")
-			}
-			if pos.MessageID != "" {
-				if err := updateGraphMetaTx(ctx, tx, id, pos.MessageID, GraphMetaPatch{X: pos.X, Y: pos.Y}); err != nil {
-					return err
-				}
-			} else if pos.BranchID != "" {
-				if i := branchIndex(state, pos.BranchID); i >= 0 {
-					state.Branches[i].X, state.Branches[i].Y = pos.X, pos.Y
-				} else {
-					return invalidGraph("话题内分支不存在")
-				}
-			} else if i := noteIndex(state, pos.NoteID); i >= 0 {
-				state.Notes[i].X, state.Notes[i].Y = pos.X, pos.Y
-			} else {
-				return invalidGraph("文字标注不存在")
-			}
-		}
-	case "deleteNodes":
-		msgIDs := dedupeNonEmpty(in.MessageIDs)
-		branchIDs := dedupeNonEmpty(in.BranchIDs)
-		noteIDs := dedupeNonEmpty(in.NoteIDs)
-		if len(msgIDs) == 0 && len(branchIDs) == 0 && len(noteIDs) == 0 {
-			return invalidGraph("请选择要删除的节点")
-		}
-		rows, err := tx.QueryContext(ctx, `SELECT id, parent_id FROM messages WHERE conversation_id = ?`, id)
-		if err != nil {
-			return err
-		}
-		parentOf := make(map[string]string)
-		allMsgIDs := make([]string, 0)
-		for rows.Next() {
-			var mid, pid string
-			if err := rows.Scan(&mid, &pid); err != nil {
-				rows.Close()
-				return err
-			}
-			parentOf[mid] = pid
-			allMsgIDs = append(allMsgIDs, mid)
-		}
-		if err := rows.Close(); err != nil {
-			return err
-		}
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		deleteMsgSet := make(map[string]bool, len(msgIDs))
-		for _, mid := range msgIDs {
-			if _, ok := parentOf[mid]; !ok {
-				return invalidGraph("消息不在当前话题中")
-			}
-			deleteMsgSet[mid] = true
-		}
-		deleteBranchSet := make(map[string]bool, len(branchIDs))
-		for _, bid := range branchIDs {
-			if branchIndex(state, bid) < 0 {
-				return invalidGraph("话题内分支不存在")
-			}
-			deleteBranchSet[bid] = true
-		}
-		deleteNoteSet := make(map[string]bool, len(noteIDs))
-		for _, nid := range noteIDs {
-			if noteIndex(state, nid) < 0 {
-				return invalidGraph("文字标注不存在")
-			}
-			deleteNoteSet[nid] = true
-		}
-		survivingAncestor := func(start string) string {
-			seen := make(map[string]bool)
-			for cur := start; cur != ""; {
-				if !deleteMsgSet[cur] {
-					return cur
-				}
-				if seen[cur] {
-					return ""
-				}
-				seen[cur] = true
-				cur = parentOf[cur]
-			}
-			return ""
-		}
-		for _, mid := range allMsgIDs {
-			if deleteMsgSet[mid] {
-				continue
-			}
-			if parent := parentOf[mid]; parent != "" && deleteMsgSet[parent] {
-				if _, err := tx.ExecContext(ctx, `UPDATE messages SET parent_id = ? WHERE conversation_id = ? AND id = ?`, survivingAncestor(parent), id, mid); err != nil {
-					return err
-				}
-			}
-		}
-		for _, mid := range msgIDs {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM messages WHERE conversation_id = ? AND id = ?`, id, mid); err != nil {
+	} else if c.ActiveLeafID != "" && deleteMsgSet[c.ActiveLeafID] {
+		next := survivingAncestor(c.ActiveLeafID)
+		if next == "" {
+			next, err = fallbackGraphLeafTx(ctx, tx, id)
+			if err != nil {
 				return err
 			}
 		}
-		if err := pruneSideRefsTx(ctx, tx, id, deleteMsgSet); err != nil {
-			return err
-		}
-		remaining := make([]domain.ConversationBranchSlot, 0, len(state.Branches))
-		for _, slot := range state.Branches {
-			if deleteBranchSet[slot.ID] {
-				continue
-			}
-			if slot.ParentMessageID != "" && deleteMsgSet[slot.ParentMessageID] {
-				slot.ParentMessageID = survivingAncestor(slot.ParentMessageID)
-			}
-			remaining = append(remaining, slot)
-		}
-		state.Branches = remaining
-		if len(deleteNoteSet) > 0 {
-			keptNotes := make([]domain.ConversationGraphNote, 0, len(state.Notes))
-			for _, note := range state.Notes {
-				if !deleteNoteSet[note.ID] {
-					keptNotes = append(keptNotes, note)
-				}
-			}
-			if len(keptNotes) == 0 {
-				state.Notes = nil
-			} else {
-				state.Notes = keptNotes
-			}
-		}
-		deletedAll := make(map[string]bool, len(deleteMsgSet)+len(deleteBranchSet)+len(deleteNoteSet))
-		for k := range deleteMsgSet {
-			deletedAll[k] = true
-		}
-		for k := range deleteBranchSet {
-			deletedAll[k] = true
-		}
-		for k := range deleteNoteSet {
-			deletedAll[k] = true
-		}
-		pruneNoteEdges(state, deletedAll)
-		if state.ActiveBranchID != "" {
-			if deleteBranchSet[state.ActiveBranchID] {
-				state.ActiveBranchID = ""
-				c.ActiveLeafID, err = fallbackGraphLeafTx(ctx, tx, id)
-				if err != nil {
-					return err
-				}
-			} else if i := branchIndex(state, state.ActiveBranchID); i >= 0 {
-				c.ActiveLeafID = state.Branches[i].ParentMessageID
-			}
-		} else if c.ActiveLeafID != "" && deleteMsgSet[c.ActiveLeafID] {
-			next := survivingAncestor(c.ActiveLeafID)
-			if next == "" {
-				next, err = fallbackGraphLeafTx(ctx, tx, id)
-				if err != nil {
-					return err
-				}
-			}
-			c.ActiveLeafID = next
-		}
+		c.ActiveLeafID = next
+	}
+	return nil
+}
+
+func applyGraphBranchMutationTx(ctx context.Context, tx *sql.Tx, id string, c *domain.Conversation, in GraphMutationInput) error {
+	state := c.GraphState
+	switch in.Op {
 	case "createBranch":
 		if in.ParentMessageID != "" {
 			if _, err := graphMessageTx(ctx, tx, id, in.ParentMessageID); err != nil {
@@ -584,11 +618,34 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 		pruneNoteEdges(state, map[string]bool{in.BranchID: true})
 		if state.ActiveBranchID == in.BranchID {
 			state.ActiveBranchID = ""
+			var err error
 			c.ActiveLeafID, err = newestGraphMessageTx(ctx, tx, id, true)
 			if err != nil {
 				return err
 			}
 		}
+	case "activateBranch":
+		if (in.BranchID == "") == (in.LeafMessageID == "") {
+			return invalidGraph("请选择一个分支目标")
+		}
+		if in.BranchID != "" {
+			i := branchIndex(state, in.BranchID)
+			if i < 0 {
+				return invalidGraph("话题内分支不存在")
+			}
+			state.ActiveBranchID, c.ActiveLeafID = in.BranchID, state.Branches[i].ParentMessageID
+		} else {
+			if _, err := graphMessageTx(ctx, tx, id, in.LeafMessageID); err != nil {
+				return err
+			}
+			state.ActiveBranchID, c.ActiveLeafID = "", in.LeafMessageID
+		}
+	}
+	return nil
+}
+
+func applyGraphNoteMutationTx(ctx context.Context, tx *sql.Tx, id string, state *domain.ConversationGraphState, in GraphMutationInput) error {
+	switch in.Op {
 	case "createNote":
 		text, err := normalizeNoteText(in.Text)
 		if err != nil {
@@ -677,6 +734,12 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 		if len(state.NoteEdges) == 0 {
 			state.NoteEdges = nil
 		}
+	}
+	return nil
+}
+
+func applyGraphSideRefMutationTx(ctx context.Context, tx *sql.Tx, id string, in GraphMutationInput) error {
+	switch in.Op {
 	case "addSideRef":
 		if in.MessageID == "" || in.SourceMessageID == "" {
 			return invalidGraph("缺少目标或源消息")
@@ -737,16 +800,15 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET graph_meta_json = ? WHERE conversation_id = ? AND id = ?`, string(data), id, targetMsg.ID); err != nil {
-			return err
-		}
+		_, err = tx.ExecContext(ctx, `UPDATE messages SET graph_meta_json = ? WHERE conversation_id = ? AND id = ?`, string(data), id, targetMsg.ID)
+		return err
 	case "removeSideRef":
 		targetMsg, err := graphMessageTx(ctx, tx, id, in.MessageID)
 		if err != nil {
 			return err
 		}
 		if targetMsg.GraphMeta == nil || len(targetMsg.GraphMeta.SideRefs) == 0 {
-			break
+			return nil
 		}
 		if in.SourceMessageID == "" {
 			targetMsg.GraphMeta.SideRefs = nil
@@ -767,32 +829,10 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE messages SET graph_meta_json = ? WHERE conversation_id = ? AND id = ?`, string(data), id, targetMsg.ID); err != nil {
-			return err
-		}
-	case "activateBranch":
-		if (in.BranchID == "") == (in.LeafMessageID == "") {
-			return invalidGraph("请选择一个分支目标")
-		}
-		if in.BranchID != "" {
-			i := branchIndex(state, in.BranchID)
-			if i < 0 {
-				return invalidGraph("话题内分支不存在")
-			}
-			state.ActiveBranchID, c.ActiveLeafID = in.BranchID, state.Branches[i].ParentMessageID
-		} else {
-			if _, err := graphMessageTx(ctx, tx, id, in.LeafMessageID); err != nil {
-				return err
-			}
-			state.ActiveBranchID, c.ActiveLeafID = "", in.LeafMessageID
-		}
-	default:
-		return invalidGraph("不支持的图谱操作")
-	}
-	if err := saveGraphStateTx(ctx, tx, c); err != nil {
+		_, err = tx.ExecContext(ctx, `UPDATE messages SET graph_meta_json = ? WHERE conversation_id = ? AND id = ?`, string(data), id, targetMsg.ID)
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 func appendGraphMessageTx(ctx context.Context, tx *sql.Tx, c *domain.Conversation, m *domain.Message) error {

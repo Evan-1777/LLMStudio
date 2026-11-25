@@ -167,7 +167,7 @@ func (h *PluginHandler) ExecuteMCPTools(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if strings.Contains(r.Header.Get("Accept"), "text/event-stream") || r.URL.Query().Get("stream") == "true" {
-		streamSSEToolEvents(w, "", run)
+		StreamSSEToolEvents(w, "", writeServiceError, run)
 		return
 	}
 

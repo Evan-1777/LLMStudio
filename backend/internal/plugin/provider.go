@@ -1,10 +1,11 @@
 package plugin
 
 import (
+	"cmp"
 	"fmt"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"sync"
 
 	"llmstudio/backend/internal/domain"
@@ -94,8 +95,8 @@ func (r *ProviderRegistry) List() []ProviderAdapterInfo {
 			DisplayName: a.DisplayName(),
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].ID < out[j].ID
+	slices.SortFunc(out, func(a, b ProviderAdapterInfo) int {
+		return cmp.Compare(a.ID, b.ID)
 	})
 	return out
 }

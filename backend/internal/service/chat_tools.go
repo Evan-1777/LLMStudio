@@ -2,10 +2,11 @@ package service
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -74,11 +75,8 @@ func listNormalizedScopedServers(ctx context.Context, catalog MCPCatalog) ([]Sco
 				out = append(out, entry)
 			}
 		}
-		sort.Slice(out, func(i, j int) bool {
-			if out[i].Scope != out[j].Scope {
-				return out[i].Scope < out[j].Scope
-			}
-			return out[i].Server.ID < out[j].Server.ID
+		slices.SortFunc(out, func(a, b ScopedMCPServer) int {
+			return cmp.Or(cmp.Compare(a.Scope, b.Scope), cmp.Compare(a.Server.ID, b.Server.ID))
 		})
 		return out, true, nil
 	}
@@ -152,24 +150,22 @@ func discoverToolsConcurrent(ctx context.Context, mcpClient plugin.MCPClientBoun
 	sem := make(chan struct{}, min(maxDiscoveryConcurrency, len(entries)))
 	var wg sync.WaitGroup
 	for i, entry := range entries {
-		wg.Add(1)
-		go func(idx int, e ScopedMCPServer) {
-			defer wg.Done()
+		wg.Go(func() {
 			select {
 			case sem <- struct{}{}:
 				defer func() { <-sem }()
 			case <-ctx.Done():
-				results[idx].err = ctx.Err()
+				results[i].err = ctx.Err()
 				return
 			}
 			discCtx, cancel := context.WithTimeout(ctx, mcpDiscoveryTimeout)
-			descriptors, listErr := listServerTools(discCtx, mcpClient, e)
+			descriptors, listErr := listServerTools(discCtx, mcpClient, entry)
 			cancel()
-			results[idx] = serverDiscoveryResult{
+			results[i] = serverDiscoveryResult{
 				descriptors: descriptors,
 				err:         listErr,
 			}
-		}(i, entry)
+		})
 	}
 	wg.Wait()
 	return results
@@ -257,14 +253,14 @@ func normalizedServers(servers []domain.MCPServerConfig) []domain.MCPServerConfi
 			out = append(out, srv)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	slices.SortFunc(out, func(a, b domain.MCPServerConfig) int { return cmp.Compare(a.ID, b.ID) })
 	return out
 }
 
 // normalizedDescriptors returns upstream tools ordered by name.
 func normalizedDescriptors(descriptors []plugin.MCPToolDescriptor) []plugin.MCPToolDescriptor {
 	out := append([]plugin.MCPToolDescriptor(nil), descriptors...)
-	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	slices.SortFunc(out, func(a, b plugin.MCPToolDescriptor) int { return cmp.Compare(a.Name, b.Name) })
 	return out
 }
 

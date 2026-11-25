@@ -608,6 +608,108 @@ async function startMockUpstream(): Promise<{
   };
 }
 
+const PROXY_ENV_KEYS = [
+  'http_proxy',
+  'https_proxy',
+  'HTTP_PROXY',
+  'HTTPS_PROXY',
+  'all_proxy',
+  'ALL_PROXY',
+] as const;
+
+const LOOPBACK_NO_PROXY_ENTRIES = ['127.0.0.1', 'localhost', '::1'] as const;
+
+function mergeLoopbackNoProxy(existing?: string): string {
+  const parts = (existing ?? '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (const entry of LOOPBACK_NO_PROXY_ENTRIES) {
+    if (!parts.includes(entry)) {
+      parts.push(entry);
+    }
+  }
+  return parts.join(',');
+}
+
+export function buildLoopbackCleanEnv(
+  baseEnv: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const next: NodeJS.ProcessEnv = { ...baseEnv };
+  for (const key of PROXY_ENV_KEYS) {
+    delete next[key];
+  }
+  const mergedNoProxy = mergeLoopbackNoProxy(next.NO_PROXY || next.no_proxy);
+  next.NO_PROXY = mergedNoProxy;
+  next.no_proxy = mergedNoProxy;
+  return next;
+}
+
+function isLoopbackUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.toLowerCase();
+    return host === '127.0.0.1' || host === 'localhost' || host === '::1' || host === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
+function probeLoopbackHttp(urlStr: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (!settled) {
+        settled = true;
+        resolve(ok);
+      }
+    };
+    try {
+      const req = http.request(
+        urlStr,
+        { method: 'GET', agent: false, timeout: timeoutMs },
+        (res) => {
+          res.resume();
+          const code = res.statusCode ?? 0;
+          done(code >= 200 && code < 300);
+        },
+      );
+      req.on('timeout', () => {
+        req.destroy();
+        done(false);
+      });
+      req.on('error', () => done(false));
+      req.end();
+    } catch {
+      done(false);
+    }
+  });
+}
+
+async function withLoopbackProxyBypass<T>(fn: () => Promise<T>): Promise<T> {
+  const saved: Partial<Record<(typeof PROXY_ENV_KEYS)[number], string | undefined>> = {};
+  for (const key of PROXY_ENV_KEYS) {
+    saved[key] = process.env[key];
+    delete process.env[key];
+  }
+  const mergedNoProxy = mergeLoopbackNoProxy(
+    process.env.NO_PROXY || process.env.no_proxy,
+  );
+  process.env.NO_PROXY = mergedNoProxy;
+  process.env.no_proxy = mergedNoProxy;
+  try {
+    return await fn();
+  } finally {
+    for (const key of PROXY_ENV_KEYS) {
+      if (saved[key] === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = saved[key];
+      }
+    }
+  }
+}
+
 async function resolveBrowser(): Promise<{
   browser: Browser;
   isCdp: boolean;
@@ -617,21 +719,35 @@ async function resolveBrowser(): Promise<{
     (!process.env.CI ? 'http://127.0.0.1:9222' : '');
 
   if (cdpUrl) {
+    const versionUrl = `${cdpUrl.replace(/\/+$/, '')}/json/version`;
+    const loopback = isLoopbackUrl(cdpUrl);
     try {
-      const controller = new AbortController();
-      const t = setTimeout(() => controller.abort(), 800);
-      const res = await fetch(`${cdpUrl.replace(/\/+$/, '')}/json/version`, {
-        signal: controller.signal,
-      });
-      clearTimeout(t);
-      if (res.ok) {
-        const browser = await chromium.connectOverCDP(cdpUrl);
+      let reachable = false;
+      if (loopback) {
+        reachable = await probeLoopbackHttp(versionUrl, 1200);
+      } else {
+        const controller = new AbortController();
+        const t = setTimeout(() => controller.abort(), 800);
+        try {
+          const res = await fetch(versionUrl, { signal: controller.signal });
+          reachable = res.ok;
+        } finally {
+          clearTimeout(t);
+        }
+      }
+      if (reachable) {
+        const browser = loopback
+          ? await withLoopbackProxyBypass(() => chromium.connectOverCDP(cdpUrl))
+          : await chromium.connectOverCDP(cdpUrl);
         return { browser, isCdp: true };
       }
     } catch {
       if (process.env.CDP_ENDPOINT) {
         throw new Error(`CDP_ENDPOINT ${cdpUrl} is not reachable`);
       }
+    }
+    if (process.env.CDP_ENDPOINT) {
+      throw new Error(`CDP_ENDPOINT ${cdpUrl} is not reachable`);
     }
   }
 
@@ -714,7 +830,7 @@ export const test = base.extend<
 
     const proc: ChildProcess = spawn(workerShared.binPath, [], {
       env: {
-        ...process.env,
+        ...buildLoopbackCleanEnv(process.env),
         LLMSTUDIO_PORT: String(goPort),
         LLMSTUDIO_DB_PATH: dbPath,
         LLMSTUDIO_STATIC_DIR: DIST_DIR,
@@ -728,14 +844,9 @@ export const test = base.extend<
     try {
       let healthy = false;
       for (let i = 0; i < 60; i++) {
-        try {
-          const resp = await fetch(`${baseUrl}/healthz`);
-          if (resp.ok) {
-            healthy = true;
-            break;
-          }
-        } catch {
-          // Wait for startup.
+        if (await probeLoopbackHttp(`${baseUrl}/healthz`, 1000)) {
+          healthy = true;
+          break;
         }
         await new Promise((r) => setTimeout(r, 100));
       }

@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -287,7 +287,7 @@ func writeSortedHeaderHash(h io.Writer, headers map[string]string) {
 	for k := range headers {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	slices.Sort(keys)
 	for _, k := range keys {
 		_, _ = io.WriteString(h, k)
 		_, _ = io.WriteString(h, ":")

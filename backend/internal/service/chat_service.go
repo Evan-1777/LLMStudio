@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -280,41 +279,6 @@ type PreparedStream struct {
 	detachedRun          *detachedRun
 }
 
-// PreparedLocalHTTPRequest describes a pre-encoded HTTP request without server-stored secrets.
-type PreparedLocalHTTPRequest struct {
-	Method   string            `json:"method"`
-	URL      string            `json:"url"`
-	Headers  map[string]string `json:"headers"`
-	Body     json.RawMessage   `json:"body"`
-	AuthType string            `json:"authType"`
-}
-
-// PreparedLocalCacheStep describes an optional explicit cache creation step to run before the main request.
-type PreparedLocalCacheStep struct {
-	Request PreparedLocalHTTPRequest `json:"request"`
-	PlanKey string                   `json:"planKey"`
-}
-
-// PreparedLocalRequest holds a pre-encoded upstream request for browser-direct execution.
-// Server-stored API keys are never included in URL or Headers.
-type PreparedLocalRequest struct {
-	ParentID             *string                  `json:"parentId,omitempty"`
-	ConsumeBranchID      string                   `json:"consumeBranchId,omitempty"`
-	Method               string                   `json:"method"`
-	URL                  string                   `json:"url"`
-	Headers              map[string]string        `json:"headers"`
-	Body                 json.RawMessage          `json:"body"`
-	AuthType             string                   `json:"authType"`
-	WebSearchBlock       *domain.ContentBlock     `json:"webSearchBlock,omitempty"`
-	ReplaceMessageID     string                   `json:"replaceMessageId,omitempty"`
-	InsertAfterMessageID string                   `json:"insertAfterMessageId,omitempty"`
-	CacheStep            *PreparedLocalCacheStep  `json:"cacheStep,omitempty"`
-	CacheState           *plugin.PromptCacheState `json:"cacheState,omitempty"`
-	// CacheRetry marks a prepared request that resends once without the rejected
-	// cache resource.
-	CacheRetry bool `json:"cacheRetry,omitempty"`
-}
-
 type preparedUpstream struct {
 	graphWrite           *domain.MessageGraphWrite
 	conversation         domain.Conversation
@@ -486,199 +450,6 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	return ps, nil
 }
 
-// PrepareLocal validates inputs, runs optional web search, plans stateless explicit cache steps,
-// and encodes the upstream request without mutating SQLite or emitting server-stored API keys.
-func (s *ChatService) PrepareLocal(ctx context.Context, in StreamChatInput) (PreparedLocalRequest, error) {
-	prep, err := s.prepareUpstream(ctx, in, true)
-	if err != nil {
-		return PreparedLocalRequest{}, err
-	}
-
-	authType := strings.TrimSpace(prep.provider.AuthType)
-	if authType == "" {
-		authType = domain.AuthTypeBearer
-	}
-
-	chatInput := prep.chatInput
-	var (
-		cacheStep     *PreparedLocalCacheStep
-		outCacheState *plugin.PromptCacheState
-		cacheRetry    bool
-	)
-	planner, hasPlanner := prep.apiFormat.(plugin.PromptCachePlanner)
-
-	// A rejected browser-direct main request is classified by the same rules as
-	// the server path, allowing at most one cache-less resend.
-	if hasPlanner && in.LocalMainFailure != nil {
-		used := in.CacheState
-		if used == nil {
-			used = s.cacheStore.Get(prep.cacheScope)
-		}
-		if used != nil && strings.TrimSpace(used.ResourceName) != "" {
-			action := planner.ClassifyCacheError(in.LocalMainFailure.Status, []byte(in.LocalMainFailure.Body), used)
-			switch {
-			case action.InvalidateScope:
-				s.cacheStore.Delete(prep.cacheScope)
-				cacheRetry = true
-			case action.MarkUnsupported:
-				s.cacheStore.Set(prep.cacheScope, plugin.PromptCacheState{Unsupported: true})
-				cacheRetry = true
-			case action.RetryWithoutCache:
-				cacheRetry = true
-			}
-		}
-	}
-
-	if hasPlanner && !cacheRetry {
-		// The gateway owns the reusable state; the browser only echoes the state of
-		// the request it just executed.
-		current := in.CacheState
-		if current == nil {
-			current = s.cacheStore.Get(prep.cacheScope)
-		}
-		plan, planErr := planner.PlanCache(ctx, chatInput, current)
-		if planErr != nil {
-			return PreparedLocalRequest{}, planErr
-		}
-		fullPlanKey := ""
-		if plan.PlanKey != "" {
-			fullPlanKey = buildLocalPlanKey(prep.cacheScope, prep.systemPrompt, prep.tools, plan.PlanKey)
-		}
-
-		switch {
-		case in.CacheResolution != nil:
-			// A resolution only registers when it labels the candidate planned for this
-			// scope; stale or foreign resolutions are discarded.
-			if plan.CreateRequest != nil && fullPlanKey != "" && in.CacheResolution.PlanKey == fullPlanKey {
-				resBody := sanitizeLocalCacheResolutionBody(*in.CacheResolution)
-				res, resErr := planner.ResolveCache(ctx, chatInput, plan, plugin.CacheResolutionInput{
-					StatusCode: in.CacheResolution.Status,
-					Body:       resBody,
-					PlanKey:    plan.PlanKey,
-				})
-				if resErr != nil {
-					s.cacheStore.FinishCreate(prep.cacheScope, plan.PlanKey, nil)
-					return PreparedLocalRequest{}, resErr
-				}
-				if res.HardError != nil {
-					s.cacheStore.FinishCreate(prep.cacheScope, plan.PlanKey, nil)
-					return PreparedLocalRequest{}, res.HardError
-				}
-				if res.State != nil {
-					s.cacheStore.Set(prep.cacheScope, *res.State)
-				}
-				s.cacheStore.FinishCreate(prep.cacheScope, plan.PlanKey, res.State)
-				outCacheState = res.State
-				chatInput.PromptCache = res.State
-			} else if plan.CreateRequest == nil && plan.ReuseState != nil {
-				outCacheState = plan.ReuseState
-				chatInput.PromptCache = plan.ReuseState
-			}
-		case plan.CreateRequest != nil:
-			claim := s.cacheStore.ClaimCreate(prep.cacheScope, plan.PlanKey, promptCachePendingTTL)
-			if !claim.leader {
-				// The same candidate is already handed out elsewhere; this overlapping
-				// request proceeds without the cache resource.
-				break
-			}
-			flightPlanKey := plan.PlanKey
-			if in.CacheState == nil {
-				var shouldCreate bool
-				plan, shouldCreate, planErr = s.recheckCachePlanAfterClaim(ctx, chatInput, planner, prep.cacheScope, plan)
-				if planErr != nil {
-					return PreparedLocalRequest{}, planErr
-				}
-				if !shouldCreate {
-					outCacheState = plan.ReuseState
-					chatInput.PromptCache = plan.ReuseState
-					break
-				}
-				if plan.PlanKey != "" {
-					fullPlanKey = buildLocalPlanKey(prep.cacheScope, prep.systemPrompt, prep.tools, plan.PlanKey)
-				} else {
-					fullPlanKey = ""
-				}
-			}
-			createEndpoint, epErr := resolveEndpointForCacheCreate(
-				prep.adapter,
-				localEndpointProvider(prep.provider, prep.resolveProv, prep.credentialEnvelope),
-				prep.model,
-				*plan.CreateRequest,
-				prep.compat,
-			)
-			if epErr != nil {
-				s.cacheStore.FinishCreate(prep.cacheScope, flightPlanKey, nil)
-				return PreparedLocalRequest{}, epErr
-			}
-			createBody := json.RawMessage(plan.CreateRequest.Body)
-			if len(createBody) == 0 {
-				createBody = json.RawMessage("{}")
-			}
-			cacheStep = &PreparedLocalCacheStep{
-				PlanKey: fullPlanKey,
-				Request: PreparedLocalHTTPRequest{
-					Method:   plan.CreateRequest.Method,
-					URL:      createEndpoint.URL,
-					Headers:  headersToStringMap(mergeRequestHeaders(plan.CreateRequest.Headers, createEndpoint.Headers)),
-					Body:     createBody,
-					AuthType: authType,
-				},
-			}
-		default:
-			outCacheState = plan.ReuseState
-			chatInput.PromptCache = plan.ReuseState
-		}
-	}
-
-	if cacheRetry {
-		outCacheState = &plugin.PromptCacheState{Unsupported: true}
-		chatInput.PromptCache = outCacheState
-	}
-
-	encoded, encErr := prep.apiFormat.EncodeRequest(ctx, chatInput)
-	if encErr != nil {
-		if appErr, ok := domain.AsAppError(encErr); ok {
-			return PreparedLocalRequest{}, appErr
-		}
-		return PreparedLocalRequest{}, domain.NewError(domain.ErrCodeInternalError, "encode upstream request failed", encErr)
-	}
-	endpoint, epErr := prep.adapter.ResolveEndpoint(
-		localEndpointProvider(prep.provider, prep.resolveProv, prep.credentialEnvelope),
-		prep.model,
-		encoded.DefaultPath,
-		encoded.Query,
-		prep.compat,
-	)
-	if epErr != nil {
-		return PreparedLocalRequest{}, epErr
-	}
-
-	body := json.RawMessage(encoded.Body)
-	if len(body) == 0 {
-		body = json.RawMessage("{}")
-	}
-
-	var write domain.MessageGraphWrite
-	if prep.graphWrite != nil {
-		write = *prep.graphWrite
-	}
-	return PreparedLocalRequest{
-		ParentID:             write.ParentID,
-		ConsumeBranchID:      write.ConsumeBranchID,
-		Method:               encoded.Method,
-		URL:                  endpoint.URL,
-		Headers:              headersToStringMap(mergeRequestHeaders(encoded.Headers, endpoint.Headers)),
-		Body:                 body,
-		AuthType:             authType,
-		WebSearchBlock:       prep.webSearchBlock,
-		ReplaceMessageID:     prep.replaceMessageID,
-		InsertAfterMessageID: prep.insertAfterMessageID,
-		CacheStep:            cacheStep,
-		CacheState:           outCacheState,
-		CacheRetry:           cacheRetry,
-	}, nil
-}
-
 type conversationUpstreamContext struct {
 	conversation  domain.Conversation
 	provider      domain.ProviderConfig
@@ -807,6 +578,123 @@ func (s *ChatService) resolveConversationUpstreamContext(
 	}, nil
 }
 
+type resolvedTurnHistory struct {
+	allMessages          []domain.Message
+	history              []domain.Message
+	graphWrite           *domain.MessageGraphWrite
+	replaceMessageID     string
+	insertAfterMessageID string
+}
+
+func resolveTurnHistory(
+	conv domain.Conversation,
+	prov domain.ProviderConfig,
+	model domain.ModelConfig,
+	in StreamChatInput,
+	allMessages []domain.Message,
+	isRegen bool,
+	isLocalCont bool,
+	userBlocks []domain.ContentBlock,
+) (resolvedTurnHistory, error) {
+	history := allMessages
+	active := resolveActiveBranchPath(conv, history)
+	var (
+		graphWrite           *domain.MessageGraphWrite
+		replaceMessageID     string
+		insertAfterMessageID string
+		err                  error
+	)
+	switch {
+	case isRegen:
+		if graphEnabled(conv) {
+			history, err = resolvePathUpToMessage(history, in.RegenerateMessageID)
+			if err != nil {
+				return resolvedTurnHistory{}, err
+			}
+		}
+		targetIdx := -1
+		for i, m := range history {
+			if m.ID == in.RegenerateMessageID {
+				targetIdx = i
+				break
+			}
+		}
+		if targetIdx < 0 {
+			return resolvedTurnHistory{}, domain.NewError(domain.ErrCodeNotFound, "target message not found in conversation", nil)
+		}
+		target := history[targetIdx]
+		if target.Role == domain.RoleUser {
+			if graphEnabled(conv) {
+				insertAfterMessageID = target.ID
+			}
+			for i, m := range active {
+				if m.ID != target.ID || i+1 == len(active) {
+					continue
+				}
+				if active[i+1].Role == domain.RoleAssistant {
+					replaceMessageID, insertAfterMessageID = active[i+1].ID, ""
+				} else {
+					insertAfterMessageID = target.ID
+				}
+				break
+			}
+			history = history[:targetIdx+1]
+		} else {
+			replaceMessageID = target.ID
+			history = history[:targetIdx]
+		}
+	case isLocalCont:
+		anchorID := strings.TrimSpace(in.LocalContinuation.UserMessageID)
+		if graphEnabled(conv) {
+			history, err = resolvePathUpToMessage(history, anchorID)
+			if err != nil {
+				return resolvedTurnHistory{}, err
+			}
+		} else {
+			for i, m := range history {
+				if m.ID == anchorID {
+					history = history[:i+1]
+					break
+				}
+			}
+		}
+		if len(history) == 0 || history[len(history)-1].ID != anchorID {
+			return resolvedTurnHistory{}, domain.NewError(domain.ErrCodeNotFound, "anchor user message not found in conversation", nil)
+		}
+	default:
+		if graphEnabled(conv) {
+			parentID := ""
+			if len(active) > 0 {
+				parentID = active[len(active)-1].ID
+			}
+			graphWrite = &domain.MessageGraphWrite{ParentID: &parentID, ConsumeBranchID: conv.GraphState.ActiveBranchID}
+		}
+		history = append(active, domain.Message{
+			ConversationID: conv.ID,
+			Role:           domain.RoleUser,
+			Blocks:         userBlocks,
+			CreatedAt:      time.Now().UTC(),
+		})
+	}
+
+	if isLocalCont {
+		history = append(history, domain.Message{
+			ConversationID: conv.ID,
+			Role:           domain.RoleAssistant,
+			Blocks:         filterBlocksForModelHistory(in.LocalContinuation.Blocks),
+			ProviderID:     prov.ID,
+			ModelID:        model.ID,
+		})
+	}
+	return resolvedTurnHistory{
+		allMessages:          allMessages,
+		history:              history,
+		graphWrite:           graphWrite,
+		replaceMessageID:     replaceMessageID,
+		insertAfterMessageID: insertAfterMessageID,
+	}, nil
+}
+
 func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, allowMissingLocalKey bool) (preparedUpstream, error) {
 	up, err := s.resolveConversationUpstreamContext(ctx, in.ConversationID, in.ProviderID, in.ModelID, in.Params, allowMissingLocalKey)
 	if err != nil {
@@ -881,98 +769,17 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		}
 	}
 
-	history, err := s.msgs.ListByConversation(ctx, conv.ID)
+	allMessages, err := s.msgs.ListByConversation(ctx, conv.ID)
 	if err != nil {
 		return preparedUpstream{}, err
 	}
-	allMessages := history
-
-	active := resolveActiveBranchPath(conv, history)
-	var graphWrite *domain.MessageGraphWrite
-	var replaceMessageID, insertAfterMessageID string
-	if isRegen {
-		if graphEnabled(conv) {
-			history, err = resolvePathUpToMessage(history, in.RegenerateMessageID)
-			if err != nil {
-				return preparedUpstream{}, err
-			}
-		}
-		targetIdx := -1
-		for i, m := range history {
-			if m.ID == in.RegenerateMessageID {
-				targetIdx = i
-				break
-			}
-		}
-		if targetIdx < 0 {
-			return preparedUpstream{}, domain.NewError(domain.ErrCodeNotFound, "target message not found in conversation", nil)
-		}
-		target := history[targetIdx]
-		if target.Role == domain.RoleUser {
-			if graphEnabled(conv) {
-				insertAfterMessageID = target.ID
-			}
-			for i, m := range active {
-				if m.ID != target.ID || i+1 == len(active) {
-					continue
-				}
-				if active[i+1].Role == domain.RoleAssistant {
-					replaceMessageID, insertAfterMessageID = active[i+1].ID, ""
-				} else {
-					insertAfterMessageID = target.ID
-				}
-				break
-			}
-			history = history[:targetIdx+1]
-		} else {
-			replaceMessageID = target.ID
-			history = history[:targetIdx]
-		}
-	} else if isLocalCont {
-		anchorID := strings.TrimSpace(in.LocalContinuation.UserMessageID)
-		if graphEnabled(conv) {
-			history, err = resolvePathUpToMessage(history, anchorID)
-			if err != nil {
-				return preparedUpstream{}, err
-			}
-		} else {
-			for i, m := range history {
-				if m.ID == anchorID {
-					history = history[:i+1]
-					break
-				}
-			}
-		}
-		if len(history) == 0 || history[len(history)-1].ID != anchorID {
-			return preparedUpstream{}, domain.NewError(domain.ErrCodeNotFound, "anchor user message not found in conversation", nil)
-		}
-	} else {
-		if graphEnabled(conv) {
-			parentID := ""
-			if len(active) > 0 {
-				parentID = active[len(active)-1].ID
-			}
-			graphWrite = &domain.MessageGraphWrite{ParentID: &parentID, ConsumeBranchID: conv.GraphState.ActiveBranchID}
-		}
-		history = append(active, domain.Message{
-			ConversationID: conv.ID,
-			Role:           domain.RoleUser,
-			Blocks:         userBlocks,
-			CreatedAt:      time.Now().UTC(),
-		})
-	}
-	if isLocalCont {
-		history = append(history, domain.Message{
-			ConversationID: conv.ID,
-			Role:           domain.RoleAssistant,
-			Blocks:         filterBlocksForModelHistory(in.LocalContinuation.Blocks),
-			ProviderID:     prov.ID,
-			ModelID:        model.ID,
-		})
+	turnHist, err := resolveTurnHistory(conv, prov, model, in, allMessages, isRegen, isLocalCont, userBlocks)
+	if err != nil {
+		return preparedUpstream{}, err
 	}
 
-	rawHistoryLen := len(history)
-	history = projectModelHistory(history)
+	rawHistoryLen := len(turnHist.history)
+	history := projectModelHistory(turnHist.history)
 
 	// Search results belong to the current user turn, not to the reusable system
 	// prompt: appending them after the user input keeps every earlier prefix stable.
@@ -994,7 +801,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	if searchPrompt != "" {
 		history = appendSearchContext(history, searchPrompt)
 	}
-	history = expandSideReferences(allMessages, history)
+	history = expandSideReferences(turnHist.allMessages, history)
 
 	prefs := s.resolvePreferencesSnapshot(ctx)
 
@@ -1019,7 +826,7 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 	cacheScope := buildPromptCacheScope(prov, model, up.apiFormat.ID(), up.compat, conv.ID)
 
 	return preparedUpstream{
-		graphWrite:           graphWrite,
+		graphWrite:           turnHist.graphWrite,
 		conversation:         conv,
 		provider:             prov,
 		resolveProv:          up.resolveProv,
@@ -1036,24 +843,14 @@ func (s *ChatService) prepareUpstream(ctx context.Context, in StreamChatInput, a
 		isRegen:              isRegen,
 		userBlocks:           userBlocks,
 		historyLen:           rawHistoryLen,
-		replaceMessageID:     replaceMessageID,
-		insertAfterMessageID: insertAfterMessageID,
+		replaceMessageID:     turnHist.replaceMessageID,
+		insertAfterMessageID: turnHist.insertAfterMessageID,
 		autoCreateCache:      autoCreateCache,
 		mcpMaxToolRounds:     prefs.MCPMaxToolRounds,
 		credentialEnvelope:   in.CredentialEnvelope,
 		cacheScope:           cacheScope,
 		chatInput:            chatInput,
 	}, nil
-}
-
-// localEndpointProvider selects the provider used to build a browser-direct request
-// envelope. Only an explicit credential request resolves against stored secrets;
-// otherwise the credential-free copy keeps prior behaviour.
-func localEndpointProvider(prov, resolveProv domain.ProviderConfig, includeCredentials bool) domain.ProviderConfig {
-	if includeCredentials {
-		return prov
-	}
-	return resolveProv
 }
 
 // appendSearchContext projects search results onto the tail of the current turn.
@@ -1102,615 +899,6 @@ func mergeRequestHeaders(encodedHeaders, endpointHeaders http.Header) http.Heade
 	return merged
 }
 
-// Stream consumes upstream response bodies across tool-use rounds, translates events via emit,
-// handles cancellation, and persists the single resulting assistant message.
-func (p *PreparedStream) Stream(ctx context.Context, emit func(domain.StreamEvent) error) error {
-	if p.detachedRun != nil {
-		return p.detachedRun.subscribe(ctx, nil, emit)
-	}
-	acc := newStreamAccumulator()
-	applyAndEmit := func(ev domain.StreamEvent) error {
-		acc.apply(ev)
-		return emit(ev)
-	}
-	setUsage := func(u *domain.Usage) {
-		acc.usage = u
-	}
-	snapshotState := func() ([]domain.ContentBlock, *domain.Usage) {
-		return acc.blocksSlice(), acc.usage
-	}
-	return p.runStream(ctx, applyAndEmit, setUsage, snapshotState, false)
-}
-
-func (p *PreparedStream) runStream(
-	ctx context.Context,
-	applyAndEmit func(domain.StreamEvent) error,
-	setUsage func(*domain.Usage),
-	snapshotState func() ([]domain.ContentBlock, *domain.Usage),
-	emitAbortedEnd bool,
-) error {
-	assistantID := p.assistantID
-	if assistantID == "" {
-		assistantID = domain.NewUUID()
-		if graphEnabled(p.conversation) && p.replaceMessageID != "" {
-			assistantID = p.replaceMessageID
-		}
-	}
-
-	persistAndMaybeNotifyAbort := func() {
-		blocks, usage := snapshotState()
-		saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonAborted, "")
-		if emitAbortedEnd && persistErr == nil {
-			_ = applyAndEmit(domain.StreamEvent{
-				Type:           domain.StreamEventMessageEnd,
-				ConversationID: p.conversation.ID,
-				MessageID:      assistantID,
-				ProviderID:     p.provider.ID,
-				ModelID:        p.model.ID,
-				Message:        &saved,
-			})
-		}
-	}
-
-	startEvent := domain.StreamEvent{
-		Type:           domain.StreamEventMessageStart,
-		ConversationID: p.conversation.ID,
-		MessageID:      assistantID,
-		ProviderID:     p.provider.ID,
-		ModelID:        p.model.ID,
-	}
-	if err := applyAndEmit(startEvent); err != nil {
-		_ = p.resp.Body.Close()
-		persistAndMaybeNotifyAbort()
-		return err
-	}
-
-	indexOffset := 0
-	if p.webSearchBlock != nil {
-		idxZero := domain.IntPtr(0)
-		wsStart := domain.StreamEvent{
-			Type:           domain.StreamEventBlockStart,
-			ConversationID: p.conversation.ID,
-			MessageID:      assistantID,
-			ProviderID:     p.provider.ID,
-			ModelID:        p.model.ID,
-			Index:          idxZero,
-			BlockType:      domain.BlockTypeWebSearch,
-			Block:          p.webSearchBlock,
-		}
-		if err := applyAndEmit(wsStart); err != nil {
-			_ = p.resp.Body.Close()
-			persistAndMaybeNotifyAbort()
-			return err
-		}
-
-		wsEnd := domain.StreamEvent{
-			Type:           domain.StreamEventBlockEnd,
-			ConversationID: p.conversation.ID,
-			MessageID:      assistantID,
-			ProviderID:     p.provider.ID,
-			ModelID:        p.model.ID,
-			Index:          idxZero,
-			BlockType:      domain.BlockTypeWebSearch,
-			Block:          p.webSearchBlock,
-		}
-		if err := applyAndEmit(wsEnd); err != nil {
-			_ = p.resp.Body.Close()
-			persistAndMaybeNotifyAbort()
-			return err
-		}
-		indexOffset = 1
-	}
-
-	seenCallIDs := make(map[string]struct{})
-	var cumulativeUsage *domain.Usage
-	finalStopReason := domain.StopReasonStop
-	resp := p.resp
-	maxRounds := p.maxToolRounds
-	if maxRounds <= 0 {
-		maxRounds = domain.DefaultMCPMaxToolRounds
-	}
-
-	for round := 0; ; round++ {
-		var (
-			streamErrMsg string
-			roundUsage   *domain.Usage
-			roundStop    string
-			roundCalls   []domain.ContentBlock
-			roundCallIDs = make(map[int]string)
-			maxSeenIdx   = indexOffset - 1
-		)
-
-		decodeErr := p.apiFormat.DecodeStream(ctx, resp.Body, func(ev domain.StreamEvent) error {
-			ev.ConversationID = p.conversation.ID
-			ev.MessageID = assistantID
-			ev.ProviderID = p.provider.ID
-			ev.ModelID = p.model.ID
-			if ev.Index != nil {
-				shifted := *ev.Index + indexOffset
-				ev.Index = &shifted
-				if shifted > maxSeenIdx {
-					maxSeenIdx = shifted
-				}
-			}
-
-			if ev.Block != nil && ev.Block.Type == domain.BlockTypeToolCall && ev.Index != nil {
-				bCopy := *ev.Block
-				bCopy.ToolSource = p.toolBindings[bCopy.Name].source()
-				idx := *ev.Index
-				switch ev.Type {
-				case domain.StreamEventBlockStart:
-					id := strings.TrimSpace(bCopy.ID)
-					if id == "" {
-						id = fmt.Sprintf("call_r%d_%d", round+1, idx)
-					}
-					if _, exists := seenCallIDs[id]; exists {
-						base := fmt.Sprintf("call_r%d_%d", round+1, idx)
-						id = base
-						for suffix := 2; ; suffix++ {
-							if _, clash := seenCallIDs[id]; !clash {
-								break
-							}
-							id = fmt.Sprintf("%s_%d", base, suffix)
-						}
-					}
-					seenCallIDs[id] = struct{}{}
-					roundCallIDs[idx] = id
-					bCopy.ID = id
-					ev.Block = &bCopy
-				case domain.StreamEventBlockEnd:
-					id, ok := roundCallIDs[idx]
-					if !ok {
-						id = strings.TrimSpace(bCopy.ID)
-						if id == "" {
-							id = fmt.Sprintf("call_r%d_%d", round+1, idx)
-						}
-						if _, exists := seenCallIDs[id]; exists {
-							base := fmt.Sprintf("call_r%d_%d", round+1, idx)
-							id = base
-							for suffix := 2; ; suffix++ {
-								if _, clash := seenCallIDs[id]; !clash {
-									break
-								}
-								id = fmt.Sprintf("%s_%d", base, suffix)
-							}
-						}
-						seenCallIDs[id] = struct{}{}
-						roundCallIDs[idx] = id
-					}
-					bCopy.ID = id
-					ev.Block = &bCopy
-					roundCalls = append(roundCalls, bCopy)
-				}
-			}
-
-			if ev.Type == domain.StreamEventMessageDelta {
-				if ev.Usage != nil {
-					u := *ev.Usage
-					roundUsage = &u
-					ev.Usage = addUsage(addUsage(nil, cumulativeUsage), roundUsage)
-				}
-				if ev.StopReason != "" {
-					roundStop = ev.StopReason
-				}
-			}
-
-			if ev.Type == domain.StreamEventError && ev.Error != nil {
-				streamErrMsg = ev.Error.Message
-			}
-			return applyAndEmit(ev)
-		})
-		_ = resp.Body.Close()
-
-		if ctx.Err() != nil || errors.Is(decodeErr, context.Canceled) {
-			persistAndMaybeNotifyAbort()
-			return nil
-		}
-
-		if decodeErr != nil || streamErrMsg != "" {
-			errMsg := streamErrMsg
-			if errMsg == "" && decodeErr != nil {
-				errMsg = decodeErr.Error()
-			}
-			blocks, usage := snapshotState()
-			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
-			if streamErrMsg == "" {
-				_ = applyAndEmit(domain.StreamEvent{
-					Type:           domain.StreamEventError,
-					ConversationID: p.conversation.ID,
-					MessageID:      assistantID,
-					ProviderID:     p.provider.ID,
-					ModelID:        p.model.ID,
-					Error: &domain.StreamError{
-						Code:    domain.ErrCodeUpstreamError,
-						Message: errMsg,
-					},
-				})
-			}
-			return nil
-		}
-
-		cumulativeUsage = addUsage(cumulativeUsage, roundUsage)
-		setUsage(cumulativeUsage)
-		indexOffset = maxSeenIdx + 1
-
-		effectiveStop := roundStop
-		if effectiveStop == "" {
-			if len(roundCalls) > 0 {
-				effectiveStop = domain.StopReasonToolUse
-			} else {
-				effectiveStop = domain.StopReasonStop
-			}
-		}
-
-		if effectiveStop != domain.StopReasonToolUse || len(roundCalls) == 0 {
-			finalStopReason = effectiveStop
-			break
-		}
-		if len(p.tools) == 0 && p.service.mcpClient == nil {
-			finalStopReason = effectiveStop
-			break
-		}
-
-		if round >= maxRounds {
-			limitMsg := fmt.Sprintf("达到最大工具调用轮数上限（%d 轮）", maxRounds)
-			blocks, usage := snapshotState()
-			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, limitMsg)
-			_ = applyAndEmit(domain.StreamEvent{
-				Type:           domain.StreamEventError,
-				ConversationID: p.conversation.ID,
-				MessageID:      assistantID,
-				ProviderID:     p.provider.ID,
-				ModelID:        p.model.ID,
-				Error: &domain.StreamError{
-					Code:    "MCP_ROUND_LIMIT",
-					Message: limitMsg,
-				},
-			})
-			return nil
-		}
-
-		for _, tc := range roundCalls {
-			if ctx.Err() != nil {
-				persistAndMaybeNotifyAbort()
-				return nil
-			}
-			trBlock, execErr := p.service.executeToolCall(ctx, p.toolBindings, tc)
-			if execErr != nil || ctx.Err() != nil {
-				persistAndMaybeNotifyAbort()
-				return nil
-			}
-			resIdx := indexOffset
-			indexOffset++
-			trCopy := trBlock
-			evStart := domain.StreamEvent{
-				Type:           domain.StreamEventBlockStart,
-				ConversationID: p.conversation.ID,
-				MessageID:      assistantID,
-				ProviderID:     p.provider.ID,
-				ModelID:        p.model.ID,
-				Index:          domain.IntPtr(resIdx),
-				BlockType:      domain.BlockTypeToolResult,
-				Block:          &trCopy,
-			}
-			if err := applyAndEmit(evStart); err != nil {
-				persistAndMaybeNotifyAbort()
-				return err
-			}
-			evEnd := domain.StreamEvent{
-				Type:           domain.StreamEventBlockEnd,
-				ConversationID: p.conversation.ID,
-				MessageID:      assistantID,
-				ProviderID:     p.provider.ID,
-				ModelID:        p.model.ID,
-				Index:          domain.IntPtr(resIdx),
-				BlockType:      domain.BlockTypeToolResult,
-				Block:          &trCopy,
-			}
-			if err := applyAndEmit(evEnd); err != nil {
-				persistAndMaybeNotifyAbort()
-				return err
-			}
-		}
-
-		if ctx.Err() != nil {
-			persistAndMaybeNotifyAbort()
-			return nil
-		}
-
-		currentBlocks, _ := snapshotState()
-		nextHistory := make([]domain.Message, len(p.history)+1)
-		copy(nextHistory, p.history)
-		nextHistory[len(p.history)] = domain.Message{
-			ConversationID: p.conversation.ID,
-			Role:           domain.RoleAssistant,
-			Blocks:         filterBlocksForModelHistory(currentBlocks),
-			ProviderID:     p.provider.ID,
-			ModelID:        p.model.ID,
-		}
-		activeTools := p.service.filterEnabledToolsWithBindings(ctx, p.tools, p.toolBindings)
-		nextInput := plugin.ChatInput{
-			ConversationID:  p.conversation.ID,
-			Provider:        p.provider,
-			Model:           p.model,
-			SystemPrompt:    p.systemPrompt,
-			Messages:        nextHistory,
-			Params:          p.params,
-			Compat:          p.compat,
-			Tools:           activeTools,
-			AutoCreateCache: p.autoCreateCache,
-		}
-		var usedInlineCache bool
-		if p.autoCreateCache {
-			curCache := p.service.cacheStore.Get(p.cacheScope)
-			activeCache, nextPlan, planErr := p.service.executeCachePlan(
-				ctx,
-				nextInput,
-				p.apiFormat,
-				p.adapter,
-				p.cacheScope,
-				curCache,
-			)
-			if planErr != nil {
-				if ctx.Err() != nil {
-					persistAndMaybeNotifyAbort()
-					return nil
-				}
-				errMsg := planErr.Error()
-				blocks, usage := snapshotState()
-				_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
-				_ = applyAndEmit(domain.StreamEvent{
-					Type:           domain.StreamEventError,
-					ConversationID: p.conversation.ID,
-					MessageID:      assistantID,
-					ProviderID:     p.provider.ID,
-					ModelID:        p.model.ID,
-					Error:          &domain.StreamError{Code: domain.ErrCodeUpstreamError, Message: errMsg},
-				})
-				return nil
-			}
-			nextInput.PromptCache = activeCache
-			usedInlineCache = nextPlan.InlineCache
-		}
-		nextResp, _, openErr := p.service.encodeAndOpenMainRequest(
-			ctx,
-			nextInput,
-			p.apiFormat,
-			p.adapter,
-			p.cacheScope,
-			usedInlineCache,
-			true,
-		)
-		if openErr != nil {
-			if ctx.Err() != nil {
-				persistAndMaybeNotifyAbort()
-				return nil
-			}
-			errMsg := openErr.Error()
-			blocks, usage := snapshotState()
-			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
-			_ = applyAndEmit(domain.StreamEvent{
-				Type:           domain.StreamEventError,
-				ConversationID: p.conversation.ID,
-				MessageID:      assistantID,
-				ProviderID:     p.provider.ID,
-				ModelID:        p.model.ID,
-				Error:          &domain.StreamError{Code: domain.ErrCodeUpstreamError, Message: errMsg},
-			})
-			return nil
-		}
-		resp = nextResp
-	}
-
-	blocks, usage := snapshotState()
-	saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, finalStopReason, "")
-	if persistErr != nil {
-		_ = applyAndEmit(domain.StreamEvent{
-			Type:           domain.StreamEventError,
-			ConversationID: p.conversation.ID,
-			MessageID:      assistantID,
-			ProviderID:     p.provider.ID,
-			ModelID:        p.model.ID,
-			Error: &domain.StreamError{
-				Code:    "PERSIST_FAILED",
-				Message: fmt.Sprintf("保存消息失败: %v", persistErr),
-			},
-		})
-		return nil
-	}
-	return applyAndEmit(domain.StreamEvent{
-		Type:           domain.StreamEventMessageEnd,
-		ConversationID: p.conversation.ID,
-		MessageID:      assistantID,
-		ProviderID:     p.provider.ID,
-		ModelID:        p.model.ID,
-		Message:        &saved,
-	})
-}
-
-func (p *PreparedStream) persistResult(
-	ctx context.Context,
-	assistantID string,
-	blocks []domain.ContentBlock,
-	usage *domain.Usage,
-	stopReason string,
-	errMsg string,
-) (domain.Message, error) {
-	// Detach from canceled request context so partial responses persist reliably on abort.
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-
-	msg := domain.Message{
-		ID:             assistantID,
-		GraphWrite:     p.graphWrite,
-		ConversationID: p.conversation.ID,
-		Role:           domain.RoleAssistant,
-		Blocks:         blocks,
-		ProviderID:     p.provider.ID,
-		ModelID:        p.model.ID,
-		Usage:          usage,
-		StopReason:     stopReason,
-		ErrorMessage:   errMsg,
-		CreatedAt:      time.Now().UTC(),
-	}
-	var (
-		saved domain.Message
-		err   error
-	)
-	switch {
-	case p.replaceMessageID != "":
-		saved, err = p.service.msgs.ReplaceByID(persistCtx, p.conversation.ID, p.replaceMessageID, msg)
-	case p.insertAfterMessageID != "":
-		saved, err = p.service.msgs.InsertAfter(persistCtx, p.conversation.ID, p.insertAfterMessageID, msg)
-	default:
-		saved, err = p.service.msgs.Create(persistCtx, msg)
-	}
-	if err != nil {
-		return domain.Message{}, err
-	}
-	_ = p.service.convs.TouchUpdatedAt(persistCtx, p.conversation.ID, time.Now().UTC())
-	return saved, nil
-}
-
-type blockAccum struct {
-	blockType  string
-	id         string
-	name       string
-	startBlock *domain.ContentBlock
-	completed  bool
-	text       strings.Builder
-	signature  strings.Builder
-	finalized  *domain.ContentBlock
-}
-
-type streamAccumulator struct {
-	order      []int
-	blocks     map[int]*blockAccum
-	usage      *domain.Usage
-	stopReason string
-}
-
-func newStreamAccumulator() *streamAccumulator {
-	return &streamAccumulator{
-		blocks: make(map[int]*blockAccum),
-	}
-}
-
-func (a *streamAccumulator) apply(ev domain.StreamEvent) {
-	switch ev.Type {
-	case domain.StreamEventBlockStart:
-		if ev.Index == nil {
-			return
-		}
-		idx := *ev.Index
-		if _, exists := a.blocks[idx]; !exists {
-			a.order = append(a.order, idx)
-			b := &blockAccum{blockType: ev.BlockType}
-			if ev.Block != nil {
-				cp := *ev.Block
-				b.startBlock = &cp
-				b.id = ev.Block.ID
-				b.name = ev.Block.Name
-				if b.blockType == "" {
-					b.blockType = ev.Block.Type
-				}
-			}
-			a.blocks[idx] = b
-		}
-	case domain.StreamEventBlockDelta:
-		if ev.Index == nil {
-			return
-		}
-		b, ok := a.blocks[*ev.Index]
-		if !ok {
-			b = &blockAccum{blockType: ev.BlockType}
-			a.order = append(a.order, *ev.Index)
-			a.blocks[*ev.Index] = b
-		}
-		switch ev.DeltaType {
-		case domain.DeltaTypeSignature:
-			b.signature.WriteString(ev.Delta)
-		default:
-			b.text.WriteString(ev.Delta)
-		}
-	case domain.StreamEventBlockEnd:
-		if ev.Index == nil {
-			return
-		}
-		b, ok := a.blocks[*ev.Index]
-		if !ok {
-			bt := ev.BlockType
-			if bt == "" && ev.Block != nil {
-				bt = ev.Block.Type
-			}
-			b = &blockAccum{blockType: bt}
-			a.order = append(a.order, *ev.Index)
-			a.blocks[*ev.Index] = b
-		}
-		b.completed = true
-		if ev.Block != nil {
-			cp := *ev.Block
-			b.finalized = &cp
-		}
-	case domain.StreamEventMessageDelta:
-		if ev.Usage != nil {
-			a.usage = ev.Usage
-		}
-		if ev.StopReason != "" {
-			a.stopReason = ev.StopReason
-		}
-	}
-}
-
-func (a *streamAccumulator) blocksSlice() []domain.ContentBlock {
-	out := make([]domain.ContentBlock, 0, len(a.order))
-	for _, idx := range a.order {
-		b := a.blocks[idx]
-		if b.finalized != nil {
-			out = append(out, *b.finalized)
-			continue
-		}
-		switch b.blockType {
-		case domain.BlockTypeThinking:
-			out = append(out, domain.ContentBlock{
-				Type:      domain.BlockTypeThinking,
-				Thinking:  b.text.String(),
-				Signature: b.signature.String(),
-			})
-		case domain.BlockTypeToolCall:
-			var args json.RawMessage
-			if raw := strings.TrimSpace(b.text.String()); raw != "" {
-				if json.Valid([]byte(raw)) {
-					args = json.RawMessage(raw)
-				} else if encoded, err := json.Marshal(raw); err == nil {
-					args = json.RawMessage(encoded)
-				}
-			}
-			var source string
-			if b.startBlock != nil {
-				source = b.startBlock.ToolSource
-			}
-			out = append(out, domain.ContentBlock{
-				Type:       domain.BlockTypeToolCall,
-				ID:         b.id,
-				Name:       b.name,
-				ToolSource: source,
-				Arguments:  args,
-			})
-		default:
-			if b.startBlock != nil && b.blockType != domain.BlockTypeText {
-				out = append(out, *b.startBlock)
-				continue
-			}
-			out = append(out, domain.ContentBlock{
-				Type: domain.BlockTypeText,
-				Text: b.text.String(),
-			})
-		}
-	}
-	return out
-}
-
 func findModel(models []domain.ModelConfig, modelID string) (domain.ModelConfig, bool) {
 	for _, m := range models {
 		if m.ID == modelID {
@@ -1743,8 +931,8 @@ func deriveTitleFromBlocks(blocks []domain.ContentBlock) string {
 			if line == "" {
 				continue
 			}
-			if idx := strings.IndexByte(line, '\n'); idx >= 0 {
-				line = strings.TrimSpace(line[:idx])
+			if first, _, ok := strings.Cut(line, "\n"); ok {
+				line = strings.TrimSpace(first)
 			}
 			runes := []rune(line)
 			if len(runes) > 40 {

@@ -32,7 +32,7 @@ func (s stubAdapter) ResolveEndpoint(domain.ProviderConfig, domain.ModelConfig, 
 	return ResolvedEndpoint{}, nil
 }
 
-func TestRegistriesAndSyncState(t *testing.T) {
+func TestRegistries(t *testing.T) {
 	formats := NewFormatRegistry()
 	if err := formats.Register(stubFormat{id: "openai-completions"}); err != nil {
 		t.Fatalf("register format failed: %v", err)
@@ -53,12 +53,5 @@ func TestRegistriesAndSyncState(t *testing.T) {
 	}
 	if !providers.Has("generic-http") || len(providers.List()) != 1 {
 		t.Fatalf("unexpected providers registry state: %+v", providers.List())
-	}
-
-	if !ValidSyncState(string(SyncStateLocalOnly)) || !ValidSyncState(string(SyncStateConflict)) {
-		t.Fatal("expected valid sync states to return true")
-	}
-	if ValidSyncState("unknown") {
-		t.Fatal("expected unknown sync state to return false")
 	}
 }

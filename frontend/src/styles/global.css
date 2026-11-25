@@ -619,28 +619,6 @@ a {
   flex: 1;
 }
 
-/* Grouped Apple Inset Surface */
-.ui-group-card {
-  background: var(--bg-surface);
-  border: 1px solid var(--border-panel);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-panel);
-  overflow: hidden;
-}
-
-.ui-group-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 11px 14px;
-  border-bottom: 1px solid var(--border-hairline);
-  font-size: 13px;
-}
-
-.ui-group-row:last-child {
-  border-bottom: 0;
-}
-
 @keyframes fadeIn {
   from { opacity: 0; }
   to { opacity: 1; }

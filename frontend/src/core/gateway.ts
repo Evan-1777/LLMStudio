@@ -34,7 +34,6 @@ import {
   type MCPServerTestResult,
   type MCPToolDescriptor,
   type Message,
-  type ModelConfig,
   type PatchConversationInput,
   type PrepareLocalCompactInput,
   type PreparedLocalCompactRequest,
@@ -66,6 +65,12 @@ import {
   type WorkspaceFileWriteResult,
   type WorkspaceSearchResponse,
 } from './types';
+import {
+  buildStreamChatPayload,
+  sanitizeProbePayload,
+  sanitizeProviderPayload,
+  sanitizeSearchUpdatePayload,
+} from './gatewayPayloads';
 
 function withScopeQuery(path: string, scope?: TopicScope): string {
   if (!scope) return path;
@@ -147,163 +152,6 @@ export function measureUtf8Bytes(input: string): number {
   return utf8Encoder.encode(input).length;
 }
 
-function sanitizeModel(model: ModelConfig): ModelConfig {
-  const out: ModelConfig = {
-    id: model.id,
-    name: model.name,
-    apiFormat: model.apiFormat,
-  };
-  if (model.contextWindow !== undefined && model.contextWindow > 0) {
-    out.contextWindow = model.contextWindow;
-  }
-  if (model.maxTokens !== undefined && model.maxTokens > 0) {
-    out.maxTokens = model.maxTokens;
-  }
-  if (model.reasoning) {
-    out.reasoning = true;
-  }
-  if (model.inputModalities && model.inputModalities.length > 0) {
-    out.inputModalities = [...model.inputModalities];
-  }
-  if (model.compat) {
-    const compat: NonNullable<ModelConfig['compat']> = {};
-    if (model.compat.maxTokensField) {
-      compat.maxTokensField = model.compat.maxTokensField;
-    }
-    if (
-      model.compat.supportsDeveloperRole !== undefined &&
-      model.compat.supportsDeveloperRole !== null
-    ) {
-      compat.supportsDeveloperRole = model.compat.supportsDeveloperRole;
-    }
-    if (
-      model.compat.supportsStreamOptions !== undefined &&
-      model.compat.supportsStreamOptions !== null
-    ) {
-      compat.supportsStreamOptions = model.compat.supportsStreamOptions;
-    }
-    if (model.compat.thinkingFormat) {
-      compat.thinkingFormat = model.compat.thinkingFormat;
-    }
-    if (model.compat.reasoningEffortField) {
-      compat.reasoningEffortField = model.compat.reasoningEffortField;
-    }
-    if (model.compat.pathOverride) {
-      compat.pathOverride = model.compat.pathOverride;
-    }
-    if (model.compat.cacheMode) {
-      compat.cacheMode = model.compat.cacheMode;
-    }
-    if (
-      model.compat.extraHeaders &&
-      Object.keys(model.compat.extraHeaders).length > 0
-    ) {
-      compat.extraHeaders = { ...model.compat.extraHeaders };
-    }
-    if (
-      model.compat.extraBody &&
-      Object.keys(model.compat.extraBody).length > 0
-    ) {
-      compat.extraBody = { ...model.compat.extraBody };
-    }
-    if (Object.keys(compat).length > 0) {
-      out.compat = compat;
-    }
-  }
-  if (model.defaultParams) {
-    const params: NonNullable<ModelConfig['defaultParams']> = {};
-    if (model.defaultParams.temperature !== undefined) {
-      params.temperature = model.defaultParams.temperature;
-    }
-    if (model.defaultParams.maxTokens !== undefined) {
-      params.maxTokens = model.defaultParams.maxTokens;
-    }
-    if (model.defaultParams.reasoningEffort) {
-      params.reasoningEffort = model.defaultParams.reasoningEffort;
-    }
-    if (Object.keys(params).length > 0) {
-      out.defaultParams = params;
-    }
-  }
-  return out;
-}
-
-function sanitizeProviderPayload(
-  payload: ProviderUpsertPayload,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {
-    name: payload.name,
-    adapter: payload.adapter,
-    baseURL: payload.baseURL,
-    authType: payload.authType,
-    models: payload.models.map(sanitizeModel),
-  };
-  if (payload.id) {
-    out.id = payload.id;
-  }
-  if (payload.clearApiKey) {
-    out.clearApiKey = true;
-  } else if (payload.apiKey && payload.apiKey.trim() !== '') {
-    out.apiKey = payload.apiKey.trim();
-  }
-  if (payload.headers !== undefined) {
-    out.headers = { ...payload.headers };
-  }
-  if (payload.enabled !== undefined) {
-    out.enabled = payload.enabled;
-  }
-  if (payload.localRequest !== undefined) {
-    out.localRequest = payload.localRequest;
-  }
-  return out;
-}
-
-function sanitizeProbePayload(
-  probe?: ProviderProbeInput,
-): Record<string, unknown> {
-  if (!probe) return {};
-  const out: Record<string, unknown> = {};
-  if (probe.baseURL && probe.baseURL.trim() !== '') {
-    out.baseURL = probe.baseURL.trim();
-  }
-  if (probe.authType && probe.authType.trim() !== '') {
-    out.authType = probe.authType.trim();
-  }
-  if (probe.clearApiKey) {
-    out.clearApiKey = true;
-  } else if (probe.apiKey && probe.apiKey.trim() !== '') {
-    out.apiKey = probe.apiKey.trim();
-  }
-  if (probe.headers !== undefined) {
-    out.headers = { ...probe.headers };
-  }
-  return out;
-}
-
-function sanitizeSearchUpdatePayload(
-  input: SearchEngineUpdateInput,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  if (input.enabled !== undefined) {
-    out.enabled = input.enabled;
-  }
-  if (input.endpoint !== undefined && input.endpoint.trim() !== '') {
-    out.endpoint = input.endpoint.trim();
-  }
-  if (input.clearApiKey) {
-    out.clearApiKey = true;
-  } else if (input.apiKey && input.apiKey.trim() !== '') {
-    out.apiKey = input.apiKey.trim();
-  }
-  if (input.maxResults !== undefined) {
-    out.maxResults = input.maxResults;
-  }
-  if (input.isDefault !== undefined) {
-    out.isDefault = input.isDefault;
-  }
-  return out;
-}
-
 function parseErrorEnvelope(
   rawText: string,
   status: number,
@@ -333,56 +181,6 @@ function parseErrorEnvelope(
     }
   }
   return { code: `HTTP_${status}`, message: `请求失败 (${status})` };
-}
-
-function buildStreamChatPayload(input: StreamChatInput): Record<string, unknown> {
-  const payload: Record<string, unknown> = {};
-  if (input.blocks && input.blocks.length > 0) {
-    payload.blocks = input.blocks;
-  } else if (input.text && input.text !== '') {
-    payload.text = input.text;
-  }
-  if (input.providerId) payload.providerId = input.providerId;
-  if (input.modelId) payload.modelId = input.modelId;
-  if (input.params && Object.keys(input.params).length > 0) {
-    payload.params = input.params;
-  }
-  if (input.regenerateMessageId) {
-    payload.regenerateMessageId = input.regenerateMessageId;
-  }
-  if (input.mcpToolsEnabled !== undefined) payload.mcpToolsEnabled = input.mcpToolsEnabled;
-  if (input.webSearch) {
-    payload.webSearch = true;
-  }
-  if (input.searchEngineId) {
-    payload.searchEngineId = input.searchEngineId;
-  }
-  if (input.preparedSearch !== undefined) {
-    payload.preparedSearch = {
-      block: input.preparedSearch.block ?? null,
-    };
-  }
-  if (input.cacheState) {
-    payload.cacheState = input.cacheState;
-  }
-  if (input.cacheResolution) {
-    payload.cacheResolution = input.cacheResolution;
-  }
-  if (input.localMainFailure) {
-    payload.localMainFailure = input.localMainFailure;
-  }
-  if (input.credentialEnvelope) {
-    payload.credentialEnvelope = true;
-  }
-  if (input.localContinuation) {
-    payload.localContinuation = {
-      ...(input.localContinuation.userMessageId
-        ? { userMessageId: input.localContinuation.userMessageId }
-        : {}),
-      blocks: input.localContinuation.blocks,
-    };
-  }
-  return payload;
 }
 
 export class GatewayClient {
@@ -1522,28 +1320,27 @@ export class GatewayClient {
     );
   }
 
-  async openToolExecutionStream(
-    conversationId: string,
-    calls: ToolCallExecutionInput[],
-    signal?: AbortSignal,
-    scope?: TopicScope,
-  ): Promise<Response> {
-    const serialized = this.serializeBody({ calls });
-    const url = resolveGatewayUrl(
-      this.baseUrl,
-      withScopeQuery(
-        `/api/v1/conversations/${encodeURIComponent(conversationId)}/tools/execute`,
-        scope,
-      ),
-    );
+  private async openSseStream(opts: {
+    method: 'GET' | 'POST';
+    path: string;
+    body?: unknown;
+    signal?: AbortSignal;
+    allowNoContent?: boolean;
+    networkErrorMessage: string;
+  }): Promise<Response> {
+    const hasBody = opts.body !== undefined;
+    const serialized = hasBody ? this.serializeBody(opts.body) : undefined;
+    const url = resolveGatewayUrl(this.baseUrl, opts.path);
 
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
-        method: 'POST',
-        headers: this.buildHeaders(true, true, { Accept: 'text/event-stream' }),
+        method: opts.method,
+        headers: this.buildHeaders(hasBody, true, {
+          Accept: 'text/event-stream',
+        }),
         body: serialized,
-        signal,
+        signal: opts.signal,
       });
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -1554,96 +1351,11 @@ export class GatewayClient {
       }
       throw new GatewayError(
         'NETWORK_ERROR',
-        err instanceof Error ? err.message : '工具执行连接失败',
+        err instanceof Error ? err.message : opts.networkErrorMessage,
       );
     }
 
-    if (!response.ok) {
-      const rawText = await response.text();
-      const env = parseErrorEnvelope(rawText, response.status);
-      throw new GatewayError(env.code, env.message, response.status);
-    }
-    return response;
-  }
-
-  async openChatStream(
-    conversationId: string,
-    input: StreamChatInput,
-    signal?: AbortSignal,
-    scope?: TopicScope,
-  ): Promise<Response> {
-    const serialized = this.serializeBody(buildStreamChatPayload(input));
-    const url = resolveGatewayUrl(
-      this.baseUrl,
-      withScopeQuery(
-        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/stream`,
-        scope,
-      ),
-    );
-
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url, {
-        method: 'POST',
-        headers: this.buildHeaders(true, true, { Accept: 'text/event-stream' }),
-        body: serialized,
-        signal,
-      });
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw err;
-      }
-      if (err instanceof Error && err.name === 'AbortError') {
-        throw err;
-      }
-      throw new GatewayError(
-        'NETWORK_ERROR',
-        err instanceof Error ? err.message : '流式连接建立失败',
-      );
-    }
-
-    if (!response.ok) {
-      const rawText = await response.text();
-      const env = parseErrorEnvelope(rawText, response.status);
-      throw new GatewayError(env.code, env.message, response.status);
-    }
-    return response;
-  }
-
-  async openRunStream(
-    conversationId: string,
-    signal?: AbortSignal,
-    scope?: TopicScope,
-  ): Promise<Response> {
-    const url = resolveGatewayUrl(
-      this.baseUrl,
-      withScopeQuery(
-        `/api/v1/conversations/${encodeURIComponent(conversationId)}/run/stream`,
-        scope,
-      ),
-    );
-
-    let response: Response;
-    try {
-      response = await this.fetchImpl(url, {
-        method: 'GET',
-        headers: this.buildHeaders(false, true, { Accept: 'text/event-stream' }),
-        signal,
-      });
-    } catch (err) {
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw err;
-      }
-      if (err instanceof Error && err.name === 'AbortError') {
-        throw err;
-      }
-      throw new GatewayError(
-        'NETWORK_ERROR',
-        err instanceof Error ? err.message : '重连运行流失败',
-      );
-    }
-
-    if (response.status === 204) {
+    if (opts.allowNoContent && response.status === 204) {
       return response;
     }
     if (!response.ok) {
@@ -1652,6 +1364,59 @@ export class GatewayClient {
       throw new GatewayError(env.code, env.message, response.status);
     }
     return response;
+  }
+
+  openToolExecutionStream(
+    conversationId: string,
+    calls: ToolCallExecutionInput[],
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<Response> {
+    return this.openSseStream({
+      method: 'POST',
+      path: withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/tools/execute`,
+        scope,
+      ),
+      body: { calls },
+      signal,
+      networkErrorMessage: '工具执行连接失败',
+    });
+  }
+
+  openChatStream(
+    conversationId: string,
+    input: StreamChatInput,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<Response> {
+    return this.openSseStream({
+      method: 'POST',
+      path: withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/messages/stream`,
+        scope,
+      ),
+      body: buildStreamChatPayload(input),
+      signal,
+      networkErrorMessage: '流式连接建立失败',
+    });
+  }
+
+  openRunStream(
+    conversationId: string,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<Response> {
+    return this.openSseStream({
+      method: 'GET',
+      path: withScopeQuery(
+        `/api/v1/conversations/${encodeURIComponent(conversationId)}/run/stream`,
+        scope,
+      ),
+      signal,
+      allowNoContent: true,
+      networkErrorMessage: '重连运行流失败',
+    });
   }
 
   cancelConversationRun(

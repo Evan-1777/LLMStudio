@@ -1,9 +1,10 @@
 package plugin
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 )
 
@@ -100,8 +101,8 @@ func (r *SearchRegistry) List() []SearchEngineInfo {
 			RequiresAPIKey:  e.RequiresAPIKey(),
 		})
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].ID < out[j].ID
+	slices.SortFunc(out, func(a, b SearchEngineInfo) int {
+		return cmp.Compare(a.ID, b.ID)
 	})
 	return out
 }

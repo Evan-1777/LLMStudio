@@ -1,4 +1,3 @@
-import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import {
   useCallback,
   useEffect,
@@ -10,9 +9,9 @@ import {
   type PointerEvent,
 } from 'react';
 import { useApp } from '../../app/AppProvider';
-import { Button, ConfirmDialog, DropdownItem, DropdownSeparator, Icon, IconButton, Modal } from '../../components/ui';
+import { Button, ConfirmDialog, Icon, IconButton, Modal } from '../../components/ui';
 import type { Conversation, ConversationDetail, GraphMutationInput, GraphNotePort, Message } from '../../core/types';
-import { ContentRenderer, MarkdownDocument, imageBlockSource } from '../../rendering/ContentRenderer';
+import { ContentRenderer, MarkdownDocument } from '../../rendering/ContentRenderer';
 import {
   collectSubtreeIds,
   computeAutoLayout,
@@ -35,6 +34,12 @@ import {
   sidePort,
   sideRefCurve,
 } from './conversationGraphGeometry';
+import {
+  GraphBottomControls,
+  GraphContextMenu,
+  GraphFloatingBatchBar,
+  PlainMessageDetail,
+} from './ConversationGraphControls';
 import { GraphNoteEditor } from './GraphNoteEditor';
 import './conversation-graph.css';
 
@@ -76,46 +81,6 @@ function isEditableElement(target: EventTarget | null): boolean {
   if (target.isContentEditable) return true;
   const tag = target.tagName;
   return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
-}
-
-function PlainMessageDetail({ message }: { message: Message }) {
-  const texts = message.blocks
-    .filter((b): b is Extract<Message['blocks'][number], { type: 'text' | 'compaction' }> =>
-      (b.type === 'text' || b.type === 'compaction') && typeof b.text === 'string' && b.text.length > 0)
-    .map((b) => b.text);
-  const images = message.blocks.filter(
-    (b): b is Extract<Message['blocks'][number], { type: 'image' }> => b.type === 'image',
-  );
-  const thinkingCount = message.blocks.filter((b) => b.type === 'thinking').length;
-  const toolCount = message.blocks.filter((b) => b.type === 'toolCall').length;
-  const searchCount = message.blocks.filter((b) => b.type === 'webSearch').length;
-  const hasTags = thinkingCount > 0 || toolCount > 0 || searchCount > 0 || Boolean(message.errorMessage);
-
-  return (
-    <div className="cg-node__plain">
-      {texts.length > 0 ? (
-        <div className="cg-node__plain-text">{texts.join('\n\n')}</div>
-      ) : !images.length && !hasTags ? (
-        <div className="cg-node__plain-empty">—</div>
-      ) : null}
-      {images.length > 0 && (
-        <div className="cg-node__plain-images">
-          {images.map((img, i) => {
-            const src = imageBlockSource(img);
-            return src ? <img key={i} src={src} alt="" className="cg-node__plain-img" loading="lazy" /> : null;
-          })}
-        </div>
-      )}
-      {hasTags && (
-        <div className="cg-node__plain-tags">
-          {thinkingCount > 0 && <span><Icon name="brain" size={12} />思考 ×{thinkingCount}</span>}
-          {toolCount > 0 && <span><Icon name="wrench" size={12} />工具 ×{toolCount}</span>}
-          {searchCount > 0 && <span><Icon name="globe" size={12} />检索 ×{searchCount}</span>}
-          {message.errorMessage && <span className="cg-node__plain-tag--error"><Icon name="warning" size={12} />{message.errorMessage}</span>}
-        </div>
-      )}
-    </div>
-  );
 }
 
 export function ConversationGraphView({
@@ -1519,290 +1484,90 @@ export function ConversationGraphView({
         />
       )}
 
-      {effectiveSelectedIds.size > 0 && (
-        <div
-          className="cg-selection-bar"
-          role="toolbar"
-          aria-label="批量操作"
-          onPointerDown={(event) => event.stopPropagation()}
-        >
-          <span className="cg-selection-bar__count">已选 {effectiveSelectedIds.size} 项</span>
-          <span className="cg-controls__divider" aria-hidden="true" />
-          {selectedMessages.length > 0 && (
-            <IconButton
-              icon={hasUnexpandedSelected ? 'expand' : 'compress'}
-              label={hasUnexpandedSelected ? '展开信息' : '收起信息'}
-              size="sm"
-              onClick={() => toggleExpandTargets(selectedMessages)}
-            />
-          )}
-          {selectedSubtree.size > effectiveSelectedIds.size && (
-            <IconButton
-              icon="mindMap"
-              label="选中子树"
-              size="sm"
-              onClick={() => setSelectedIds(selectedSubtree)}
-            />
-          )}
-          {disconnectableSelectedIds.length > 0 && (
-            <IconButton
-              icon="unlink"
-              label="断开上下文"
-              size="sm"
-              disabled={busy}
-              onClick={() => disconnectIds(disconnectableSelectedIds)}
-            />
-          )}
-          <IconButton
-            icon="trash"
-            tone="danger"
-            label="删除所选"
-            size="sm"
-            disabled={busy}
-            onClick={() => setDeletingNodes(selectedNodes)}
-          />
-          <span className="cg-controls__divider" aria-hidden="true" />
-          <IconButton
-            icon="close"
-            label="取消选择"
-            size="sm"
-            onClick={() => setSelectedIds(new Set())}
-          />
-        </div>
-      )}
+      <GraphFloatingBatchBar
+        selectedCount={effectiveSelectedIds.size}
+        hasSelectedMessages={selectedMessages.length > 0}
+        hasUnexpandedSelected={hasUnexpandedSelected}
+        canExpandSubtree={selectedSubtree.size > effectiveSelectedIds.size}
+        hasDisconnectable={disconnectableSelectedIds.length > 0}
+        busy={busy}
+        onToggleExpandSelected={() => toggleExpandTargets(selectedMessages)}
+        onSelectSubtree={() => setSelectedIds(selectedSubtree)}
+        onDisconnectSelected={() => disconnectIds(disconnectableSelectedIds)}
+        onDeleteSelected={() => setDeletingNodes(selectedNodes)}
+        onClearSelection={() => setSelectedIds(new Set())}
+      />
 
       {!nodes.length && !draftNote && <div className="cg-empty"><Icon name="mindMap" size={30} /><span>暂无节点</span></div>}
 
-      <div className="cg-controls" role="group" aria-label="图谱控制">
-        <IconButton
-          icon="boxSelect"
-          label="框选模式"
-          size="sm"
-          active={selectMode}
-          aria-pressed={selectMode}
-          onClick={() => setSelectMode((value) => !value)}
-        />
-        <span className="cg-controls__divider" aria-hidden="true" />
-        <IconButton icon="zoomOut" label="缩小" size="sm" disabled={view.scale <= minZoom} onClick={() => changeZoom(1 / 1.2)} />
-        <button type="button" className="cg-controls__fit" title="适配画布" aria-label="适配画布" onClick={() => fit(display)}>
-          <Icon name="fitView" size={15} /><span>{Math.round(view.scale * 100)}%</span>
-        </button>
-        <IconButton icon="zoomIn" label="放大" size="sm" disabled={view.scale >= maxZoom} onClick={() => changeZoom(1.2)} />
-        <span className="cg-controls__divider" aria-hidden="true" />
-        <IconButton
-          icon="userSummary"
-          label={allUsersCollapsed ? '一键恢复用户消息' : '一键缩放用户信息为摘要'}
-          size="sm"
-          active={allUsersCollapsed}
-          aria-pressed={allUsersCollapsed}
-          disabled={busy || !userMessages.length}
-          onClick={toggleAllUsersSummary}
-        />
-        <IconButton
-          icon="botExpand"
-          label={allAssistantsExpanded ? '一键收起助手信息' : '一键展开助手信息'}
-          size="sm"
-          active={allAssistantsExpanded}
-          aria-pressed={allAssistantsExpanded}
-          disabled={!assistantMessages.length}
-          onClick={toggleAllAssistantsExpand}
-        />
-        <span className="cg-controls__divider" aria-hidden="true" />
-        <IconButton icon="autoLayout" label="自动整理布局" size="sm" disabled={busy || !nodes.length} onClick={() => void layout()} />
-        <IconButton icon="stickyNote" label="新建文字标注" size="sm" disabled={busy} onClick={() => startDraftNote(toWorld(center(), viewRef.current))} />
-        <IconButton icon="plus" label="新建空白分支" size="sm" disabled={busy} onClick={() => makeBranch(toWorld(center(), viewRef.current))} />
-      </div>
+      <GraphBottomControls
+        selectMode={selectMode}
+        scale={view.scale}
+        minZoom={minZoom}
+        maxZoom={maxZoom}
+        allUsersCollapsed={allUsersCollapsed}
+        allAssistantsExpanded={allAssistantsExpanded}
+        hasUserMessages={userMessages.length > 0}
+        hasAssistantMessages={assistantMessages.length > 0}
+        hasNodes={nodes.length > 0}
+        busy={busy}
+        onToggleSelectMode={() => setSelectMode((value) => !value)}
+        onZoomOut={() => changeZoom(1 / 1.2)}
+        onFit={() => fit(display)}
+        onZoomIn={() => changeZoom(1.2)}
+        onToggleAllUsersSummary={toggleAllUsersSummary}
+        onToggleAllAssistantsExpand={toggleAllAssistantsExpand}
+        onAutoLayout={() => void layout()}
+        onCreateNote={() => startDraftNote(toWorld(center(), viewRef.current))}
+        onCreateBranch={() => makeBranch(toWorld(center(), viewRef.current))}
+      />
 
-      <DropdownMenu.Root modal={false} open={!!menu} onOpenChange={(open) => { if (!open) setMenu(null); }}>
-        <DropdownMenu.Trigger asChild>
-          <span className="cg-menu-anchor" style={{ left: menu?.client.x, top: menu?.client.y }} />
-        </DropdownMenu.Trigger>
-        <DropdownMenu.Portal>
-          <DropdownMenu.Content
-            className="ui-menu-content cg-menu"
-            align="start"
-            collisionPadding={12}
-            sideOffset={3}
-            onCloseAutoFocus={(event) => { event.preventDefault(); menuOrigin.current?.focus({ preventScroll: true }); }}
-          >
-            {!menuNode ? (
-              <>
-                <DropdownItem disabled={busy} onSelect={() => menu && makeBranch(menu.world)}>
-                  <Icon name="plus" size={15} />新建空白分支
-                </DropdownItem>
-                <DropdownItem disabled={busy} onSelect={() => menu && startDraftNote(menu.world)}>
-                  <Icon name="stickyNote" size={15} />新建文字标注
-                </DropdownItem>
-                {userMessages.length > 0 && (
-                  <DropdownItem disabled={busy} onSelect={toggleAllUsersSummary}>
-                    <Icon name="userSummary" size={15} />
-                    {allUsersCollapsed ? '一键恢复用户消息' : '一键缩放用户信息为摘要'}
-                  </DropdownItem>
-                )}
-                {assistantMessages.length > 0 && (
-                  <DropdownItem onSelect={toggleAllAssistantsExpand}>
-                    <Icon name="botExpand" size={15} />
-                    {allAssistantsExpanded ? '一键收起助手信息' : '一键展开助手信息'}
-                  </DropdownItem>
-                )}
-                {validMessageIds.size > 0 && (
-                  <DropdownItem onSelect={() => persistExpanded(Array.from(validMessageIds), !allMessagesExpanded)}>
-                    <Icon name={allMessagesExpanded ? 'compress' : 'expand'} size={15} />
-                    {allMessagesExpanded ? '全部收起信息' : '全部展开信息'}
-                  </DropdownItem>
-                )}
-                <DropdownItem disabled={busy || !nodes.length} onSelect={() => void layout()}>
-                  <Icon name="autoLayout" size={15} />自动整理布局
-                </DropdownItem>
-                <DropdownItem onSelect={() => fit(display)}>
-                  <Icon name="fitView" size={15} />适配画布
-                </DropdownItem>
-              </>
-            ) : isBatchMenu ? (
-              <>
-                {selectedMessages.length > 0 && (
-                  <DropdownItem onSelect={() => toggleExpandTargets(selectedMessages)}>
-                    <Icon name={hasUnexpandedSelected ? 'expand' : 'compress'} size={15} />
-                    {hasUnexpandedSelected ? '展开所选信息' : '收起所选信息'}
-                  </DropdownItem>
-                )}
-                {selectedSubtree.size > effectiveSelectedIds.size && (
-                  <DropdownItem onSelect={() => setSelectedIds(selectedSubtree)}>
-                    <Icon name="mindMap" size={15} />选中子树
-                  </DropdownItem>
-                )}
-                {selectedUserMessages.length > 0 && (() => {
-                  const hasUncollapsed = selectedUserMessages.some((n) => !summary(n));
-                  return (
-                    <DropdownItem
-                      disabled={busy}
-                      onSelect={() => void mutate({
-                        op: 'setNodeMeta',
-                        messageIds: selectedUserMessages.map((n) => n.id),
-                        graphMeta: hasUncollapsed ? { collapsed: true, expanded: false } : { collapsed: false },
-                      })}
-                    >
-                      <Icon name={hasUncollapsed ? 'compress' : 'expand'} size={15} />
-                      {hasUncollapsed ? '缩略所选用户节点' : '恢复所选完整节点'}
-                    </DropdownItem>
-                  );
-                })()}
-                {disconnectableSelectedIds.length > 0 && (
-                  <DropdownItem disabled={busy} onSelect={() => disconnectIds(disconnectableSelectedIds)}>
-                    <Icon name="unlink" size={15} />断开所选上下文
-                  </DropdownItem>
-                )}
-                <DropdownSeparator />
-                <DropdownItem danger disabled={busy} onSelect={() => requestAnimationFrame(() => setDeletingNodes(selectedNodes))}>
-                  <Icon name="trash" size={15} />删除所选 {selectedNodes.length} 个节点
-                </DropdownItem>
-              </>
-            ) : menuNode.note ? (
-              <>
-                <DropdownItem
-                  disabled={busy}
-                  onSelect={() => requestAnimationFrame(() => setEditingNote({ id: menuNode.id, text: menuNode.note!.text }))}
-                >
-                  <Icon name="edit" size={15} />编辑标注
-                </DropdownItem>
-                {noteEdges.filter((e) => e.sourceId === menuNode.id || e.targetId === menuNode.id).map((edge) => (
-                  <DropdownItem
-                    key={edge.id}
-                    disabled={busy}
-                    onSelect={() => void mutate({ op: 'deleteNoteEdge', edgeId: edge.id })}
-                  >
-                    <Icon name="unlink" size={15} />断开标注连线
-                  </DropdownItem>
-                ))}
-                <DropdownSeparator />
-                <DropdownItem danger disabled={busy} onSelect={() => requestAnimationFrame(() => setDeletingNodes([menuNode]))}>
-                  <Icon name="trash" size={15} />删除标注
-                </DropdownItem>
-              </>
-            ) : (
-              <>
-                {menuNode.message && (
-                  <DropdownItem onSelect={() => toggleExpandNode(menuNode.id)}>
-                    <Icon name={effectiveExpandedIds.has(menuNode.id) ? 'compress' : 'expand'} size={15} />
-                    {effectiveExpandedIds.has(menuNode.id) ? '收起信息' : '展开信息'}
-                  </DropdownItem>
-                )}
-                {collectSubtreeIds(display, [menuNode.id]).size > 1 && (
-                  <DropdownItem onSelect={() => setSelectedIds(collectSubtreeIds(display, [menuNode.id]))}>
-                    <Icon name="mindMap" size={15} />选中子树
-                  </DropdownItem>
-                )}
-                {menuNode.message?.role === 'user' && (
-                  <>
-                    <DropdownItem
-                      disabled={busy}
-                      onSelect={() => void mutate({
-                        op: 'setNodeMeta',
-                        messageId: menuNode.id,
-                        graphMeta: summary(menuNode) ? { collapsed: false } : { collapsed: true, expanded: false },
-                      })}
-                    >
-                      <Icon name={summary(menuNode) ? 'expand' : 'compress'} size={15} />
-                      {summary(menuNode) ? '展开为完整节点' : '缩略为箭头摘要'}
-                    </DropdownItem>
-                    <DropdownItem
-                      disabled={busy}
-                      onSelect={() => requestAnimationFrame(() => setEditing({ id: menuNode.id, text: menuNode.message?.graphMeta?.summary ?? '' }))}
-                    >
-                      <Icon name="edit" size={15} />编辑摘要
-                    </DropdownItem>
-                  </>
-                )}
-                {isLeaf(menuNode) && (
-                  <DropdownItem disabled={busy} onSelect={() => activate(menuNode)}>
-                    <Icon name="arrowUp" size={15} />在此分支继续
-                  </DropdownItem>
-                )}
-                {menuNode.message && (
-                  <>
-                    <DropdownItem disabled={busy} onSelect={() => onJump(menuNode.id)}>
-                      <Icon name="messageSquare" size={15} />跳转至此消息
-                    </DropdownItem>
-                    <DropdownItem
-                      disabled={busy}
-                      onSelect={() => makeBranch({ x: menuNode.x + menuNode.width / 2, y: menuNode.y + menuNode.height + 86 }, menuNode.id)}
-                    >
-                      <Icon name="branch" size={15} />从此处新建分支
-                    </DropdownItem>
-                    <DropdownItem disabled={busy || messages.length < 2} onSelect={() => setPickParent(menuNode.id)}>
-                      <Icon name="link" size={15} />更改上游节点
-                    </DropdownItem>
-                    {isSideRefEligible(menuNode.message) && (
-                      <DropdownItem disabled={busy || messages.length < 2} onSelect={() => setPickSideRef(menuNode.id)}>
-                        <Icon name="sideLink" size={15} />侧边接入至…
-                      </DropdownItem>
-                    )}
-                    {menuNode.message.graphMeta?.sideRefs?.map((ref, idx) => (
-                      <DropdownItem
-                        key={ref.sourceMessageId}
-                        disabled={busy}
-                        onSelect={() => void mutate({ op: 'removeSideRef', messageId: menuNode.id, sourceMessageId: ref.sourceMessageId })}
-                      >
-                        <Icon name="unlink" size={15} />
-                        {(menuNode.message!.graphMeta!.sideRefs!.length > 1) ? `断开侧边接入 ${idx + 1}` : '断开侧边接入'}
-                      </DropdownItem>
-                    ))}
-                    {menuNode.parentId && (
-                      <DropdownItem disabled={busy} onSelect={() => void mutate({ op: 'reparent', messageId: menuNode.id, parentId: '' })}>
-                        <Icon name="unlink" size={15} />断开上下文
-                      </DropdownItem>
-                    )}
-                  </>
-                )}
-                <DropdownSeparator />
-                <DropdownItem danger disabled={busy} onSelect={() => requestAnimationFrame(() => setDeletingNodes([menuNode]))}>
-                  <Icon name="trash" size={15} />{menuNode.branch ? '删除分支' : '删除消息'}
-                </DropdownItem>
-              </>
-            )}
-          </DropdownMenu.Content>
-        </DropdownMenu.Portal>
-      </DropdownMenu.Root>
+      <GraphContextMenu
+        menu={menu}
+        menuNode={menuNode}
+        isBatchMenu={isBatchMenu}
+        busy={busy}
+        nodes={nodes}
+        display={display}
+        messagesCount={messages.length}
+        userMessagesCount={userMessages.length}
+        assistantMessagesCount={assistantMessages.length}
+        validMessageIds={validMessageIds}
+        allUsersCollapsed={allUsersCollapsed}
+        allAssistantsExpanded={allAssistantsExpanded}
+        allMessagesExpanded={allMessagesExpanded}
+        effectiveSelectedIds={effectiveSelectedIds}
+        effectiveExpandedIds={effectiveExpandedIds}
+        selectedNodes={selectedNodes}
+        selectedMessages={selectedMessages}
+        selectedUserMessages={selectedUserMessages}
+        selectedSubtree={selectedSubtree}
+        hasUnexpandedSelected={hasUnexpandedSelected}
+        disconnectableSelectedIds={disconnectableSelectedIds}
+        noteEdges={noteEdges}
+        isLeaf={isLeaf}
+        onClose={() => setMenu(null)}
+        onRestoreFocus={() => menuOrigin.current?.focus({ preventScroll: true })}
+        onMakeBranch={makeBranch}
+        onStartDraftNote={startDraftNote}
+        onToggleAllUsersSummary={toggleAllUsersSummary}
+        onToggleAllAssistantsExpand={toggleAllAssistantsExpand}
+        onPersistExpanded={persistExpanded}
+        onAutoLayout={() => void layout()}
+        onFit={() => fit(display)}
+        onToggleExpandTargets={toggleExpandTargets}
+        onSetSelectedIds={setSelectedIds}
+        onDisconnectIds={disconnectIds}
+        onSetDeletingNodes={setDeletingNodes}
+        onSetEditingNote={setEditingNote}
+        onToggleExpandNode={toggleExpandNode}
+        onSetEditingSummary={setEditing}
+        onActivateNode={activate}
+        onJump={onJump}
+        onPickParent={setPickParent}
+        onPickSideRef={setPickSideRef}
+        mutate={mutate}
+      />
 
       <Modal
         open={!!editing}
