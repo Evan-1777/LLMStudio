@@ -41,7 +41,10 @@ import {
   type CustomFontInfo,
 } from './useCustomFontManager';
 import { usePreferencesManager } from './usePreferencesManager';
-import { useToastAndDirtyGuard } from './useToastAndDirtyGuard';
+import {
+  useToastAndDirtyGuard,
+  type ToastOptions,
+} from './useToastAndDirtyGuard';
 
 export type { CustomFontInfo } from './useCustomFontManager';
 
@@ -170,7 +173,7 @@ export interface AppContextValue {
   upsertLocalSearchEngine: (engine: SearchEngineView) => void;
   upsertLocalMcpServer: (server: MCPServerConfig, scope?: TopicScope) => void;
   removeLocalMcpServer: (id: string, scope?: TopicScope) => void;
-  toast: (message: string, tone?: 'default' | 'error') => void;
+  toast: (message: string, toneOrOptions?: ToastOptions) => void;
   registerDirtyGuard: (guard: (() => boolean) | null) => void;
   confirmLeaveIfDirty: () => Promise<boolean>;
 }
@@ -386,6 +389,7 @@ export function AppProvider({
   const {
     toastState,
     toast,
+    dismissToast,
     discardPromptResolver,
     setDiscardPromptResolver,
     registerDirtyGuard,
@@ -1795,7 +1799,20 @@ export function AppProvider({
           role="status"
           aria-live="polite"
         >
-          {toastState.message}
+          <span>{toastState.message}</span>
+          {toastState.action ? (
+            <button
+              type="button"
+              className="ui-toast__action"
+              onClick={() => {
+                const action = toastState.action;
+                dismissToast();
+                action?.onClick();
+              }}
+            >
+              {toastState.action.label}
+            </button>
+          ) : null}
         </div>
       ) : null}
       <ConfirmDialog

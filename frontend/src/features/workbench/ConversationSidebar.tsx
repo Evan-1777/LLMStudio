@@ -37,6 +37,7 @@ import {
   SessionInspector,
   type DraftSessionParams,
 } from './SessionInspector';
+import { SchedulePanel } from '../schedule/SchedulePanel';
 import {
   ConversationSidebarDialogs,
   type SidebarGroupModalMode,
@@ -160,6 +161,12 @@ export function ConversationSidebar({
   lastSyncedAt = null,
   syncingServer = false,
   onSyncServer,
+  defaultProviderId,
+  defaultModelId,
+  scheduleRefreshTrigger = 0,
+  onReloadActiveConversation,
+  onOpenConversationSchedule,
+  onSchedulesChanged,
 }: {
   assistantId: string;
   conversations: Conversation[];
@@ -187,6 +194,12 @@ export function ConversationSidebar({
   lastSyncedAt?: string | null;
   syncingServer?: boolean;
   onSyncServer?: () => void;
+  defaultProviderId?: string;
+  defaultModelId?: string;
+  scheduleRefreshTrigger?: number;
+  onReloadActiveConversation?: () => Promise<void>;
+  onOpenConversationSchedule?: (conversation: Conversation) => void;
+  onSchedulesChanged?: () => void;
 }) {
   const navigate = useNavigate();
   const {
@@ -207,7 +220,9 @@ export function ConversationSidebar({
   const cloudOffline = isDesktop && scope === 'cloud' && cloudConnectionState !== 'connected';
   const canBrowseWorkspace = !isDesktop || scope === 'cloud';
 
-  const [rightPanelTab, setRightPanelTab] = useState<'topics' | 'files'>('topics');
+  const [rightPanelTab, setRightPanelTab] = useState<'topics' | 'files' | 'schedules'>('topics');
+  const [scheduleCreateTrigger, setScheduleCreateTrigger] = useState(0);
+  const [scheduleReloadTrigger, setScheduleReloadTrigger] = useState(0);
   const [fileManageMode, setFileManageMode] = useState(false);
   const [workspaceAvailable, setWorkspaceAvailable] = useState(false);
   const [fileCreateTrigger, setFileCreateTrigger] = useState<WorkspaceCreateTrigger | null>(null);
@@ -662,12 +677,16 @@ export function ConversationSidebar({
     ).filter((el) => el.dataset.topicId !== draggingConvId);
 
     let beforeId: string | null = null;
-    for (const rowEl of rowEls) {
-      const r = rowEl.getBoundingClientRect();
-      const midY = r.top + r.height / 2;
-      if (clientY < midY) {
-        beforeId = rowEl.dataset.topicId ?? null;
-        break;
+    if (!pinned && groupId !== null && rowEls.length === 0) {
+      beforeId = bucketItemsMap.get(bucketKey)?.find((c) => c.id !== draggingConvId)?.id ?? null;
+    } else {
+      for (const rowEl of rowEls) {
+        const r = rowEl.getBoundingClientRect();
+        const midY = r.top + r.height / 2;
+        if (clientY < midY) {
+          beforeId = rowEl.dataset.topicId ?? null;
+          break;
+        }
       }
     }
     return { bucketKey, pinned, groupId, beforeId };
@@ -773,7 +792,9 @@ export function ConversationSidebar({
             ? '话题参数'
             : rightPanelTab === 'files' && canBrowseWorkspace
               ? '工作区文件'
-              : '话题'
+              : rightPanelTab === 'schedules' && canBrowseWorkspace
+                ? '定时任务'
+                : '话题'
         }
       >
         {inspectorOpen ? (
@@ -793,15 +814,15 @@ export function ConversationSidebar({
           <>
             <div className={`wb-history__head${rightPanelTab === 'files' && canBrowseWorkspace ? ' ws-history-head' : ''}`}>
               {canBrowseWorkspace ? (
-                <SegmentedControl<'topics' | 'files'>
+                <SegmentedControl<'topics' | 'files' | 'schedules'>
                   ariaLabel="右侧面板"
                   value={rightPanelTab}
                   onChange={(next) => {
                     setRightPanelTab(next);
-                    if (next === 'files' && manageMode) {
+                    if (next !== 'topics' && manageMode) {
                       onManageModeChange(false);
                     }
-                    if (next === 'topics') {
+                    if (next !== 'files') {
                       setFileCreateTrigger(null);
                       setFileManageMode(false);
                     }
@@ -818,6 +839,12 @@ export function ConversationSidebar({
                       ariaLabel: '工作区文件',
                       title: '工作区文件',
                       label: <Icon name="folder" size={14} />,
+                    },
+                    {
+                      value: 'schedules',
+                      ariaLabel: '定时任务',
+                      title: '定时任务',
+                      label: <Icon name="alarmClock" size={14} />,
                     },
                   ]}
                 />
@@ -848,6 +875,23 @@ export function ConversationSidebar({
                       active={fileManageMode}
                       disabled={!workspaceAvailable || cloudOffline}
                       onClick={() => setFileManageMode((v) => !v)}
+                    />
+                  </>
+                ) : rightPanelTab === 'schedules' && canBrowseWorkspace ? (
+                  <>
+                    <IconButton
+                      size="sm"
+                      icon="refresh"
+                      label="刷新定时任务"
+                      disabled={cloudOffline}
+                      onClick={() => setScheduleReloadTrigger((n) => n + 1)}
+                    />
+                    <IconButton
+                      size="sm"
+                      icon="plus"
+                      label="新建定时任务"
+                      disabled={cloudOffline}
+                      onClick={() => setScheduleCreateTrigger((n) => n + 1)}
                     />
                   </>
                 ) : (
@@ -883,7 +927,9 @@ export function ConversationSidebar({
                     label={
                       rightPanelTab === 'files' && canBrowseWorkspace
                         ? '关闭工作区栏'
-                        : '关闭话题栏'
+                        : rightPanelTab === 'schedules' && canBrowseWorkspace
+                          ? '关闭定时任务栏'
+                          : '关闭话题栏'
                     }
                     className="wb-mobile-only"
                     onClick={onCloseDrawer}
@@ -936,7 +982,23 @@ export function ConversationSidebar({
                 </div>
               ) : null}
 
-              {rightPanelTab === 'files' && canBrowseWorkspace ? (
+              {rightPanelTab === 'schedules' && canBrowseWorkspace ? (
+                <SchedulePanel
+                  scope={reqScope}
+                  cloudOffline={cloudOffline}
+                  activeConversationId={activeConversationId}
+                  defaultAssistantId={assistantId}
+                  defaultProviderId={defaultProviderId}
+                  defaultModelId={defaultModelId}
+                  refreshTrigger={scheduleRefreshTrigger + scheduleReloadTrigger}
+                  createTrigger={scheduleCreateTrigger}
+                  onOpenConversation={(convId) => onSelectConversation(convId)}
+                  onReloadActiveConversation={
+                    onReloadActiveConversation ?? (() => Promise.resolve())
+                  }
+                  onSchedulesChanged={() => onSchedulesChanged?.()}
+                />
+              ) : rightPanelTab === 'files' && canBrowseWorkspace ? (
                 <div className="ws-tree-wrap">
                   <WorkspaceFileTree
                     gateway={gateway}
@@ -1452,6 +1514,20 @@ export function ConversationSidebar({
                                                 ? '上传至云端'
                                                 : '拉取至本地'}
                                             </span>
+                                          </DropdownItem>
+                                        ) : null}
+                                        {canBrowseWorkspace &&
+                                        !conv.ephemeral &&
+                                        conv.mode === 'agent' &&
+                                        !cloudOffline &&
+                                        onOpenConversationSchedule ? (
+                                          <DropdownItem
+                                            onSelect={() =>
+                                              onOpenConversationSchedule(conv)
+                                            }
+                                          >
+                                            <Icon name="alarmClock" size={14} />
+                                            <span>定时任务</span>
                                           </DropdownItem>
                                         ) : null}
                                         <DropdownItem

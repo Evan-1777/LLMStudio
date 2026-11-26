@@ -27,6 +27,7 @@ type RouterDeps struct {
 	PreferenceService   *service.PreferenceService
 	CustomFontService   *service.CustomFontService
 	StorageService      *service.StorageService
+	ScheduleService     *service.ScheduleService
 }
 
 // NewRouter constructs the root HTTP handler with CORS, authentication, API routes, and optional static assets.
@@ -116,6 +117,14 @@ func NewRouter(deps RouterDeps) http.Handler {
 	}
 	if deps.AgentRuntime != nil {
 		RegisterAgentRoutes(mux, deps.AgentRuntime, nil)
+	}
+	if deps.ScheduleService != nil {
+		sch := NewScheduleHandler(deps.ScheduleService)
+		mux.HandleFunc("GET /api/v1/schedules", sch.List)
+		mux.HandleFunc("POST /api/v1/schedules", sch.Create)
+		mux.HandleFunc("PATCH /api/v1/schedules/{id}", sch.Update)
+		mux.HandleFunc("DELETE /api/v1/schedules/{id}", sch.Delete)
+		mux.HandleFunc("POST /api/v1/schedules/{id}/run", sch.RunNow)
 	}
 	if deps.ChatService != nil {
 		chatHandler := NewChatHandler(deps.ChatService)

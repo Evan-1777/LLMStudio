@@ -9,6 +9,7 @@ import { AgentDirectoryControl } from '../agent/AgentDirectoryControl';
 const TOOL_LABELS = {
   read: '读取文件', ls: '列出目录', find: '查找文件', grep: '搜索文本',
   write: '写入文件', edit: '编辑文件', bash: '执行命令', skill: '调用技能',
+  schedule: '定时任务',
 } as const;
 
 export function AgentPage() {
@@ -121,20 +122,22 @@ function AgentEndpointSettings({ gateway, scope }: { gateway: GatewayClient; sco
       <section>
         <h3 className="st-subhead">工具授权</h3>
         <div className="st-group" aria-busy={busy || undefined}>
-          {Object.entries(TOOL_LABELS).map(([tool, label]) => {
-            const allowed = settings.allowedTools.includes(tool);
-            const available = settings.availableTools.includes(tool);
-            return (
-              <div className="st-row--inline" key={tool}>
-                <span className="st-row__label--plain">{label}</span>
-                <div className="st-agent-tool-control">
-                  {!available && <span className="st-subtitle">不可用</span>}
-                  <Switch label={label} checked={allowed} disabled={busy || (!available && !allowed)}
-                    onCheckedChange={(next) => void save({ allowedTools: next ? [...settings.allowedTools, tool] : settings.allowedTools.filter((name) => name !== tool) })} />
+          {Object.entries(TOOL_LABELS)
+            .filter(([tool]) => tool === 'bash' || settings.availableTools.includes(tool) || settings.allowedTools.includes(tool))
+            .map(([tool, label]) => {
+              const allowed = settings.allowedTools.includes(tool);
+              const available = settings.availableTools.includes(tool);
+              return (
+                <div className="st-row--inline" key={tool}>
+                  <span className="st-row__label--plain">{label}</span>
+                  <div className="st-agent-tool-control">
+                    {!available && <span className="st-subtitle">不可用</span>}
+                    <Switch label={label} checked={allowed} disabled={busy || (!available && !allowed)}
+                      onCheckedChange={(next) => void save({ allowedTools: next ? [...settings.allowedTools, tool] : settings.allowedTools.filter((name) => name !== tool) })} />
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
         </div>
       </section>
       {skills.length > 0 && (

@@ -75,6 +75,8 @@ export type IconName =
   | 'cloudDownload'
   | 'folderOpen'
   | 'clock'
+  | 'alarmClock'
+  | 'play'
   | 'file'
   | 'fileText'
   | 'fileCode'
@@ -589,6 +591,17 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
       <path d="m10 7.5-4 2.5 4 2.5" />
     </>
   ),
+  alarmClock: (
+    <>
+      <circle cx="12" cy="13" r="8" />
+      <path d="M12 9v4l2 2" />
+      <path d="M5 3 2 6" />
+      <path d="m22 6-3-3" />
+      <path d="m6.38 18.7-1.38 2.3" />
+      <path d="m17.62 18.7 1.38 2.3" />
+    </>
+  ),
+  play: <polygon points="6 4 20 12 6 20 6 4" />,
 };
 
 export interface IconProps {

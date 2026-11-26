@@ -18,6 +18,7 @@ import {
   type CreateConversationInput,
   type CreateMessageInput,
   type CreateMessageResult,
+  type CreateScheduledTaskInput,
   type CustomFontMeta,
   type DeletedConversation,
   type DesktopConnectionConfig,
@@ -45,6 +46,8 @@ import {
   type ProviderProbeInput,
   type ProviderUpsertPayload,
   type ReorderConversationsInput,
+  type RunScheduledTaskResult,
+  type ScheduledTask,
   type SearchEngineTestInput,
   type SearchEngineTestResult,
   type SearchEngineUpdateInput,
@@ -57,6 +60,7 @@ import {
   type StreamChatInput,
   type ToolCallExecutionInput,
   type TopicScope,
+  type UpdateScheduledTaskInput,
   type WorkspaceBatchOperation,
   type WorkspaceBatchResult,
   type WorkspaceEntriesResponse,
@@ -1442,5 +1446,69 @@ export class GatewayClient {
       withScopeQuery('/api/v1/agent/runs', scope),
       { signal },
     ).then((res) => res.conversationIds ?? []);
+  }
+
+  listScheduledTasks(
+    conversationId?: string,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<ScheduledTask[]> {
+    const base = conversationId
+      ? `/api/v1/schedules?conversationId=${encodeURIComponent(conversationId)}`
+      : '/api/v1/schedules';
+    return this.requestJson<{ schedules?: ScheduledTask[] }>(
+      'GET',
+      withScopeQuery(base, scope),
+      { signal },
+    ).then((res) => res.schedules ?? []);
+  }
+
+  createScheduledTask(
+    input: CreateScheduledTaskInput,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<ScheduledTask> {
+    return this.requestJson<{ schedule: ScheduledTask }>(
+      'POST',
+      withScopeQuery('/api/v1/schedules', scope),
+      { body: input, signal },
+    ).then((res) => res.schedule);
+  }
+
+  updateScheduledTask(
+    id: string,
+    input: UpdateScheduledTaskInput,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<ScheduledTask> {
+    return this.requestJson<{ schedule: ScheduledTask }>(
+      'PATCH',
+      withScopeQuery(`/api/v1/schedules/${encodeURIComponent(id)}`, scope),
+      { body: input, signal },
+    ).then((res) => res.schedule);
+  }
+
+  deleteScheduledTask(
+    id: string,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<void> {
+    return this.requestJson<void>(
+      'DELETE',
+      withScopeQuery(`/api/v1/schedules/${encodeURIComponent(id)}`, scope),
+      { signal },
+    );
+  }
+
+  runScheduledTaskNow(
+    id: string,
+    signal?: AbortSignal,
+    scope?: TopicScope,
+  ): Promise<RunScheduledTaskResult> {
+    return this.requestJson<RunScheduledTaskResult>(
+      'POST',
+      withScopeQuery(`/api/v1/schedules/${encodeURIComponent(id)}/run`, scope),
+      { body: {}, signal },
+    );
   }
 }

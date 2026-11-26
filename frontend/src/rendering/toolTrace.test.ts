@@ -19,6 +19,7 @@ describe('toolTrace helpers', () => {
     expect(toolIconName('bash')).toBe('terminal');
     expect(toolIconName('skill')).toBe('plugin');
     expect(toolIconName('get_current_time')).toBe('clock');
+    expect(toolIconName('schedule')).toBe('alarmClock');
     expect(toolIconName('mcp_custom_query')).toBe('wrench');
   });
 
@@ -44,6 +45,18 @@ describe('toolTrace helpers', () => {
     expect(summarizeToolArgs('skill', { name: 'demo-skill' })).toBe('demo-skill');
     expect(summarizeToolArgs('get_current_time', { timezone: 'Asia/Shanghai' })).toBe(
       'Asia/Shanghai',
+    );
+    expect(summarizeToolArgs('schedule', { action: 'create', name: '晨报', hour: 8, minute: 30 })).toBe(
+      'create · 晨报 08:30',
+    );
+    expect(summarizeToolArgs('schedule', { action: 'update', id: 'sched-1', name: '晚报' })).toBe(
+      'update · 晚报',
+    );
+    expect(summarizeToolArgs('schedule', { action: 'list', current_topic_only: true })).toBe(
+      'list · 当前话题',
+    );
+    expect(summarizeToolArgs('schedule', { action: 'delete', id: 'sched-1' })).toBe(
+      'delete · sched-1',
     );
     expect(summarizeToolArgs('lookup', { q: 'alpha beta' })).toBe('alpha beta');
     expect(summarizeToolArgs('summarize', { depth: 2 })).toBe('2');

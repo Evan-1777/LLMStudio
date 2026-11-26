@@ -10,6 +10,36 @@ import (
 	"llmstudio/backend/internal/plugin"
 )
 
+func (s *Server) proxyCloudRequest(w http.ResponseWriter, r *http.Request, maxBody int64) {
+	if s.cfg.Cloud == nil || !s.cfg.Cloud.IsConfigured() {
+		httpapi.WriteError(w, http.StatusServiceUnavailable, domain.ErrCodeCloudNotConnected, "cloud gateway is not connected")
+		return
+	}
+	ctx, release := s.cfg.Cloud.bind(r.Context())
+	defer release()
+	q := r.URL.Query()
+	q.Del("scope")
+	target := r.URL.EscapedPath()
+	if len(q) > 0 {
+		target += "?" + q.Encode()
+	}
+	body := r.Body
+	if body != nil && maxBody > 0 {
+		body = http.MaxBytesReader(w, body, maxBody)
+	}
+	resp, err := s.cfg.Cloud.proxyRequest(ctx, r.Method, target, r.Header, body, r.ContentLength)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			writeDesktopError(w, domain.NewError(domain.ErrCodePayloadTooLarge, "请求体超过大小限制", err))
+			return
+		}
+		writeDesktopError(w, err)
+		return
+	}
+	copyAgentResponse(w, resp, false)
+}
+
 func (s *Server) dispatchAgent(local http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		scope, err := scopeFromRequest(r)
@@ -21,18 +51,6 @@ func (s *Server) dispatchAgent(local http.HandlerFunc) http.HandlerFunc {
 			local(w, r)
 			return
 		}
-		if s.cfg.Cloud == nil || !s.cfg.Cloud.IsConfigured() {
-			httpapi.WriteError(w, http.StatusServiceUnavailable, domain.ErrCodeCloudNotConnected, "cloud gateway is not connected")
-			return
-		}
-		ctx, release := s.cfg.Cloud.bind(r.Context())
-		defer release()
-		q := r.URL.Query()
-		q.Del("scope")
-		target := r.URL.EscapedPath()
-		if len(q) > 0 {
-			target += "?" + q.Encode()
-		}
 		maxBody := int64(64 << 10)
 		switch {
 		case (r.Method == http.MethodPut || r.Method == http.MethodPost) && r.URL.Path == "/api/v1/agent/workspace/file":
@@ -40,18 +58,21 @@ func (s *Server) dispatchAgent(local http.HandlerFunc) http.HandlerFunc {
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/agent/workspace/upload":
 			maxBody = (32 << 20) + (64 << 10)
 		}
-		resp, err := s.cfg.Cloud.proxyRequest(ctx, r.Method, target, r.Header, http.MaxBytesReader(w, r.Body, maxBody), r.ContentLength)
-		if err != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(err, &maxErr) {
-				writeDesktopError(w, domain.NewError(domain.ErrCodePayloadTooLarge, "请求体超过大小限制", err))
-				return
-			}
-			writeDesktopError(w, err)
-			return
-		}
-		copyAgentResponse(w, resp, false)
+		s.proxyCloudRequest(w, r, maxBody)
 	}
+}
+
+func (s *Server) handleCloudSchedule(w http.ResponseWriter, r *http.Request) {
+	scope, err := scopeFromRequest(r)
+	if err != nil {
+		writeDesktopError(w, err)
+		return
+	}
+	if scope == plugin.ExecutionScopeLocal {
+		httpapi.WriteError(w, http.StatusNotFound, domain.ErrCodeNotFound, "定时任务仅支持云端")
+		return
+	}
+	s.proxyCloudRequest(w, r, 64<<10)
 }
 
 func copyAgentResponse(w http.ResponseWriter, resp *http.Response, stream bool) {

@@ -107,6 +107,41 @@ func (r *detachedRun) finish() {
 	r.mu.Unlock()
 }
 
+func (r *detachedRun) waitOutcome(ctx context.Context) (stopReason, errMsg string, completed bool) {
+	select {
+	case <-r.doneCh:
+	case <-ctx.Done():
+		return "", "", false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for _, ev := range r.terminalEvents {
+		if ev.Type == domain.StreamEventError {
+			msg := ""
+			if ev.Error != nil {
+				msg = ev.Error.Message
+			}
+			return domain.StopReasonError, msg, true
+		}
+	}
+	for i := len(r.terminalEvents) - 1; i >= 0; i-- {
+		ev := r.terminalEvents[i]
+		if ev.Type == domain.StreamEventMessageEnd && ev.Message != nil {
+			sr := ev.Message.StopReason
+			if sr == "" && ev.Message.ErrorMessage != "" {
+				sr = domain.StopReasonError
+			}
+			if sr == "" {
+				sr = domain.StopReasonStop
+			}
+			return sr, ev.Message.ErrorMessage, true
+		}
+	}
+	return domain.StopReasonAborted, "运行已取消", true
+}
+
 // snapshotEventsLocked builds a compact, protocol-standard replay sequence from the
 // single streamAccumulator while holding r.mu.
 func (r *detachedRun) snapshotEventsLocked() []domain.StreamEvent {

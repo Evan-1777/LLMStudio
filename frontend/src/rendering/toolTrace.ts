@@ -99,6 +99,8 @@ export function toolIconName(toolName: string): IconName {
       return 'plugin';
     case 'get_current_time':
       return 'clock';
+    case 'schedule':
+      return 'alarmClock';
     default:
       return 'wrench';
   }
@@ -190,6 +192,23 @@ export function summarizeToolArgs(
   } else if (normalized === 'get_current_time') {
     const tz = nonEmptyString(rec.timezone);
     if (tz) return truncateSingleLine(tz, maxLen);
+  } else if (normalized === 'schedule') {
+    const action = nonEmptyString(rec.action);
+    const name = nonEmptyString(rec.name);
+    const id = nonEmptyString(rec.id);
+    const hour = typeof rec.hour === 'number' && Number.isInteger(rec.hour) && rec.hour >= 0 && rec.hour <= 23 ? rec.hour : undefined;
+    const minute = typeof rec.minute === 'number' && Number.isInteger(rec.minute) && rec.minute >= 0 && rec.minute <= 59 ? rec.minute : undefined;
+    const clock = hour !== undefined && minute !== undefined
+      ? `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+      : '';
+    const detail = [name || (action === 'delete' || action === 'update' ? id : ''), clock].filter(Boolean).join(' ');
+    if (action) {
+      if (action === 'list' && rec.current_topic_only === true) {
+        return truncateSingleLine('list · 当前话题', maxLen);
+      }
+      return truncateSingleLine(detail ? `${action} · ${detail}` : action, maxLen);
+    }
+    if (detail) return truncateSingleLine(detail, maxLen);
   }
 
   for (const key of PREFERRED_ARG_KEYS) {

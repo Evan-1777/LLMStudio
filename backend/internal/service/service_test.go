@@ -492,7 +492,7 @@ func TestConversationGroupsBatchAndReorder(t *testing.T) {
 		t.Fatalf("unexpected order after unpin c2: %+v", snap.Conversations)
 	}
 
-	// Move C2 to ungrouped explicitly with groupId: null, placed after C1.
+	// Move C2 to ungrouped explicitly with groupId: null, placed at ungrouped head before C1.
 	snap, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
 		AssistantID: domain.DefaultAssistantID,
 		IDs:         []string{c2.ID},
@@ -502,8 +502,8 @@ func TestConversationGroupsBatchAndReorder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("batch move to ungrouped failed: %v", err)
 	}
-	if snap.Conversations[2].ID != c1.ID || snap.Conversations[3].ID != c2.ID || snap.Conversations[3].GroupID != nil {
-		t.Fatalf("expected C2 moved to ungrouped tail: %+v", snap.Conversations)
+	if snap.Conversations[2].ID != c2.ID || snap.Conversations[3].ID != c1.ID || snap.Conversations[2].GroupID != nil {
+		t.Fatalf("expected C2 moved to ungrouped head: %+v", snap.Conversations)
 	}
 
 	// Move C1 into g1 before C4 via reorder, then delete g1 -> C1, C4 move to ungrouped tail after C2!
@@ -516,6 +516,61 @@ func TestConversationGroupsBatchAndReorder(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("reorder c1 before c4 in g1 failed: %v", err)
+	}
+	// Create g3 with existing C5, move C4 and C1 into g3 -> C1, C4 land at g3 head before C5.
+	g3Res, err := convSvc.CreateGroup(ctx, CreateGroupInput{AssistantID: domain.DefaultAssistantID, Name: "G3"})
+	if err != nil {
+		t.Fatalf("create g3 failed: %v", err)
+	}
+	c5, err := convSvc.Create(ctx, CreateConversationInput{AssistantID: domain.DefaultAssistantID, Title: "C5"})
+	if err != nil {
+		t.Fatalf("create c5 failed: %v", err)
+	}
+	if _, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c5.ID},
+		Operation:   "move",
+		GroupID:     PatchField[string]{Set: true, Value: g3Res.Group.ID},
+	}); err != nil {
+		t.Fatalf("move c5 to g3 failed: %v", err)
+	}
+	snap, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c4.ID, c1.ID},
+		Operation:   "move",
+		GroupID:     PatchField[string]{Set: true, Value: g3Res.Group.ID},
+	})
+	if err != nil {
+		t.Fatalf("batch move C4, C1 to g3 failed: %v", err)
+	}
+	// Canonical in g3: C1, C4 (source order in g1), then existing C5.
+	var g3IDs []string
+	for _, conv := range snap.Conversations {
+		if !conv.Pinned && conv.GroupID != nil && *conv.GroupID == g3Res.Group.ID {
+			g3IDs = append(g3IDs, conv.ID)
+		}
+	}
+	if len(g3IDs) != 3 || g3IDs[0] != c1.ID || g3IDs[1] != c4.ID || g3IDs[2] != c5.ID {
+		t.Fatalf("expected C1, C4 prepended before C5 in g3, got %v", g3IDs)
+	}
+	// Move C1, C4 back into g1 (ordered C1, C4) before deleting g1 so subsequent DeleteGroup check stays intact.
+	if _, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c1.ID, c4.ID},
+		Operation:   "move",
+		GroupID:     PatchField[string]{Set: true, Value: g1Res.Group.ID},
+	}); err != nil {
+		t.Fatalf("batch move back to g1 failed: %v", err)
+	}
+	if _, err = convSvc.BatchConversations(ctx, BatchConversationsInput{
+		AssistantID: domain.DefaultAssistantID,
+		IDs:         []string{c5.ID},
+		Operation:   "delete",
+	}); err != nil {
+		t.Fatalf("delete c5 failed: %v", err)
+	}
+	if _, err = convSvc.DeleteGroup(ctx, g3Res.Group.ID); err != nil {
+		t.Fatalf("delete g3 failed: %v", err)
 	}
 	delGroupRes, err := convSvc.DeleteGroup(ctx, g1Res.Group.ID)
 	if err != nil {

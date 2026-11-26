@@ -279,6 +279,23 @@ type PreparedStream struct {
 	detachedRun          *detachedRun
 }
 
+// ConversationID returns the target conversation ID of the prepared stream.
+func (p *PreparedStream) ConversationID() string {
+	if p == nil {
+		return ""
+	}
+	return p.conversation.ID
+}
+
+// WaitDetachedOutcome blocks until a detached background Agent run finishes or ctx is canceled,
+// returning the terminal stopReason and error summary derived from terminal stream events.
+func (p *PreparedStream) WaitDetachedOutcome(ctx context.Context) (stopReason, errMsg string, completed bool) {
+	if p == nil || p.detachedRun == nil {
+		return "", "", false
+	}
+	return p.detachedRun.waitOutcome(ctx)
+}
+
 type preparedUpstream struct {
 	graphWrite           *domain.MessageGraphWrite
 	conversation         domain.Conversation

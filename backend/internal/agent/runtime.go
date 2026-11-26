@@ -34,6 +34,7 @@ type Runtime struct {
 	gateway       bool
 	base          string
 	authenticated bool
+	scheduler     ScheduleManager
 }
 
 func NewGateway(store PolicyStore, base string, authenticated bool) *Runtime {
@@ -42,6 +43,14 @@ func NewGateway(store PolicyStore, base string, authenticated bool) *Runtime {
 
 func NewDesktop(store PolicyStore) *Runtime {
 	return &Runtime{store: store, authenticated: true}
+}
+
+// WithScheduler attaches a cloud-only scheduled task manager to a gateway Runtime.
+func (a *Runtime) WithScheduler(scheduler ScheduleManager) *Runtime {
+	if a != nil {
+		a.scheduler = scheduler
+	}
+	return a
 }
 
 type Directory struct {
@@ -136,20 +145,23 @@ func (a *Runtime) directory(path string, override bool) Directory {
 	return d
 }
 
-func definitions() []plugin.ChatTool {
+func (a *Runtime) definitions() []plugin.ChatTool {
 	tools := slices.Clone(fileTools)
 	if commandPath() != "" {
 		tools = append(tools, commandTool())
 	}
 	tools = append(tools, skillTool())
+	if a != nil && a.gateway && a.scheduler != nil {
+		tools = append(tools, scheduleTool())
+	}
 	return tools
 }
 
-func isKnownTool(name string) bool {
+func (a *Runtime) isKnownTool(name string) bool {
 	if name == "bash" {
 		return true
 	}
-	return slices.ContainsFunc(definitions(), func(tool plugin.ChatTool) bool {
+	return slices.ContainsFunc(a.definitions(), func(tool plugin.ChatTool) bool {
 		return tool.Alias == name
 	})
 }
@@ -163,7 +175,7 @@ func (a *Runtime) Settings(ctx context.Context) (Settings, error) {
 		return Settings{}, err
 	}
 	available := []string{}
-	for _, tool := range definitions() {
+	for _, tool := range a.definitions() {
 		available = append(available, tool.Alias)
 	}
 	dir := a.directory(policy.DefaultDirectory, false)
@@ -198,7 +210,7 @@ func (a *Runtime) UpdateSettings(ctx context.Context, patch SettingsPatch) (Sett
 	if patch.AllowedTools != nil {
 		seen := map[string]bool{}
 		for _, name := range *patch.AllowedTools {
-			if seen[name] || !isKnownTool(name) {
+			if seen[name] || !a.isKnownTool(name) {
 				return Settings{}, domain.NewError(domain.ErrCodeInvalidArgument, "无效的 Agent 工具名单", nil)
 			}
 			seen[name] = true
@@ -347,7 +359,7 @@ func (a *Runtime) prepareContext(ctx context.Context, id string, includeInstruct
 	}
 
 	var tools []plugin.ChatTool
-	for _, def := range definitions() {
+	for _, def := range a.definitions() {
 		if !slices.Contains(policy.AllowedTools, def.Alias) {
 			continue
 		}
@@ -392,6 +404,8 @@ func (a *Runtime) Execute(ctx context.Context, id, name string, args json.RawMes
 		return runCommand(ctx, root, args)
 	case "skill":
 		return runSkill(ctx, root, args)
+	case "schedule":
+		return a.runSchedule(ctx, id, args)
 	}
 	if !slices.ContainsFunc(fileTools, func(def plugin.ChatTool) bool { return def.Alias == name }) {
 		return "", errors.New("unknown Agent tool")

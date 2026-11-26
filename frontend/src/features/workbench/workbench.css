@@ -2344,6 +2344,23 @@
   .wb-rail .ui-icon-btn,
   .wb-history .ui-icon-btn { min-width: 44px; }
 
+  .wb-history__head {
+    gap: 4px;
+    padding-inline: 8px;
+  }
+
+  .wb-history__head .ui-segmented__item {
+    min-width: 28px;
+    padding: 3px 6px;
+  }
+
+  .wb-history .wb-history__head .ui-icon-btn--sm {
+    width: 34px;
+    min-width: 34px;
+    height: 34px;
+    min-height: 34px;
+  }
+
   .wb-nav-row__actions,
   .wb-topic-row__actions { opacity: 1; }
 

@@ -343,4 +343,110 @@ describe('GatewayClient', () => {
       },
     });
   });
+
+  it('serializes scheduled task endpoints and preserves scope=cloud query parameter', async () => {
+    const calls: Array<{ method: string; url: string; body?: unknown }> = [];
+    const sampleTask = {
+      id: 'sched_1',
+      name: '晨间简报',
+      prompt: '总结待办',
+      enabled: true,
+      hour: 8,
+      minute: 30,
+      weekdays: [1, 3, 5],
+      timezone: 'Asia/Shanghai',
+      maxRuns: 0,
+      runCount: 0,
+      bindMode: 'new' as const,
+      assistantId: 'asst_1',
+      providerId: 'prov_1',
+      modelId: 'gpt-4o',
+      lastStatus: '' as const,
+      createdAt: '2026-11-26T00:00:00Z',
+      updatedAt: '2026-11-26T00:00:00Z',
+    };
+
+    const fetchMock: typeof fetch = vi.fn(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ method, url, body });
+      if (method === 'GET') {
+        return new Response(JSON.stringify({ schedules: [sampleTask] }), { status: 200 });
+      }
+      if (url.includes('/run')) {
+        return new Response(
+          JSON.stringify({ schedule: sampleTask, conversationId: 'conv_run' }),
+          { status: 200 },
+        );
+      }
+      if (method === 'DELETE') {
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify({ schedule: sampleTask }), {
+        status: method === 'POST' ? 201 : 200,
+      });
+    });
+
+    const client = new GatewayClient({
+      baseUrl: 'https://gw.test',
+      accessToken: 'tok',
+      fetchImpl: fetchMock,
+    });
+
+    const listed = await client.listScheduledTasks('conv_1', undefined, 'cloud');
+    expect(listed).toHaveLength(1);
+    expect(calls[0]).toEqual({
+      method: 'GET',
+      url: 'https://gw.test/api/v1/schedules?conversationId=conv_1&scope=cloud',
+      body: undefined,
+    });
+
+    await client.createScheduledTask(
+      {
+        name: '晨间简报',
+        prompt: '总结待办',
+        hour: 8,
+        minute: 30,
+        weekdays: [1, 3, 5],
+        timezone: 'Asia/Shanghai',
+        bindMode: 'new',
+        assistantId: 'asst_1',
+        providerId: 'prov_1',
+        modelId: 'gpt-4o',
+      },
+      undefined,
+      'cloud',
+    );
+    expect(calls[1].method).toBe('POST');
+    expect(calls[1].url).toBe('https://gw.test/api/v1/schedules?scope=cloud');
+    expect(calls[1].body).toMatchObject({ name: '晨间简报', hour: 8, minute: 30 });
+
+    await client.updateScheduledTask(
+      'sched_1',
+      { enabled: false, resetRunCount: true },
+      undefined,
+      'cloud',
+    );
+    expect(calls[2]).toEqual({
+      method: 'PATCH',
+      url: 'https://gw.test/api/v1/schedules/sched_1?scope=cloud',
+      body: { enabled: false, resetRunCount: true },
+    });
+
+    const runResult = await client.runScheduledTaskNow('sched_1', undefined, 'cloud');
+    expect(runResult.conversationId).toBe('conv_run');
+    expect(calls[3]).toEqual({
+      method: 'POST',
+      url: 'https://gw.test/api/v1/schedules/sched_1/run?scope=cloud',
+      body: {},
+    });
+
+    await client.deleteScheduledTask('sched_1', undefined, 'cloud');
+    expect(calls[4]).toEqual({
+      method: 'DELETE',
+      url: 'https://gw.test/api/v1/schedules/sched_1?scope=cloud',
+      body: undefined,
+    });
+  });
 });

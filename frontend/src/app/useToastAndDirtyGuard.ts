@@ -1,9 +1,23 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 export interface ToastState {
   message: string;
   tone: 'default' | 'error';
+  action?: ToastAction;
 }
+
+export type ToastOptions =
+  | 'default'
+  | 'error'
+  | {
+      tone?: 'default' | 'error';
+      action?: ToastAction;
+    };
 
 export function useToastAndDirtyGuard() {
   const [toastState, setToastState] = useState<ToastState | null>(null);
@@ -15,18 +29,32 @@ export function useToastAndDirtyGuard() {
   >(null);
 
   const toast = useCallback(
-    (message: string, tone: 'default' | 'error' = 'default') => {
+    (message: string, toneOrOptions: ToastOptions = 'default') => {
       if (toastTimerRef.current !== null) {
         window.clearTimeout(toastTimerRef.current);
       }
-      setToastState({ message, tone });
+      const tone =
+        typeof toneOrOptions === 'string'
+          ? toneOrOptions
+          : (toneOrOptions.tone ?? 'default');
+      const action =
+        typeof toneOrOptions === 'string' ? undefined : toneOrOptions.action;
+      setToastState({ message, tone, action });
       toastTimerRef.current = window.setTimeout(() => {
         setToastState(null);
         toastTimerRef.current = null;
-      }, 2800);
+      }, action ? 4500 : 2800);
     },
     [],
   );
+
+  const dismissToast = useCallback(() => {
+    if (toastTimerRef.current !== null) {
+      window.clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = null;
+    }
+    setToastState(null);
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -53,6 +81,7 @@ export function useToastAndDirtyGuard() {
   return {
     toastState,
     toast,
+    dismissToast,
     discardPromptResolver,
     setDiscardPromptResolver,
     registerDirtyGuard,

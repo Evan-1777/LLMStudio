@@ -70,6 +70,7 @@ func main() {
 	prefSvc := service.NewPreferenceService(prefStore)
 	customFontSvc := service.NewCustomFontService(customFontStore)
 	storageSvc := service.NewStorageService(store.NewStorageMaintenance(db, cfg.DBPath))
+	scheduleStore := store.NewScheduledTaskStore(db)
 	agentRuntime := agent.NewGateway(store.NewAgentStore(db), cfg.AgentRoot, cfg.AccessToken != "")
 	chatSvc := service.NewChatService(providerStore, convStore, msgStore, formats, adapters, &http.Client{}).
 		WithAssistants(assistantStore).
@@ -78,6 +79,9 @@ func main() {
 		WithMCP(mcpStore, mcpRuntime).
 		WithAgent(agentRuntime)
 	convSvc.WithRunTracker(chatSvc.ActiveRun, chatSvc.ActiveRunConversationIDs, chatSvc.CancelRunsAndWait)
+	scheduleSvc := service.NewScheduleService(scheduleStore, convStore, providerStore, assistantStore, chatSvc)
+	agentRuntime.WithScheduler(scheduleSvc)
+	scheduleSvc.Start(ctx)
 
 	router := httpapi.NewRouter(httpapi.RouterDeps{
 		Config:              cfg,
@@ -92,6 +96,7 @@ func main() {
 		PreferenceService:   prefSvc,
 		CustomFontService:   customFontSvc,
 		StorageService:      storageSvc,
+		ScheduleService:     scheduleSvc,
 	})
 
 	srv := &http.Server{
@@ -116,11 +121,17 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("server shutdown error: %v", err)
 	}
+	scheduleSvc.StopScheduler()
 	chatShutdownCtx, chatCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := chatSvc.Shutdown(chatShutdownCtx); err != nil {
 		log.Printf("chat service shutdown error: %v", err)
 	}
 	chatCancel()
+	obsCtx, obsCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	if err := scheduleSvc.WaitObservers(obsCtx); err != nil {
+		log.Printf("schedule service observer shutdown error: %v", err)
+	}
+	obsCancel()
 	if err := mcpRuntime.Close(); err != nil {
 		log.Printf("mcp runtime shutdown error: %v", err)
 	}

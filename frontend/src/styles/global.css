@@ -512,6 +512,21 @@ a {
   color: #ffffff;
 }
 
+.ui-toast__action {
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--bg-surface) 18%, transparent);
+  color: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ui-toast__action:hover {
+  background: color-mix(in srgb, var(--bg-surface) 28%, transparent);
+}
+
 .ui-banner-error {
   display: flex;
   align-items: center;

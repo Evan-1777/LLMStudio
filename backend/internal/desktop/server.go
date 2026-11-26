@@ -246,6 +246,13 @@ func (s *Server) buildHandler() http.Handler {
 
 	httpapi.RegisterAgentRoutes(mux, agent.NewDesktop(s.cfg.Store.Agent), s.dispatchAgent)
 
+	// Cloud-only scheduled tasks: reject local scope and proxy cloud scope.
+	mux.HandleFunc("GET /api/v1/schedules", s.handleCloudSchedule)
+	mux.HandleFunc("POST /api/v1/schedules", s.handleCloudSchedule)
+	mux.HandleFunc("PATCH /api/v1/schedules/{id}", s.handleCloudSchedule)
+	mux.HandleFunc("DELETE /api/v1/schedules/{id}", s.handleCloudSchedule)
+	mux.HandleFunc("POST /api/v1/schedules/{id}/run", s.handleCloudSchedule)
+
 	// Local-first chat streaming, compaction, and MCP tool execution for both domains.
 	mux.HandleFunc("POST /api/v1/conversations/{id}/messages/stream", s.handleChatStream)
 	mux.HandleFunc("GET /api/v1/conversations/{id}/run/stream", s.handleAttachRunStream)

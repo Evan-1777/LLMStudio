@@ -390,7 +390,7 @@ func (s *ConversationStore) CleanupUngrouped(ctx context.Context) ([]domain.Dele
 }
 
 // BatchMove atomically moves conversations to targetGroupID (nil for ungrouped) within assistantID.
-// Unpinned items are appended to the target bucket tail in source order; pinned items update group_id while keeping pinned order.
+// Unpinned items are prepended to the target bucket head in source order; pinned items update group_id while keeping pinned order.
 func (s *ConversationStore) BatchMove(ctx context.Context, assistantID string, ids []string, targetGroupID *string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -441,7 +441,7 @@ func (s *ConversationStore) BatchMove(ctx context.Context, assistantID string, i
 		}
 	}
 
-	merged := append(existingTargetUnpinned, movedUnpinned...)
+	merged := append(movedUnpinned, existingTargetUnpinned...)
 	for i, id := range merged {
 		if _, err := tx.ExecContext(ctx, `UPDATE conversations SET group_id = ?, sort_order = ? WHERE id = ?`, targetArg, i+1, id); err != nil {
 			return fmt.Errorf("reorder moved conversation %s: %w", id, err)

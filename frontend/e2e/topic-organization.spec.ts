@@ -408,3 +408,118 @@ test('drags group headers only onto ordinary headers and preserves membership ac
     await ctx.close();
   }
 });
+
+test('places topic at head of target group via move-to-group and collapsed group header drag across reload', async ({
+  appUrl,
+  page,
+}) => {
+  const post = <T,>(path: string, body: unknown) =>
+    apiJson<T>(appUrl, path, { method: 'POST', body: JSON.stringify(body) });
+  const targetGroupId = (
+    await post<{ group: { id: string } }>('/api/v1/conversation-groups', {
+      assistantId: 'default',
+      name: 'PriorityGroup',
+    })
+  ).group.id;
+
+  const existingId = (
+    await post<{ conversation: { id: string } }>('/api/v1/conversations', {
+      title: 'Existing Grouped',
+    })
+  ).conversation.id;
+  await post('/api/v1/conversations/batch', {
+    assistantId: 'default',
+    ids: [existingId],
+    operation: 'move',
+    groupId: targetGroupId,
+  });
+
+  const moveByMenuId = (
+    await post<{ conversation: { id: string } }>('/api/v1/conversations', {
+      title: 'Moved By Menu',
+    })
+  ).conversation.id;
+  const dragToCollapsedId = (
+    await post<{ conversation: { id: string } }>('/api/v1/conversations', {
+      title: 'Dragged To Collapsed',
+    })
+  ).conversation.id;
+
+  await connectWithToken(page, appUrl);
+  const groupToggle = page.locator(`[data-group-head="${targetGroupId}"] .wb-topic-group__toggle`);
+  await expect(groupToggle).toHaveAttribute('aria-expanded', 'false');
+
+  // Move 'Moved By Menu' into collapsed PriorityGroup via row menu -> lands before 'Existing Grouped'.
+  await page.getByRole('button', { name: '更多操作 Moved By Menu' }).click();
+  await page.getByRole('menuitem', { name: '移至分组' }).click();
+  await page.getByRole('radio', { name: 'PriorityGroup' }).check();
+  await page.getByRole('button', { name: '确定' }).click();
+
+  await expect
+    .poll(async () => {
+      const list = await apiJson<{
+        conversations: Array<{ id: string; groupId: string | null }>;
+      }>(appUrl, '/api/v1/conversations?assistantId=default');
+      return list.conversations
+        .filter((c) => c.groupId === targetGroupId)
+        .map((c) => c.id);
+    })
+    .toEqual([moveByMenuId, existingId]);
+
+  // Wait for Move dialog & ungrouped DOM update to finish before sampling drag coordinates.
+  await expect(page.getByRole('dialog')).toBeHidden();
+  await expect(page.locator('.wb-topic-row__title')).toHaveText([
+    'Dragged To Collapsed',
+  ]);
+
+  // Drag 'Dragged To Collapsed' onto collapsed PriorityGroup header -> lands at head of group.
+  const groupSectionBucket = page.locator(
+    `[data-drop-bucket="group:${targetGroupId}"]`,
+  );
+  const dragBtn = page.locator(
+    `[data-topic-id="${dragToCollapsedId}"] .wb-topic-row__btn`,
+  );
+  await groupSectionBucket.scrollIntoViewIfNeeded();
+  await dragBtn.scrollIntoViewIfNeeded();
+  await expect(groupToggle).toHaveAttribute('aria-expanded', 'false');
+  const srcBox = (await dragBtn.boundingBox())!;
+  await page.mouse.move(srcBox.x + srcBox.width / 2, srcBox.y + srcBox.height / 2);
+  await page.mouse.down();
+  // Activate drag threshold first so any conditional pinned drop zone settles before sampling target bounds.
+  await page.mouse.move(srcBox.x + srcBox.width / 2, srcBox.y + srcBox.height / 2 - 10, {
+    steps: 3,
+  });
+  await expect(page.locator(`[data-topic-id="${dragToCollapsedId}"]`)).toHaveClass(
+    /wb-topic-row--dragging/,
+  );
+  const dstBox = (await groupSectionBucket.boundingBox())!;
+  await page.mouse.move(dstBox.x + dstBox.width / 2, dstBox.y + dstBox.height / 2, {
+    steps: 8,
+  });
+  await expect(groupSectionBucket).toHaveClass(/wb-topic-section--drop/);
+  await page.mouse.up();
+
+  await expect
+    .poll(async () => {
+      const list = await apiJson<{
+        conversations: Array<{ id: string; groupId: string | null }>;
+      }>(appUrl, '/api/v1/conversations?assistantId=default');
+      return list.conversations
+        .filter((c) => c.groupId === targetGroupId)
+        .map((c) => c.id);
+    })
+    .toEqual([dragToCollapsedId, moveByMenuId, existingId]);
+
+  await page.reload({ waitUntil: 'networkidle' });
+  await page
+    .locator(`[data-group-head="${targetGroupId}"] .wb-topic-group__toggle`)
+    .click();
+  const groupSection = page.locator(
+    `[data-drop-bucket="group:${targetGroupId}"] .wb-topic-row__title`,
+  );
+  await expect(groupSection).toHaveText([
+    'Dragged To Collapsed',
+    'Moved By Menu',
+    'Existing Grouped',
+  ]);
+});

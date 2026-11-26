@@ -28,7 +28,7 @@ it('opens native picker only for local settings and drops results from the previ
   const cloud: AgentSettings = {
     directory: { path: 'remote', status: 'ready' },
     allowedTools: ['read'],
-    availableTools: ['read', 'skill'],
+    availableTools: ['read', 'skill', 'schedule'],
     injectAgentMd: false,
     markdownVisualRender: true,
     skills: [{ name: 'deploy-check', description: 'Verify deployment', path: '.agent/skills/deploy-check/SKILL.md' }],
@@ -43,6 +43,7 @@ it('opens native picker only for local settings and drops results from the previ
   await screen.findByText('C:/local');
   expect(screen.getByRole('switch', { name: '注入目录 AGENT.md' })).toBeChecked();
   expect(screen.queryByRole('switch', { name: '工作区 Markdown 可视化渲染' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('switch', { name: '定时任务' })).not.toBeInTheDocument();
   expect(screen.queryByText('目录技能')).not.toBeInTheDocument();
 
   const choose = () => screen.getByRole('button', { name: '选择工作目录' });
@@ -57,6 +58,7 @@ it('opens native picker only for local settings and drops results from the previ
   await act(async () => { resolveLocal({ ...local, directory: { path: 'C:/chosen', status: 'ready' } }); });
   expect(screen.queryByText('C:/chosen')).not.toBeInTheDocument();
   expect(screen.getByRole('switch', { name: '读取文件' })).toBeChecked();
+  expect(screen.getByRole('switch', { name: '定时任务' })).not.toBeChecked();
   expect(screen.getByRole('switch', { name: '注入目录 AGENT.md' })).not.toBeChecked();
   expect(screen.getByRole('switch', { name: '工作区 Markdown 可视化渲染' })).toBeChecked();
   expect(screen.getByText('目录技能')).toBeInTheDocument();

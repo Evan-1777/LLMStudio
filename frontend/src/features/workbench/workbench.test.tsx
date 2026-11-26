@@ -2766,4 +2766,131 @@ describe('Workbench flows and attachments', () => {
     await user.click(screen.getByRole('button', { name: '在缩略图中查看' }));
     expect(onOpenGraphNode).toHaveBeenCalledWith('a-side');
   });
+
+  it('drops ungrouped topic onto collapsed group header with first group item as beforeId', async () => {
+    const convs: Conversation[] = [
+      {
+        id: 't-grouped-1',
+        assistantId: 'default',
+        title: 'Grouped First',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: '',
+        params: {},
+        syncEnabled: false,
+        syncState: 'local_only',
+        syncVersion: 0,
+        groupId: 'g-collapsed',
+        pinned: false,
+        sortOrder: 1,
+        createdAt: '2026-11-17T08:00:00Z',
+        updatedAt: '2026-11-17T08:00:00Z',
+      },
+      {
+        id: 't-grouped-2',
+        assistantId: 'default',
+        title: 'Grouped Second',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: '',
+        params: {},
+        syncEnabled: false,
+        syncState: 'local_only',
+        syncVersion: 0,
+        groupId: 'g-collapsed',
+        pinned: false,
+        sortOrder: 2,
+        createdAt: '2026-11-17T08:01:00Z',
+        updatedAt: '2026-11-17T08:01:00Z',
+      },
+      {
+        id: 't-ungrouped',
+        assistantId: 'default',
+        title: 'Ungrouped Source',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        systemPrompt: '',
+        params: {},
+        syncEnabled: false,
+        syncState: 'local_only',
+        syncVersion: 0,
+        groupId: null,
+        pinned: false,
+        sortOrder: 1,
+        createdAt: '2026-11-17T08:02:00Z',
+        updatedAt: '2026-11-17T08:02:00Z',
+      },
+    ];
+    const groups = [
+      { id: 'g-collapsed', assistantId: 'default', name: 'Collapsed Group', sortOrder: 1, createdAt: '2026-11-17T07:00:00Z' },
+    ];
+    const reorderCalls: Array<Record<string, unknown>> = [];
+    const { fetchMock } = makeWorkbenchFetch();
+    const dragFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const bodyStr = typeof init?.body === 'string' ? init.body : undefined;
+      if (url.endsWith('/api/v1/conversations') && method === 'GET') {
+        return Response.json({ conversations: convs });
+      }
+      if (url.endsWith('/api/v1/conversation-groups') && method === 'GET') {
+        return Response.json({ groups });
+      }
+      if (url.endsWith('/api/v1/conversations/t-ungrouped') && method === 'GET') {
+        return Response.json({ conversation: convs[2], messages: [] });
+      }
+      if (url.endsWith('/api/v1/conversations/reorder') && method === 'POST') {
+        reorderCalls.push(JSON.parse(bodyStr ?? '{}') as Record<string, unknown>);
+        return Response.json({ assistantId: 'default', conversations: convs, groups });
+      }
+      return fetchMock(input, init);
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={dragFetch}>
+        <MemoryRouter initialEntries={['/chat/t-ungrouped']}>
+          <Routes>
+            <Route path="/chat/:conversationId" element={<WorkbenchPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByText('Ungrouped Source')).toBeInTheDocument());
+    await user.click(screen.getByRole('button', { name: '切换话题栏' }));
+
+    const collapsedToggle = screen.getByRole('button', { name: /^Collapsed Group/ });
+    expect(collapsedToggle).toHaveAttribute('aria-expanded', 'false');
+
+    const listEl = document.querySelector<HTMLElement>('.wb-topic-groups')!;
+    const groupSection = document.querySelector<HTMLElement>('[data-drop-bucket="group:g-collapsed"]')!;
+    const ungroupedSection = document.querySelector<HTMLElement>('[data-drop-bucket="ungrouped"]')!;
+    const topicDragBtn = document.querySelector<HTMLElement>('[data-topic-id="t-ungrouped"] .wb-topic-row__btn')!;
+
+    vi.spyOn(listEl, 'getBoundingClientRect').mockReturnValue({
+      top: 0, bottom: 300, left: 0, right: 300, width: 300, height: 300, x: 0, y: 0, toJSON: () => ({}),
+    });
+    vi.spyOn(groupSection, 'getBoundingClientRect').mockReturnValue({
+      top: 10, bottom: 50, left: 0, right: 300, width: 300, height: 40, x: 0, y: 10, toJSON: () => ({}),
+    });
+    vi.spyOn(ungroupedSection, 'getBoundingClientRect').mockReturnValue({
+      top: 60, bottom: 150, left: 0, right: 300, width: 300, height: 90, x: 0, y: 60, toJSON: () => ({}),
+    });
+
+    fireEvent.pointerDown(topicDragBtn, { pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0, clientX: 50, clientY: 100 });
+    fireEvent.pointerMove(window, { pointerId: 1, pointerType: 'mouse', isPrimary: true, clientX: 50, clientY: 30 });
+    fireEvent.pointerUp(window, { pointerId: 1, pointerType: 'mouse', isPrimary: true, clientX: 50, clientY: 30 });
+
+    await waitFor(() => {
+      expect(reorderCalls.length).toBe(1);
+    });
+    expect(reorderCalls[0]).toMatchObject({
+      assistantId: 'default',
+      ids: ['t-ungrouped'],
+      pinned: false,
+      groupId: 'g-collapsed',
+      beforeId: 't-grouped-1',
+    });
+  });
 });

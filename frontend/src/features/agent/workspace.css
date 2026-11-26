@@ -252,16 +252,16 @@
   }
 
   .ws-history-head .ui-segmented__item {
-    min-width: 34px;
+    min-width: 28px;
     padding-inline: 6px;
   }
 
   .ws-history-head .ui-icon-btn--sm,
   .ws-toolbar .ui-icon-btn--sm {
-    width: 36px;
-    min-width: 36px;
-    height: 36px;
-    min-height: 36px;
+    width: 34px;
+    min-width: 34px;
+    height: 34px;
+    min-height: 34px;
   }
 
   .ws-toolbar { gap: 4px; }

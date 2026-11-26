@@ -998,3 +998,76 @@ export interface StorageCompactResult {
   freedBytes: number;
   usage: StorageUsage;
 }
+
+export type ScheduleBindMode = 'new' | 'conversation';
+
+export type ScheduleRunStatus =
+  | ''
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'skipped';
+
+export interface ScheduledTask {
+  id: string;
+  name: string;
+  prompt: string;
+  enabled: boolean;
+  hour: number;
+  minute: number;
+  weekdays: number[];
+  timezone: string;
+  maxRuns: number;
+  runCount: number;
+  bindMode: ScheduleBindMode;
+  conversationId?: string;
+  conversationTitle?: string;
+  assistantId: string;
+  providerId: string;
+  modelId: string;
+  nextRunAt?: string;
+  lastRunAt?: string;
+  lastStatus: ScheduleRunStatus;
+  lastError?: string;
+  lastConversationId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateScheduledTaskInput {
+  name: string;
+  prompt: string;
+  enabled?: boolean;
+  hour: number;
+  minute: number;
+  weekdays?: number[];
+  timezone?: string;
+  maxRuns?: number;
+  bindMode?: ScheduleBindMode;
+  conversationId?: string;
+  assistantId?: string;
+  providerId?: string;
+  modelId?: string;
+}
+
+export interface UpdateScheduledTaskInput {
+  name?: string;
+  prompt?: string;
+  enabled?: boolean;
+  hour?: number;
+  minute?: number;
+  weekdays?: number[];
+  timezone?: string;
+  maxRuns?: number;
+  resetRunCount?: boolean;
+  bindMode?: ScheduleBindMode;
+  conversationId?: string;
+  assistantId?: string;
+  providerId?: string;
+  modelId?: string;
+}
+
+export interface RunScheduledTaskResult {
+  schedule: ScheduledTask;
+  conversationId: string;
+}

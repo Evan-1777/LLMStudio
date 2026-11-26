@@ -347,6 +347,46 @@ async function startMockUpstream(): Promise<{
         return;
       }
 
+      if (prompt.includes('[AGENT_SCHEDULE]')) {
+        const messages = Array.isArray(body.messages) ? body.messages : [];
+        const last = messages.at(-1);
+        if (last?.role === 'tool') {
+          writeChunk({ choices: [{ delta: { content: 'Schedule verified: ' + last.content }, finish_reason: 'stop' }] });
+        } else {
+          writeChunk({
+            choices: [
+              {
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: 'agent-schedule',
+                      function: {
+                        name: 'schedule',
+                        arguments: JSON.stringify({
+                          action: 'create',
+                          name: 'AI 自动巡检',
+                          prompt: '检查日志并返回摘要',
+                          hour: 9,
+                          minute: 15,
+                          weekdays: [1, 3, 5],
+                          timezone: 'Asia/Shanghai',
+                          max_runs: 2,
+                          bind_current_topic: true,
+                        }),
+                      },
+                    },
+                  ],
+                },
+                finish_reason: 'tool_calls',
+              },
+            ],
+          });
+        }
+        res.end('data: [DONE]\n\n');
+        return;
+      }
+
       if (prompt.includes('[SLOW_ABORT]')) {
         let closed = false;
         const onAbort = () => {

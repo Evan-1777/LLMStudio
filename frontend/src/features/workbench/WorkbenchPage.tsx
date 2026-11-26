@@ -11,11 +11,32 @@ import {
   useSearchParams,
 } from 'react-router-dom';
 import { useApp } from '../../app/AppProvider';
-import { Icon, IconButton, Popover, SegmentedControl } from '../../components/ui';
+import {
+  ConfirmDialog,
+  Icon,
+  IconButton,
+  Modal,
+  Popover,
+  SegmentedControl,
+} from '../../components/ui';
 import { getAgentModeVisible } from '../../core/settings';
-import { isReasoningEffort, type Assistant, type ContentBlock, type GraphMutationInput, type ConversationMode, type Message, type ReasoningEffort, type TopicScope } from '../../core/types';
+import { formatScheduleError } from '../schedule/scheduleFormat';
+import {
+  isReasoningEffort,
+  type Assistant,
+  type ContentBlock,
+  type Conversation,
+  type ConversationMode,
+  type GraphMutationInput,
+  type Message,
+  type ReasoningEffort,
+  type ScheduledTask,
+  type TopicScope,
+} from '../../core/types';
 import { AgentTopicDirectory } from '../agent/AgentTopicDirectory';
 import { ChatProvider, useChat } from '../chat/ChatProvider';
+import { ScheduleDialog } from '../schedule/ScheduleDialog';
+import { TopicScheduleList } from '../schedule/TopicScheduleList';
 import { AssistantEditor } from './AssistantEditor';
 import { AssistantSidebar } from './AssistantSidebar';
 import { ChatCanvas } from './ChatCanvas';
@@ -129,6 +150,23 @@ function WorkbenchInner() {
   const [editingAssistant, setEditingAssistant] = useState<Assistant | null>(
     null,
   );
+  const [scheduleRefreshTrigger, setScheduleRefreshTrigger] = useState(0);
+  const bumpScheduleRefresh = useCallback(
+    () => setScheduleRefreshTrigger((n) => n + 1),
+    [],
+  );
+  const [topicSchedulePopoverOpen, setTopicSchedulePopoverOpen] = useState(false);
+  const [topicScheduleModalOpen, setTopicScheduleModalOpen] = useState(false);
+  const [topicHasActiveSchedule, setTopicHasActiveSchedule] = useState(false);
+  const [topicScheduleDialog, setTopicScheduleDialog] = useState<{
+    open: boolean;
+    editingTask: ScheduledTask | null;
+    lockedConversation: Conversation | null;
+  }>({ open: false, editingTask: null, lockedConversation: null });
+  const [deletingTopicSchedule, setDeletingTopicSchedule] =
+    useState<ScheduledTask | null>(null);
+  const [deletingTopicScheduleBusy, setDeletingTopicScheduleBusy] =
+    useState(false);
 
   const leftToggleRef = useRef<HTMLButtonElement | null>(null);
   const rightToggleRef = useRef<HTMLButtonElement | null>(null);
@@ -397,6 +435,56 @@ function WorkbenchInner() {
   const conversationMode = currentConversation?.mode ?? draft?.mode ?? 'chat';
   // Desktop chat discovers both tool catalogs; cloud Agent execution runs on the gateway.
   const cloudAgent = reqScope === 'cloud' && conversationMode === 'agent';
+  const canBindTopicSchedule =
+    (!isDesktop || activeScope === 'cloud') &&
+    Boolean(currentConversation?.id) &&
+    !currentConversation?.ephemeral &&
+    !isTemporaryMode &&
+    conversationMode === 'agent';
+
+  useEffect(() => {
+    setTopicSchedulePopoverOpen(false);
+    setTopicScheduleModalOpen(false);
+    if (
+      !canBindTopicSchedule ||
+      !currentConversation?.id ||
+      connectionState !== 'connected'
+    ) {
+      setTopicHasActiveSchedule(false);
+      return;
+    }
+    const ctrl = new AbortController();
+    gateway
+      .listScheduledTasks(currentConversation.id, ctrl.signal, reqScope)
+      .then((list) => {
+        if (!ctrl.signal.aborted) {
+          setTopicHasActiveSchedule(list.some((task) => task.enabled));
+        }
+      })
+      .catch(() => {
+        if (!ctrl.signal.aborted) {
+          setTopicHasActiveSchedule(false);
+        }
+      });
+    return () => ctrl.abort();
+  }, [
+    canBindTopicSchedule,
+    connectionEpoch,
+    connectionState,
+    currentConversation?.id,
+    gateway,
+    reqScope,
+    scheduleRefreshTrigger,
+  ]);
+
+  const prevAgentBusyRef = useRef(false);
+  useEffect(() => {
+    const busyNow = Boolean(canBindTopicSchedule && (isBusy || isGenerating));
+    if (prevAgentBusyRef.current && !busyNow) {
+      bumpScheduleRefresh();
+    }
+    prevAgentBusyRef.current = busyNow;
+  }, [bumpScheduleRefresh, canBindTopicSchedule, isBusy, isGenerating]);
   const hasMcpSource = settings.builtinTimeToolEnabled || resources.cloudMcpServers.some((server) => server.enabled)
     || (!cloudAgent && resources.mcpServers.some((server) => server.enabled));
   const toggleMcp = () => {
@@ -1128,7 +1216,10 @@ function WorkbenchInner() {
                     active={toolbarMenuOpen}
                     aria-expanded={toolbarMenuOpen}
                     data-has-active={
-                      showBranch || isTemporaryMode || inspectorOpen
+                      showBranch ||
+                      isTemporaryMode ||
+                      inspectorOpen ||
+                      topicHasActiveSchedule
                         ? 'true'
                         : undefined
                     }
@@ -1136,6 +1227,27 @@ function WorkbenchInner() {
                 }
               >
                 <div className="wb-toolbar-menu" role="group" aria-label="话题操作">
+                  {canBindTopicSchedule && currentConversation && (
+                    <button
+                      type="button"
+                      className={`wb-toolbar-menu__item${
+                        topicScheduleModalOpen ? ' wb-toolbar-menu__item--active' : ''
+                      }`}
+                      aria-pressed={topicScheduleModalOpen}
+                      onClick={() => {
+                        setToolbarMenuOpen(false);
+                        setTopicScheduleModalOpen(true);
+                      }}
+                    >
+                      <Icon name="alarmClock" size={15} />
+                      <span className="wb-toolbar-menu__label">话题定时任务</span>
+                      {topicHasActiveSchedule && (
+                        <span className="wb-toolbar-menu__badge">
+                          <span>启用中</span>
+                        </span>
+                      )}
+                    </button>
+                  )}
                   {graphConversation && (
                     <button
                       type="button"
@@ -1241,6 +1353,55 @@ function WorkbenchInner() {
                 active={isTemporaryMode}
                 onClick={handleToggleTemporaryMode}
               />
+              {canBindTopicSchedule && currentConversation && (
+                <Popover
+                  open={topicSchedulePopoverOpen}
+                  onOpenChange={setTopicSchedulePopoverOpen}
+                  side="bottom"
+                  align="end"
+                  contentProps={{ 'aria-label': '话题定时任务' }}
+                  trigger={
+                    <IconButton
+                      className="wb-toolbar-alarm"
+                      icon="alarmClock"
+                      label="话题定时任务"
+                      active={topicSchedulePopoverOpen}
+                      aria-expanded={topicSchedulePopoverOpen}
+                      data-has-active={
+                        topicHasActiveSchedule ? 'true' : undefined
+                      }
+                    />
+                  }
+                >
+                  <TopicScheduleList
+                    conversation={currentConversation}
+                    scope={reqScope}
+                    refreshTrigger={scheduleRefreshTrigger}
+                    onCreateNew={() => {
+                      setTopicSchedulePopoverOpen(false);
+                      setTopicScheduleDialog({
+                        open: true,
+                        editingTask: null,
+                        lockedConversation: currentConversation,
+                      });
+                    }}
+                    onEditTask={(task) => {
+                      setTopicSchedulePopoverOpen(false);
+                      setTopicScheduleDialog({
+                        open: true,
+                        editingTask: task,
+                        lockedConversation: currentConversation,
+                      });
+                    }}
+                    onDeleteTask={(task) => {
+                      setTopicSchedulePopoverOpen(false);
+                      setDeletingTopicSchedule(task);
+                    }}
+                    onReloadActiveConversation={reloadCurrentConversation}
+                    onSchedulesChanged={bumpScheduleRefresh}
+                  />
+                </Popover>
+              )}
               <IconButton
                 icon="sliders"
                 label="话题参数"
@@ -1409,6 +1570,18 @@ function WorkbenchInner() {
         lastSyncedAt={lastSyncedAt}
         syncingServer={syncingServer}
         onSyncServer={() => void handleSyncServer()}
+        defaultProviderId={selectedProviderId}
+        defaultModelId={selectedModelId}
+        scheduleRefreshTrigger={scheduleRefreshTrigger}
+        onReloadActiveConversation={reloadCurrentConversation}
+        onOpenConversationSchedule={(conv) =>
+          setTopicScheduleDialog({
+            open: true,
+            editingTask: null,
+            lockedConversation: conv,
+          })
+        }
+        onSchedulesChanged={bumpScheduleRefresh}
       />
 
       <button
@@ -1446,6 +1619,95 @@ function WorkbenchInner() {
             navigate(buildChatUrl(undefined, { assistantId: fallback }), {
               replace: true,
             });
+          }
+        }}
+      />
+
+      <Modal
+        open={
+          topicScheduleModalOpen &&
+          Boolean(canBindTopicSchedule && currentConversation)
+        }
+        onOpenChange={setTopicScheduleModalOpen}
+        title="话题定时任务"
+      >
+        {currentConversation ? (
+          <TopicScheduleList
+            conversation={currentConversation}
+            scope={reqScope}
+            refreshTrigger={scheduleRefreshTrigger}
+            onCreateNew={() => {
+              setTopicScheduleModalOpen(false);
+              setTopicScheduleDialog({
+                open: true,
+                editingTask: null,
+                lockedConversation: currentConversation,
+              });
+            }}
+            onEditTask={(task) => {
+              setTopicScheduleModalOpen(false);
+              setTopicScheduleDialog({
+                open: true,
+                editingTask: task,
+                lockedConversation: currentConversation,
+              });
+            }}
+            onDeleteTask={(task) => {
+              setTopicScheduleModalOpen(false);
+              setDeletingTopicSchedule(task);
+            }}
+            onReloadActiveConversation={reloadCurrentConversation}
+            onSchedulesChanged={bumpScheduleRefresh}
+          />
+        ) : null}
+      </Modal>
+
+      <ScheduleDialog
+        open={topicScheduleDialog.open}
+        onOpenChange={(open) =>
+          setTopicScheduleDialog((prev) => ({ ...prev, open }))
+        }
+        editingTask={topicScheduleDialog.editingTask}
+        lockedConversation={topicScheduleDialog.lockedConversation}
+        defaultAssistantId={activeAssistant.id}
+        defaultProviderId={selectedProviderId}
+        defaultModelId={selectedModelId}
+        scope={reqScope}
+        onSaved={() => {
+          bumpScheduleRefresh();
+        }}
+      />
+
+      <ConfirmDialog
+        open={deletingTopicSchedule !== null}
+        onOpenChange={(open) => {
+          if (!open && !deletingTopicScheduleBusy) {
+            setDeletingTopicSchedule(null);
+          }
+        }}
+        title="删除定时任务"
+        message={
+          deletingTopicSchedule
+            ? `确定删除「${deletingTopicSchedule.name}」吗？此操作不可撤销。`
+            : ''
+        }
+        confirmLabel="删除"
+        busy={deletingTopicScheduleBusy}
+        onConfirm={async () => {
+          if (!deletingTopicSchedule || deletingTopicScheduleBusy) return;
+          setDeletingTopicScheduleBusy(true);
+          try {
+            await gateway.deleteScheduledTask(
+              deletingTopicSchedule.id,
+              undefined,
+              reqScope,
+            );
+            setDeletingTopicSchedule(null);
+            bumpScheduleRefresh();
+          } catch (err) {
+            toast(formatScheduleError(err, '删除失败'), 'error');
+          } finally {
+            setDeletingTopicScheduleBusy(false);
           }
         }}
       />
