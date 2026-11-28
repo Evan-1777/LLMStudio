@@ -168,7 +168,15 @@ test.describe('Topic Organization, Manual Order, Touch Drag, and Batch Operation
     await expect.poll(getTitles).toEqual(['Topic C Renamed']);
     await page.getByRole('button', { name: '更多操作 Topic C Renamed' }).click();
     await page.getByRole('menuitem', { name: '置顶' }).click();
-    await page.getByLabel('搜索话题').fill('');
+    // Wait for the pin mutation to render before clearing the filter. Clearing the
+    // search while the pin response is still landing can drop the input event and
+    // leave the list filtered, hiding the reordered rows.
+    await expect(page.locator('[data-drop-bucket="pinned"]')).toContainText('Topic C Renamed');
+    const searchInput = page.getByLabel('搜索话题');
+    await searchInput.click();
+    await searchInput.press('Control+A');
+    await searchInput.press('Backspace');
+    await expect(searchInput).toHaveValue('');
     await expect.poll(getTitles).toEqual(['Topic C Renamed', 'Topic B', 'Topic A']);
 
     // 5. Real touch pointer drag in mobile touch context (390x844, hasTouch=true): reorder pinned Topic B above Topic C Renamed!
