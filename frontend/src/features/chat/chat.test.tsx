@@ -9,7 +9,7 @@ import { ChatCanvas } from '../workbench/ChatCanvas';
 import { ChatProvider, useChat } from './ChatProvider';
 import { chatReducer, initialChatState } from './chatReducer';
 import { MessageActions } from './MessageActions';
-import type { Conversation, Message, TopicScope } from '../../core/types';
+import type { ActiveRunInfo, Conversation, Message, TopicScope } from '../../core/types';
 
 function makeConv(id = 'c1'): Conversation {
   return {
@@ -2255,12 +2255,7 @@ describe('chatReducer and ChatProvider', () => {
         createdAt: '2026-11-24T00:00:00Z',
       },
     ];
-    let activeRunPayload: {
-      conversationId: string;
-      messageId: string;
-      providerId: string;
-      modelId: string;
-    } | undefined;
+    let activeRunPayload: ActiveRunInfo | undefined;
 
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = typeof input === 'string' ? input : input.toString();
