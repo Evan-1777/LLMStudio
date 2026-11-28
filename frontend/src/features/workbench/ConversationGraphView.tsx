@@ -80,6 +80,12 @@ const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
 const midpoint = (a: Point, b: Point) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 const summary = (node: GraphNode) => node.message?.role === 'user' && node.message.graphMeta?.collapsed;
 const isSideRefEligible = (msg?: Message) => Boolean(msg && (msg.role === 'user' || msg.role === 'assistant'));
+
+const sideToward = (
+  source: { x: number; width: number },
+  target: { x: number; width: number },
+): 'left' | 'right' =>
+  source.x + source.width / 2 > target.x + target.width / 2 ? 'right' : 'left';
 const zoomAt = (view: View, from: Point, to: Point, scale: number): View => ({
   scale, x: to.x - (from.x - view.x) * scale / view.scale, y: to.y - (from.y - view.y) * scale / view.scale,
 });
@@ -579,7 +585,7 @@ export function ConversationGraphView({
     const right = left + width * camera.scale;
     const bottom = top + height * camera.scale;
     const dx = left < 16 ? 16 - left : Math.min(0, stage.current.clientWidth - 16 - right);
-    const dy = top < 16 ? 16 - top : Math.min(0, stage.current.clientHeight - height - bottom);
+    const dy = top < 16 ? 16 - top : Math.min(0, stage.current.clientHeight - 16 - bottom);
     if (dx || dy) setCamera({ ...camera, x: camera.x + dx, y: camera.y + dy });
   };
 
@@ -726,7 +732,7 @@ export function ConversationGraphView({
     if (pickSideRef) {
       if (isSideRefEligible(node.message) && canSideAttach(node.id, pickSideRef.sourceId)) {
         const sourceNode = byId.get(pickSideRef.sourceId);
-        const side: 'left' | 'right' = sourceNode && sourceNode.x + sourceNode.width / 2 > node.x + node.width / 2 ? 'right' : 'left';
+        const side: 'left' | 'right' = sourceNode ? sideToward(sourceNode, node) : 'left';
         void mutate({
           op: 'addSideRef',
           messageId: node.id,
@@ -846,7 +852,7 @@ export function ConversationGraphView({
       const sidePortEl = hitEl?.closest<HTMLElement>('[data-port="side-left"], [data-port="side-right"]');
       const side: 'left' | 'right' = sidePortEl
         ? sidePortEl.dataset.port === 'side-left' ? 'left' : 'right'
-        : drag.node.x + drag.node.width / 2 > target.x + target.width / 2 ? 'left' : 'right';
+        : sideToward(drag.node, target);
       const valid = canSideAttach(target.id, drag.node.id);
       return { mode: 'sideRef', origin: 'nodeOut', scope: 'node', node: drag.node, side, pointer, target, valid };
     }

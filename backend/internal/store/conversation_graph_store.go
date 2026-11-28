@@ -385,7 +385,7 @@ func applyGraphCreateMessageTx(ctx context.Context, tx *sql.Tx, id string, c *do
 	if err := insertMessage(ctx, tx, msg); err != nil {
 		return err
 	}
-	if in.Activate || parentID == c.ActiveLeafID || (c.ActiveLeafID == "" && c.GraphState.ActiveBranchID == "") {
+	if in.Activate || (c.GraphState.ActiveBranchID == "" && parentID == c.ActiveLeafID) {
 		c.ActiveLeafID = msg.ID
 		c.GraphState.ActiveBranchID = ""
 	}

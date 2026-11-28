@@ -855,6 +855,44 @@ func TestChatServiceRollsBackUserMessageWhenNoAssistantOutput(t *testing.T) {
 	}
 }
 
+func TestChatServiceRollsBackNormalEmptyStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	svc, _, msgs, _, conv, _ := setupChatMCPFixture(t, upstream.URL, &stubMCPClient{})
+	prep, err := svc.Prepare(t.Context(), service.StreamChatInput{ConversationID: conv.ID, Text: "empty stream"})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	var events []domain.StreamEvent
+	if err := prep.Stream(t.Context(), func(ev domain.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	items, err := msgs.ListByConversation(t.Context(), conv.ID)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected zero persisted messages on empty stream, got %d: %+v", len(items), items)
+	}
+	var sawRollback bool
+	for _, ev := range events {
+		if ev.Type == domain.StreamEventError && ev.RolledBack && ev.Message == nil && ev.Error != nil && ev.Error.Code == "STREAM_EMPTY" {
+			sawRollback = true
+		}
+	}
+	if !sawRollback {
+		t.Fatalf("expected STREAM_EMPTY rolledBack event, got %+v", events)
+	}
+}
+
 func TestChatServiceErrorAfterPartialOutputKeepsSavedMessage(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

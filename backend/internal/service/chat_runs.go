@@ -382,16 +382,15 @@ func (m *chatRunManager) pruneCancelIntentsLocked(now time.Time) {
 	}
 }
 
-func (m *chatRunManager) reserve(conversationID string, parentCtx context.Context) (*detachedRun, context.Context, error) {
+func (m *chatRunManager) reserve(conversationID string, parentCtx context.Context, requestStartedAt time.Time) (*detachedRun, context.Context, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if _, exists := m.active[conversationID]; exists {
 		return nil, nil, domain.NewError(domain.ErrCodeConflict, "该 Agent 话题正在运行中", nil)
 	}
-	now := time.Now()
-	m.pruneCancelIntentsLocked(now)
-	if at, canceled := m.cancelIntents[conversationID]; canceled && now.Sub(at) < cancelIntentTTL {
+	m.pruneCancelIntentsLocked(time.Now())
+	if at, canceled := m.cancelIntents[conversationID]; canceled && !at.Before(requestStartedAt) {
 		delete(m.cancelIntents, conversationID)
 		return nil, nil, domain.NewError(domain.ErrCodeConflict, "该 Agent 话题运行已取消", nil)
 	}
@@ -451,7 +450,7 @@ func (m *chatRunManager) cancel(conversationID string) bool {
 	run := m.active[conversationID]
 	if run == nil {
 		// Explicit stop may arrive before Prepare reserves the run. Remember the
-		// intent briefly so the racing reserve cannot start a background Agent.
+		// intent briefly so only the request that was already in flight is blocked.
 		m.cancelIntents[conversationID] = time.Now()
 		m.pruneCancelIntentsLocked(time.Now())
 		m.mu.Unlock()

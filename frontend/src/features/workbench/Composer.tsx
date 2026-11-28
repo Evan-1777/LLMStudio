@@ -280,7 +280,10 @@ export function Composer({
           if (draftVersionRef.current === submitVersion) {
             setDraft(snapshotDraft);
             setAttachments(snapshotAttachments);
-            window.requestAnimationFrame(() => adjustHeight());
+            window.requestAnimationFrame(() => {
+              adjustHeight();
+              textareaRef.current?.focus();
+            });
           } else {
             for (const att of snapshotAttachments) {
               revokeAttachmentResources(att);

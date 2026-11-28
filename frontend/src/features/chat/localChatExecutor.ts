@@ -607,6 +607,9 @@ export async function runLocalChatStream(
 
           if (nextEv.type === 'error') {
             streamErrorMsg = nextEv.error?.message || '流式生成失败';
+            // A failed new send without assistant output is rolled back after the loop;
+            // emitting this now would materialize an empty local-assistant bubble.
+            if (opts.optimisticUserId && !hasAssistantOutput) return;
           }
           emitEvent(nextEv);
         },
@@ -713,12 +716,6 @@ export async function runLocalChatStream(
       const currentBlocks = accOrder.map((idx) =>
         bufferToBlock(accBlocks[idx]),
       );
-      if (opts.optimisticUserId) {
-        const userId = await ensureUserMessagePersisted();
-        if (!userId) {
-          throw new GatewayError('USER_PERSIST_FAILED', userPersistError || '用户消息保存失败');
-        }
-      }
 
       const nextOpened = await prepareAndOpenLocalUpstream(
         gateway,

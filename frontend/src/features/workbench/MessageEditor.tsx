@@ -43,19 +43,11 @@ function buildEditedBlocks(
   removedImages: ReadonlySet<number>,
   added: PendingAttachment[],
 ): ContentBlock[] {
-  const out: ContentBlock[] = [];
-  let foundText = false;
-  blocks.forEach((block, index) => {
-    if (block.type === 'image' && removedImages.has(index)) return;
-    if (block.type === 'text' && textChanged) {
-      if (!foundText && nextText.trim()) out.push({ type: 'text', text: nextText });
-      foundText = true;
-    } else {
-      out.push(block);
-    }
-  });
-  if (!foundText && textChanged && nextText.trim()) out.push({ type: 'text', text: nextText });
-  return out.concat(added.map(attachmentToContentBlock));
+  const kept = blocks.filter(
+    (block, index) => !(block.type === 'image' && removedImages.has(index)),
+  );
+  const edited = textChanged ? replaceMessageTextBlocks(kept, nextText) : kept;
+  return edited.concat(added.map(attachmentToContentBlock));
 }
 
 export function MessageEditor({ message, saving, onCancel, onSave }: {

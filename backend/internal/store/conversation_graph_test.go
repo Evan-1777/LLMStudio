@@ -547,4 +547,24 @@ func TestGraphCreateMessageAndNodeSideRefScope(t *testing.T) {
 	}); err == nil {
 		t.Fatal("expected invalid scope to be rejected")
 	}
+
+	// Activating a blank branch leaves ActiveLeafID empty; creating an independent
+	// message must not silently clear the active branch.
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{Op: "createBranch", Activate: true}); err != nil {
+		t.Fatalf("create blank active branch: %v", err)
+	}
+	blank, err := cs.Get(ctx, conv.ID)
+	if err != nil || blank.GraphState.ActiveBranchID == "" || blank.ActiveLeafID != "" {
+		t.Fatalf("expected blank active branch, got %+v err=%v", blank.GraphState, err)
+	}
+	branchID := blank.GraphState.ActiveBranchID
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{
+		Op: "createMessage", Role: domain.RoleUser, Text: "standalone",
+	}); err != nil {
+		t.Fatalf("create independent message under blank branch: %v", err)
+	}
+	after, err := cs.Get(ctx, conv.ID)
+	if err != nil || after.GraphState.ActiveBranchID != branchID || after.ActiveLeafID != "" {
+		t.Fatalf("creating an independent message must preserve the active blank branch: %+v err=%v", after.GraphState, err)
+	}
 }

@@ -242,6 +242,10 @@ func normalizeAssistantBlocks(
 				}
 			}
 		default:
+			if (b.Type == domain.BlockTypeText && strings.TrimSpace(b.Text) == "") ||
+				(b.Type == domain.BlockTypeThinking && strings.TrimSpace(b.Thinking) == "" && strings.TrimSpace(b.Signature) == "") {
+				continue
+			}
 			if len(pending) > 0 {
 				flush()
 			}

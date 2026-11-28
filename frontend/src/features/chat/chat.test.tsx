@@ -808,6 +808,112 @@ describe('chatReducer and ChatProvider', () => {
     expect(screen.getByTestId('loc-msgs').textContent).toContain('Local hello');
   });
 
+  it('rolls back a direct local send when HTTP 200 emits only an SSE error', async () => {
+    localStorage.clear();
+
+    const encoder = new TextEncoder();
+    let rollbackCount = 0;
+    let createMessageCalls = 0;
+
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.endsWith('/healthz')) {
+        return new Response(JSON.stringify({ status: 'ok', version: '1.3.0', authRequired: false }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return new Response(JSON.stringify({ formats: [], adapters: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return new Response(JSON.stringify({
+          providers: [{
+            id: 'local-p', name: 'Local', adapter: 'generic-http', baseURL: 'http://127.0.0.1:11434/v1',
+            authType: 'bearer', apiKeyMasked: '', apiKeySet: false, localRequest: true,
+            models: [{ id: 'qwen', name: 'Qwen', apiFormat: 'openai-completions' }], enabled: true, builtIn: false,
+          }],
+        }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return new Response(JSON.stringify({ assistants: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations')) {
+        return new Response(JSON.stringify({ conversations: [makeConv('c-empty')] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/plugins/search')) {
+        return new Response(JSON.stringify({ engines: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/mcp/servers')) {
+        return new Response(JSON.stringify({ servers: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-empty') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: makeConv('c-empty'), messages: [] }), { status: 200 });
+      }
+      if (url.endsWith('/api/v1/conversations/c-empty/messages/prepare-local')) {
+        return new Response(JSON.stringify({
+          method: 'POST', url: 'http://127.0.0.1:11434/v1/chat/completions',
+          headers: { 'Content-Type': 'application/json', Authorization: 'Bearer sk-local' },
+          body: { model: 'qwen', stream: true, messages: [] }, authType: 'bearer',
+        }), { status: 200 });
+      }
+      if (url === 'http://127.0.0.1:11434/v1/chat/completions') {
+        const body = new ReadableStream<Uint8Array>({
+          start(c) {
+            c.enqueue(encoder.encode('data: {"error":{"message":"boom"}}\n\n'));
+            c.close();
+          },
+        });
+        return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      if (url.endsWith('/api/v1/conversations/c-empty/messages') && method === 'POST') {
+        createMessageCalls += 1;
+        return new Response(JSON.stringify({ message: {}, conversation: makeConv('c-empty') }), { status: 201 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+
+    function EmptyHarness() {
+      const { state, sendMessage } = useChat();
+      return (
+        <div>
+          <span data-testid="empty-state">{state.runState}</span>
+          <span data-testid="empty-ids">{state.messages.map((m) => m.id).join(',')}</span>
+          <button
+            type="button"
+            onClick={() => void sendMessage({
+              conversationId: 'c-empty',
+              blocks: [{ type: 'text', text: 'rollback me' }],
+              text: 'rollback me',
+              providerId: 'local-p',
+              modelId: 'qwen',
+              onPrepareRollback: () => { rollbackCount += 1; },
+            })}
+          >
+            send-empty
+          </button>
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock}>
+        <ChatProvider>
+          <EmptyHarness />
+        </ChatProvider>
+      </AppProvider>,
+    );
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining('/api/v1/providers'), expect.anything());
+    });
+    await user.click(screen.getByRole('button', { name: 'send-empty' }));
+
+    await waitFor(() => expect(screen.getByTestId('empty-state')).toHaveTextContent('error'));
+    expect(screen.getByTestId('empty-ids')).toHaveTextContent('');
+    expect(createMessageCalls).toBe(0);
+    expect(rollbackCount).toBe(1);
+  });
+
   it('closes retry confirm dialog immediately before slow onRetry settles, guards double-click and rejected promises, and keeps delete blocking', async () => {
     let resolveRetry!: (v: boolean) => void;
     const onRetry = vi.fn(
@@ -2123,6 +2229,8 @@ describe('chatReducer and ChatProvider', () => {
     const runStreamCalls: string[] = [];
     let nextRunStreamMode: 'live' | '204' = 'live';
     let conflictOnNextSend = false;
+    let attachErrorOnNext = false;
+    let attachRunFinished = false;
     let openStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
     let attachStreamController: ReadableStreamDefaultController<Uint8Array> | null = null;
 
@@ -2194,9 +2302,23 @@ describe('chatReducer and ChatProvider', () => {
               encoder.encode(
                 `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', conversationId: 'agent-1', messageId: 'asst-live', providerId: 'p1', modelId: 'm1' })}\n\n` +
                   `event: block_start\ndata: ${JSON.stringify({ type: 'block_start', index: 0, blockType: 'text' })}\n\n` +
-                  `event: block_delta\ndata: ${JSON.stringify({ type: 'block_delta', index: 0, blockType: 'text', deltaType: 'text_delta', delta: 'reconnected-progress' })}\n\n`,
+                  `event: block_delta\ndata: ${JSON.stringify({ type: 'block_delta', index: 0, blockType: 'text', deltaType: 'text_delta', delta: 'reconnected-progress' })}\n\n` +
+                  (attachErrorOnNext
+                    ? `event: error\ndata: ${JSON.stringify({
+                        type: 'error',
+                        conversationId: 'agent-1',
+                        messageId: 'asst-live',
+                        error: { code: 'UPSTREAM_ERROR', message: 'boom' },
+                        message: persistedAgentMsgs[1],
+                      })}\n\n`
+                    : ''),
               ),
             );
+            if (attachErrorOnNext) {
+              attachErrorOnNext = false;
+              attachRunFinished = true;
+              controller.close();
+            }
           },
         });
         return new Response(stream, {
@@ -2227,10 +2349,11 @@ describe('chatReducer and ChatProvider', () => {
       }
 
       if (url.endsWith('/api/v1/conversations/agent-1') && method === 'GET') {
+        const active = attachRunFinished ? undefined : activeRunPayload;
         return Response.json({
-          conversation: { ...agentConv, running: Boolean(activeRunPayload) },
+          conversation: { ...agentConv, running: Boolean(active) },
           messages: persistedAgentMsgs,
-          ...(activeRunPayload ? { activeRun: activeRunPayload } : {}),
+          ...(active ? { activeRun: active } : {}),
         });
       }
 
@@ -2252,6 +2375,7 @@ describe('chatReducer and ChatProvider', () => {
           <span data-testid="run-state">{chat.state.runState}</span>
           <span data-testid="is-gen">{String(chat.isGenerating)}</span>
           <span data-testid="msg-count">{chat.state.messages.length}</span>
+          <span data-testid="msg-ids">{chat.state.messages.map((m) => m.id).join(',')}</span>
           <span data-testid="draft-text">
             {chat.state.streaming
               ? chat.state.streaming.blockOrder
@@ -2358,6 +2482,40 @@ describe('chatReducer and ChatProvider', () => {
     expect(screen.getByTestId('msg-count')).toHaveTextContent('2');
     await user.click(screen.getByRole('button', { name: 'detach' }));
     expect(cancelCalls).toHaveLength(1);
+
+    // 5. Non-rolled-back error during reattach reconciles server detail and drops the virtual pending user.
+    attachErrorOnNext = true;
+    activeRunPayload = {
+      conversationId: 'agent-1',
+      messageId: 'asst-live',
+      providerId: 'p1',
+      modelId: 'm1',
+      pendingUserMessage: {
+        id: 'pending-user-asst-live',
+        conversationId: 'agent-1',
+        role: 'user',
+        blocks: [{ type: 'text', text: 'run task' }],
+        createdAt: '2026-11-24T00:00:00Z',
+      },
+    };
+    persistedAgentMsgs = [
+      persistedAgentMsgs[0],
+      {
+        id: 'asst-live',
+        conversationId: 'agent-1',
+        role: 'assistant',
+        blocks: [{ type: 'text', text: 'partial' }],
+        stopReason: 'error',
+        errorMessage: 'boom',
+        createdAt: '2026-11-24T00:00:01Z',
+      },
+    ];
+    await user.click(screen.getByRole('button', { name: 'load-agent' }));
+    await waitFor(() => expect(runStreamCalls).toHaveLength(4));
+    await waitFor(() => expect(screen.getByTestId('run-state')).toHaveTextContent('error'));
+    await waitFor(() => expect(screen.getByTestId('msg-ids')).toHaveTextContent('u1,asst-live'));
+    expect(screen.getByTestId('msg-ids')).not.toHaveTextContent('pending-user');
+    expect(screen.getByTestId('msg-count')).toHaveTextContent('2');
   });
 
   it('rolls a new send back to the composer when HTTP 200 yields only a rolledBack error', async () => {

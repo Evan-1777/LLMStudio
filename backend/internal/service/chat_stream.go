@@ -210,6 +210,10 @@ func (p *PreparedStream) runStream(
 	}
 
 	blocks, usage := snapshotState()
+	if !p.isRegen && p.pendingUser != nil && !hasSubstantiveAssistantContent(blocks) {
+		emitStreamError("STREAM_EMPTY", "上游未返回有效内容", nil, true)
+		return nil
+	}
 	if err := p.ensureUserPersisted(ctx); err != nil {
 		emitStreamError(domain.ErrCodeUpstreamError, err.Error(), nil, false)
 		return nil

@@ -455,8 +455,24 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           );
           return;
         }
-        if (receivedStreamError) return;
+        if (receivedStreamError) {
+          void reconcileAfterStream(
+            activeRun.conversationId,
+            run.epoch,
+            run.connectionEpoch,
+            { isAbort: false, minExpectedMessages: 0 },
+            reqScope,
+          );
+          return;
+        }
         dispatch({ type: 'STREAM_EOF_INCOMPLETE' });
+        void reconcileAfterStream(
+          activeRun.conversationId,
+          run.epoch,
+          run.connectionEpoch,
+          { isAbort: false, minExpectedMessages: 0 },
+          reqScope,
+        );
       } catch (err) {
         releaseGeneration(run);
         if (!isRunCurrent(run) || run.detached) return;
@@ -474,6 +490,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
         const e = formatError(err);
         dispatch({ type: 'STREAM_NETWORK_ERROR', code: e.code, message: e.message });
+        void reconcileAfterStream(
+          activeRun.conversationId,
+          run.epoch,
+          run.connectionEpoch,
+          { isAbort: false, minExpectedMessages: 0 },
+          reqScope,
+        );
       } finally {
         releaseGeneration(run);
       }
@@ -686,6 +709,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
               rolledBackAbort = true;
               break;
             }
+            if (!ev.rolledBack) acceptStream();
           }
           if (ev.type === 'error') {
             receivedStreamError = true;

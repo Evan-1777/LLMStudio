@@ -336,6 +336,7 @@ type preparedUpstream struct {
 // and opens the upstream HTTP connection. The new user prompt is persisted lazily right
 // before the first substantive assistant block, so an empty rollback writes nothing.
 func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*PreparedStream, error) {
+	prepareStartedAt := time.Now()
 	workCtx := ctx
 	var (
 		detached        *detachedRun
@@ -344,7 +345,7 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	if s.agent != nil && s.convs != nil && s.runs != nil && strings.TrimSpace(in.ConversationID) != "" {
 		if conv, getErr := s.convs.Get(ctx, in.ConversationID); getErr == nil &&
 			conv.Mode == domain.ConversationModeAgent && !conv.Ephemeral {
-			run, runCtx, resErr := s.runs.reserve(conv.ID, s.baseCtx)
+			run, runCtx, resErr := s.runs.reserve(conv.ID, s.baseCtx, prepareStartedAt)
 			if resErr != nil {
 				return nil, resErr
 			}

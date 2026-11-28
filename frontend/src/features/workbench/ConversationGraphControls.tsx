@@ -637,12 +637,14 @@ export function GraphContextMenu({
                   <DropdownItem disabled={busy} onSelect={() => onJump(menuNode.id)}>
                     <Icon name="messageSquare" size={15} />跳转至此消息
                   </DropdownItem>
-                  <DropdownItem
-                    disabled={busy}
-                    onSelect={() => onEditMessageContent(menuNode.message!)}
-                  >
-                    <Icon name="edit" size={15} />编辑消息内容
-                  </DropdownItem>
+                  {isSideRefEligible(menuNode.message) && (
+                    <DropdownItem
+                      disabled={busy}
+                      onSelect={() => onEditMessageContent(menuNode.message!)}
+                    >
+                      <Icon name="edit" size={15} />编辑消息内容
+                    </DropdownItem>
+                  )}
                   <DropdownItem
                     disabled={busy}
                     onSelect={() =>

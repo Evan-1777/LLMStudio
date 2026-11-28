@@ -408,6 +408,26 @@ func TestNormalizeMessagesForEncodingPairsStandaloneToolResults(t *testing.T) {
 	}
 }
 
+func TestNormalizeMessagesForEncodingSkipsEmptyBlocksInsideToolPairs(t *testing.T) {
+	messages := []domain.Message{
+		{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}},
+		{Role: domain.RoleAssistant, Blocks: []domain.ContentBlock{
+			{Type: domain.BlockTypeToolCall, ID: "c1", Name: "lookup", Arguments: json.RawMessage(`{}`)},
+			{Type: domain.BlockTypeText, Text: "   "},
+			{Type: domain.BlockTypeThinking, Thinking: "", Signature: ""},
+			{Type: domain.BlockTypeToolResult, ToolCallID: "c1", ToolName: "lookup", Content: "done"},
+		}},
+	}
+	normalized := normalizeMessagesForEncoding(messages)
+	if len(normalized) != 2 {
+		t.Fatalf("expected user and assistant messages, got %+v", normalized)
+	}
+	blocks := normalized[1].Blocks
+	if len(blocks) != 2 || blocks[0].Type != domain.BlockTypeToolCall || blocks[1].Type != domain.BlockTypeToolResult || blocks[1].Content != "done" {
+		t.Fatalf("expected paired call/result without synthetic interruption, got %+v", blocks)
+	}
+}
+
 func TestNormalizeMessagesForEncodingDeduplicatesAcrossMessages(t *testing.T) {
 	toolRound := func() domain.Message {
 		return domain.Message{Role: domain.RoleAssistant, Blocks: []domain.ContentBlock{
