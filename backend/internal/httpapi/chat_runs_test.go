@@ -130,8 +130,10 @@ func TestAgentRunEndpointsGateway(t *testing.T) {
 		}
 		attachRespCh <- resp
 	}()
-	close(release)
+	// Wait until the SSE headers prove the subscriber is attached before letting
+	// the upstream finish; otherwise the short run can end and return 204.
 	attachResp := <-attachRespCh
+	close(release)
 	defer attachResp.Body.Close()
 	if attachResp.StatusCode != http.StatusOK {
 		t.Fatalf("attach status=%d want 200", attachResp.StatusCode)

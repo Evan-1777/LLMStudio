@@ -164,4 +164,36 @@ describe('conversation graph', () => {
     expect(materials.text).not.toContain('uSide');
     expect(materials.text).not.toContain('a1');
   });
+
+  it('resolves node-scoped side references without walking ancestors', () => {
+    const u1 = message('u1', '', 'user');
+    const a1 = message('a1', 'u1', 'assistant');
+    const u2 = message('u2', 'a1', 'user');
+    const a2 = message('a2', 'u2', 'assistant');
+    const uSide = message('uSide', 'a1', 'user');
+    const aSide = message('aSide', 'uSide', 'assistant');
+    const all = [u1, a1, u2, a2, uSide, aSide];
+    const target: Message = {
+      ...a2,
+      graphMeta: {
+        sideRefs: [
+          { sourceMessageId: 'aSide', side: 'left', scope: 'node' },
+          { sourceMessageId: 'uSide', side: 'right', scope: 'node' },
+          { sourceMessageId: 'a1', side: 'left', scope: 'node' },
+        ],
+      },
+    };
+    const resolved = resolveSideRefMaterials(all, target);
+    expect(resolved.branches.map((b) => [b.scope, ids(b.messages)])).toEqual([
+      ['node', ['aSide']],
+      ['node', ['uSide']],
+      ['node', []],
+    ]);
+    expect(resolved.branches[1].sourceMessage?.id).toBe('uSide');
+    expect(resolved.text).toContain('aSide');
+    expect(resolved.text).toContain('uSide');
+    expect(resolved.text).not.toContain('u1');
+    expect(resolved.text).not.toContain('u2');
+    expect(resolved.text).not.toContain('a2');
+  });
 });

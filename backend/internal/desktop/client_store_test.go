@@ -96,6 +96,34 @@ func TestDesktopProviderKeyStorage(t *testing.T) {
 	}
 }
 
+func TestDesktopCachedPreferencesNormalizeNewTopicDefaults(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old-prefs.db")
+	s, err := OpenDesktopStore(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	legacy := `{"themeMode":"dark","seedColorValue":4281553408,"enterToSend":false}`
+	if _, err := s.DB.Exec(
+		`INSERT INTO desktop_cache(key, value_json, updated_at) VALUES(?,?,?)`,
+		cacheKeyPreferences, legacy, time.Now().UTC().Format(time.RFC3339Nano),
+	); err != nil {
+		t.Fatal(err)
+	}
+	prefs, ok, err := s.LoadCachedPreferences(ctx)
+	if err != nil || !ok {
+		t.Fatalf("load legacy cached preferences: ok=%v err=%v", ok, err)
+	}
+	if prefs.ThemeMode != "dark" || prefs.EnterToSend {
+		t.Fatalf("legacy fields not preserved: %+v", prefs)
+	}
+	if prefs.DefaultTopicMode != "chat" || prefs.LastProviderID != "" || prefs.LastModelID != "" {
+		t.Fatalf("new fields did not fall back to defaults: %+v", prefs)
+	}
+}
+
 func TestDesktopUpgradeRetiresUnboundProviderMetadata(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "legacy.db")

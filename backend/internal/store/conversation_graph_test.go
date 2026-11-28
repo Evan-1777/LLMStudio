@@ -470,3 +470,81 @@ func TestGraphExpandedNotesEdgesSideRefsAndImport(t *testing.T) {
 		t.Fatalf("deleteNodes did not remove note")
 	}
 }
+
+func TestGraphCreateMessageAndNodeSideRefScope(t *testing.T) {
+	ctx := t.Context()
+	db, err := OpenSQLite(ctx, ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	cs, ms := NewConversationStore(db), NewMessageStore(db)
+	conv, err := cs.Create(ctx, domain.Conversation{AssistantID: domain.DefaultAssistantID, Title: "graph"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := ms.Create(ctx, domain.Message{ConversationID: conv.ID, Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "root"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y := 42.0, 76.0
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{
+		Op: "createMessage", Role: domain.RoleAssistant, Text: "created text", ParentMessageID: root.ID, X: &x, Y: &y,
+	}); err != nil {
+		t.Fatalf("createMessage: %v", err)
+	}
+	items, err := ms.ListByConversation(ctx, conv.ID)
+	if err != nil || len(items) != 2 {
+		t.Fatalf("expected created message, got %d err=%v", len(items), err)
+	}
+	created := items[1]
+	if created.Role != domain.RoleAssistant || created.ParentID != root.ID || created.Blocks[0].Text != "created text" ||
+		created.GraphMeta == nil || *created.GraphMeta.X != x || *created.GraphMeta.Y != y {
+		t.Fatalf("unexpected created message: %+v", created)
+	}
+	if got, _ := cs.Get(ctx, conv.ID); got.ActiveLeafID != created.ID {
+		t.Fatalf("creating after the active leaf must advance ActiveLeafID: %+v", got)
+	}
+	for _, bad := range []GraphMutationInput{
+		{Op: "createMessage", Role: "system", Text: "x"},
+		{Op: "createMessage", Role: domain.RoleUser, Text: "   "},
+		{Op: "createMessage", Role: domain.RoleUser, Text: "x", ParentMessageID: "missing"},
+	} {
+		if err := cs.ApplyGraphMutation(ctx, conv.ID, bad); err == nil {
+			t.Fatalf("expected %+v to be rejected", bad)
+		}
+	}
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{
+		Op: "createMessage", Role: domain.RoleUser, Text: "independent",
+	}); err != nil {
+		t.Fatalf("create independent message: %v", err)
+	}
+	items, err = ms.ListByConversation(ctx, conv.ID)
+	if err != nil || len(items) != 3 {
+		t.Fatalf("expected independent message, got %d err=%v", len(items), err)
+	}
+	source := items[2]
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{
+		Op: "addSideRef", MessageID: root.ID, SourceMessageID: source.ID, Side: "right", Scope: domain.SideRefScopeNode,
+	}); err != nil {
+		t.Fatalf("add node side ref: %v", err)
+	}
+	rootMsg, err := ms.Get(ctx, root.ID)
+	if err != nil || rootMsg.GraphMeta == nil || len(rootMsg.GraphMeta.SideRefs) != 1 || rootMsg.GraphMeta.SideRefs[0].Scope != domain.SideRefScopeNode {
+		t.Fatalf("node scope not persisted: %+v err=%v", rootMsg.GraphMeta, err)
+	}
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{
+		Op: "addSideRef", MessageID: root.ID, SourceMessageID: source.ID, Side: "left",
+	}); err != nil {
+		t.Fatalf("switch back to branch scope: %v", err)
+	}
+	rootMsg, _ = ms.Get(ctx, root.ID)
+	if len(rootMsg.GraphMeta.SideRefs) != 1 || rootMsg.GraphMeta.SideRefs[0].Scope != "" || rootMsg.GraphMeta.SideRefs[0].Side != "left" {
+		t.Fatalf("branch scope normalization failed: %+v", rootMsg.GraphMeta.SideRefs)
+	}
+	if err := cs.ApplyGraphMutation(ctx, conv.ID, GraphMutationInput{
+		Op: "addSideRef", MessageID: root.ID, SourceMessageID: source.ID, Scope: "weird",
+	}); err == nil {
+		t.Fatal("expected invalid scope to be rejected")
+	}
+}

@@ -38,9 +38,21 @@
   stroke: color-mix(in srgb, var(--accent) 76%, transparent);
   stroke-width: 1.75;
 }
+.cg-edge--sideref-node path {
+  fill: none;
+  stroke: color-mix(in srgb, var(--accent) 52%, var(--text-tertiary));
+  stroke-width: 1.5;
+  stroke-dasharray: 4 3;
+}
+.cg-edge-draft--side-node {
+  color: color-mix(in srgb, var(--accent) 52%, var(--text-tertiary));
+  stroke-dasharray: 4 3;
+  stroke-width: 1.75;
+}
 .cg-marker { fill: color-mix(in srgb, var(--text-secondary) 38%, var(--bg-surface-secondary)); }
 .cg-marker--active { fill: var(--accent); }
 .cg-marker--sideref { fill: color-mix(in srgb, var(--accent) 82%, transparent); }
+.cg-marker--sideref-node { fill: color-mix(in srgb, var(--accent) 52%, var(--text-tertiary)); }
 
 /* Edge hover disconnect micro-button */
 .cg-edge-detach {
@@ -422,6 +434,25 @@
   border-color: var(--accent);
   background: var(--accent-soft);
 }
+.cg-port--node-side-out {
+  left: calc(50% + 30px);
+  top: 100%;
+}
+.cg-port--node-side-out::after {
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--text-tertiary));
+  background:
+    radial-gradient(circle at center, color-mix(in srgb, var(--accent) 55%, transparent) 0 2px, transparent 2.5px),
+    var(--bg-surface);
+}
+.cg-port--node-side-out:hover::after {
+  border-color: var(--accent);
+  background:
+    radial-gradient(circle at center, var(--accent) 0 2.5px, transparent 3px),
+    var(--accent-soft);
+}
 .cg-port--note-top { left: 50%; top: 0; }
 .cg-port--note-bottom { left: 50%; top: 100%; }
 .cg-port--note-left { left: 0; top: 50%; }
@@ -435,6 +466,8 @@
   border-color: color-mix(in srgb, var(--warning) 62%, var(--text-secondary));
 }
 .cg-node--path .cg-port, .cg-port:hover { color: var(--accent); }
+.cg-msg-form { display: grid; gap: 12px; }
+.cg-msg-form .ui-textarea { min-height: 132px; resize: vertical; }
 .cg-node:is(:hover, :focus-within, .cg-node--current, .cg-node--selected) .cg-port, .cg-stage--linking .cg-port { opacity: 1; }
 .cg-stage--linking .cg-node__actions { opacity: 0; pointer-events: none; }
 

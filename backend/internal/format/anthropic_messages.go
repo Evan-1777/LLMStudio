@@ -80,7 +80,7 @@ func (f *AnthropicMessagesFormat) EncodeRequest(_ context.Context, input plugin.
 		})
 	}
 
-	for _, msg := range input.Messages {
+	for _, msg := range normalizeMessagesForEncoding(input.Messages) {
 		switch msg.Role {
 		case domain.RoleUser:
 			var parts []map[string]any

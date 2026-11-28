@@ -16,9 +16,10 @@ func graphEnabled(conv domain.Conversation) bool {
 	return conv.GraphState != nil && conv.GraphState.Enabled
 }
 
-// expandSideReferences injects single-level side-branch assistant replies immediately
-// after each target message in activePath as an independent User message wrapped in
-// <reference_materials>...</reference_materials>.
+// expandSideReferences injects side-reference materials immediately after each target
+// message in activePath as an independent User message wrapped in
+// <reference_materials>...</reference_materials>. Branch refs walk up to the main path
+// and only collect assistant replies; node refs inject exactly the referenced message.
 func expandSideReferences(all []domain.Message, activePath []domain.Message) []domain.Message {
 	hasSideRefs := false
 	for _, m := range activePath {
@@ -49,10 +50,24 @@ func expandSideReferences(all []domain.Message, activePath []domain.Message) []d
 			continue
 		}
 
-		seenAssistant := make(map[string]bool)
+		seenMsg := make(map[string]bool)
 		var refParts []string
 		for _, ref := range m.GraphMeta.SideRefs {
 			if ref.SourceMessageID == "" {
+				continue
+			}
+			if ref.Scope == domain.SideRefScopeNode {
+				src, ok := byID[ref.SourceMessageID]
+				if !ok || mainAncestors[src.ID] || seenMsg[src.ID] {
+					continue
+				}
+				if src.Role != domain.RoleUser && src.Role != domain.RoleAssistant {
+					continue
+				}
+				seenMsg[src.ID] = true
+				if text := extractMessageTextBlocks(src.Blocks); text != "" {
+					refParts = append(refParts, text)
+				}
 				continue
 			}
 			var branchMsgs []domain.Message
@@ -71,11 +86,11 @@ func expandSideReferences(all []domain.Message, activePath []domain.Message) []d
 			}
 			slices.Reverse(branchMsgs)
 			for _, bm := range branchMsgs {
-				if bm.Role != domain.RoleAssistant || seenAssistant[bm.ID] {
+				if bm.Role != domain.RoleAssistant || seenMsg[bm.ID] {
 					continue
 				}
-				seenAssistant[bm.ID] = true
-				if text := extractAssistantTextBlocks(bm.Blocks); text != "" {
+				seenMsg[bm.ID] = true
+				if text := extractMessageTextBlocks(bm.Blocks); text != "" {
 					refParts = append(refParts, text)
 				}
 			}
@@ -97,7 +112,7 @@ func expandSideReferences(all []domain.Message, activePath []domain.Message) []d
 	return out
 }
 
-func extractAssistantTextBlocks(blocks []domain.ContentBlock) string {
+func extractMessageTextBlocks(blocks []domain.ContentBlock) string {
 	var parts []string
 	for _, b := range blocks {
 		if b.Type == domain.BlockTypeText {

@@ -4,6 +4,7 @@ import type {
   ConversationGraphNote,
   Message,
   MessageSideRef,
+  MessageSideRefScope,
 } from '../../core/types';
 
 export interface Point { x: number; y: number }
@@ -189,7 +190,9 @@ export function resolveSideRefBranchMessages(
 
 export interface ResolvedSideRefBranch {
   ref: MessageSideRef;
-  assistantMessages: Message[];
+  scope: MessageSideRefScope;
+  sourceMessage?: Message;
+  messages: Message[];
   preview: string;
 }
 
@@ -199,27 +202,38 @@ export function resolveSideRefMaterials(
 ): { text: string; branches: ResolvedSideRefBranch[] } {
   const refs = targetMessage.graphMeta?.sideRefs ?? [];
   if (!refs.length) return { text: '', branches: [] };
-  const seenAssistant = new Set<string>();
+  const byId = indexMessages(allMessages);
+  const mainAncestors = new Set<string>();
+  for (const { id } of ancestors(byId, targetMessage.id)) mainAncestors.add(id);
+  const seenMsg = new Set<string>();
   const mergedParts: string[] = [];
   const branches: ResolvedSideRefBranch[] = [];
   for (const ref of refs) {
-    const assistantMessages = resolveSideRefBranchMessages(
-      allMessages,
-      targetMessage,
-      ref.sourceMessageId,
-    );
+    const scope: MessageSideRefScope = ref.scope === 'node' ? 'node' : 'branch';
+    let messages: Message[];
+    if (scope === 'node') {
+      const src = byId.get(ref.sourceMessageId);
+      messages =
+        src && !mainAncestors.has(src.id) && (src.role === 'user' || src.role === 'assistant')
+          ? [src]
+          : [];
+    } else {
+      messages = resolveSideRefBranchMessages(allMessages, targetMessage, ref.sourceMessageId);
+    }
     const branchParts: string[] = [];
-    for (const msg of assistantMessages) {
+    for (const msg of messages) {
       const content = extractSideRefMessageText(msg);
       if (content) branchParts.push(content);
-      if (!seenAssistant.has(msg.id)) {
-        seenAssistant.add(msg.id);
+      if (!seenMsg.has(msg.id)) {
+        seenMsg.add(msg.id);
         if (content) mergedParts.push(content);
       }
     }
     branches.push({
       ref,
-      assistantMessages,
+      scope,
+      sourceMessage: scope === 'node' ? messages[0] : undefined,
+      messages,
       preview: branchParts.join('\n\n'),
     });
   }

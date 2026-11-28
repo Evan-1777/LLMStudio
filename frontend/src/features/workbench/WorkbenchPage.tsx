@@ -432,7 +432,7 @@ function WorkbenchInner() {
     setGraphViewKey(null);
   };
   const draft = !activeId && draftAgent?.key === draftKey ? draftAgent : null;
-  const conversationMode = currentConversation?.mode ?? draft?.mode ?? 'chat';
+  const conversationMode = currentConversation?.mode ?? draft?.mode ?? settings.defaultTopicMode;
   // Desktop chat discovers both tool catalogs; cloud Agent execution runs on the gateway.
   const cloudAgent = reqScope === 'cloud' && conversationMode === 'agent';
   const canBindTopicSchedule =
@@ -558,6 +558,14 @@ function WorkbenchInner() {
       );
       if (resolved) return resolved;
     }
+    if (settings.lastProviderId && settings.lastModelId) {
+      const resolved = resolveModelOption(
+        resources.providers,
+        settings.lastProviderId,
+        settings.lastModelId,
+      );
+      if (resolved) return resolved;
+    }
     if (activeAssistant.defaultProviderId && activeAssistant.defaultModelId) {
       const resolved = resolveModelOption(
         resources.providers,
@@ -575,6 +583,8 @@ function WorkbenchInner() {
     draftModel.modelId,
     draftModel.providerId,
     resources.providers,
+    settings.lastModelId,
+    settings.lastProviderId,
   ]);
 
   const selectedProviderId = targetModel?.provider.id ?? '';
@@ -856,9 +866,15 @@ function WorkbenchInner() {
   const isSavingModel =
     currentModelScopeKey !== null && savingModelKey === currentModelScopeKey;
 
+  const persistLastModel = (providerId: string, modelId: string) => {
+    if (settings.lastProviderId === providerId && settings.lastModelId === modelId) return;
+    void updatePreferences({ lastProviderId: providerId, lastModelId: modelId }, { silent: true });
+  };
+
   const handleSelectModel = async (providerId: string, modelId: string) => {
     if (!currentConversation) {
       setDraftModel({ providerId, modelId });
+      persistLastModel(providerId, modelId);
       return;
     }
     const targetConvId = currentConversation.id;
@@ -888,6 +904,8 @@ function WorkbenchInner() {
       }
       upsertLocalConversation(updated, targetScope);
       updateConversationMeta(updated);
+      setDraftModel({ providerId, modelId });
+      persistLastModel(providerId, modelId);
     } catch {
       if (
         activeConnEpochRef.current === startEpoch &&
@@ -1466,6 +1484,7 @@ function WorkbenchInner() {
             key={modeKey} conversation={graphConversation} messages={chatState.messages} activeMessages={activeMessages}
             busy={graphBusy || !graphReady} mutate={submitGraphMutation} onJump={(id) => void jumpToGraphMessage(id)}
             onActivate={(target) => void activateGraphBranch(target)} onDelete={handleDeleteMessage}
+            onUpdateMessage={handleUpdateMessage}
             focusNodeId={graphFocusNodeId} onFocusHandled={() => setGraphFocusNodeId(null)}
           />}
           <div className="wb-chat-view" hidden={graphOpen}>

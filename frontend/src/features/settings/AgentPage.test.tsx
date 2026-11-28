@@ -6,14 +6,32 @@ import { AgentPage } from './AgentPage';
 
 const mocked = vi.hoisted(() => ({
   getAgentSettings: vi.fn(), updateAgentSettings: vi.fn(), listAgentDirectories: vi.fn(),
-  pickDirectory: vi.fn(),
+  pickDirectory: vi.fn(), updatePreferences: vi.fn(), toast: vi.fn(),
 }));
 vi.mock('../../app/AppProvider', () => ({ useApp: () => ({
   gateway: mocked, isDesktop: true, connectionEpoch: 1, cloudConnectionState: 'connected',
+  settings: { defaultTopicMode: 'chat' }, updatePreferences: mocked.updatePreferences, toast: mocked.toast,
 }) }));
 vi.mock('../../core/desktop', () => ({ pickDesktopDirectory: mocked.pickDirectory }));
 
 afterEach(() => vi.resetAllMocks());
+
+it('persists the default new-topic mode from the workbench section', async () => {
+  const user = userEvent.setup();
+  mocked.getAgentSettings.mockResolvedValue({
+    directory: { path: 'C:/local', status: 'ready' },
+    allowedTools: [],
+    availableTools: ['read'],
+    injectAgentMd: true,
+    markdownVisualRender: false,
+    skills: [],
+  });
+  mocked.updatePreferences.mockResolvedValue({ ok: true });
+  render(<AgentPage />);
+  await user.click(screen.getByRole('radio', { name: 'Agent' }));
+  expect(mocked.updatePreferences).toHaveBeenCalledWith({ defaultTopicMode: 'agent' });
+  expect(mocked.toast).not.toHaveBeenCalled();
+});
 
 it('opens native picker only for local settings and drops results from the previous scope', async () => {
   const user = userEvent.setup();

@@ -244,6 +244,75 @@ func TestPreferenceStoreDefaultsPartialUpdateAndLegacyImport(t *testing.T) {
 	}
 }
 
+func TestPreferenceStoreTopicDefaultsAndLastModel(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "topic-prefs.db")
+
+	db, err := OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	prefs := NewPreferenceStore(db)
+	got, _, err := prefs.Get(ctx)
+	if err != nil {
+		t.Fatalf("get defaults: %v", err)
+	}
+	if got.DefaultTopicMode != domain.ConversationModeChat || got.LastProviderID != "" || got.LastModelID != "" {
+		t.Fatalf("unexpected topic defaults: %+v", got)
+	}
+
+	invalid := "hybrid"
+	if _, _, err := prefs.Update(ctx, domain.PreferencesPatch{DefaultTopicMode: &invalid}, false, validatePrefs); err == nil {
+		t.Fatal("expected invalid defaultTopicMode to fail validation")
+	}
+
+	mode := " AGENT "
+	provider := "  provider-a  "
+	model := " model-b "
+	updated, initialized, err := prefs.Update(ctx, domain.PreferencesPatch{
+		DefaultTopicMode: &mode,
+		LastProviderID:   &provider,
+		LastModelID:      &model,
+	}, false, validatePrefs)
+	if err != nil {
+		t.Fatalf("update topic prefs: %v", err)
+	}
+	if !initialized || updated.DefaultTopicMode != domain.ConversationModeAgent ||
+		updated.LastProviderID != "provider-a" || updated.LastModelID != "model-b" {
+		t.Fatalf("unexpected topic prefs after update: %+v", updated)
+	}
+
+	// An unrelated partial update must preserve the new fields.
+	size := 16
+	afterUnrelated, _, err := prefs.Update(ctx, domain.PreferencesPatch{FontSize: &size}, false, validatePrefs)
+	if err != nil {
+		t.Fatalf("unrelated update: %v", err)
+	}
+	if afterUnrelated.DefaultTopicMode != domain.ConversationModeAgent ||
+		afterUnrelated.LastProviderID != "provider-a" || afterUnrelated.LastModelID != "model-b" {
+		t.Fatalf("unrelated update overwrote topic prefs: %+v", afterUnrelated)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	db, err = OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("reopen sqlite: %v", err)
+	}
+	prefs = NewPreferenceStore(db)
+	reloaded, _, err := prefs.Get(ctx)
+	if err != nil {
+		t.Fatalf("reload topic prefs: %v", err)
+	}
+	if reloaded.DefaultTopicMode != domain.ConversationModeAgent ||
+		reloaded.LastProviderID != "provider-a" || reloaded.LastModelID != "model-b" {
+		t.Fatalf("topic prefs not persisted: %+v", reloaded)
+	}
+}
+
 func TestMigration005BackfillsManagedAPIKeys(t *testing.T) {
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")

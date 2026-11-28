@@ -1,6 +1,6 @@
 import type { Dispatch } from 'react';
 import { GatewayError } from '../../core/gateway';
-import type { LocalCacheResultData, TopicScope } from '../../core/types';
+import type { LocalCacheResultData, StreamEvent, TopicScope } from '../../core/types';
 import type { chatReducer } from './chatReducer';
 
 export type ChatAction = Parameters<typeof chatReducer>[1];
@@ -24,6 +24,45 @@ export interface GenerationRun {
   detached: boolean;
   aborted: boolean;
   released: boolean;
+  streamOpened?: boolean;
+}
+
+function blockText(block: StreamEvent['block']): string {
+  if (!block || !('text' in block) || typeof block.text !== 'string') return '';
+  return block.text;
+}
+
+function blockThinking(block: StreamEvent['block']): boolean {
+  if (!block) return false;
+  const thinking = 'thinking' in block && typeof block.thinking === 'string' ? block.thinking : '';
+  const signature = 'signature' in block && typeof block.signature === 'string' ? block.signature : '';
+  return Boolean(thinking || signature);
+}
+
+function blockName(block: StreamEvent['block']): string {
+  if (!block || !('name' in block) || typeof block.name !== 'string') return '';
+  return block.name.trim();
+}
+
+export function isSubstantiveAssistantEvent(ev: StreamEvent): boolean {
+  if (ev.type === 'message_end') {
+    if (ev.rolledBack || !ev.message) return false;
+    return ev.message.blocks.some((block) => {
+      if (block.type === 'text') return Boolean(blockText(block));
+      if (block.type === 'thinking') return blockThinking(block);
+      if (block.type === 'toolCall') return Boolean(blockName(block));
+      return block.type === 'toolResult' || block.type === 'image';
+    });
+  }
+  if (ev.blockType === 'webSearch') return false;
+  if (ev.type !== 'block_start' && ev.type !== 'block_delta' && ev.type !== 'block_end') {
+    return false;
+  }
+  const blockType = ev.blockType || ev.block?.type || '';
+  if (blockType === 'text') return Boolean(ev.delta || blockText(ev.block));
+  if (blockType === 'thinking') return Boolean(ev.delta) || blockThinking(ev.block);
+  if (blockType === 'toolCall') return Boolean(blockName(ev.block));
+  return blockType === 'toolResult' || blockType === 'image';
 }
 
 export function isAbortError(err: unknown): boolean {

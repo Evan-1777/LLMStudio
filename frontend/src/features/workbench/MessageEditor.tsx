@@ -16,6 +16,26 @@ import {
   type PendingAttachment,
 } from './attachments';
 
+export function replaceMessageTextBlocks(
+  blocks: ContentBlock[],
+  nextText: string,
+): ContentBlock[] {
+  const out: ContentBlock[] = [];
+  let replaced = false;
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      if (!replaced) {
+        replaced = true;
+        if (nextText.trim()) out.push({ ...block, text: nextText });
+      }
+      continue;
+    }
+    out.push(block);
+  }
+  if (!replaced && nextText.trim()) out.push({ type: 'text', text: nextText });
+  return out;
+}
+
 function buildEditedBlocks(
   blocks: ContentBlock[],
   nextText: string,

@@ -2713,6 +2713,102 @@ describe('Workbench flows and attachments', () => {
     expect(mutations.some((m) => m.op === 'deleteNoteEdge' && m.edgeId === 'e1')).toBe(true);
   });
 
+  it('creates and edits message nodes from the graph view', async () => {
+    const user = userEvent.setup();
+    const mutations: GraphMutationInput[] = [];
+    const conv: Conversation = {
+      id: 'c-graph',
+      assistantId: 'default',
+      title: '图谱测试',
+      providerId: 'openai',
+      modelId: 'gpt-4.1',
+      params: {},
+      activeLeafId: 'a1',
+      graphState: { enabled: true },
+      syncEnabled: false,
+      syncState: 'local_only',
+      syncVersion: 0,
+      createdAt: '2026-11-24T00:00:00Z',
+      updatedAt: '2026-11-24T00:00:00Z',
+    };
+    const msgs: Message[] = [
+      {
+        id: 'u1',
+        conversationId: 'c-graph',
+        parentId: '',
+        role: 'user',
+        blocks: [{ type: 'text', text: '用户第一问' }],
+        createdAt: '2026-11-24T00:00:00Z',
+      },
+      {
+        id: 'a1',
+        conversationId: 'c-graph',
+        parentId: 'u1',
+        role: 'assistant',
+        blocks: [{ type: 'text', text: '助手详细回答' }],
+        graphMeta: { expanded: true },
+        createdAt: '2026-11-24T00:00:01Z',
+      },
+    ];
+    const mutate = vi.fn(async (input: GraphMutationInput) => {
+      mutations.push(input);
+      if (input.op === 'createMessage') {
+        return {
+          conversation: conv,
+          messages: [
+            ...msgs,
+            {
+              id: 'created',
+              conversationId: 'c-graph',
+              parentId: input.parentMessageId ?? '',
+              role: input.role,
+              blocks: [{ type: 'text' as const, text: input.text }],
+              createdAt: '2026-11-24T00:00:02Z',
+            },
+          ],
+        };
+      }
+      return { conversation: conv, messages: msgs };
+    });
+    const onUpdateMessage = vi.fn(async () => true);
+
+    render(
+      <AppProvider fetchImpl={makeWorkbenchFetch().fetchMock}>
+        <ConversationGraphView
+          conversation={conv}
+          messages={msgs}
+          activeMessages={msgs}
+          busy={false}
+          mutate={mutate}
+          onJump={vi.fn()}
+          onActivate={vi.fn()}
+          onUpdateMessage={onUpdateMessage}
+        />
+      </AppProvider>,
+    );
+
+    await user.click(screen.getByRole('button', { name: '新建助手消息' }));
+    const createDialog = await screen.findByRole('dialog');
+    await user.type(within(createDialog).getByLabelText('消息内容'), '缩略图新答案');
+    await user.click(within(createDialog).getByRole('button', { name: '创建' }));
+    await waitFor(() =>
+      expect(mutations.some(
+        (m) => m.op === 'createMessage' && m.role === 'assistant' && m.text === '缩略图新答案',
+      )).toBe(true),
+    );
+
+    const a1Node = document.querySelector('[data-graph-node="a1"]') as HTMLElement;
+    fireEvent.click(within(a1Node).getByRole('button', { name: '节点操作' }));
+    await user.click(await screen.findByRole('menuitem', { name: '编辑消息内容' }));
+    const editDialog = await screen.findByRole('dialog');
+    const textarea = within(editDialog).getByLabelText('编辑消息内容');
+    await user.clear(textarea);
+    await user.type(textarea, '改写后的回答');
+    await user.click(within(editDialog).getByRole('button', { name: '保存' }));
+    await waitFor(() => expect(onUpdateMessage).toHaveBeenCalledWith('a1', [{ type: 'text', text: '改写后的回答' }]));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+
   it('renders MessageSideRefBadge with merged assistant preview, graph jump, and disconnect actions', async () => {
     const user = userEvent.setup();
     const onOpenGraphNode = vi.fn();
@@ -2765,6 +2861,37 @@ describe('Workbench flows and attachments', () => {
 
     await user.click(screen.getByRole('button', { name: '在缩略图中查看' }));
     expect(onOpenGraphNode).toHaveBeenCalledWith('a-side');
+  });
+
+  it('labels a single-node side reference with its role and raw text', async () => {
+    const user = userEvent.setup();
+    const source: Message = {
+      id: 'u-node',
+      conversationId: 'c1',
+      parentId: '',
+      role: 'user',
+      blocks: [{ type: 'text', text: '独立用户节点' }],
+      createdAt: '2026-11-24T00:00:00Z',
+    };
+    const target: Message = {
+      id: 'a-main',
+      conversationId: 'c1',
+      parentId: '',
+      role: 'assistant',
+      blocks: [{ type: 'text', text: '主干回答' }],
+      graphMeta: { sideRefs: [{ sourceMessageId: 'u-node', side: 'left', scope: 'node' }] },
+      createdAt: '2026-11-24T00:00:01Z',
+    };
+
+    render(
+      <MessageSideRefBadge message={target} allMessages={[source, target]} />,
+    );
+
+    const pill = screen.getByRole('button', { name: '参考节点' });
+    await user.click(pill);
+    expect(await screen.findByText('独立用户节点')).toBeInTheDocument();
+    expect(screen.getByText('单节点')).toBeInTheDocument();
+    expect(screen.getByText('用户消息')).toBeInTheDocument();
   });
 
   it('drops ungrouped topic onto collapsed group header with first group item as beforeId', async () => {
@@ -2892,5 +3019,84 @@ describe('Workbench flows and attachments', () => {
       groupId: 'g-collapsed',
       beforeId: 't-grouped-1',
     });
+  });
+
+  it('applies the default topic mode and remembers the selected model across new topics', async () => {
+    const createBodies: Array<Record<string, unknown>> = [];
+    const settingsPatches: Array<Record<string, unknown>> = [];
+    let prefs = {
+      ...defaultAppPreferences(),
+      defaultTopicMode: 'agent' as const,
+      lastProviderId: 'p2',
+      lastModelId: 'm2',
+    };
+    const customFetch = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) : {};
+      if (url.endsWith('/healthz')) {
+        return Response.json({ status: 'ok', version: '1.0', authRequired: false });
+      }
+      if (url.endsWith('/api/v1/settings') && method === 'GET') {
+        return Response.json({ preferences: prefs, initialized: true });
+      }
+      if (url.endsWith('/api/v1/settings') && method === 'PATCH') {
+        settingsPatches.push(body as Record<string, unknown>);
+        prefs = { ...prefs, ...(body as Record<string, unknown>) } as typeof prefs;
+        return Response.json({ preferences: prefs, initialized: true });
+      }
+      if (url.endsWith('/api/v1/formats')) {
+        return Response.json({ formats: [], adapters: [] });
+      }
+      if (url.endsWith('/api/v1/providers')) {
+        return Response.json({
+          providers: [
+            { id: 'p1', name: 'P1', adapter: 'generic-http', baseURL: 'https://p1.example', authType: 'bearer', apiKeySet: true, enabled: true, builtIn: true,
+              models: [{ id: 'm1', name: 'M1', apiFormat: 'openai-responses' }] },
+            { id: 'p2', name: 'P2', adapter: 'generic-http', baseURL: 'https://p2.example', authType: 'bearer', apiKeySet: true, enabled: true, builtIn: true,
+              models: [{ id: 'm2', name: 'M2', apiFormat: 'openai-responses' }] },
+          ],
+        });
+      }
+      if (url.endsWith('/api/v1/assistants')) {
+        return Response.json({ assistants: [{ id: 'default', name: '默认助手', params: {}, isDefault: true }] });
+      }
+      if (url.endsWith('/api/v1/conversations') && method === 'GET') {
+        return Response.json({ conversations: [] });
+      }
+      if (url.endsWith('/api/v1/conversation-groups') && method === 'GET') {
+        return Response.json({ groups: [] });
+      }
+      if (url.endsWith('/api/v1/conversations') && method === 'POST') {
+        createBodies.push(body as Record<string, unknown>);
+        return new Response(JSON.stringify({ code: 'UPSTREAM_ERROR', message: 'create failed' }), { status: 500 });
+      }
+      return Response.json({});
+    });
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={customFetch}>
+        <MemoryRouter initialEntries={['/chat']}>
+          <Routes>
+            <Route path="/chat" element={<WorkbenchPage />} />
+          </Routes>
+        </MemoryRouter>
+      </AppProvider>,
+    );
+
+    const modelButton = await screen.findByRole('button', { name: '选择模型' });
+    await waitFor(() => expect(modelButton).toHaveTextContent('M2'));
+
+    await user.click(modelButton);
+    await user.click(screen.getByRole('option', { name: /M1/ }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '选择模型' })).toHaveTextContent('M1'));
+    await waitFor(() => expect(settingsPatches).toContainEqual({ lastProviderId: 'p1', lastModelId: 'm1' }));
+
+    const box = screen.getByLabelText('消息输入框');
+    await user.type(box, 'hello');
+    fireEvent.keyDown(box, { key: 'Enter' });
+    await waitFor(() => expect(createBodies).toHaveLength(1));
+    expect(createBodies[0]).toMatchObject({ mode: 'agent', providerId: 'p1', modelId: 'm1' });
   });
 });

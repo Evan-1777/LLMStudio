@@ -14,7 +14,7 @@ const preferencesSelect = "SELECT theme_mode, seed_color_value, enter_to_send, v
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
 	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, mcp_max_tool_rounds, " +
 	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, math_render_enabled, " +
-	"graph_markdown_render, graph_visual_html_render, imported " +
+	"graph_markdown_render, graph_visual_html_render, default_topic_mode, last_provider_id, last_model_id, imported " +
 	"FROM user_preferences WHERE id = 1"
 
 const preferencesUpsert = "INSERT INTO user_preferences (" +
@@ -23,8 +23,8 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"auto_collapse_tools_on_complete, auto_create_cache, collapse_line_threshold, " +
 	"collapse_char_threshold, user_avatar_data_url, composer_reasoning_effort, mcp_max_tool_rounds, " +
 	"chat_width_mode, chat_manual_width, font_family, font_size, builtin_time_tool_enabled, math_render_enabled, " +
-	"graph_markdown_render, graph_visual_html_render, imported, updated_at" +
-	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
+	"graph_markdown_render, graph_visual_html_render, default_topic_mode, last_provider_id, last_model_id, imported, updated_at" +
+	") VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?) " +
 	"ON CONFLICT(id) DO UPDATE SET " +
 	"theme_mode = excluded.theme_mode, " +
 	"seed_color_value = excluded.seed_color_value, " +
@@ -49,6 +49,9 @@ const preferencesUpsert = "INSERT INTO user_preferences (" +
 	"math_render_enabled = excluded.math_render_enabled, " +
 	"graph_markdown_render = excluded.graph_markdown_render, " +
 	"graph_visual_html_render = excluded.graph_visual_html_render, " +
+	"default_topic_mode = excluded.default_topic_mode, " +
+	"last_provider_id = excluded.last_provider_id, " +
+	"last_model_id = excluded.last_model_id, " +
 	"imported = 1, " +
 	"updated_at = excluded.updated_at"
 
@@ -137,6 +140,9 @@ func (s *PreferenceStore) Update(
 		boolToInt(next.MathRenderEnabled),
 		boolToInt(next.GraphMarkdownRender),
 		boolToInt(next.GraphVisualHTMLRender),
+		next.DefaultTopicMode,
+		next.LastProviderID,
+		next.LastModelID,
 		formatTime(time.Now().UTC()),
 	); err != nil {
 		return domain.Preferences{}, false, fmt.Errorf("write preferences: %w", err)
@@ -192,6 +198,9 @@ func queryPreferences(ctx context.Context, q preferencesQuerier) (domain.Prefere
 		&mathRender,
 		&graphMarkdown,
 		&graphVisual,
+		&prefs.DefaultTopicMode,
+		&prefs.LastProviderID,
+		&prefs.LastModelID,
 		&initialized,
 	)
 	if err != nil {

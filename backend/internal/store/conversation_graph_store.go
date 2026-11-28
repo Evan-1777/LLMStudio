@@ -41,6 +41,8 @@ type GraphMutationInput struct {
 	TargetPort      string          `json:"targetPort,omitempty"`
 	SourceMessageID string          `json:"sourceMessageId,omitempty"`
 	Side            string          `json:"side,omitempty"`
+	Scope           string          `json:"scope,omitempty"`
+	Role            string          `json:"role,omitempty"`
 }
 
 type GraphMetaPatch struct {
@@ -324,6 +326,8 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 		err = applyGraphSetNodeMetaTx(ctx, tx, id, c.GraphState, in)
 	case "deleteNodes":
 		err = applyGraphDeleteNodesTx(ctx, tx, id, &c, in)
+	case "createMessage":
+		err = applyGraphCreateMessageTx(ctx, tx, id, &c, in)
 	case "createBranch", "deleteBranch", "activateBranch":
 		err = applyGraphBranchMutationTx(ctx, tx, id, &c, in)
 	case "createNote", "updateNote", "createNoteEdge", "deleteNoteEdge":
@@ -340,6 +344,52 @@ func (s *ConversationStore) ApplyGraphMutation(ctx context.Context, id string, i
 		return err
 	}
 	return tx.Commit()
+}
+
+func applyGraphCreateMessageTx(ctx context.Context, tx *sql.Tx, id string, c *domain.Conversation, in GraphMutationInput) error {
+	role := strings.TrimSpace(in.Role)
+	if role != domain.RoleUser && role != domain.RoleAssistant {
+		return invalidGraph("仅支持新建用户或助手消息")
+	}
+	text := strings.TrimSpace(in.Text)
+	if text == "" {
+		return invalidGraph("消息内容不能为空")
+	}
+	if len([]rune(text)) > 200000 {
+		return invalidGraph("消息内容不能超过 200000 字")
+	}
+	parentID := strings.TrimSpace(in.ParentMessageID)
+	if parentID != "" {
+		if _, err := graphMessageTx(ctx, tx, id, parentID); err != nil {
+			return err
+		}
+	}
+	msg := domain.Message{
+		ID:             domain.NewUUID(),
+		ConversationID: id,
+		Role:           role,
+		Blocks:         []domain.ContentBlock{{Type: domain.BlockTypeText, Text: in.Text}},
+		ParentID:       parentID,
+		CreatedAt:      time.Now().UTC(),
+	}
+	if in.X != nil || in.Y != nil {
+		meta := &domain.MessageGraphMeta{}
+		if in.X != nil {
+			meta.X = in.X
+		}
+		if in.Y != nil {
+			meta.Y = in.Y
+		}
+		msg.GraphMeta = meta
+	}
+	if err := insertMessage(ctx, tx, msg); err != nil {
+		return err
+	}
+	if in.Activate || parentID == c.ActiveLeafID || (c.ActiveLeafID == "" && c.GraphState.ActiveBranchID == "") {
+		c.ActiveLeafID = msg.ID
+		c.GraphState.ActiveBranchID = ""
+	}
+	return nil
 }
 
 func applyGraphReparentTx(ctx context.Context, tx *sql.Tx, id string, in GraphMutationInput) error {
@@ -747,6 +797,14 @@ func applyGraphSideRefMutationTx(ctx context.Context, tx *sql.Tx, id string, in 
 		if in.MessageID == in.SourceMessageID {
 			return invalidGraph("不能形成循环上下文连接")
 		}
+		scope := strings.TrimSpace(in.Scope)
+		switch scope {
+		case "", domain.SideRefScopeBranch:
+			scope = ""
+		case domain.SideRefScopeNode:
+		default:
+			return invalidGraph("侧边接入模式仅支持 branch 或 node")
+		}
 		side := strings.TrimSpace(in.Side)
 		if side == "" {
 			side = "left"
@@ -761,8 +819,12 @@ func applyGraphSideRefMutationTx(ctx context.Context, tx *sql.Tx, id string, in 
 		if targetMsg.Role != domain.RoleUser && targetMsg.Role != domain.RoleAssistant {
 			return invalidGraph("仅支持向用户或助手消息接入侧边分支")
 		}
-		if _, err := graphMessageTx(ctx, tx, id, in.SourceMessageID); err != nil {
+		sourceMsg, err := graphMessageTx(ctx, tx, id, in.SourceMessageID)
+		if err != nil {
 			return err
+		}
+		if sourceMsg.Role != domain.RoleUser && sourceMsg.Role != domain.RoleAssistant {
+			return invalidGraph("仅支持引用用户或助手消息")
 		}
 		parentOf, sideRefsOf, err := loadGraphDependenciesTx(ctx, tx, id)
 		if err != nil {
@@ -790,10 +852,12 @@ func applyGraphSideRefMutationTx(ctx context.Context, tx *sql.Tx, id string, in 
 		})
 		if existingIdx >= 0 {
 			targetMsg.GraphMeta.SideRefs[existingIdx].Side = side
+			targetMsg.GraphMeta.SideRefs[existingIdx].Scope = scope
 		} else {
 			targetMsg.GraphMeta.SideRefs = append(targetMsg.GraphMeta.SideRefs, domain.MessageSideRef{
 				SourceMessageID: in.SourceMessageID,
 				Side:            side,
+				Scope:           scope,
 			})
 		}
 		data, err := json.Marshal(targetMsg.GraphMeta)

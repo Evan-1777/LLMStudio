@@ -306,6 +306,7 @@ func TestDetachedAgentCancelDeleteAndCleanupConvergeWithoutRace(t *testing.T) {
 		chatSvc, _, _, msgs, conv, _ := setupDetachedAgentFixture(t, func(w http.ResponseWriter, r *http.Request) {
 			if turn.Add(1) == 1 {
 				w.Header().Set("Content-Type", "text/event-stream")
+				fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}`+"\n\n")
 				w.(http.Flusher).Flush()
 				close(blocked)
 				<-r.Context().Done()
@@ -318,6 +319,10 @@ func TestDetachedAgentCancelDeleteAndCleanupConvergeWithoutRace(t *testing.T) {
 			t.Fatalf("Prepare: %v", err)
 		}
 		<-blocked
+		waitForCondition(t, 2*time.Second, "partial content persistence before cancel", func() bool {
+			items, err := msgs.ListByConversation(t.Context(), conv.ID)
+			return err == nil && len(items) >= 1
+		})
 
 		if !chatSvc.CancelRun(conv.ID) {
 			t.Fatal("expected CancelRun to return true")

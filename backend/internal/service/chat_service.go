@@ -253,6 +253,13 @@ func (s *ChatService) WithMCP(mcpStore MCPCatalog, mcpClient plugin.MCPClientBou
 	return s
 }
 
+type pendingUserWrite struct {
+	blocks          []domain.ContentBlock
+	graphWrite      *domain.MessageGraphWrite
+	shouldAutoTitle bool
+	createdAt       time.Time
+}
+
 // PreparedStream holds a validated, open upstream HTTP response ready to stream SSE events to the client.
 type PreparedStream struct {
 	graphWrite           *domain.MessageGraphWrite
@@ -277,6 +284,8 @@ type PreparedStream struct {
 	cacheScope           plugin.PromptCacheScope
 	assistantID          string
 	detachedRun          *detachedRun
+	isRegen              bool
+	pendingUser          *pendingUserWrite
 }
 
 // ConversationID returns the target conversation ID of the prepared stream.
@@ -324,7 +333,8 @@ type preparedUpstream struct {
 }
 
 // Prepare validates inputs, runs optional cache planning, encodes the upstream payload,
-// opens the upstream HTTP connection, and persists any new user prompt BEFORE SSE headers are sent.
+// and opens the upstream HTTP connection. The new user prompt is persisted lazily right
+// before the first substantive assistant block, so an empty rollback writes nothing.
 func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*PreparedStream, error) {
 	workCtx := ctx
 	var (
@@ -401,35 +411,29 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 	}
 
 	conv := prep.conversation
-	var assistantWrite *domain.MessageGraphWrite
+	var pendingUser *pendingUserWrite
 	if !prep.isRegen {
-		saved, err := s.msgs.Create(workCtx, domain.Message{
-			GraphWrite:     prep.graphWrite,
-			ConversationID: conv.ID,
-			Role:           domain.RoleUser,
-			Blocks:         prep.userBlocks,
-			CreatedAt:      time.Now().UTC(),
-		})
-		if err != nil {
-			_ = resp.Body.Close()
-			return nil, err
+		pendingUser = &pendingUserWrite{
+			blocks:          prep.userBlocks,
+			graphWrite:      prep.graphWrite,
+			shouldAutoTitle: (conv.Title == "" || conv.Title == "New Chat") && prep.historyLen == 1,
+			createdAt:       time.Now().UTC(),
 		}
-		if prep.graphWrite != nil {
-			assistantWrite = &domain.MessageGraphWrite{ParentID: &saved.ID}
-		}
-		// Auto-title freshly created conversations from the first user prompt.
-		if (conv.Title == "" || conv.Title == "New Chat") && prep.historyLen == 1 {
-			if derived := deriveTitleFromBlocks(prep.userBlocks); derived != "" {
-				conv.Title = derived
-				if updated, uErr := s.convs.Update(workCtx, conv); uErr == nil {
-					conv = updated
+		if detached != nil {
+			detached.updateInfo(func(info *ActiveRunInfo) {
+				info.PendingUserMessage = &domain.Message{
+					ID:             "pending-user-" + assistantID,
+					ConversationID: conv.ID,
+					Role:           domain.RoleUser,
+					Blocks:         prep.userBlocks,
+					CreatedAt:      pendingUser.createdAt,
 				}
-			}
+			})
 		}
 	}
 
 	ps := &PreparedStream{
-		graphWrite:           assistantWrite,
+		graphWrite:           nil,
 		maxToolRounds:        prep.mcpMaxToolRounds,
 		service:              s,
 		conversation:         conv,
@@ -451,6 +455,8 @@ func (s *ChatService) Prepare(ctx context.Context, in StreamChatInput) (*Prepare
 		cacheScope:           prep.cacheScope,
 		assistantID:          assistantID,
 		detachedRun:          detached,
+		isRegen:              prep.isRegen,
+		pendingUser:          pendingUser,
 	}
 
 	if detached != nil {

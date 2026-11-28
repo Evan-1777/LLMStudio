@@ -121,11 +121,11 @@ func TestAnthropicReusableBreakpoints(t *testing.T) {
 	blocks := []domain.ContentBlock{
 		{Type: domain.BlockTypeThinking, Thinking: "think", Signature: "sig"},
 		{Type: domain.BlockTypeToolCall, ID: "tc1", Name: "t1", Arguments: json.RawMessage(`{}`)},
+		{Type: domain.BlockTypeToolResult, ToolCallID: "tc1", ToolName: "t1", Content: "res"},
 	}
 	for i := 0; i < 25; i++ {
 		blocks = append(blocks, domain.ContentBlock{Type: domain.BlockTypeText, Text: fmt.Sprintf("chunk-%d", i)})
 	}
-	blocks = append(blocks, domain.ContentBlock{Type: domain.BlockTypeToolResult, ToolCallID: "tc1", ToolName: "t1", Content: "res"})
 	round3 := base
 	round3.Messages = []domain.Message{
 		{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "u1"}}},
@@ -136,7 +136,7 @@ func TestAnthropicReusableBreakpoints(t *testing.T) {
 	if len(encoded3) < 3 {
 		t.Fatalf("expected assistant plus tool-result messages, got %d", len(encoded3))
 	}
-	anchor := contentParts(t, body3, 0)
+	anchor := contentParts(t, body3, 2)
 	if anchor[0].(map[string]any)["cache_control"] == nil {
 		t.Fatalf("long tool round must keep the previous boundary anchor: %+v", encoded3)
 	}

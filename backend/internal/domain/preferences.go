@@ -79,6 +79,9 @@ type Preferences struct {
 	MathRenderEnabled            bool   `json:"mathRenderEnabled"`
 	GraphMarkdownRender          bool   `json:"graphMarkdownRender"`
 	GraphVisualHTMLRender        bool   `json:"graphVisualHtmlRender"`
+	DefaultTopicMode             string `json:"defaultTopicMode"`
+	LastProviderID               string `json:"lastProviderId"`
+	LastModelID                  string `json:"lastModelId"`
 }
 
 // DefaultPreferences returns the built-in preference values.
@@ -104,6 +107,7 @@ func DefaultPreferences() Preferences {
 		MathRenderEnabled:            true,
 		GraphMarkdownRender:          true,
 		GraphVisualHTMLRender:        true,
+		DefaultTopicMode:             ConversationModeChat,
 	}
 }
 
@@ -134,6 +138,9 @@ type PreferencesPatch struct {
 	MathRenderEnabled            *bool   `json:"mathRenderEnabled"`
 	GraphMarkdownRender          *bool   `json:"graphMarkdownRender"`
 	GraphVisualHTMLRender        *bool   `json:"graphVisualHtmlRender"`
+	DefaultTopicMode             *string `json:"defaultTopicMode"`
+	LastProviderID               *string `json:"lastProviderId"`
+	LastModelID                  *string `json:"lastModelId"`
 }
 
 // Merge overlays the patch onto base and returns the resulting preferences.
@@ -208,6 +215,15 @@ func (p PreferencesPatch) Merge(base Preferences) Preferences {
 	if p.GraphVisualHTMLRender != nil {
 		out.GraphVisualHTMLRender = *p.GraphVisualHTMLRender
 	}
+	if p.DefaultTopicMode != nil {
+		out.DefaultTopicMode = *p.DefaultTopicMode
+	}
+	if p.LastProviderID != nil {
+		out.LastProviderID = *p.LastProviderID
+	}
+	if p.LastModelID != nil {
+		out.LastModelID = *p.LastModelID
+	}
 	return out
 }
 
@@ -234,6 +250,12 @@ func (p Preferences) Normalize() Preferences {
 	if p.FontSize == 0 {
 		p.FontSize = defaults.FontSize
 	}
+	p.DefaultTopicMode = strings.ToLower(strings.TrimSpace(p.DefaultTopicMode))
+	if p.DefaultTopicMode == "" {
+		p.DefaultTopicMode = defaults.DefaultTopicMode
+	}
+	p.LastProviderID = strings.TrimSpace(p.LastProviderID)
+	p.LastModelID = strings.TrimSpace(p.LastModelID)
 	return p
 }
 
@@ -281,6 +303,9 @@ func (p Preferences) Validate() error {
 	}
 	if p.FontSize < MinFontSize || p.FontSize > MaxFontSize {
 		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("fontSize must be between %d and %d", MinFontSize, MaxFontSize), nil)
+	}
+	if p.DefaultTopicMode != ConversationModeChat && p.DefaultTopicMode != ConversationModeAgent {
+		return NewError(ErrCodeInvalidArgument, fmt.Sprintf("unsupported defaultTopicMode %q", p.DefaultTopicMode), nil)
 	}
 	return ValidateAvatarDataURL(p.UserAvatarDataURL)
 }

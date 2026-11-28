@@ -87,7 +87,10 @@ export type IconName =
   | 'stickyNote'
   | 'userSummary'
   | 'botExpand'
-  | 'sideLink';
+  | 'sideLink'
+  | 'nodeSideLink'
+  | 'userPlus'
+  | 'botPlus';
 
 const ICON_BODIES: Record<IconName, ReactNode> = {
   mindMap: <><rect x="9" y="3" width="6" height="5" rx="1" /><rect x="3" y="16" width="6" height="5" rx="1" /><rect x="15" y="16" width="6" height="5" rx="1" /><path d="M12 8v4m-6 4v-4h12v4" /></>,
@@ -589,6 +592,32 @@ const ICON_BODIES: Record<IconName, ReactNode> = {
       <path d="M6 8.5v9.5" />
       <path d="M18 15.5v-1a4.5 4.5 0 0 0-4.5-4.5H6" />
       <path d="m10 7.5-4 2.5 4 2.5" />
+    </>
+  ),
+  nodeSideLink: (
+    <>
+      <circle cx="7" cy="17" r="2.5" />
+      <circle cx="7" cy="7" r="2.5" />
+      <path d="M9.5 17h4.5a4 4 0 0 0 4-4V9" />
+      <path d="m15 11 3-3 3 3" />
+    </>
+  ),
+  userPlus: (
+    <>
+      <circle cx="10" cy="8" r="4" />
+      <path d="M3 20a7 7 0 0 1 12.4-4.6" />
+      <path d="M18 14v6" />
+      <path d="M15 17h6" />
+    </>
+  ),
+  botPlus: (
+    <>
+      <rect x="3" y="8" width="13" height="10" rx="2" />
+      <path d="M9.5 8V5H7" />
+      <path d="M7.5 12.5v1.5" />
+      <path d="M11.5 12.5v1.5" />
+      <path d="M18 14v6" />
+      <path d="M15 17h6" />
     </>
   ),
   alarmClock: (

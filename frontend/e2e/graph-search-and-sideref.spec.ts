@@ -221,4 +221,58 @@ test.describe('topic content search, graph notes, persistence, and side referenc
     const searchRes = await fetch(appUrl + '/api/v1/conversations/search?q=Main', { headers: auth });
     expect(searchRes.ok).toBeTruthy();
   });
+
+  test('attaches only the selected node as a node-scoped side reference', async ({ appUrl, upstream, page }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await seedMockProviderViaApi(appUrl, upstream.url);
+    await connectWithToken(page, appUrl);
+    await page.getByRole('button', { name: '选择模型' }).click();
+    await page.getByRole('option', { name: /Mock Chat/ }).click();
+
+    const input = page.getByRole('textbox', { name: '消息输入框' });
+    const openGraph = page.getByRole('button', { name: '对话缩略图' });
+    const stage = page.getByRole('region', { name: '对话图谱' });
+    const send = async (text: string) => {
+      await input.fill(text);
+      await page.getByRole('button', { name: '发送消息' }).click();
+      await expect(page.getByText(new RegExp('Reply #\\d+ to: ' + text))).toBeVisible();
+      await expect(openGraph).toBeEnabled();
+    };
+
+    await send('Node scope trunk');
+    await openGraph.click();
+    await stage.getByRole('button', { name: '新建空白分支' }).click();
+    await stage.locator('[data-kind="branch"] .cg-node__body').dblclick();
+    await send('Node scope side question');
+
+    await openGraph.click();
+    const sideAsst = stage.locator('[data-kind="assistant"]', { hasText: 'Node scope side question' });
+    const mainAsst = stage.locator('[data-kind="assistant"]', { hasText: 'Node scope trunk' });
+    // The dedicated node-side port must not overlap the bottom-center out port.
+    const outBox = (await mainAsst.locator('[data-port="out"]').boundingBox())!;
+    const nodeOutBox = (await mainAsst.locator('[data-port="node-side-out"]').boundingBox())!;
+    expect(outBox.x + outBox.width <= nodeOutBox.x || nodeOutBox.x + nodeOutBox.width <= outBox.x).toBe(true);
+    await sideAsst.click({ button: 'right' });
+    await page.getByRole('menuitem', { name: '仅此节点侧边接入至…', exact: true }).click();
+    await mainAsst.locator('.cg-node__body').click();
+    await expect(stage.locator('[data-sideref-edge][data-sideref-scope="node"]')).toHaveCount(1);
+
+    await mainAsst.hover();
+    await mainAsst.getByRole('button', { name: '跳转至此消息' }).click();
+    await expect(page.getByRole('button', { name: '参考节点' })).toBeVisible();
+
+    await send('Node scope follow-up');
+    const msgsSent = upstream.lastChatBodies.at(-1)?.messages as Array<{ role: string; content: string }>;
+    const refMsg = msgsSent.find(
+      (m) => m.role === 'user' && typeof m.content === 'string' && m.content.includes('<reference_materials>'),
+    );
+    expect(refMsg).toBeDefined();
+    expect(refMsg!.content).toBe(
+      '<reference_materials>\nReply #2 to: Node scope side question\n</reference_materials>',
+    );
+
+    await page.getByRole('button', { name: '参考节点' }).click();
+    await expect(page.getByText('单节点')).toBeVisible();
+    await expect(page.getByText('助手消息')).toBeVisible();
+  });
 });

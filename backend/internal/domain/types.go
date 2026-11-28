@@ -274,9 +274,15 @@ type Usage struct {
 }
 
 // MessageSideRef represents a side-branch reference attached to a message node.
+const (
+	SideRefScopeBranch = "branch"
+	SideRefScopeNode   = "node"
+)
+
 type MessageSideRef struct {
 	SourceMessageID string `json:"sourceMessageId"`
-	Side            string `json:"side,omitempty"` // "left" or "right"
+	Side            string `json:"side,omitempty"`  // "left" or "right"
+	Scope           string `json:"scope,omitempty"` // "branch" (default) or "node"
 }
 
 // MessageGraphMeta stores display preferences and side references for a conversation node.
@@ -523,6 +529,7 @@ type StreamEvent struct {
 	StopReason     string        `json:"stopReason,omitempty"`
 	Message        *Message      `json:"message,omitempty"`
 	Error          *StreamError  `json:"error,omitempty"`
+	RolledBack     bool          `json:"rolledBack,omitempty"`
 }
 
 // IntPtr returns a pointer to v for optional integer fields such as StreamEvent.Index.

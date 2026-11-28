@@ -1,4 +1,4 @@
-import { connectWithToken, expect, test } from './fixtures';
+import { connectWithToken, expect, seedMockProviderViaApi, test } from './fixtures';
 
 async function openAppearance(page: import('@playwright/test').Page) {
   if (!page.url().includes('/settings/')) {
@@ -65,4 +65,34 @@ test('keeps the font size slider, value, step buttons and reset on stable tracks
     await expect(page.locator('.st-font-size-value')).toHaveText('14 px');
     await expect(reset).toBeDisabled();
   }
+});
+
+test('persists the default new-topic mode and remembers the last selected model', async ({ appUrl, upstream, page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await seedMockProviderViaApi(appUrl, upstream.url);
+  await connectWithToken(page, appUrl);
+  await page.getByRole('button', { name: '选择模型' }).click();
+  await page.getByRole('option', { name: /Mock Chat/ }).click();
+  await expect(page.getByRole('button', { name: '选择模型' })).toContainText('Mock Chat');
+
+  await page.getByRole('button', { name: '新建话题' }).click();
+  await expect(page.getByRole('button', { name: '选择模型' })).toContainText('Mock Chat');
+
+  await page.getByRole('link', { name: '设置' }).click();
+  await page.getByRole('button', { name: 'Agent', exact: true }).click();
+  const modeGroup = page.getByRole('radiogroup', { name: '默认新建话题' });
+  await modeGroup.getByRole('radio', { name: 'Agent' }).click();
+  await expect(modeGroup.getByRole('radio', { name: 'Agent' })).toHaveAttribute('aria-checked', 'true');
+
+  await page.getByRole('button', { name: '返回工作台' }).click();
+  await page.getByRole('button', { name: '新建话题' }).click();
+  await expect(
+    page.getByRole('radiogroup', { name: '话题模式' }).getByRole('radio', { name: 'Agent' }),
+  ).toHaveAttribute('aria-checked', 'true');
+
+  await page.reload();
+  await expect(
+    page.getByRole('radiogroup', { name: '话题模式' }).getByRole('radio', { name: 'Agent' }),
+  ).toHaveAttribute('aria-checked', 'true');
+  await expect(page.getByRole('button', { name: '选择模型' })).toContainText('Mock Chat');
 });

@@ -680,17 +680,40 @@ describe('ContentRenderer and HTML sandbox', () => {
     expect(container.querySelector('del')?.textContent).toBe('删除线');
     expect(container.textContent).toContain('const nested = 1;');
 
-    // User messages stay plain text without Markdown or math rendering.
-    render(
+    // User messages render Markdown and math while preserving soft line breaks.
+    const userView = render(
       <AppProvider skipInitialBootstrap>
         <ContentRenderer
-          messageId="u-plain"
+          messageId="u-md"
           isUser
-          blocks={[{ type: 'text', text: '**bold** $x^2$ \\(y\\)' }]}
+          blocks={[{ type: 'text', text: '**bold** $x^2$ \\(y\\)\nsecond line' }]}
         />
       </AppProvider>,
     );
-    expect(screen.getByText('**bold** $x^2$ \\(y\\)')).toBeInTheDocument();
+    expect(userView.container.querySelector('strong')?.textContent).toBe('bold');
+    expect(userView.container.querySelector('.katex')).not.toBeNull();
+    expect(userView.container.querySelector('br')).not.toBeNull();
+    expect(userView.container.textContent).toContain('second line');
+  });
+
+  it('renders user fenced code without mounting an HTML preview iframe', () => {
+    const longCode = Array.from({ length: 40 }, (_, i) => `const u${i} = ${i};`).join('\n');
+    const { container } = render(
+      <AppProvider skipInitialBootstrap>
+        <CollapseStateProvider>
+          <ContentRenderer
+            messageId="u-code"
+            isUser
+            blocks={[{
+              type: 'text',
+              text: `\`\`\`html\n<div>hi</div>\n${longCode}\n\`\`\`\n\n<script>alert(1)</script>`,
+            }]}
+          />
+        </CollapseStateProvider>
+      </AppProvider>,
+    );
+    expect(container.querySelector('iframe')).toBeNull();
+    expect(container.querySelector('.block-card')).not.toBeNull();
   });
 
   it('renders four LaTeX delimiters via KaTeX, respects mathRenderEnabled toggle, protects code/URL/HTML/currency, and falls back on invalid/unclosed math', () => {

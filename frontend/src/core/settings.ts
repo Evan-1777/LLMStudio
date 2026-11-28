@@ -1,5 +1,5 @@
 import { isDesktopApp } from './desktop';
-import { isReasoningEffort, type ChatWidthMode, type FontFamily, type ReasoningEffort, type ServerPreferencesImport } from './types';
+import { isReasoningEffort, type ChatWidthMode, type ConversationMode, type FontFamily, type ReasoningEffort, type ServerPreferencesImport } from './types';
 
 // Legacy single-blob key: pre-migration browser state, removed once the gateway
 // confirms the import (or already holds server-owned preferences).
@@ -174,6 +174,9 @@ export interface AppSettings {
   mathRenderEnabled: boolean;
   graphMarkdownRender: boolean;
   graphVisualHtmlRender: boolean;
+  defaultTopicMode: ConversationMode;
+  lastProviderId: string;
+  lastModelId: string;
 }
 
 export interface SettingsLoadResult {
@@ -214,6 +217,9 @@ export const APP_PREFERENCE_KEYS = [
   'mathRenderEnabled',
   'graphMarkdownRender',
   'graphVisualHtmlRender',
+  'defaultTopicMode',
+  'lastProviderId',
+  'lastModelId',
 ] as const satisfies readonly (keyof AppSettings)[];
 
 export type AppPreferenceKey = (typeof APP_PREFERENCE_KEYS)[number];
@@ -245,6 +251,9 @@ export function pickAppPreferences(settings: AppSettings): AppPreferences {
     mathRenderEnabled: settings.mathRenderEnabled,
     graphMarkdownRender: settings.graphMarkdownRender,
     graphVisualHtmlRender: settings.graphVisualHtmlRender,
+    defaultTopicMode: settings.defaultTopicMode,
+    lastProviderId: settings.lastProviderId,
+    lastModelId: settings.lastModelId,
   };
 }
 
@@ -280,6 +289,9 @@ export function defaultSettings(): AppSettings {
     mathRenderEnabled: true,
     graphMarkdownRender: true,
     graphVisualHtmlRender: true,
+    defaultTopicMode: 'chat',
+    lastProviderId: '',
+    lastModelId: '',
   };
 }
 
@@ -408,6 +420,18 @@ export function normalizeSettings(raw: unknown): AppSettings {
       typeof obj.graphVisualHtmlRender === 'boolean'
         ? obj.graphVisualHtmlRender
         : defaults.graphVisualHtmlRender,
+    defaultTopicMode:
+      obj.defaultTopicMode === 'agent' || obj.defaultTopicMode === 'chat'
+        ? obj.defaultTopicMode
+        : defaults.defaultTopicMode,
+    lastProviderId:
+      typeof obj.lastProviderId === 'string'
+        ? obj.lastProviderId.trim()
+        : defaults.lastProviderId,
+    lastModelId:
+      typeof obj.lastModelId === 'string'
+        ? obj.lastModelId.trim()
+        : defaults.lastModelId,
   };
 }
 
@@ -607,6 +631,9 @@ export function readLegacyPreferences(
         mathRenderEnabled: _mr,
         graphMarkdownRender: _gm,
         graphVisualHtmlRender: _gv,
+        defaultTopicMode: _dt,
+        lastProviderId: _lp,
+        lastModelId: _lm,
         ...legacy
       } = pickAppPreferences(normalizeSettings(JSON.parse(raw)));
       return legacy;
@@ -624,6 +651,9 @@ export function readLegacyPreferences(
         mathRenderEnabled: _mr,
         graphMarkdownRender: _gm,
         graphVisualHtmlRender: _gv,
+        defaultTopicMode: _dt,
+        lastProviderId: _lp,
+        lastModelId: _lm,
         ...legacy
       } = pickAppPreferences(
         normalizeSettings(parseLegacyDoubleEncoded(flutterRaw)),

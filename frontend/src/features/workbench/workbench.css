@@ -754,6 +754,47 @@
   max-width: 82%;
 }
 
+.wb-user-bubble .prose {
+  font-size: inherit;
+  line-height: inherit;
+  color: inherit;
+}
+
+.wb-user-bubble .prose p {
+  margin: 0 0 6px;
+}
+
+.wb-user-bubble .prose > :first-child {
+  margin-top: 0;
+}
+
+.wb-user-bubble .prose > :last-child,
+.wb-user-bubble .prose p:last-child {
+  margin-bottom: 0;
+}
+
+.wb-user-bubble .prose .block-card,
+.wb-user-bubble .prose .prose-table-wrap {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  box-shadow: var(--shadow-xs);
+}
+
+.wb-user-bubble .prose .block-card + .block-card,
+.wb-user-bubble .prose .prose-table-wrap + .prose-table-wrap {
+  margin-top: 8px;
+}
+
+.wb-user-bubble:has(.block-card, .prose-table-wrap) {
+  width: min(100%, 620px);
+  max-width: 100%;
+}
+
+.wb-chat-stage[data-width-mode='manual'] .wb-user-bubble:has(.block-card, .prose-table-wrap) {
+  width: 82%;
+  max-width: 82%;
+}
+
 .wb-asst-msg {
   display: flex;
   flex-direction: column;

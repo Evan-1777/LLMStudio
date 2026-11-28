@@ -36,6 +36,7 @@ export interface StreamingDraft {
   blocksByIndex: Record<number, StreamingBlockBuffer>;
   usage?: TokenUsage;
   stopReason?: string;
+  pendingUserId?: string;
 }
 
 export interface ChatState {
@@ -482,6 +483,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         }
       }
 
+      const pendingUser = run.pendingUserMessage;
+      if (pendingUser && !nextMessages.some((message) => message.id === pendingUser.id)) {
+        nextMessages = [...nextMessages, pendingUser];
+      }
+
       return {
         ...state,
         messages: nextMessages,
@@ -499,6 +505,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           graphTarget,
           blockOrder: [],
           blocksByIndex: {},
+          pendingUserId: pendingUser?.id,
         },
       };
     }
@@ -664,6 +671,24 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       }
 
       if (ev.type === 'message_end') {
+        if (ev.rolledBack) {
+          const pendingId = state.streaming?.pendingUserId;
+          const nextMessages = pendingId
+            ? state.messages.filter((message) => message.id !== pendingId)
+            : state.messages;
+          const rest = deriveRestState(resolveActiveBranchMessages(state.conversation, nextMessages));
+          return {
+            ...state,
+            messages: nextMessages,
+            pendingInsertIndex: null,
+            pendingRollback: null,
+            streaming: null,
+            runState: rest.runState,
+            errorCode: rest.errorCode,
+            errorMessage: rest.errorMessage,
+            needsReloadAfterAbort: false,
+          };
+        }
         const finalMsg =
           ev.message ??
           (state.streaming
@@ -700,12 +725,37 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       if (ev.type === 'error') {
         const errMsg = ev.error?.message || '流式生成失败';
         const errCode = ev.error?.code || 'UPSTREAM_ERROR';
-        const finalized = state.streaming
-          ? materializeStreamingMessage(convId, state.streaming, {
-              stopReason: 'error',
-              errorMessage: errMsg,
-            })
-          : null;
+        if (ev.rolledBack) {
+          const pendingId = state.streaming?.pendingUserId;
+          const nextMessages = pendingId
+            ? state.messages.filter((message) => message.id !== pendingId)
+            : state.messages;
+          return {
+            ...state,
+            messages: nextMessages,
+            pendingInsertIndex: null,
+            pendingRollback: null,
+            streaming: null,
+            runState: 'error',
+            errorCode: errCode,
+            errorMessage: errMsg,
+          };
+        }
+        const finalized =
+          ev.message ??
+          (state.streaming
+            ? materializeStreamingMessage(convId, state.streaming, {
+                stopReason: 'error',
+                errorMessage: errMsg,
+              })
+            : null);
+        let nextKeys = state.uiKeyByMsgId;
+        if (state.streaming && finalized && finalized.id !== state.streaming.messageId) {
+          const uiKey =
+            state.uiKeyByMsgId[state.streaming.messageId] ??
+            state.streaming.messageId;
+          nextKeys = { ...state.uiKeyByMsgId, [finalized.id]: uiKey };
+        }
         return {
           ...state,
           ...applyStreamMessage(state, finalized),
@@ -714,6 +764,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
           runState: 'error',
           errorCode: errCode,
           errorMessage: errMsg,
+          uiKeyByMsgId: nextKeys,
         };
       }
 

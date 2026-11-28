@@ -144,6 +144,9 @@ export function usePreferencesManager({
         fontSize: _fs,
         builtinTimeToolEnabled: _bt,
         mathRenderEnabled: _mr,
+        defaultTopicMode: _dt,
+        lastProviderId: _lp,
+        lastModelId: _lm,
         ...fallback
       } = pickAppPreferences(settingsRef.current);
       const seed = legacy ?? fallback;
@@ -177,6 +180,7 @@ export function usePreferencesManager({
   const updatePreferences = useCallback(
     async (
       patch: Partial<AppPreferences>,
+      opts?: { silent?: boolean },
     ): Promise<{ ok: boolean; error?: string }> => {
       const epoch = epochRef.current;
       const confirmedBefore = serverPreferencesRef.current;
@@ -212,7 +216,9 @@ export function usePreferencesManager({
         ) as Partial<AppPreferences>;
         applyPreferenceFields(rollback);
         const message = errorMessageOf(err);
-        setSettingsNotice(`设置保存失败：${message}`);
+        if (!opts?.silent) {
+          setSettingsNotice(`设置保存失败：${message}`);
+        }
         return { ok: false, error: message };
       }
     },

@@ -364,12 +364,6 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 		t.Fatalf("cloud cancel Prepare: %v", err)
 	}
 
-	// Verify user message is already persisted on cloud BEFORE Stream() consumes any event.
-	midMsgs, err := cloudMsgStore.ListByConversation(ctx, cloudConv.ID)
-	if err != nil || len(midMsgs) != 3 || midMsgs[2].Role != domain.RoleUser || midMsgs[2].Blocks[0].Type != domain.BlockTypeImage {
-		t.Fatalf("expected user image message persisted on cloud before stream consumption, got %+v err=%v", midMsgs, err)
-	}
-
 	var cancelOnce sync.Once
 	_ = cloudCancelPrep.Stream(cancelCtx, func(ev domain.StreamEvent) error {
 		if strings.Contains(ev.Delta, "Part 1") {
@@ -381,6 +375,9 @@ func TestLocalTopicWithCloudAssistantImageDirectAndCloudCancelContract(t *testin
 	afterMsgs, err := cloudMsgStore.ListByConversation(ctx, cloudConv.ID)
 	if err != nil || len(afterMsgs) != 4 {
 		t.Fatalf("expected 4 cloud messages after cancel (2 prior + user + aborted assistant), got %d err=%v", len(afterMsgs), err)
+	}
+	if afterMsgs[2].Role != domain.RoleUser || afterMsgs[2].Blocks[0].Type != domain.BlockTypeImage {
+		t.Fatalf("expected image user message persisted at first assistant content, got %+v", afterMsgs[2])
 	}
 	last := afterMsgs[3]
 	if last.Role != domain.RoleAssistant || last.StopReason != domain.StopReasonAborted || len(last.Blocks) == 0 || !strings.Contains(last.Blocks[0].Text, "Part 1") {

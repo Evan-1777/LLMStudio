@@ -372,3 +372,58 @@ test('expands nodes inline as mind-map cards and respects Markdown and visual HT
   await expect(assistantNode.locator('.cg-node__plain')).toBeVisible();
   await expect(assistantNode.locator('.cg-node__detail iframe')).toHaveCount(0);
 });
+
+test('creates and edits graph message nodes and links the created parent chain', async ({ appUrl, upstream, page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await seedMockProviderViaApi(appUrl, upstream.url);
+  await connectWithToken(page, appUrl);
+  await page.getByRole('button', { name: '选择模型' }).click();
+  await page.getByRole('option', { name: /Mock Chat/ }).click();
+
+  const input = page.getByRole('textbox', { name: '消息输入框' });
+  const openGraph = page.getByRole('button', { name: '对话缩略图' });
+  const stage = page.getByRole('region', { name: '对话图谱' });
+  await input.fill('Graph create root');
+  await page.getByRole('button', { name: '发送消息' }).click();
+  await expect(page.getByText(/Reply #1 to: Graph create root/)).toBeVisible();
+  await expect(openGraph).toBeEnabled();
+
+  await openGraph.click();
+  await stage.getByRole('button', { name: '新建用户消息' }).click();
+  let dialog = page.getByRole('dialog');
+  await dialog.getByLabel('消息内容').fill('Created user node');
+  await dialog.getByRole('button', { name: '创建' }).click();
+  const createdUser = stage.locator('[data-kind="user"]', { hasText: 'Created user node' });
+  await expect(createdUser).toBeVisible();
+
+  await createdUser.click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '在此后新建助手消息', exact: true }).click();
+  dialog = page.getByRole('dialog');
+  await dialog.getByLabel('消息内容').fill('Created assistant node');
+  await dialog.getByRole('button', { name: '创建' }).click();
+  await expect(stage.locator('[data-kind="assistant"]', { hasText: 'Created assistant node' })).toBeVisible();
+
+  const topicId = new URL(page.url()).pathname.split('/').at(-1)!;
+  const detail = async () => {
+    const response = await fetch(appUrl + '/api/v1/conversations/' + topicId, { headers: auth });
+    expect(response.ok).toBeTruthy();
+    return await response.json() as {
+      messages: { id: string; parentId?: string; role: string; blocks: { type: string; text?: string }[] }[];
+    };
+  };
+  let payload = await detail();
+  const createdUserMsg = payload.messages.find((m) => m.blocks.some((b) => b.text === 'Created user node'));
+  const createdAssistantMsg = payload.messages.find((m) => m.blocks.some((b) => b.text === 'Created assistant node'));
+  expect(createdUserMsg).toBeDefined();
+  expect(createdAssistantMsg?.parentId).toBe(createdUserMsg!.id);
+
+  await createdUser.click({ button: 'right' });
+  await page.getByRole('menuitem', { name: '编辑消息内容', exact: true }).click();
+  dialog = page.getByRole('dialog');
+  await dialog.getByLabel('编辑消息内容').fill('Edited user node');
+  await dialog.getByRole('button', { name: '保存' }).click();
+  await expect(stage.locator('[data-kind="user"]', { hasText: 'Edited user node' })).toBeVisible();
+
+  payload = await detail();
+  expect(payload.messages.some((m) => m.blocks.some((b) => b.text === 'Edited user node'))).toBe(true);
+});

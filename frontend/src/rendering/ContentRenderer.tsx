@@ -140,11 +140,13 @@ const MarkdownProse = memo(function MarkdownProse({
   isStreaming = false,
   collapsePrefix = 'prose',
   defaultHtmlPreview,
+  preserveLineBreaks = false,
 }: {
   markdown: string;
   isStreaming?: boolean;
   collapsePrefix?: string;
   defaultHtmlPreview?: boolean;
+  preserveLineBreaks?: boolean;
 }) {
   const { settings } = useApp();
   const normalized = useMemo(
@@ -159,9 +161,10 @@ const MarkdownProse = memo(function MarkdownProse({
         isStreaming,
         collapsePrefix,
         mathRenderEnabled: settings.mathRenderEnabled,
+        preserveLineBreaks,
       }),
     ],
-    [collapsePrefix, isStreaming, normalized, settings.mathRenderEnabled],
+    [collapsePrefix, isStreaming, normalized, preserveLineBreaks, settings.mathRenderEnabled],
   );
 
   return (
@@ -684,9 +687,14 @@ export const ContentRenderer = memo(function ContentRenderer({
 
       if (isUser) {
         nodes.push(
-          <div key={baseKey} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-            {text}
-          </div>,
+          <MarkdownProse
+            key={baseKey}
+            markdown={text}
+            isStreaming={false}
+            collapsePrefix={baseKey}
+            defaultHtmlPreview={false}
+            preserveLineBreaks
+          />,
         );
         return;
       }

@@ -3,7 +3,7 @@ import { useApp } from '../../app/AppProvider';
 import { ErrorBanner, LoadingSpinner, SegmentedControl, Switch } from '../../components/ui';
 import type { GatewayClient } from '../../core/gateway';
 import { getAgentModeVisible, setAgentModeVisible } from '../../core/settings';
-import type { AgentSettings, AgentSettingsPatch, TopicScope } from '../../core/types';
+import type { AgentSettings, AgentSettingsPatch, ConversationMode, TopicScope } from '../../core/types';
 import { AgentDirectoryControl } from '../agent/AgentDirectoryControl';
 
 const TOOL_LABELS = {
@@ -13,10 +13,24 @@ const TOOL_LABELS = {
 } as const;
 
 export function AgentPage() {
-  const { gateway, isDesktop, connectionEpoch, cloudConnectionState } = useApp();
+  const { gateway, isDesktop, connectionEpoch, cloudConnectionState, settings, updatePreferences, toast } = useApp();
   const [scope, setScope] = useState<TopicScope>('local');
   const [visible, setVisible] = useState(getAgentModeVisible);
+  const [savingDefaultMode, setSavingDefaultMode] = useState(false);
   const selectedScope = isDesktop ? scope : undefined;
+
+  const changeDefaultTopicMode = async (next: ConversationMode) => {
+    if (savingDefaultMode || settings.defaultTopicMode === next) return;
+    setSavingDefaultMode(true);
+    try {
+      const result = await updatePreferences({ defaultTopicMode: next });
+      if (!result.ok) {
+        toast('默认话题模式保存失败：' + (result.error ?? ''), 'error');
+      }
+    } finally {
+      setSavingDefaultMode(false);
+    }
+  };
   return (
     <div className="st-scroll">
       <div className="st-container">
@@ -27,6 +41,16 @@ export function AgentPage() {
             <div className="st-row--inline">
               <span className="st-row__label--plain">显示模式切换</span>
               <Switch label="显示模式切换" checked={visible} onCheckedChange={(next) => { setAgentModeVisible(next); setVisible(next); }} />
+            </div>
+            <div className="st-row--inline">
+              <span className="st-row__label--plain">默认新建话题</span>
+              <SegmentedControl<ConversationMode>
+                value={settings.defaultTopicMode}
+                ariaLabel="默认新建话题"
+                disabled={savingDefaultMode}
+                options={[{ value: 'chat', label: '对话' }, { value: 'agent', label: 'Agent' }]}
+                onChange={(next) => void changeDefaultTopicMode(next)}
+              />
             </div>
             {isDesktop && <div className="st-row--inline">
               <span className="st-row__label--plain">执行端</span>

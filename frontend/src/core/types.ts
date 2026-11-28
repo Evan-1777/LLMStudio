@@ -272,9 +272,12 @@ export interface TokenUsage {
 
 export type StopReason = 'stop' | 'length' | 'toolUse' | 'aborted' | 'error' | '';
 
+export type MessageSideRefScope = 'branch' | 'node';
+
 export interface MessageSideRef {
   sourceMessageId: string;
   side?: 'left' | 'right';
+  scope?: MessageSideRefScope;
 }
 
 export interface MessageGraphMeta {
@@ -349,7 +352,8 @@ export type GraphMutationInput =
   | { op: 'updateNote'; noteId: string; text: string }
   | { op: 'createNoteEdge'; sourceId: string; sourcePort: GraphNotePort; targetId: string; targetPort: GraphNotePort }
   | { op: 'deleteNoteEdge'; edgeId: string }
-  | { op: 'addSideRef'; messageId: string; sourceMessageId: string; side?: 'left' | 'right' }
+  | { op: 'addSideRef'; messageId: string; sourceMessageId: string; side?: 'left' | 'right'; scope?: MessageSideRefScope }
+  | { op: 'createMessage'; role: 'user' | 'assistant'; text: string; parentMessageId?: string; x?: number; y?: number; activate?: boolean }
   | { op: 'removeSideRef'; messageId: string; sourceMessageId?: string };
 
 export interface Message {
@@ -637,6 +641,7 @@ export interface ActiveRunInfo {
   modelId: string;
   replaceMessageId?: string;
   insertAfterMessageId?: string;
+  pendingUserMessage?: Message;
 }
 
 export interface ConversationDetail {
@@ -779,6 +784,7 @@ export interface StreamEvent {
   stopReason?: string;
   message?: Message;
   error?: StreamError;
+  rolledBack?: boolean;
 }
 
 export interface PromptCacheState {
@@ -965,6 +971,9 @@ export interface ServerPreferences {
   fontSize: number;
   builtinTimeToolEnabled: boolean;
   mathRenderEnabled: boolean;
+  defaultTopicMode: ConversationMode;
+  lastProviderId: string;
+  lastModelId: string;
 }
 
 export interface ServerPreferencesEnvelope {
@@ -983,6 +992,9 @@ export type ServerPreferencesImport = Omit<
   | 'fontSize'
   | 'builtinTimeToolEnabled'
   | 'mathRenderEnabled'
+  | 'defaultTopicMode'
+  | 'lastProviderId'
+  | 'lastModelId'
 >;
 
 export interface StorageUsage {

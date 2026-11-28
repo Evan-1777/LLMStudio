@@ -50,6 +50,22 @@ func (p *PreparedStream) runStream(
 
 	persistAndMaybeNotifyAbort := func() {
 		blocks, usage := snapshotState()
+		if !p.isRegen && p.pendingUser != nil {
+			// Nothing substantive reached the client: keep the database untouched
+			// and let the frontend restore the draft.
+			if emitAbortedEnd {
+				_ = applyAndEmit(p.newStreamEvent(domain.StreamEventMessageEnd, assistantID, func(ev *domain.StreamEvent) {
+					ev.RolledBack = true
+				}))
+			}
+			return
+		}
+		if err := p.ensureUserPersisted(ctx); err != nil {
+			_ = applyAndEmit(p.newStreamEvent(domain.StreamEventError, assistantID, func(ev *domain.StreamEvent) {
+				ev.Error = &domain.StreamError{Code: domain.ErrCodeUpstreamError, Message: err.Error()}
+			}))
+			return
+		}
 		saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonAborted, "")
 		if emitAbortedEnd && persistErr == nil {
 			_ = applyAndEmit(p.newStreamEvent(domain.StreamEventMessageEnd, assistantID, func(ev *domain.StreamEvent) {
@@ -58,9 +74,13 @@ func (p *PreparedStream) runStream(
 		}
 	}
 
-	emitStreamError := func(code, msg string) {
+	emitStreamError := func(code, msg string, saved *domain.Message, rolledBack bool) {
 		_ = applyAndEmit(p.newStreamEvent(domain.StreamEventError, assistantID, func(ev *domain.StreamEvent) {
 			ev.Error = &domain.StreamError{Code: code, Message: msg}
+			ev.RolledBack = rolledBack
+			if saved != nil && saved.ID != "" {
+				ev.Message = saved
+			}
 		}))
 	}
 
@@ -95,15 +115,29 @@ func (p *PreparedStream) runStream(
 			return nil
 		}
 		if decodeErr != nil || roundOut.streamErrMsg != "" {
+			code := roundOut.streamErrCode
+			if code == "" {
+				code = domain.ErrCodeUpstreamError
+			}
 			errMsg := roundOut.streamErrMsg
 			if errMsg == "" && decodeErr != nil {
 				errMsg = decodeErr.Error()
 			}
 			blocks, usage := snapshotState()
-			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
-			if roundOut.streamErrMsg == "" {
-				emitStreamError(domain.ErrCodeUpstreamError, errMsg)
+			if !p.isRegen && p.pendingUser != nil && !hasSubstantiveAssistantContent(blocks) {
+				emitStreamError(code, errMsg, nil, true)
+				return nil
 			}
+			if err := p.ensureUserPersisted(ctx); err != nil {
+				emitStreamError(code, errMsg, nil, false)
+				return nil
+			}
+			saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
+			var savedPtr *domain.Message
+			if persistErr == nil {
+				savedPtr = &saved
+			}
+			emitStreamError(code, errMsg, savedPtr, false)
 			return nil
 		}
 
@@ -132,8 +166,16 @@ func (p *PreparedStream) runStream(
 		if round >= maxRounds {
 			limitMsg := fmt.Sprintf("达到最大工具调用轮数上限（%d 轮）", maxRounds)
 			blocks, usage := snapshotState()
-			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, limitMsg)
-			emitStreamError("MCP_ROUND_LIMIT", limitMsg)
+			if err := p.ensureUserPersisted(ctx); err == nil {
+				saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, limitMsg)
+				var savedPtr *domain.Message
+				if persistErr == nil {
+					savedPtr = &saved
+				}
+				emitStreamError("MCP_ROUND_LIMIT", limitMsg, savedPtr, false)
+				return nil
+			}
+			emitStreamError("MCP_ROUND_LIMIT", limitMsg, nil, false)
 			return nil
 		}
 
@@ -152,17 +194,29 @@ func (p *PreparedStream) runStream(
 			}
 			errMsg := contErr.Error()
 			blocks, usage := snapshotState()
-			_, _ = p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
-			emitStreamError(domain.ErrCodeUpstreamError, errMsg)
+			if err := p.ensureUserPersisted(ctx); err == nil {
+				saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, domain.StopReasonError, errMsg)
+				var savedPtr *domain.Message
+				if persistErr == nil {
+					savedPtr = &saved
+				}
+				emitStreamError(domain.ErrCodeUpstreamError, errMsg, savedPtr, false)
+				return nil
+			}
+			emitStreamError(domain.ErrCodeUpstreamError, errMsg, nil, false)
 			return nil
 		}
 		resp = nextResp
 	}
 
 	blocks, usage := snapshotState()
+	if err := p.ensureUserPersisted(ctx); err != nil {
+		emitStreamError(domain.ErrCodeUpstreamError, err.Error(), nil, false)
+		return nil
+	}
 	saved, persistErr := p.persistResult(ctx, assistantID, blocks, usage, finalStopReason, "")
 	if persistErr != nil {
-		emitStreamError("PERSIST_FAILED", fmt.Sprintf("保存消息失败: %v", persistErr))
+		emitStreamError("PERSIST_FAILED", fmt.Sprintf("保存消息失败: %v", persistErr), nil, false)
 		return nil
 	}
 	return applyAndEmit(p.newStreamEvent(domain.StreamEventMessageEnd, assistantID, func(ev *domain.StreamEvent) {
@@ -209,11 +263,104 @@ func (p *PreparedStream) emitWebSearchBlock(assistantID string, applyAndEmit fun
 }
 
 type streamRoundOutcome struct {
-	streamErrMsg string
-	usage        *domain.Usage
-	stopReason   string
-	calls        []domain.ContentBlock
-	maxSeenIdx   int
+	streamErrCode string
+	streamErrMsg  string
+	usage         *domain.Usage
+	stopReason    string
+	calls         []domain.ContentBlock
+	maxSeenIdx    int
+}
+
+func hasSubstantiveAssistantContent(blocks []domain.ContentBlock) bool {
+	for _, b := range blocks {
+		switch b.Type {
+		case domain.BlockTypeText:
+			if b.Text != "" {
+				return true
+			}
+		case domain.BlockTypeThinking:
+			if b.Thinking != "" || b.Signature != "" {
+				return true
+			}
+		case domain.BlockTypeToolCall:
+			if strings.TrimSpace(b.Name) != "" {
+				return true
+			}
+		case domain.BlockTypeToolResult, domain.BlockTypeImage:
+			return true
+		}
+	}
+	return false
+}
+
+func isSubstantiveAssistantEvent(ev domain.StreamEvent) bool {
+	if ev.BlockType == domain.BlockTypeWebSearch {
+		return false
+	}
+	switch ev.Type {
+	case domain.StreamEventBlockStart, domain.StreamEventBlockDelta, domain.StreamEventBlockEnd:
+	default:
+		return false
+	}
+	blockType := ev.BlockType
+	if blockType == "" && ev.Block != nil {
+		blockType = ev.Block.Type
+	}
+	switch blockType {
+	case domain.BlockTypeText:
+		if ev.Delta != "" {
+			return true
+		}
+		return ev.Block != nil && ev.Block.Text != ""
+	case domain.BlockTypeThinking:
+		if ev.Delta != "" {
+			return true
+		}
+		return ev.Block != nil && (ev.Block.Thinking != "" || ev.Block.Signature != "")
+	case domain.BlockTypeToolCall:
+		return ev.Block != nil && strings.TrimSpace(ev.Block.Name) != ""
+	case domain.BlockTypeToolResult, domain.BlockTypeImage:
+		return true
+	default:
+		return false
+	}
+}
+
+// ensureUserPersisted flushes the pending user prompt right before the first
+// substantive assistant block is emitted, keeping timestamps ordered.
+func (p *PreparedStream) ensureUserPersisted(ctx context.Context) error {
+	if p.pendingUser == nil {
+		return nil
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	saved, err := p.service.msgs.Create(persistCtx, domain.Message{
+		GraphWrite:     p.pendingUser.graphWrite,
+		ConversationID: p.conversation.ID,
+		Role:           domain.RoleUser,
+		Blocks:         p.pendingUser.blocks,
+		CreatedAt:      p.pendingUser.createdAt,
+	})
+	if err != nil {
+		return err
+	}
+	if p.pendingUser.graphWrite != nil {
+		p.graphWrite = &domain.MessageGraphWrite{ParentID: &saved.ID}
+	}
+	if p.pendingUser.shouldAutoTitle {
+		if derived := deriveTitleFromBlocks(p.pendingUser.blocks); derived != "" {
+			conv := p.conversation
+			conv.Title = derived
+			if updated, updateErr := p.service.convs.Update(persistCtx, conv); updateErr == nil {
+				p.conversation = updated
+			}
+		}
+	}
+	p.pendingUser = nil
+	if p.detachedRun != nil {
+		p.detachedRun.clearPendingUser()
+	}
+	return nil
 }
 
 func allocateUniqueToolCallID(rawID string, round, idx int, seen map[string]struct{}) string {
@@ -294,8 +441,20 @@ func (p *PreparedStream) decodeStreamRound(
 			}
 		}
 
-		if ev.Type == domain.StreamEventError && ev.Error != nil {
-			out.streamErrMsg = ev.Error.Message
+		if p.pendingUser != nil && isSubstantiveAssistantEvent(ev) {
+			if persistErr := p.ensureUserPersisted(ctx); persistErr != nil {
+				return persistErr
+			}
+		}
+
+		if ev.Type == domain.StreamEventError {
+			if ev.Error != nil {
+				out.streamErrCode = ev.Error.Code
+				out.streamErrMsg = ev.Error.Message
+			}
+			// The terminal error is emitted once by runStream after persistence and
+			// rollback decisions, so the wire never carries two conflicting frames.
+			return nil
 		}
 		return applyAndEmit(ev)
 	})
@@ -537,6 +696,9 @@ func (a *streamAccumulator) blocksSlice() []domain.ContentBlock {
 	for _, idx := range a.order {
 		b := a.blocks[idx]
 		if b.finalized != nil {
+			if b.finalized.Type == domain.BlockTypeToolCall && strings.TrimSpace(b.finalized.Name) == "" {
+				continue
+			}
 			out = append(out, *b.finalized)
 			continue
 		}
@@ -548,6 +710,9 @@ func (a *streamAccumulator) blocksSlice() []domain.ContentBlock {
 				Signature: b.signature.String(),
 			})
 		case domain.BlockTypeToolCall:
+			if strings.TrimSpace(b.name) == "" {
+				continue
+			}
 			var args json.RawMessage
 			if raw := strings.TrimSpace(b.text.String()); raw != "" {
 				if json.Valid([]byte(raw)) {

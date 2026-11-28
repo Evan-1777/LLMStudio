@@ -71,7 +71,7 @@ func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.Ch
 	compatFields := policy.explicitOnly() && !cacheStateUnsupported(input.PromptCache)
 
 	items := make([]map[string]any, 0, len(input.Messages))
-	for _, msg := range input.Messages {
+	for _, msg := range normalizeMessagesForEncoding(input.Messages) {
 		switch msg.Role {
 		case domain.RoleUser:
 			if parts := encodeResponsesUserParts(msg.Blocks); len(parts) > 0 {
@@ -91,6 +91,7 @@ func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.Ch
 				}
 			}
 		case domain.RoleAssistant:
+			itemStart := len(items)
 			var textParts []map[string]any
 			flushAssistantText := func() {
 				if len(textParts) == 0 {
@@ -135,7 +136,7 @@ func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.Ch
 						"type":      "function_call",
 						"call_id":   b.ID,
 						"name":      b.Name,
-						"arguments": rawArgumentsString(b.Arguments),
+						"arguments": rawArgumentsObjectString(b.Arguments),
 					})
 				case domain.BlockTypeToolResult:
 					flushAssistantText()
@@ -147,6 +148,18 @@ func (f *OpenAIResponsesFormat) EncodeRequest(_ context.Context, input plugin.Ch
 				}
 			}
 			flushAssistantText()
+			if itemStart < len(items) {
+				onlyReasoning := true
+				for _, item := range items[itemStart:] {
+					if item["type"] != "reasoning" {
+						onlyReasoning = false
+						break
+					}
+				}
+				if onlyReasoning {
+					items = items[:itemStart]
+				}
+			}
 		case domain.RoleToolResult:
 			for _, b := range msg.Blocks {
 				if b.Type == domain.BlockTypeToolResult {

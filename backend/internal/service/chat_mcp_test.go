@@ -686,12 +686,16 @@ func TestChatServiceFinalPersistFailureEmitsErrorNotMessageEnd(t *testing.T) {
 		t.Fatalf("Prepare: %v", err)
 	}
 
-	// Close SQLite before Stream finishes to simulate final persistence failure cleanly.
-	_ = db.Close()
-
 	var events []domain.StreamEvent
+	closed := false
 	if err := prep.Stream(ctx, func(ev domain.StreamEvent) error {
 		events = append(events, ev)
+		// Close SQLite after the first content block so the user prompt is already
+		// persisted and only the final assistant write fails.
+		if !closed && ev.Type == domain.StreamEventBlockDelta {
+			closed = true
+			_ = db.Close()
+		}
 		return nil
 	}); err != nil {
 		t.Fatalf("Stream: %v", err)
@@ -811,4 +815,93 @@ func TestChatServicePrepareReadsPreferencesOnceAndDiscoversToolsConcurrently(t *
 			t.Fatalf("expected deterministic tool order [%s] at index %d, got %v", wantSuffix, i, names)
 		}
 	}
+}
+
+func TestChatServiceRollsBackUserMessageWhenNoAssistantOutput(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"error\":{\"code\":\"bad_request\",\"message\":\"upstream exploded\"}}\n\n")
+	}))
+	defer upstream.Close()
+
+	svc, _, msgs, _, conv, _ := setupChatMCPFixture(t, upstream.URL, &stubMCPClient{})
+	prep, err := svc.Prepare(t.Context(), service.StreamChatInput{ConversationID: conv.ID, Text: "rollback me"})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	var events []domain.StreamEvent
+	if err := prep.Stream(t.Context(), func(ev domain.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	items, err := msgs.ListByConversation(t.Context(), conv.ID)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("expected zero persisted messages on empty rollback, got %d: %+v", len(items), items)
+	}
+	var sawRollback bool
+	for _, ev := range events {
+		if ev.Type == domain.StreamEventError && ev.RolledBack && ev.Message == nil {
+			sawRollback = true
+		}
+	}
+	if !sawRollback {
+		t.Fatalf("expected rolledBack error event, got %+v", events)
+	}
+}
+
+func TestChatServiceErrorAfterPartialOutputKeepsSavedMessage(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"Part 1\"}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: {\"error\":{\"code\":\"upstream_error\",\"message\":\"stream broke\"}}\n\n")
+	}))
+	defer upstream.Close()
+
+	svc, _, msgs, _, conv, _ := setupChatMCPFixture(t, upstream.URL, &stubMCPClient{})
+	prep, err := svc.Prepare(t.Context(), service.StreamChatInput{ConversationID: conv.ID, Text: "keep me"})
+	if err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	var events []domain.StreamEvent
+	if err := prep.Stream(t.Context(), func(ev domain.StreamEvent) error {
+		events = append(events, ev)
+		return nil
+	}); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	items, err := msgs.ListByConversation(t.Context(), conv.ID)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected user + partial assistant, got %d: %+v", len(items), items)
+	}
+	if items[1].StopReason != domain.StopReasonError || !hasTextBlock(items[1].Blocks, "Part 1") {
+		t.Fatalf("unexpected assistant persistence: %+v", items[1])
+	}
+	var errorEvent *domain.StreamEvent
+	for i := range events {
+		if events[i].Type == domain.StreamEventError {
+			errorEvent = &events[i]
+		}
+	}
+	if errorEvent == nil || errorEvent.RolledBack || errorEvent.Message == nil || errorEvent.Message.ID != items[1].ID {
+		t.Fatalf("expected non-rollback error carrying saved message, got %+v", events)
+	}
+}
+
+func hasTextBlock(blocks []domain.ContentBlock, want string) bool {
+	for _, b := range blocks {
+		if b.Type == domain.BlockTypeText && b.Text == want {
+			return true
+		}
+	}
+	return false
 }

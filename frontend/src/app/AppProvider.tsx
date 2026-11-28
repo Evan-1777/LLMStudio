@@ -116,6 +116,7 @@ export interface AppContextValue {
   ) => SettingsSaveResult;
   updatePreferences: (
     patch: Partial<AppPreferences>,
+    opts?: { silent?: boolean },
   ) => Promise<{ ok: boolean; error?: string }>;
   connectionState: ConnectionState;
   connectionError: string | null;

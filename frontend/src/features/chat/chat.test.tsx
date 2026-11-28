@@ -162,6 +162,43 @@ describe('chatReducer and ChatProvider', () => {
     });
   });
 
+  it('removes pending user messages on rolledBack terminal events', () => {
+    let attached = chatReducer(initialChatState, {
+      type: 'LOAD_SUCCESS',
+      conversation: makeConv(),
+      messages: [],
+    });
+    attached = chatReducer(attached, {
+      type: 'ATTACH_RUN_START',
+      run: {
+        conversationId: 'c1',
+        messageId: 'a-pending',
+        providerId: 'openai',
+        modelId: 'gpt-4.1',
+        pendingUserMessage: {
+          id: 'pending-user-a-pending',
+          conversationId: 'c1',
+          role: 'user',
+          blocks: [{ type: 'text', text: 'pending' }],
+          createdAt: '2026-11-17T00:00:00Z',
+        },
+      },
+    });
+    expect(attached.messages.map((message) => message.id)).toEqual(['pending-user-a-pending']);
+    expect(attached.streaming?.pendingUserId).toBe('pending-user-a-pending');
+
+    attached = chatReducer(attached, {
+      type: 'STREAM_EVENT',
+      fallbackProviderId: 'openai',
+      fallbackModelId: 'gpt-4.1',
+      event: { type: 'error', error: { code: 'UPSTREAM_ERROR', message: 'boom' }, rolledBack: true },
+    });
+    expect(attached.messages).toHaveLength(0);
+    expect(attached.streaming).toBeNull();
+    expect(attached.runState).toBe('error');
+    expect(attached.errorMessage).toBe('boom');
+  });
+
   it('treats missing message_end EOF as error and keeps history intact when regenerate Prepare fails', async () => {
     const encoder = new TextEncoder();
     let streamCalls = 0;
@@ -1869,16 +1906,11 @@ describe('chatReducer and ChatProvider', () => {
         );
       }
       if (url === 'http://127.0.0.1:11434/v1/chat/completions') {
-        const sse = 'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
-        return new Response(
-          new ReadableStream<Uint8Array>({
-            start(c) {
-              c.enqueue(encoder.encode(sse));
-              c.close();
-            },
-          }),
-          { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
-        );
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
+        });
       }
       if (url.endsWith('/api/v1/conversations/c-abort/messages') && method === 'POST') {
         userSaveSignals.push(init?.signal ?? undefined);
@@ -2044,11 +2076,12 @@ describe('chatReducer and ChatProvider', () => {
     expect(screen.getByTestId('can-stop')).toHaveTextContent('false');
 
     await user.click(screen.getByRole('button', { name: 'send-local' }));
-    await waitFor(() => expect(userSaveSignals).toHaveLength(1));
-    expect(userSaveSignals[0]).toBeInstanceOf(AbortSignal);
+    await waitFor(() => expect(screen.getByTestId('can-stop')).toHaveTextContent('true'));
+    // The user prompt is persisted lazily on the first substantive assistant
+    // block, so an immediate stop before any output must not call POST /messages.
+    expect(userSaveSignals).toHaveLength(0);
     await user.click(screen.getByRole('button', { name: 'stop' }));
     await waitFor(() => expect(screen.getByTestId('can-stop')).toHaveTextContent('false'));
-    expect(userSaveSignals[0]?.aborted).toBe(true);
     expect(screen.getByTestId('has-streaming')).toHaveTextContent('false');
     expect(screen.getByTestId('msg-ids')).toHaveTextContent('u1,a1');
     expect(screen.getByTestId('err-msg')).toHaveTextContent('');
@@ -2325,5 +2358,74 @@ describe('chatReducer and ChatProvider', () => {
     expect(screen.getByTestId('msg-count')).toHaveTextContent('2');
     await user.click(screen.getByRole('button', { name: 'detach' }));
     expect(cancelCalls).toHaveLength(1);
+  });
+
+  it('rolls a new send back to the composer when HTTP 200 yields only a rolledBack error', async () => {
+    let rollbackCount = 0;
+    let acceptedCount = 0;
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      const method = init?.method ?? 'GET';
+      if (url.endsWith('/api/v1/conversations/c1') && method === 'GET') {
+        return Response.json({ conversation: makeConv('c1'), messages: [] });
+      }
+      if (url.endsWith('/api/v1/conversations/c1/messages/stream') && method === 'POST') {
+        const encoder = new TextEncoder();
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode(
+              'data: {"type":"error","error":{"code":"UPSTREAM_ERROR","message":"boom"},"rolledBack":true}\n\n',
+            ));
+            controller.close();
+          },
+        });
+        return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      return Response.json({});
+    });
+
+    function Harness() {
+      const { state, loadConversation, sendMessage } = useChat();
+      return (
+        <div>
+          <span data-testid="run-state">{state.runState}</span>
+          <span data-testid="msg-ids">{state.messages.map((m) => m.id).join(',')}</span>
+          <span data-testid="err-msg">{state.errorMessage ?? ''}</span>
+          <button type="button" onClick={() => void loadConversation('c1')}>load</button>
+          <button
+            type="button"
+            onClick={() => void sendMessage({
+              conversationId: 'c1',
+              blocks: [{ type: 'text', text: 'rollback me' }],
+              text: 'rollback me',
+              providerId: 'p1',
+              modelId: 'm1',
+              onPrepareRollback: () => { rollbackCount += 1; },
+              onStreamAccepted: () => { acceptedCount += 1; },
+            })}
+          >
+            send
+          </button>
+        </div>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(
+      <AppProvider fetchImpl={fetchMock} skipInitialBootstrap>
+        <ChatProvider>
+          <Harness />
+        </ChatProvider>
+      </AppProvider>,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'load' }));
+    await waitFor(() => expect(screen.getByTestId('msg-ids')).toHaveTextContent(''));
+    await user.click(screen.getByRole('button', { name: 'send' }));
+    await waitFor(() => expect(screen.getByTestId('run-state')).toHaveTextContent('error'));
+    expect(screen.getByTestId('msg-ids')).toHaveTextContent('');
+    expect(screen.getByTestId('err-msg')).toHaveTextContent('boom');
+    expect(rollbackCount).toBe(1);
+    expect(acceptedCount).toBe(0);
   });
 });

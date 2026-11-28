@@ -10,6 +10,7 @@ import type {
   ConversationGraphNoteEdge,
   GraphMutationInput,
   Message,
+  MessageSideRefScope,
 } from '../../core/types';
 import { imageBlockSource } from '../../rendering/ContentRenderer';
 import {
@@ -197,6 +198,8 @@ export function GraphBottomControls({
   onAutoLayout,
   onCreateNote,
   onCreateBranch,
+  onCreateUserMessage,
+  onCreateAssistantMessage,
 }: {
   selectMode: boolean;
   scale: number;
@@ -217,6 +220,8 @@ export function GraphBottomControls({
   onAutoLayout: () => void;
   onCreateNote: () => void;
   onCreateBranch: () => void;
+  onCreateUserMessage: () => void;
+  onCreateAssistantMessage: () => void;
 }) {
   return (
     <div className="cg-controls" role="group" aria-label="图谱控制">
@@ -281,6 +286,21 @@ export function GraphBottomControls({
         onClick={onAutoLayout}
       />
       <IconButton
+        icon="userPlus"
+        label="新建用户消息"
+        size="sm"
+        disabled={busy}
+        onClick={onCreateUserMessage}
+      />
+      <IconButton
+        icon="botPlus"
+        label="新建助手消息"
+        size="sm"
+        disabled={busy}
+        onClick={onCreateAssistantMessage}
+      />
+      <span className="cg-controls__divider" aria-hidden="true" />
+      <IconButton
         icon="stickyNote"
         label="新建文字标注"
         size="sm"
@@ -342,6 +362,8 @@ export function GraphContextMenu({
   onJump,
   onPickParent,
   onPickSideRef,
+  onCreateMessage,
+  onEditMessageContent,
   mutate,
 }: {
   menu: { client: Point; world: Point; nodeId?: string } | null;
@@ -386,7 +408,9 @@ export function GraphContextMenu({
   onActivateNode: (node: GraphNode) => void;
   onJump: (messageId: string) => void;
   onPickParent: (nodeId: string) => void;
-  onPickSideRef: (nodeId: string) => void;
+  onPickSideRef: (next: { sourceId: string; scope: MessageSideRefScope } | null) => void;
+  onCreateMessage: (role: 'user' | 'assistant', pos: Point, parentMessageId?: string) => void;
+  onEditMessageContent: (message: Message) => void;
   mutate: (input: GraphMutationInput) => Promise<ConversationDetail | null>;
 }) {
   return (
@@ -418,6 +442,12 @@ export function GraphContextMenu({
             <>
               <DropdownItem disabled={busy} onSelect={() => menu && onMakeBranch(menu.world)}>
                 <Icon name="plus" size={15} />新建空白分支
+              </DropdownItem>
+              <DropdownItem disabled={busy} onSelect={() => menu && onCreateMessage('user', menu.world)}>
+                <Icon name="userPlus" size={15} />新建用户消息
+              </DropdownItem>
+              <DropdownItem disabled={busy} onSelect={() => menu && onCreateMessage('assistant', menu.world)}>
+                <Icon name="botPlus" size={15} />新建助手消息
               </DropdownItem>
               <DropdownItem disabled={busy} onSelect={() => menu && onStartDraftNote(menu.world)}>
                 <Icon name="stickyNote" size={15} />新建文字标注
@@ -609,6 +639,36 @@ export function GraphContextMenu({
                   </DropdownItem>
                   <DropdownItem
                     disabled={busy}
+                    onSelect={() => onEditMessageContent(menuNode.message!)}
+                  >
+                    <Icon name="edit" size={15} />编辑消息内容
+                  </DropdownItem>
+                  <DropdownItem
+                    disabled={busy}
+                    onSelect={() =>
+                      onCreateMessage(
+                        'user',
+                        { x: menuNode.x, y: menuNode.y + menuNode.height + 52 },
+                        menuNode.id,
+                      )
+                    }
+                  >
+                    <Icon name="userPlus" size={15} />在此后新建用户消息
+                  </DropdownItem>
+                  <DropdownItem
+                    disabled={busy}
+                    onSelect={() =>
+                      onCreateMessage(
+                        'assistant',
+                        { x: menuNode.x, y: menuNode.y + menuNode.height + 52 },
+                        menuNode.id,
+                      )
+                    }
+                  >
+                    <Icon name="botPlus" size={15} />在此后新建助手消息
+                  </DropdownItem>
+                  <DropdownItem
+                    disabled={busy}
                     onSelect={() =>
                       onMakeBranch(
                         {
@@ -630,9 +690,17 @@ export function GraphContextMenu({
                   {isSideRefEligible(menuNode.message) && (
                     <DropdownItem
                       disabled={busy || messagesCount < 2}
-                      onSelect={() => onPickSideRef(menuNode.id)}
+                      onSelect={() => onPickSideRef({ sourceId: menuNode.id, scope: 'branch' })}
                     >
                       <Icon name="sideLink" size={15} />侧边接入至…
+                    </DropdownItem>
+                  )}
+                  {isSideRefEligible(menuNode.message) && (
+                    <DropdownItem
+                      disabled={busy || messagesCount < 2}
+                      onSelect={() => onPickSideRef({ sourceId: menuNode.id, scope: 'node' })}
+                    >
+                      <Icon name="nodeSideLink" size={15} />仅此节点侧边接入至…
                     </DropdownItem>
                   )}
                   {menuNode.message.graphMeta?.sideRefs?.map((ref, idx) => (
@@ -648,9 +716,13 @@ export function GraphContextMenu({
                       }
                     >
                       <Icon name="unlink" size={15} />
-                      {menuNode.message!.graphMeta!.sideRefs!.length > 1
-                        ? `断开侧边接入 ${idx + 1}`
-                        : '断开侧边接入'}
+                      {ref.scope === 'node'
+                        ? menuNode.message!.graphMeta!.sideRefs!.length > 1
+                          ? `断开单节点接入 ${idx + 1}`
+                          : '断开单节点接入'
+                        : menuNode.message!.graphMeta!.sideRefs!.length > 1
+                          ? `断开侧边接入 ${idx + 1}`
+                          : '断开侧边接入'}
                     </DropdownItem>
                   ))}
                   {menuNode.parentId && (

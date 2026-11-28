@@ -33,6 +33,7 @@ import {
 import {
   formatError,
   isAbortError,
+  isSubstantiveAssistantEvent,
   type CompactConversationResult,
   type GenerationRun,
 } from './chatErrors';
@@ -389,8 +390,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return;
       }
 
+      run.streamOpened = true;
       let receivedMessageEnd = false;
       let receivedStreamError = false;
+      let receivedRolledBack = false;
       try {
         if (!response.body) {
           throw new GatewayError('STREAM_EMPTY', '服务端未返回事件流');
@@ -407,9 +410,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
           if (ev.type === 'message_end') {
             receivedMessageEnd = true;
+            if (ev.rolledBack) receivedRolledBack = true;
           }
           if (ev.type === 'error') {
             receivedStreamError = true;
+            if (ev.rolledBack) receivedRolledBack = true;
           }
 
           dispatch({
@@ -428,6 +433,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         if (!isRunCurrent(run) || run.detached) return;
 
         markConversationRunning(activeRun.conversationId, false, reqScope);
+        if (receivedRolledBack) return;
         if (receivedMessageEnd) {
           void reconcileAfterStream(
             activeRun.conversationId,
@@ -636,17 +642,29 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         return false;
       }
 
-      // Prepare succeeded (HTTP 200): server has persisted user message or accepted regenerated tail.
-      opts.onStreamAccepted?.();
-      if (opts.regenerateTargetId) {
+      // HTTP 200 only proves the upstream accepted the request; for a new send the
+      // user prompt is persisted lazily at the first substantive assistant block.
+      run.streamOpened = true;
+      const isNewSend = Boolean(opts.optimisticUserId);
+      let hasAssistantOutput = false;
+      let streamAccepted = false;
+      const acceptStream = () => {
+        if (streamAccepted) return;
+        streamAccepted = true;
+        opts.onStreamAccepted?.();
+      };
+      if (!isNewSend) {
         dispatch({
           type: 'REGEN_PREPARE_CONFIRMED',
-          targetMessageId: opts.regenerateTargetId,
+          targetMessageId: opts.regenerateTargetId as string,
         });
+        acceptStream();
       }
 
       let receivedMessageEnd = false;
       let receivedStreamError = false;
+      let rolledBackError: { code: string; message: string } | null = null;
+      let rolledBackAbort = false;
 
       try {
         if (!response.body) {
@@ -664,9 +682,20 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
           if (ev.type === 'message_end') {
             receivedMessageEnd = true;
+            if (ev.rolledBack && isNewSend && !hasAssistantOutput) {
+              rolledBackAbort = true;
+              break;
+            }
           }
           if (ev.type === 'error') {
             receivedStreamError = true;
+            if (isNewSend && (ev.rolledBack || !hasAssistantOutput)) {
+              rolledBackError = {
+                code: ev.error?.code || 'UPSTREAM_ERROR',
+                message: ev.error?.message || '流式生成失败',
+              };
+              break;
+            }
           }
 
           dispatch({
@@ -675,6 +704,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             fallbackProviderId: opts.input.providerId,
             fallbackModelId: opts.input.modelId,
           });
+
+          if (isSubstantiveAssistantEvent(ev)) {
+            hasAssistantOutput = true;
+            acceptStream();
+          }
 
           if (ev.type === 'error' || (run.detachedAgent && ev.type === 'message_end')) {
             break;
@@ -686,6 +720,34 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
         if (run.detachedAgent) {
           markConversationRunning(opts.conversationId, false, reqScope);
+        }
+
+        if (
+          rolledBackAbort ||
+          (run.aborted && isNewSend && !hasAssistantOutput && !receivedMessageEnd)
+        ) {
+          dispatch({
+            type: 'SEND_PREPARE_ABORTED',
+            optimisticUserId: opts.optimisticUserId as string,
+          });
+          opts.onPrepareRollback?.();
+          return false;
+        }
+
+        if (
+          rolledBackError ||
+          ((receivedStreamError || !receivedMessageEnd) && isNewSend && !hasAssistantOutput)
+        ) {
+          const code = rolledBackError?.code ?? (receivedStreamError ? 'UPSTREAM_ERROR' : 'STREAM_INCOMPLETE');
+          const message = rolledBackError?.message ?? (receivedStreamError ? '流式生成失败' : '响应流意外中断，未收到结束标记');
+          dispatch({
+            type: 'SEND_PREPARE_FAILED',
+            optimisticUserId: opts.optimisticUserId as string,
+            code,
+            message,
+          });
+          opts.onPrepareRollback?.();
+          return false;
         }
 
         if (run.aborted && !receivedMessageEnd) {
@@ -704,11 +766,33 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }
 
         if (receivedStreamError) {
+          void reconcileAfterStream(
+            opts.conversationId,
+            run.epoch,
+            run.connectionEpoch,
+            {
+              isAbort: false,
+              minExpectedMessages: 0,
+            },
+            reqScope,
+          );
           return false;
         }
 
         if (!receivedMessageEnd) {
           dispatch({ type: 'STREAM_EOF_INCOMPLETE' });
+          if (!run.detachedAgent) {
+            void reconcileAfterStream(
+              opts.conversationId,
+              run.epoch,
+              run.connectionEpoch,
+              {
+                isAbort: true,
+                minExpectedMessages: opts.expectedCountOnAbort,
+              },
+              reqScope,
+            );
+          }
           return false;
         }
 
@@ -731,6 +815,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           markConversationRunning(opts.conversationId, false, reqScope);
         }
         if (isAbortError(err) || run.aborted) {
+          if (isNewSend && !hasAssistantOutput && !receivedMessageEnd) {
+            dispatch({
+              type: 'SEND_PREPARE_ABORTED',
+              optimisticUserId: opts.optimisticUserId as string,
+            });
+            opts.onPrepareRollback?.();
+            return false;
+          }
           dispatch({ type: 'ABORT_LOCAL' });
           void reconcileAfterStream(
             opts.conversationId,
@@ -745,11 +837,33 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           return false;
         }
         const e = formatError(err);
+        if (isNewSend && !hasAssistantOutput) {
+          dispatch({
+            type: 'SEND_PREPARE_FAILED',
+            optimisticUserId: opts.optimisticUserId as string,
+            code: e.code,
+            message: e.message,
+          });
+          opts.onPrepareRollback?.();
+          return false;
+        }
         dispatch({
           type: 'STREAM_NETWORK_ERROR',
           code: e.code,
           message: e.message,
         });
+        if (!run.detachedAgent) {
+          void reconcileAfterStream(
+            opts.conversationId,
+            run.epoch,
+            run.connectionEpoch,
+            {
+              isAbort: true,
+              minExpectedMessages: opts.expectedCountOnAbort,
+            },
+            reqScope,
+          );
+        }
         return false;
       } finally {
         releaseGeneration(run);
@@ -1029,6 +1143,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       if (run.aborted) return;
       run.aborted = true;
       void gateway.cancelConversationRun(run.conversationId, run.scope).catch(() => {});
+      if (!run.streamOpened) {
+        run.ctrl.abort();
+        return;
+      }
       window.setTimeout(() => {
         if (activeGenRef.current === run && !run.ctrl.signal.aborted) {
           run.ctrl.abort();

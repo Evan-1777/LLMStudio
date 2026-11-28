@@ -680,16 +680,44 @@ function isFencedCodeClosed(
   return closeRe.test(lastLine);
 }
 
+const SOFT_BREAK_SKIP = new Set(['code', 'inlineCode', 'html', 'math', 'inlineMath']);
+
+function insertSoftBreaks(parent: NodeLike): void {
+  if (!Array.isArray(parent.children)) return;
+  const next: NodeLike[] = [];
+  for (const child of parent.children) {
+    if (child.type === 'text' && typeof child.value === 'string' && child.value.includes('\n')) {
+      const parts = child.value.split('\n');
+      parts.forEach((part, index) => {
+        if (part) next.push({ ...child, value: part });
+        if (index < parts.length - 1 && next[next.length - 1]?.type !== 'break') {
+          next.push({ type: 'break' });
+        }
+      });
+      continue;
+    }
+    next.push(child);
+    if (!SOFT_BREAK_SKIP.has(child.type)) insertSoftBreaks(child);
+  }
+  parent.children = next;
+}
+
+function remarkSoftBreaks() {
+  return (tree: NodeLike) => insertSoftBreaks(tree);
+}
+
 export function buildRemarkPlugins({
   source,
   isStreaming,
   collapsePrefix,
   mathRenderEnabled,
+  preserveLineBreaks = false,
 }: {
   source: string;
   isStreaming: boolean;
   collapsePrefix: string;
   mathRenderEnabled: boolean;
+  preserveLineBreaks?: boolean;
 }): PluggableList {
   const remarkCodeAndMath = () => (tree: NodeLike) => {
     let codeSeq = 0;
@@ -747,6 +775,7 @@ export function buildRemarkPlugins({
   return [
     remarkCjkFriendly,
     remarkLatexExtensions,
+    ...(preserveLineBreaks ? [remarkSoftBreaks] : []),
     remarkCodeAndMath,
   ];
 }

@@ -64,8 +64,8 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     await expect(page.getByText(/Reply #1 to:/)).toBeVisible();
     await expect(page.getByRole('button', { name: '选择模型' })).toHaveText(/High/);
 
-    // 2. Abort before first byte (prepare gate) restores draft & does NOT persist user message;
-    //    abort after headers before first token persists user message & aborted assistant without releasing gate.
+    // 2. Abort before first byte (prepare gate) or after headers before the first substantive
+    //    token restores the draft and persists neither the user prompt nor an empty assistant.
     const preHeaderEntered = upstream.armFirstByteGate();
     await composer.fill('Pre-header abort draft');
     await page.getByRole('button', { name: '发送消息' }).click();
@@ -90,8 +90,16 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     await postHeaderEntered;
     await page.getByRole('button', { name: '停止生成' }).click();
     await expect.poll(() => upstream.abortedCount, { timeout: 5000 }).toBeGreaterThanOrEqual(2);
-    await expect(page.getByText('已停止')).toBeVisible();
+    await expect(composer).toHaveValue('[GATE_AFTER_HEADERS] wait before first token');
+    await expect(page.getByText('已停止')).toHaveCount(0);
     upstream.releaseFirstByteGate();
+
+    const afterPostHeaderDetail = (await (
+      await fetch(`${appUrl}/api/v1/conversations/${encodeURIComponent(convId)}`, {
+        headers: { Authorization: `Bearer ${E2E_TOKEN}` },
+      })
+    ).json()) as { messages: Array<{ id: string }> };
+    expect(afterPostHeaderDetail.messages).toHaveLength(2);
 
     // 2b. Abort streaming: receive partial content first, click stop, verify upstream disconnect & Go aborted record.
     await composer.fill('[SLOW_ABORT] please stream slowly');
@@ -100,8 +108,8 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
     await page.getByRole('button', { name: '停止生成' }).click();
 
     await expect.poll(() => upstream.abortedCount, { timeout: 5000 }).toBeGreaterThanOrEqual(1);
-    await expect(page.getByText('已停止')).toHaveCount(2);
-    await expect(page.getByText('已停止').last()).toBeVisible();
+    await expect(page.getByText('已停止')).toHaveCount(1);
+    await expect(page.getByText('已停止')).toBeVisible();
 
     // Poll Go API directly (no fixed sleep) to verify Go persisted aborted stopReason.
     await expect
@@ -123,8 +131,8 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
 
     // Reload to get clean server IDs after abort.
     await page.reload({ waitUntil: 'networkidle' });
-    await expect(page.getByText('已停止')).toHaveCount(2);
-    await expect(page.getByText('已停止').last()).toBeVisible();
+    await expect(page.getByText('已停止')).toHaveCount(1);
+    await expect(page.getByText('已停止')).toBeVisible();
 
     // 3. Prepare failure keeps history intact; incomplete EOF reports error instead of success.
     await composer.fill('[PREPARE_FAIL]');
@@ -146,7 +154,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
       conversation: { updatedAt: string };
       messages: Array<{ id: string; role: string }>;
     };
-    expect(beforeUserRetryDetail.messages).toHaveLength(8);
+    expect(beforeUserRetryDetail.messages).toHaveLength(6);
 
     const retryButtons = page.getByRole('button', { name: '重试消息' });
     await retryButtons.first().click();
@@ -176,14 +184,14 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         }
         return detail.messages.map((m) => m.role).join(',');
       })
-      .toBe('user,assistant,user,assistant,user,assistant,user,assistant');
+      .toBe('user,assistant,user,assistant,user,assistant');
 
     // Add a second turn so branch vs original divergence and single-message delete can be verified.
     await composer.fill('Second turn question');
     await page.getByRole('button', { name: '发送消息' }).click();
     await expect(page.getByText(/to: Second turn question/)).toBeVisible();
 
-    // Reload to ensure all 10 messages have final server IDs.
+    // Reload to ensure all 8 messages have final server IDs.
     await page.reload({ waitUntil: 'networkidle' });
     await expect(page.getByText(/to: Second turn question/)).toBeVisible();
 
@@ -192,10 +200,10 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         headers: { Authorization: `Bearer ${E2E_TOKEN}` },
       })
     ).json()) as { messages: Array<{ id: string }> };
-    expect(originalDetailBeforeBranch.messages).toHaveLength(10);
+    expect(originalDetailBeforeBranch.messages).toHaveLength(8);
     const originalIds = new Set(originalDetailBeforeBranch.messages.map((m) => m.id));
 
-    // 5. Branch from the FIRST assistant message -> new URL, 2 messages with newly assigned IDs; original retains 8 messages.
+    // 5. Branch from the FIRST assistant message -> new URL, 2 messages with newly assigned IDs; original retains 6 messages.
     const branchButtons = page.getByRole('button', { name: '复制为新话题' });
     await branchButtons.first().click();
     await expect(page).not.toHaveURL(new RegExp(`${convId}$`));
@@ -213,7 +221,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
       expect(originalIds.has(m.id)).toBe(false);
     }
 
-    // Navigate back to original conversation: all 8 messages remain intact.
+    // Navigate back to original conversation: all 6 messages remain intact.
     await page.goto(`${appUrl}/chat/${encodeURIComponent(convId)}`, {
       waitUntil: 'networkidle',
     });
@@ -272,7 +280,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         expect(detail.conversation.updatedAt >= beforeMidRetry.conversation.updatedAt).toBe(true);
         return detail.messages.map((m) => m.role).join(',');
       })
-      .toBe('user,assistant,user,assistant,user,assistant,user,assistant,user,assistant');
+      .toBe('user,assistant,user,assistant,user,assistant,user,assistant');
 
     // 8. Single-message delete removes ONLY the first user message; subsequent messages stay after reload.
     await page.getByRole('button', { name: '删除消息' }).first().click();
@@ -287,7 +295,7 @@ test.describe('Chat Lifecycle, Abort, Retry, Branch, and Delete', () => {
         const detail = (await res.json()) as { messages: Array<{ id: string }> };
         return detail.messages.length;
       })
-      .toBe(9);
+      .toBe(7);
 
     await page.reload({ waitUntil: 'networkidle' });
     await expect(page.getByText('Edited second reply')).toBeVisible();
@@ -393,4 +401,57 @@ test('persists Enter behavior on the gateway and preserves multiline and IME inp
   await sendButton.click();
   await expect(page.getByText(/Reply #4 to: Fourth draft/)).toBeVisible();
   expect(upstream.lastChatBodies).toHaveLength(4);
+});
+
+test('restores the composer and leaves no messages when the first stream produces no output', async ({ appUrl, upstream, page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await seedMockProviderViaApi(appUrl, upstream.url);
+  await connectWithToken(page, appUrl);
+  await page.getByRole('button', { name: '选择模型' }).click();
+  await page.getByRole('option', { name: /Mock Chat/ }).click();
+
+  const composer = page.getByRole('textbox', { name: '消息输入框' });
+  const streamPattern = '**/api/v1/conversations/*/messages/stream';
+  await page.route(streamPattern, (route) =>
+    route.fulfill({
+      status: 200,
+      headers: { 'Content-Type': 'text/event-stream' },
+      body: 'data: {"type":"error","error":{"code":"UPSTREAM_ERROR","message":"boom"},"rolledBack":true}\n\n',
+    }),
+  );
+  await composer.fill('Rollback me');
+  await page.getByRole('button', { name: '发送消息' }).click();
+  await expect(composer).toHaveValue('Rollback me');
+  await expect(page.locator('.wb-user-bubble')).toHaveCount(0);
+  await expect(page.getByText('boom')).toBeVisible();
+  await page.unroute(streamPattern);
+
+  // Cancelling before the first byte must restore the draft as well.
+  await page.route(streamPattern, () => {});
+  await composer.fill('Cancel me');
+  await page.getByRole('button', { name: '发送消息' }).click();
+  await expect(page.getByRole('button', { name: '停止生成' })).toBeVisible();
+  await page.getByRole('button', { name: '停止生成' }).click();
+  await expect(composer).toHaveValue('Cancel me');
+  await expect(page.locator('.wb-user-bubble')).toHaveCount(0);
+});
+
+test('renders user Markdown, math and fenced code while preserving soft line breaks', async ({ appUrl, upstream, page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await seedMockProviderViaApi(appUrl, upstream.url);
+  await connectWithToken(page, appUrl);
+  await page.getByRole('button', { name: '选择模型' }).click();
+  await page.getByRole('option', { name: /Mock Chat/ }).click();
+
+  const composer = page.getByRole('textbox', { name: '消息输入框' });
+  await composer.fill('**加粗文本**\n第二行 $x^2$\n\n\`\`\`ts\nconst shown = 1;\n\`\`\`');
+  await page.getByRole('button', { name: '发送消息' }).click();
+  await expect(page.getByText(/Reply #1 to:/)).toBeVisible();
+
+  const bubble = page.locator('.wb-user-bubble').last();
+  await expect(bubble.locator('strong')).toHaveText('加粗文本');
+  await expect(bubble.locator('.katex')).toBeVisible();
+  await expect(bubble.locator('br').first()).toBeAttached();
+  await expect(bubble.locator('.block-card')).toBeVisible();
+  await expect(bubble.locator('iframe')).toHaveCount(0);
 });

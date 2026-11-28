@@ -67,6 +67,9 @@ describe('settings storage and migration', () => {
       mathRenderEnabled: true,
       graphMarkdownRender: true,
       graphVisualHtmlRender: true,
+      defaultTopicMode: 'chat',
+      lastProviderId: '',
+      lastModelId: '',
     });
 
     expect(defaultSettings()).toMatchObject({
@@ -89,6 +92,24 @@ describe('settings storage and migration', () => {
 
   it.each([[undefined, 20], [0, 1], [101, 100], [12, 12]])('normalizes the tool round limit %s to %d', (value, expected) => {
     expect(normalizeSettings({ mcpMaxToolRounds: value }).mcpMaxToolRounds).toBe(expected);
+  });
+
+  it('normalizes default topic mode and trimmed recent model ids', () => {
+    expect(normalizeSettings({ defaultTopicMode: 'agent' })).toMatchObject({
+      defaultTopicMode: 'agent',
+      lastProviderId: '',
+      lastModelId: '',
+    });
+    expect(normalizeSettings({ defaultTopicMode: 'invalid', lastProviderId: ' p1 ', lastModelId: ' m1 ' })).toMatchObject({
+      defaultTopicMode: 'chat',
+      lastProviderId: 'p1',
+      lastModelId: 'm1',
+    });
+    expect(normalizeServerPreferences({ lastProviderId: 42, lastModelId: null })).toMatchObject({
+      defaultTopicMode: 'chat',
+      lastProviderId: '',
+      lastModelId: '',
+    });
   });
 
   it('prefers v2 over legacy key', () => {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"llmstudio/backend/internal/domain"
@@ -162,6 +163,34 @@ func (f *fakeSearchEngine) RequiresAPIKey() bool    { return false }
 func (f *fakeSearchEngine) Search(_ context.Context, in plugin.SearchQueryInput) ([]plugin.SearchResult, error) {
 	f.lastQuery = in.Query
 	return []plugin.SearchResult{{Title: "Result", URL: "https://example.com", Snippet: "search-snippet"}}, nil
+}
+
+func TestExpandSideReferencesSingleNodeScope(t *testing.T) {
+	all := []domain.Message{
+		{ID: "U1", ConversationID: "c1", Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "u1"}}},
+		{ID: "A1", ConversationID: "c1", Role: domain.RoleAssistant, ParentID: "U1", Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "a1"}}},
+		{ID: "U2", ConversationID: "c1", Role: domain.RoleUser, ParentID: "A1", Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "u2"}},
+			GraphMeta: &domain.MessageGraphMeta{SideRefs: []domain.MessageSideRef{
+				{SourceMessageID: "A2", Side: "left", Scope: domain.SideRefScopeNode},
+				{SourceMessageID: "U2", Side: "right", Scope: domain.SideRefScopeNode},
+				{SourceMessageID: "A1", Side: "right", Scope: domain.SideRefScopeNode},
+			}}},
+		{ID: "A2", ConversationID: "c1", Role: domain.RoleAssistant, ParentID: "U2", Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "a2"}}},
+	}
+	active := []domain.Message{all[0], all[1], all[2], all[3]}
+	expanded := expandSideReferences(all, active)
+	if len(expanded) != 5 {
+		t.Fatalf("expected 5 messages, got %d", len(expanded))
+	}
+	// Main ancestors are skipped, and only the single node itself is injected
+	// (no A2 walk up to U2), so A1 must not appear.
+	want := "<reference_materials>\na2\n</reference_materials>"
+	if got := expanded[3].Blocks[0].Text; got != want {
+		t.Fatalf("node scope text mismatch:\ngot:  %q\nwant: %q", got, want)
+	}
+	if strings.Contains(expanded[3].Blocks[0].Text, "a1") || strings.Contains(expanded[3].Blocks[0].Text, "u2") {
+		t.Fatalf("node scope leaked ancestors: %q", expanded[3].Blocks[0].Text)
+	}
 }
 
 func TestExpandSideReferencesAndFourProtocols(t *testing.T) {

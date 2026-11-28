@@ -367,3 +367,89 @@ func TestGoDecodersGoldenMultiToolAndSignatures(t *testing.T) {
 		}
 	}
 }
+
+func encodeToolHistoryBody(t *testing.T, format plugin.APIFormat, messages []domain.Message) string {
+	t.Helper()
+	req, err := format.EncodeRequest(context.Background(), plugin.ChatInput{
+		Model:    domain.ModelConfig{ID: "m1"},
+		Messages: messages,
+	})
+	if err != nil {
+		t.Fatalf("%s encode: %v", format.ID(), err)
+	}
+	return string(req.Body)
+}
+
+func TestNormalizeMessagesForEncodingPairsStandaloneToolResults(t *testing.T) {
+	messages := []domain.Message{
+		{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "hi"}}},
+		{Role: domain.RoleAssistant, Blocks: []domain.ContentBlock{
+			{Type: domain.BlockTypeToolCall, ID: "c1", Name: "lookup", Arguments: json.RawMessage(`{"q":"x"}`)},
+		}},
+		{Role: domain.RoleToolResult, Blocks: []domain.ContentBlock{
+			{Type: domain.BlockTypeToolResult, ToolCallID: "c1", ToolName: "lookup", Content: "done"},
+		}},
+		{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "continue"}}},
+	}
+	formats := []plugin.APIFormat{
+		NewOpenAICompletionsFormat(),
+		NewOpenAIResponsesFormat(),
+		NewAnthropicMessagesFormat(),
+		NewGoogleGenAIFormat(),
+	}
+	for _, format := range formats {
+		body := encodeToolHistoryBody(t, format, messages)
+		if strings.Contains(body, interruptedToolResultContent) {
+			t.Fatalf("%s synthesized an extra result: %s", format.ID(), body)
+		}
+		if got := strings.Count(body, `"c1"`); got != 2 {
+			t.Fatalf("%s expected exactly one call and one result for c1, got %d: %s", format.ID(), got, body)
+		}
+	}
+}
+
+func TestNormalizeMessagesForEncodingDeduplicatesAcrossMessages(t *testing.T) {
+	toolRound := func() domain.Message {
+		return domain.Message{Role: domain.RoleAssistant, Blocks: []domain.ContentBlock{
+			{Type: domain.BlockTypeToolCall, ID: "c1", Name: "lookup", Arguments: json.RawMessage(`{}`)},
+			{Type: domain.BlockTypeToolResult, ToolCallID: "c1", ToolName: "lookup", Content: "done"},
+		}}
+	}
+	messages := []domain.Message{
+		{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "one"}}},
+		toolRound(),
+		toolRound(),
+		{Role: domain.RoleUser, Blocks: []domain.ContentBlock{{Type: domain.BlockTypeText, Text: "two"}}},
+	}
+	formats := []plugin.APIFormat{
+		NewOpenAICompletionsFormat(),
+		NewOpenAIResponsesFormat(),
+		NewAnthropicMessagesFormat(),
+		NewGoogleGenAIFormat(),
+	}
+	for _, format := range formats {
+		body := encodeToolHistoryBody(t, format, messages)
+		if got := strings.Count(body, `"c1"`); got != 2 {
+			t.Fatalf("%s duplicated call id c1, got %d: %s", format.ID(), got, body)
+		}
+		if !strings.Contains(body, "call_norm_") {
+			t.Fatalf("%s did not renormalize the repeated call id: %s", format.ID(), body)
+		}
+	}
+}
+
+func TestToolArgumentsAlwaysEncodeAsObjects(t *testing.T) {
+	for _, raw := range []string{"", "null", "\"text\"", "[1,2]", "123", "{\"a\":"} {
+		obj := toolArgsObject(json.RawMessage(raw))
+		if len(obj) != 0 {
+			t.Fatalf("raw %q decoded to non-empty object %+v", raw, obj)
+		}
+		if got := rawArgumentsObjectString(json.RawMessage(raw)); got != "{}" {
+			t.Fatalf("raw %q encoded as %q, want {}", raw, got)
+		}
+	}
+	obj := toolArgsObject(json.RawMessage(`{"a":1}`))
+	if len(obj) != 1 || obj["a"] != float64(1) {
+		t.Fatalf("object args lost: %+v", obj)
+	}
+}

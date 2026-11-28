@@ -33,7 +33,15 @@ export function MessageSideRefBadge({
 
   const hasAnyContent = resolved.branches.some((b) => b.preview.length > 0);
   const count = resolved.branches.length;
-  const label = count > 1 ? `参考分支 ×${count}` : '参考分支';
+  const nodeCount = resolved.branches.filter((b) => b.scope === 'node').length;
+  const allNodes = nodeCount === count;
+  const label = allNodes
+    ? count > 1
+      ? `参考节点 ×${count}`
+      : '参考节点'
+    : count > 1
+      ? `参考分支 ×${count}`
+      : '参考分支';
 
   return (
     <div
@@ -56,8 +64,8 @@ export function MessageSideRefBadge({
             aria-expanded={open}
             title={label}
           >
-            <Icon name="sideLink" size={13} />
-            <span>{count > 1 ? String(count) : '参考分支'}</span>
+            <Icon name={allNodes ? 'nodeSideLink' : 'sideLink'} size={13} />
+            <span>{count > 1 ? String(count) : allNodes ? '参考节点' : '参考分支'}</span>
           </button>
         }
       >
@@ -65,18 +73,26 @@ export function MessageSideRefBadge({
           {resolved.branches.map((branch, index) => {
             const srcId = branch.ref.sourceMessageId;
             const busyThis = removingId === srcId;
+            const isNode = branch.scope === 'node';
+            const roleLabel = branch.sourceMessage?.role === 'user' ? '用户消息' : '助手消息';
             return (
               <div key={srcId} className="wb-sideref-card">
                 <div className="wb-sideref-card__head">
                   <span className="wb-sideref-card__meta">
-                    <Icon name="sideLink" size={13} />
+                    <Icon name={isNode ? 'nodeSideLink' : 'sideLink'} size={13} />
                     <span>
-                      {count > 1 ? `分支 ${index + 1}` : '参考分支'}
+                      {isNode
+                        ? '单节点'
+                        : count > 1
+                          ? `分支 ${index + 1}`
+                          : '参考分支'}
                     </span>
                     <span className="wb-sideref-card__count">
-                      {branch.assistantMessages.length > 0
-                        ? `${branch.assistantMessages.length} 条回复`
-                        : '暂无助手回复'}
+                      {isNode
+                        ? roleLabel
+                        : branch.messages.length > 0
+                          ? `${branch.messages.length} 条回复`
+                          : '暂无助手回复'}
                     </span>
                   </span>
                   <div className="wb-sideref-card__actions">
@@ -112,7 +128,9 @@ export function MessageSideRefBadge({
                 {branch.preview ? (
                   <div className="wb-sideref-card__body">{branch.preview}</div>
                 ) : (
-                  <div className="wb-sideref-card__empty">暂无助手回复</div>
+                  <div className="wb-sideref-card__empty">
+                    {isNode ? '暂无文本内容' : '暂无助手回复'}
+                  </div>
                 )}
               </div>
             );

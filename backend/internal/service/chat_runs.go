@@ -3,20 +3,25 @@ package service
 import (
 	"context"
 	"sync"
+	"time"
 
 	"llmstudio/backend/internal/domain"
 )
 
-const runSubscriberBuffer = 256
+const (
+	runSubscriberBuffer = 256
+	cancelIntentTTL     = time.Second
+)
 
 // ActiveRunInfo describes a currently executing background Agent run for a conversation.
 type ActiveRunInfo struct {
-	ConversationID       string `json:"conversationId"`
-	MessageID            string `json:"messageId"`
-	ProviderID           string `json:"providerId"`
-	ModelID              string `json:"modelId"`
-	ReplaceMessageID     string `json:"replaceMessageId,omitempty"`
-	InsertAfterMessageID string `json:"insertAfterMessageId,omitempty"`
+	ConversationID       string          `json:"conversationId"`
+	MessageID            string          `json:"messageId"`
+	ProviderID           string          `json:"providerId"`
+	ModelID              string          `json:"modelId"`
+	ReplaceMessageID     string          `json:"replaceMessageId,omitempty"`
+	InsertAfterMessageID string          `json:"insertAfterMessageId,omitempty"`
+	PendingUserMessage   *domain.Message `json:"pendingUserMessage,omitempty"`
 }
 
 type detachedRun struct {
@@ -55,6 +60,12 @@ func (r *detachedRun) snapshotInfo() ActiveRunInfo {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.info
+}
+
+func (r *detachedRun) clearPendingUser() {
+	r.mu.Lock()
+	r.info.PendingUserMessage = nil
+	r.mu.Unlock()
 }
 
 func (r *detachedRun) publish(ev domain.StreamEvent) error {
@@ -128,6 +139,9 @@ func (r *detachedRun) waitOutcome(ctx context.Context) (stopReason, errMsg strin
 	}
 	for i := len(r.terminalEvents) - 1; i >= 0; i-- {
 		ev := r.terminalEvents[i]
+		if ev.Type == domain.StreamEventMessageEnd && ev.RolledBack {
+			return domain.StopReasonAborted, "运行已取消", true
+		}
 		if ev.Type == domain.StreamEventMessageEnd && ev.Message != nil {
 			sr := ev.Message.StopReason
 			if sr == "" && ev.Message.ErrorMessage != "" {
@@ -348,13 +362,23 @@ func (r *detachedRun) subscribe(
 }
 
 type chatRunManager struct {
-	mu     sync.Mutex
-	active map[string]*detachedRun
+	mu            sync.Mutex
+	active        map[string]*detachedRun
+	cancelIntents map[string]time.Time
 }
 
 func newChatRunManager() *chatRunManager {
 	return &chatRunManager{
-		active: make(map[string]*detachedRun),
+		active:        make(map[string]*detachedRun),
+		cancelIntents: make(map[string]time.Time),
+	}
+}
+
+func (m *chatRunManager) pruneCancelIntentsLocked(now time.Time) {
+	for id, at := range m.cancelIntents {
+		if now.Sub(at) >= cancelIntentTTL {
+			delete(m.cancelIntents, id)
+		}
 	}
 }
 
@@ -364,6 +388,12 @@ func (m *chatRunManager) reserve(conversationID string, parentCtx context.Contex
 
 	if _, exists := m.active[conversationID]; exists {
 		return nil, nil, domain.NewError(domain.ErrCodeConflict, "该 Agent 话题正在运行中", nil)
+	}
+	now := time.Now()
+	m.pruneCancelIntentsLocked(now)
+	if at, canceled := m.cancelIntents[conversationID]; canceled && now.Sub(at) < cancelIntentTTL {
+		delete(m.cancelIntents, conversationID)
+		return nil, nil, domain.NewError(domain.ErrCodeConflict, "该 Agent 话题运行已取消", nil)
 	}
 	runCtx, cancel := context.WithCancel(parentCtx)
 	run := newDetachedRun(conversationID, cancel)
@@ -419,10 +449,15 @@ func (m *chatRunManager) activeIDs() []string {
 func (m *chatRunManager) cancel(conversationID string) bool {
 	m.mu.Lock()
 	run := m.active[conversationID]
-	m.mu.Unlock()
 	if run == nil {
+		// Explicit stop may arrive before Prepare reserves the run. Remember the
+		// intent briefly so the racing reserve cannot start a background Agent.
+		m.cancelIntents[conversationID] = time.Now()
+		m.pruneCancelIntentsLocked(time.Now())
+		m.mu.Unlock()
 		return false
 	}
+	m.mu.Unlock()
 	run.cancel()
 	return true
 }

@@ -355,6 +355,7 @@ func buildGeminiTools(tools []plugin.ChatTool) []map[string]any {
 }
 
 func buildGeminiContents(messages []domain.Message) []map[string]any {
+	messages = normalizeMessagesForEncoding(messages)
 	contents := make([]map[string]any, 0, len(messages))
 	appendContent := func(role string, parts []map[string]any) {
 		if len(parts) == 0 {

@@ -20,6 +20,7 @@ import {
   extractSafeCacheResult,
   formatError,
   isAbortError,
+  isSubstantiveAssistantEvent,
   type ChatDispatch,
   type GenerationRun,
 } from './chatErrors';
@@ -327,11 +328,14 @@ export async function runLocalChatStream(
   }
 
   let persistedUserMessageId = '';
-  if (opts.optimisticUserId) {
-    const userBlocks: ContentBlock[] =
-      opts.input.blocks && opts.input.blocks.length > 0
-        ? opts.input.blocks
-        : [{ type: 'text', text: opts.input.text ?? '' }];
+  let userPersistError = '';
+  let userPersistPromise: Promise<string> | null = null;
+  const userBlocks: ContentBlock[] =
+    opts.input.blocks && opts.input.blocks.length > 0
+      ? opts.input.blocks
+      : [{ type: 'text', text: opts.input.text ?? '' }];
+
+  const persistUserMessage = async (): Promise<string> => {
     try {
       const savedUser = await gateway.createMessage(
         opts.conversationId,
@@ -342,55 +346,38 @@ export async function runLocalChatStream(
             ? { parentId: prepared.parentId, consumeBranchId: prepared.consumeBranchId }
             : {}),
         },
-        run.ctrl.signal,
+        undefined,
         reqScope,
       );
       persistedUserMessageId = savedUser.message.id;
       upsertLocalConversation(savedUser.conversation, reqScope);
-      if (!isRunCurrent(run)) {
-        await response.body?.cancel().catch(() => {});
-        releaseGeneration(run);
-        return false;
-      }
-      dispatch({
-        type: 'UPDATE_CONVERSATION_META',
-        conversation: savedUser.conversation,
-      });
-      dispatch({
-        type: 'REPLACE_MESSAGE_BY_ID',
-        targetId: opts.optimisticUserId,
-        message: savedUser.message,
-      });
-      opts.onStreamAccepted?.();
-      if (run.aborted || run.ctrl.signal.aborted) {
-        await response.body?.cancel().catch(() => {});
-        releaseGeneration(run);
-        dispatch({ type: 'ABORT_LOCAL' });
-        return false;
-      }
-    } catch (userPersistErr) {
-      await response.body?.cancel().catch(() => {});
-      releaseGeneration(run);
-      if (!isRunCurrent(run)) return false;
-      if (isAbortError(userPersistErr) && run.aborted) {
+      if (isRunCurrent(run)) {
         dispatch({
-          type: 'SEND_PREPARE_ABORTED',
-          optimisticUserId: opts.optimisticUserId,
+          type: 'UPDATE_CONVERSATION_META',
+          conversation: savedUser.conversation,
         });
-        opts.onPrepareRollback?.();
-        return false;
+        dispatch({
+          type: 'REPLACE_MESSAGE_BY_ID',
+          targetId: opts.optimisticUserId as string,
+          message: savedUser.message,
+        });
+        opts.onStreamAccepted?.();
       }
-      const e = formatError(userPersistErr);
-      dispatch({
-        type: 'SEND_PREPARE_FAILED',
-        optimisticUserId: opts.optimisticUserId,
-        code: e.code,
-        message: e.message,
-      });
-      opts.onPrepareRollback?.();
-      return false;
+      return persistedUserMessageId;
+    } catch (userPersistErr) {
+      userPersistError = formatError(userPersistErr).message;
+      return '';
     }
-  } else {
+  };
+
+  const ensureUserMessagePersisted = (): Promise<string> => {
+    if (!opts.optimisticUserId) return Promise.resolve('');
+    if (persistedUserMessageId) return Promise.resolve(persistedUserMessageId);
+    if (!userPersistPromise) userPersistPromise = persistUserMessage();
+    return userPersistPromise;
+  };
+
+  if (!opts.optimisticUserId) {
     opts.onStreamAccepted?.();
   }
 
@@ -460,6 +447,7 @@ export async function runLocalChatStream(
   };
 
   let regenConfirmed = !opts.regenerateTargetId;
+  let hasAssistantOutput = false;
   const emitEvent = (ev: StreamEvent) => {
     if (
       !regenConfirmed &&
@@ -473,6 +461,12 @@ export async function runLocalChatStream(
       });
     }
     applyLocalAccum(ev);
+    if (!hasAssistantOutput && isSubstantiveAssistantEvent(ev)) {
+      hasAssistantOutput = true;
+      if (opts.optimisticUserId) {
+        void ensureUserMessagePersisted();
+      }
+    }
     dispatch({
       type: 'STREAM_EVENT',
       event: ev,
@@ -654,6 +648,13 @@ export async function runLocalChatStream(
         break;
       }
 
+      if (opts.optimisticUserId) {
+        const userId = await ensureUserMessagePersisted();
+        if (!userId) {
+          throw new GatewayError('USER_PERSIST_FAILED', userPersistError || '用户消息保存失败');
+        }
+      }
+
       const execResp = await gateway.openToolExecutionStream(
         opts.conversationId,
         roundCalls.map((c) => ({
@@ -712,6 +713,13 @@ export async function runLocalChatStream(
       const currentBlocks = accOrder.map((idx) =>
         bufferToBlock(accBlocks[idx]),
       );
+      if (opts.optimisticUserId) {
+        const userId = await ensureUserMessagePersisted();
+        if (!userId) {
+          throw new GatewayError('USER_PERSIST_FAILED', userPersistError || '用户消息保存失败');
+        }
+      }
+
       const nextOpened = await prepareAndOpenLocalUpstream(
         gateway,
         opts.conversationId,
@@ -739,9 +747,34 @@ export async function runLocalChatStream(
 
   if (!isRunCurrent(run)) return false;
 
-  const finalBlocks = accOrder.map((idx) => bufferToBlock(accBlocks[idx]));
+  const finalBlocks = accOrder
+    .map((idx) => bufferToBlock(accBlocks[idx]))
+    .filter((block) => {
+      if (block.type !== 'toolCall') return true;
+      return 'name' in block && typeof block.name === 'string' && block.name.trim() !== '';
+    });
   let stopReason = finalStopReason || accStopReason || 'stop';
   let errMsg = '';
+
+  if (opts.optimisticUserId && !hasAssistantOutput) {
+    if (run.aborted || isAbortError(caughtDecodeErr)) {
+      dispatch({
+        type: 'SEND_PREPARE_ABORTED',
+        optimisticUserId: opts.optimisticUserId,
+      });
+      opts.onPrepareRollback?.();
+      return false;
+    }
+    const e = caughtDecodeErr ? formatError(caughtDecodeErr) : null;
+    dispatch({
+      type: 'SEND_PREPARE_FAILED',
+      optimisticUserId: opts.optimisticUserId,
+      code: streamErrorMsg ? 'UPSTREAM_ERROR' : (e?.code ?? 'STREAM_EMPTY'),
+      message: streamErrorMsg || e?.message || '响应流未产出有效内容',
+    });
+    opts.onPrepareRollback?.();
+    return false;
+  }
 
   if (run.aborted || isAbortError(caughtDecodeErr)) {
     stopReason = 'aborted';
@@ -792,6 +825,17 @@ export async function runLocalChatStream(
       fallbackProviderId: opts.input.providerId,
       fallbackModelId: opts.input.modelId,
     });
+  }
+
+  if (opts.optimisticUserId) {
+    const userId = await ensureUserMessagePersisted();
+    if (!userId) {
+      const message = userPersistError || '网络异常';
+      toast('用户消息保存失败：' + message, 'error');
+      dispatch({ type: 'STREAM_NETWORK_ERROR', code: 'USER_PERSIST_FAILED', message });
+      dispatch({ type: 'MARK_NEEDS_RELOAD' });
+      return false;
+    }
   }
 
   try {

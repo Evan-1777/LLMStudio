@@ -85,7 +85,7 @@ func (f *OpenAICompletionsFormat) EncodeRequest(_ context.Context, input plugin.
 		hasSystem = true
 	}
 
-	for _, msg := range input.Messages {
+	for _, msg := range normalizeMessagesForEncoding(input.Messages) {
 		switch msg.Role {
 		case domain.RoleUser:
 			if encoded, ok := encodeOpenAIUserMessage(msg.Blocks); ok {
@@ -290,7 +290,7 @@ func encodeOpenAIAssistantTurns(blocks []domain.ContentBlock) []map[string]any {
 				"type": "function",
 				"function": map[string]any{
 					"name":      b.Name,
-					"arguments": rawArgumentsString(b.Arguments),
+					"arguments": rawArgumentsObjectString(b.Arguments),
 				},
 			})
 		case domain.BlockTypeToolResult:

@@ -7,6 +7,12 @@ export function port(node: GraphNode, end: 'in' | 'out'): Point {
   return { x: node.x + node.width / 2, y: node.y + (end === 'out' ? node.height : 0) };
 }
 
+export const NODE_SIDE_OUT_OFFSET_X = 30;
+
+export function nodeSideOutPort(node: GraphNode): Point {
+  return { x: node.x + node.width / 2 + NODE_SIDE_OUT_OFFSET_X, y: node.y + node.height };
+}
+
 export function sidePort(node: GraphNode, side: 'left' | 'right'): Point {
   return {
     x: side === 'left' ? node.x : node.x + node.width,

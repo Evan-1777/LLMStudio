@@ -9,8 +9,16 @@ import {
   type PointerEvent,
 } from 'react';
 import { useApp } from '../../app/AppProvider';
-import { Button, ConfirmDialog, Icon, IconButton, Modal } from '../../components/ui';
-import type { Conversation, ConversationDetail, GraphMutationInput, GraphNotePort, Message } from '../../core/types';
+import { Button, ConfirmDialog, Icon, IconButton, Modal, SegmentedControl, Textarea } from '../../components/ui';
+import type {
+  Conversation,
+  ConversationDetail,
+  GraphMutationInput,
+  ContentBlock,
+  GraphNotePort,
+  Message,
+  MessageSideRefScope,
+} from '../../core/types';
 import { ContentRenderer, MarkdownDocument } from '../../rendering/ContentRenderer';
 import {
   collectSubtreeIds,
@@ -29,6 +37,7 @@ import {
   moveTo,
   nearestNotePort,
   noteEdgeCurve,
+  nodeSideOutPort,
   notePortPoint,
   port,
   sidePort,
@@ -41,6 +50,7 @@ import {
   PlainMessageDetail,
 } from './ConversationGraphControls';
 import { GraphNoteEditor } from './GraphNoteEditor';
+import { replaceMessageTextBlocks } from './MessageEditor';
 import './conversation-graph.css';
 
 type View = Point & { scale: number };
@@ -52,12 +62,13 @@ type Gesture =
   | { kind: 'move'; id: number; start: Point; node: GraphNode; origins: DragOrigin[]; modifiers: boolean; moved: boolean }
   | { kind: 'link'; id: number; start: Point; node: GraphNode; end: 'in' | 'out'; moved: boolean }
   | { kind: 'sideLink'; id: number; start: Point; node: GraphNode; side: 'left' | 'right'; moved: boolean }
+  | { kind: 'nodeSideLink'; id: number; start: Point; node: GraphNode; moved: boolean }
   | { kind: 'noteLink'; id: number; start: Point; node: GraphNode; fromPort: GraphNotePort; moved: boolean }
   | { kind: 'pinch'; start: Point; distance: number; view: View };
 type MarqueeState = { start: Point; current: Point; additive: boolean; baseIds: Set<string> };
 type LinkDrag =
   | { mode: 'reparent'; node: GraphNode; end: 'in' | 'out'; pointer: Point; target?: GraphNode; valid: boolean; overNode: boolean }
-  | { mode: 'sideRef'; origin: 'out' | 'side'; node: GraphNode; side: 'left' | 'right'; pointer: Point; target?: GraphNode; valid: boolean }
+  | { mode: 'sideRef'; origin: 'out' | 'side' | 'nodeOut'; scope: MessageSideRefScope; node: GraphNode; side: 'left' | 'right'; pointer: Point; target?: GraphNode; valid: boolean }
   | { mode: 'noteEdge'; node: GraphNode; fromPort: GraphNotePort; pointer: Point; target?: GraphNode; toPort?: GraphNotePort; valid: boolean };
 
 const initialView: View = { x: 0, y: 0, scale: 1 };
@@ -91,6 +102,7 @@ export function ConversationGraphView({
   mutate,
   onJump,
   onActivate,
+  onUpdateMessage,
   focusNodeId,
   onFocusHandled,
 }: {
@@ -102,6 +114,7 @@ export function ConversationGraphView({
   onJump: (messageId: string) => void;
   onActivate: (branch: { leafMessageId: string } | { branchId: string }) => void;
   onDelete?: (message: Message) => Promise<boolean>;
+  onUpdateMessage?: (messageId: string, blocks: ContentBlock[]) => Promise<boolean>;
   focusNodeId?: string | null;
   onFocusHandled?: () => void;
 }) {
@@ -109,6 +122,8 @@ export function ConversationGraphView({
   const stage = useRef<HTMLDivElement>(null);
   const marker = useId();
   const summaryForm = useId();
+  const createMsgForm = useId();
+  const editMsgForm = useId();
   const gesture = useRef<Gesture | null>(null);
   const touches = useRef(new Map<number, Point>());
   const viewRef = useRef(initialView);
@@ -129,10 +144,18 @@ export function ConversationGraphView({
   const [measuredSizes, setMeasuredSizes] = useState<ReadonlyMap<string, NodeSize>>(() => new Map());
   const [link, setLink] = useState<LinkDrag | null>(null);
   const [pickParent, setPickParent] = useState<string | null>(null);
-  const [pickSideRef, setPickSideRef] = useState<string | null>(null);
+  const [pickSideRef, setPickSideRef] = useState<{ sourceId: string; scope: MessageSideRefScope } | null>(null);
   const [menu, setMenu] = useState<{ id?: string; client: Point; world: Point } | null>(null);
   const menuOrigin = useRef<HTMLElement | null>(null);
   const [editing, setEditing] = useState<{ id: string; text: string } | null>(null);
+  const [creatingMsg, setCreatingMsg] = useState<{
+    role: 'user' | 'assistant';
+    text: string;
+    parentMessageId?: string;
+    x: number;
+    y: number;
+  } | null>(null);
+  const [editingMsgContent, setEditingMsgContent] = useState<{ message: Message; text: string } | null>(null);
   const [draftNote, setDraftNote] = useState<{ x: number; y: number; text: string } | null>(null);
   const [editingNote, setEditingNote] = useState<{ id: string; text: string } | null>(null);
   const [deletingNodes, setDeletingNodes] = useState<GraphNode[] | null>(null);
@@ -422,7 +445,7 @@ export function ConversationGraphView({
   // Keyboard shortcuts (capture phase so Escape unwinds graph state before WorkbenchPage closes the graph).
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (menu || editing || deletingNodes || draftNote || editingNote) return;
+      if (menu || editing || deletingNodes || draftNote || editingNote || creatingMsg || editingMsgContent) return;
       if (document.querySelector('[role="dialog"], [role="menu"]')) return;
       if (isEditableElement(event.target) || isEditableElement(document.activeElement)) return;
 
@@ -495,7 +518,7 @@ export function ConversationGraphView({
       window.removeEventListener('keyup', onKeyUp, true);
       window.removeEventListener('blur', onBlur);
     };
-  }, [busy, deletingNodes, display, draftNote, editing, editingNote, effectiveSelectedIds, menu, nodes, pickParent, pickSideRef, selectMode]);
+  }, [busy, creatingMsg, deletingNodes, display, draftNote, editing, editingMsgContent, editingNote, effectiveSelectedIds, menu, nodes, pickParent, pickSideRef, selectMode]);
 
   const changeZoom = (factor: number) => {
     const point = center();
@@ -523,10 +546,74 @@ export function ConversationGraphView({
     });
   };
 
+  const openCreateMessage = (
+    role: 'user' | 'assistant',
+    point: Point,
+    parentMessageId?: string,
+  ) => {
+    setMenu(null);
+    setEditingMsgContent(null);
+    const x = Math.round(point.x);
+    const y = Math.round(point.y);
+    const vacant = (offset: number) => display.every((node) =>
+      x + offset + 248 <= node.x ||
+      x + offset >= node.x + node.width + 16 ||
+      y + 96 <= node.y ||
+      y >= node.y + node.height + 16);
+    let offset = 0;
+    while (!vacant(offset)) offset += 264;
+    setCreatingMsg({ role, text: '', parentMessageId, x: x + offset, y });
+  };
+
   const startDraftNote = (point: Point) => {
     setMenu(null);
     setEditingNote(null);
     setDraftNote({ x: Math.round(point.x - 74), y: Math.round(point.y - 22), text: '' });
+  };
+
+  const revealAt = (x: number, y: number, width: number, height: number) => {
+    if (!stage.current) return;
+    const camera = viewRef.current;
+    const left = x * camera.scale + camera.x;
+    const top = y * camera.scale + camera.y;
+    const right = left + width * camera.scale;
+    const bottom = top + height * camera.scale;
+    const dx = left < 16 ? 16 - left : Math.min(0, stage.current.clientWidth - 16 - right);
+    const dy = top < 16 ? 16 - top : Math.min(0, stage.current.clientHeight - height - bottom);
+    if (dx || dy) setCamera({ ...camera, x: camera.x + dx, y: camera.y + dy });
+  };
+
+  const submitCreatingMessage = async () => {
+    if (!creatingMsg || submitting) return;
+    const text = creatingMsg.text.trim();
+    if (!text) return;
+    const known = new Set(messages.map((message) => message.id));
+    setSubmitting(true);
+    const result = await mutate({
+      op: 'createMessage',
+      role: creatingMsg.role,
+      text,
+      parentMessageId: creatingMsg.parentMessageId,
+      x: creatingMsg.x,
+      y: creatingMsg.y,
+    });
+    setSubmitting(false);
+    if (!result) return;
+    const created = result.messages.find((message) => !known.has(message.id));
+    if (created) setSelectedIds(new Set([created.id]));
+    revealAt(creatingMsg.x, creatingMsg.y, 248, 96);
+    setCreatingMsg(null);
+  };
+
+  const submitEditedMessage = async () => {
+    if (!editingMsgContent || !onUpdateMessage || submitting) return;
+    const { message, text } = editingMsgContent;
+    const hasOtherBlocks = message.blocks.some((block) => block.type !== 'text');
+    if (!text.trim() && !hasOtherBlocks) return;
+    setSubmitting(true);
+    const ok = await onUpdateMessage(message.id, replaceMessageTextBlocks(message.blocks, text));
+    setSubmitting(false);
+    if (ok) setEditingMsgContent(null);
   };
 
   const layout = async () => {
@@ -637,10 +724,16 @@ export function ConversationGraphView({
       return;
     }
     if (pickSideRef) {
-      if (isSideRefEligible(node.message) && canSideAttach(node.id, pickSideRef)) {
-        const sourceNode = byId.get(pickSideRef);
+      if (isSideRefEligible(node.message) && canSideAttach(node.id, pickSideRef.sourceId)) {
+        const sourceNode = byId.get(pickSideRef.sourceId);
         const side: 'left' | 'right' = sourceNode && sourceNode.x + sourceNode.width / 2 > node.x + node.width / 2 ? 'right' : 'left';
-        void mutate({ op: 'addSideRef', messageId: node.id, sourceMessageId: pickSideRef, side });
+        void mutate({
+          op: 'addSideRef',
+          messageId: node.id,
+          sourceMessageId: pickSideRef.sourceId,
+          side,
+          scope: pickSideRef.scope,
+        });
         setPickSideRef(null);
       }
       return;
@@ -664,11 +757,12 @@ export function ConversationGraphView({
       | { kind: 'move'; node: GraphNode }
       | { kind: 'link'; node: GraphNode; end: 'in' | 'out' }
       | { kind: 'sideLink'; node: GraphNode; side: 'left' | 'right' }
+      | { kind: 'nodeSideLink'; node: GraphNode }
       | { kind: 'noteLink'; node: GraphNode; fromPort: GraphNotePort }
       | { kind: 'pan' }
       | { kind: 'marquee'; additive: boolean },
   ) {
-    if (menu || editing || deletingNodes || draftNote || editingNote) return;
+    if (menu || editing || deletingNodes || draftNote || editingNote || creatingMsg || editingMsgContent) return;
     const isMiddle = event.button === 1;
     if (spec.kind === 'pan') {
       if (event.button !== 0 && !isMiddle) return;
@@ -718,6 +812,8 @@ export function ConversationGraphView({
       gesture.current = { kind: 'link', id: event.pointerId, start: point, node: spec.node, end: spec.end, moved: false };
     } else if (spec.kind === 'sideLink') {
       gesture.current = { kind: 'sideLink', id: event.pointerId, start: point, node: spec.node, side: spec.side, moved: false };
+    } else if (spec.kind === 'nodeSideLink') {
+      gesture.current = { kind: 'nodeSideLink', id: event.pointerId, start: point, node: spec.node, moved: false };
     } else {
       gesture.current = { kind: 'noteLink', id: event.pointerId, start: point, node: spec.node, fromPort: spec.fromPort, moved: false };
     }
@@ -725,7 +821,7 @@ export function ConversationGraphView({
 
   function linkAt(
     event: PointerEvent,
-    drag: Extract<Gesture, { kind: 'link' | 'sideLink' | 'noteLink' }>,
+    drag: Extract<Gesture, { kind: 'link' | 'sideLink' | 'nodeSideLink' | 'noteLink' }>,
   ): LinkDrag {
     const pointer = toWorld(origin(event.clientX, event.clientY), viewRef.current);
     const hitEl = document.elementFromPoint(event.clientX, event.clientY);
@@ -740,7 +836,19 @@ export function ConversationGraphView({
 
     if (drag.kind === 'sideLink') {
       const valid = Boolean(target && isSideRefEligible(target.message) && canSideAttach(drag.node.id, target.id));
-      return { mode: 'sideRef', origin: 'side', node: drag.node, side: drag.side, pointer, target, valid };
+      return { mode: 'sideRef', origin: 'side', scope: 'branch', node: drag.node, side: drag.side, pointer, target, valid };
+    }
+
+    if (drag.kind === 'nodeSideLink') {
+      if (!target || !isSideRefEligible(target.message)) {
+        return { mode: 'sideRef', origin: 'nodeOut', scope: 'node', node: drag.node, side: 'right', pointer, valid: false };
+      }
+      const sidePortEl = hitEl?.closest<HTMLElement>('[data-port="side-left"], [data-port="side-right"]');
+      const side: 'left' | 'right' = sidePortEl
+        ? sidePortEl.dataset.port === 'side-left' ? 'left' : 'right'
+        : drag.node.x + drag.node.width / 2 > target.x + target.width / 2 ? 'left' : 'right';
+      const valid = canSideAttach(target.id, drag.node.id);
+      return { mode: 'sideRef', origin: 'nodeOut', scope: 'node', node: drag.node, side, pointer, target, valid };
     }
 
     // Orthogonal gesture boundary: out -> explicit side-left/side-right port hotzone => addSideRef;
@@ -750,7 +858,7 @@ export function ConversationGraphView({
       if (sidePortEl && target && isSideRefEligible(target.message)) {
         const side: 'left' | 'right' = sidePortEl.dataset.port === 'side-left' ? 'left' : 'right';
         const valid = canSideAttach(target.id, drag.node.id);
-        return { mode: 'sideRef', origin: 'out', node: drag.node, side, pointer, target, valid };
+        return { mode: 'sideRef', origin: 'out', scope: 'branch', node: drag.node, side, pointer, target, valid };
       }
     }
 
@@ -865,7 +973,7 @@ export function ConversationGraphView({
         setMoving(next);
         void mutate({ op: 'setNodeMeta', positions }).finally(() => setMoving(null));
       }
-    } else if ((drag.kind === 'link' || drag.kind === 'sideLink' || drag.kind === 'noteLink') && moved) {
+    } else if ((drag.kind === 'link' || drag.kind === 'sideLink' || drag.kind === 'nodeSideLink' || drag.kind === 'noteLink') && moved) {
       const drop = linkAt(event, drag);
       if (drop.mode === 'noteEdge') {
         if (drop.valid && drop.target && drop.toPort) {
@@ -881,7 +989,13 @@ export function ConversationGraphView({
         if (drop.valid && drop.target) {
           const targetId = drop.origin === 'side' ? drop.node.id : drop.target.id;
           const sourceId = drop.origin === 'side' ? drop.target.id : drop.node.id;
-          void mutate({ op: 'addSideRef', messageId: targetId, sourceMessageId: sourceId, side: drop.side });
+          void mutate({
+            op: 'addSideRef',
+            messageId: targetId,
+            sourceMessageId: sourceId,
+            side: drop.side,
+            scope: drop.scope,
+          });
         }
       } else if (drop.mode === 'reparent') {
         if (drop.valid && drop.target) {
@@ -931,7 +1045,14 @@ export function ConversationGraphView({
   }, [byId, noteEdges]);
 
   const renderedSideRefEdges = useMemo(() => {
-    const items: Array<{ key: string; targetId: string; sourceId: string; d: string; mid: Point }> = [];
+    const items: Array<{
+      key: string;
+      targetId: string;
+      sourceId: string;
+      scope: MessageSideRefScope;
+      d: string;
+      mid: Point;
+    }> = [];
     for (const node of display) {
       const refs = node.message?.graphMeta?.sideRefs;
       if (!refs?.length) continue;
@@ -939,13 +1060,15 @@ export function ConversationGraphView({
         const src = byId.get(ref.sourceMessageId);
         if (!src) continue;
         const side = ref.side ?? 'left';
-        const fromPt = port(src, 'out');
+        const scope: MessageSideRefScope = ref.scope === 'node' ? 'node' : 'branch';
+        const fromPt = scope === 'node' ? nodeSideOutPort(src) : port(src, 'out');
         const toPt = sidePort(node, side);
         const geom = sideRefCurve(fromPt, toPt, side);
         items.push({
           key: `${node.id}:${ref.sourceMessageId}`,
           targetId: node.id,
           sourceId: ref.sourceMessageId,
+          scope,
           ...geom,
         });
       }
@@ -1001,9 +1124,10 @@ export function ConversationGraphView({
         const toPt = sidePort(link.node, link.side);
         return <path className="cg-edge-draft cg-edge-draft--side" d={sideRefCurve(link.pointer, toPt, link.side).d} />;
       }
-      const fromPt = port(link.node, 'out');
+      const fromPt = link.origin === 'nodeOut' ? nodeSideOutPort(link.node) : port(link.node, 'out');
       const toPt = link.target ? sidePort(link.target, link.side) : link.pointer;
-      return <path className="cg-edge-draft cg-edge-draft--side" d={sideRefCurve(fromPt, toPt, link.side).d} />;
+      const className = link.scope === 'node' ? 'cg-edge-draft cg-edge-draft--side-node' : 'cg-edge-draft cg-edge-draft--side';
+      return <path className={className} d={sideRefCurve(fromPt, toPt, link.side).d} />;
     }
     return (
       <path
@@ -1067,12 +1191,14 @@ export function ConversationGraphView({
       <div className="cg-world" style={{ transform: 'translate(' + view.x + 'px,' + view.y + 'px) scale(' + view.scale + ')' }}>
         <svg className="cg-edges" aria-hidden="true" width="1" height="1">
           <defs>
-            {['', '-active', '-sideref'].map((suffix) => (
+            {[
+              ['', 'cg-marker'],
+              ['-active', 'cg-marker cg-marker--active'],
+              ['-sideref', 'cg-marker cg-marker--sideref'],
+              ['-sideref-node', 'cg-marker cg-marker--sideref-node'],
+            ].map(([suffix, className]) => (
               <marker key={suffix} id={marker + suffix} viewBox="0 0 7 8" refX="6.5" refY="4" markerWidth="7" markerHeight="8" orient="auto" markerUnits="userSpaceOnUse">
-                <path
-                  d="m0 0 7 4-7 4 1.4-4Z"
-                  className={suffix === '-active' ? 'cg-marker cg-marker--active' : suffix === '-sideref' ? 'cg-marker cg-marker--sideref' : 'cg-marker'}
-                />
+                <path d="m0 0 7 4-7 4 1.4-4Z" className={className} />
               </marker>
             ))}
           </defs>
@@ -1083,8 +1209,16 @@ export function ConversationGraphView({
             </g>
           ))}
           {renderedSideRefEdges.map((edge) => (
-            <g key={'side-' + edge.key} className="cg-edge cg-edge--sideref" data-sideref-edge={edge.key}>
-              <path d={edge.d} markerEnd={'url(#' + marker + '-sideref)'} />
+            <g
+              key={'side-' + edge.key}
+              className={'cg-edge ' + (edge.scope === 'node' ? 'cg-edge--sideref-node' : 'cg-edge--sideref')}
+              data-sideref-edge={edge.key}
+              data-sideref-scope={edge.scope}
+            >
+              <path
+                d={edge.d}
+                markerEnd={'url(#' + marker + (edge.scope === 'node' ? '-sideref-node' : '-sideref') + ')'}
+              />
             </g>
           ))}
           {renderDraftLink()}
@@ -1112,8 +1246,8 @@ export function ConversationGraphView({
             type="button"
             className="cg-edge-detach"
             style={{ left: edge.mid.x, top: edge.mid.y }}
-            aria-label="断开侧边接入"
-            title="断开侧边接入"
+            aria-label={edge.scope === 'node' ? '断开单节点接入' : '断开侧边接入'}
+            title={edge.scope === 'node' ? '断开单节点接入' : '断开侧边接入'}
             disabled={busy}
             onPointerDown={(event) => event.stopPropagation()}
             onClick={() => void mutate({ op: 'removeSideRef', messageId: edge.targetId, sourceMessageId: edge.sourceId })}
@@ -1215,6 +1349,11 @@ export function ConversationGraphView({
           const isUser = msg?.role === 'user';
           const sideEligible = isSideRefEligible(msg);
           const sideRefCount = msg?.graphMeta?.sideRefs?.length ?? 0;
+          const nodeSideRefCount = msg?.graphMeta?.sideRefs?.filter((ref) => ref.scope === 'node').length ?? 0;
+          const sideRefIcon = sideRefCount > 0 && nodeSideRefCount === sideRefCount ? 'nodeSideLink' : 'sideLink';
+          const sideRefLabel = sideRefCount > 0 && nodeSideRefCount === sideRefCount
+            ? `已接入 ${sideRefCount} 条参考节点`
+            : `已接入 ${sideRefCount} 条参考分支`;
           const selected = visualSelectedIds.has(node.id);
           const title = node.branch?.label || (compact ? '上下文检查点' : isUser ? '用户' : msg?.modelId || '助手');
           const preview = msg ? extractNodePreview(msg) : '';
@@ -1227,7 +1366,7 @@ export function ConversationGraphView({
             : pickParent
               ? canConnect(pickParent, node)
               : pickSideRef
-                ? sideEligible && canSideAttach(node.id, pickSideRef)
+                ? sideEligible && canSideAttach(node.id, pickSideRef.sourceId)
                 : undefined;
           const time = msg && new Date(msg.createdAt);
           const compactionText = compact
@@ -1277,8 +1416,8 @@ export function ConversationGraphView({
                       <Icon name={compact ? 'compress' : isUser ? 'user' : 'bot'} size={14} />
                       <strong>{title}</strong>
                       {sideRefCount > 0 && (
-                        <span className="cg-node__sideref-badge" aria-label={`已接入 ${sideRefCount} 条参考分支`}>
-                          <Icon name="sideLink" size={12} />{sideRefCount}
+                        <span className="cg-node__sideref-badge" aria-label={sideRefLabel}>
+                          <Icon name={sideRefIcon} size={12} />{sideRefCount}
                         </span>
                       )}
                       {time && !Number.isNaN(time.getTime()) && (
@@ -1321,7 +1460,7 @@ export function ConversationGraphView({
                           collapsePrefix={'cg:' + msg.id}
                           blocks={msg.blocks}
                           stopReason={msg.stopReason}
-                          isUser={false}
+                          isUser={msg.role === 'user'}
                           visualHtmlRender={msg.role === 'assistant' ? settings.graphVisualHtmlRender : false}
                         />
                       )
@@ -1355,8 +1494,8 @@ export function ConversationGraphView({
                         <Icon name="user" size={13} />
                         <span>{extractUserSummary(msg)}</span>
                         {sideRefCount > 0 && (
-                          <span className="cg-node__sideref-badge" aria-label={`已接入 ${sideRefCount} 条参考分支`}>
-                            <Icon name="sideLink" size={11} />{sideRefCount}
+                          <span className="cg-node__sideref-badge" aria-label={sideRefLabel}>
+                            <Icon name={sideRefIcon} size={11} />{sideRefCount}
                           </span>
                         )}
                       </>
@@ -1379,8 +1518,8 @@ export function ConversationGraphView({
                         {(images > 0 || tools > 0 || thinking || status || sideRefCount > 0) && (
                           <span className="cg-node__meta">
                             {sideRefCount > 0 && (
-                              <span className="cg-node__sideref-badge" aria-label={`已接入 ${sideRefCount} 条参考分支`}>
-                                <Icon name="sideLink" size={12} />{sideRefCount}
+                              <span className="cg-node__sideref-badge" aria-label={sideRefLabel}>
+                                <Icon name={sideRefIcon} size={12} />{sideRefCount}
                               </span>
                             )}
                             {images > 0 && <span aria-label={images + ' 张图片'}><Icon name="image" size={13} />{images}</span>}
@@ -1439,6 +1578,16 @@ export function ConversationGraphView({
                   onPointerDown={(event) => { if (!busy) start(event, { kind: 'link', node, end: side }); }}
                 />
               ))}
+
+              {sideEligible && (
+                <span
+                  aria-hidden="true"
+                  data-port="node-side-out"
+                  title="单节点侧链"
+                  className={'cg-port cg-port--node-side-out' + (link?.mode === 'sideRef' && link.origin === 'nodeOut' && link.node.id === node.id ? ' cg-port--side-hot' : '')}
+                  onPointerDown={(event) => { if (!busy) start(event, { kind: 'nodeSideLink', node }); }}
+                />
+              )}
 
               {sideEligible && (['left', 'right'] as const).map((side) => {
                 const isHot = link?.mode === 'sideRef' && link.target?.id === node.id && link.side === side;
@@ -1520,6 +1669,14 @@ export function ConversationGraphView({
         onAutoLayout={() => void layout()}
         onCreateNote={() => startDraftNote(toWorld(center(), viewRef.current))}
         onCreateBranch={() => makeBranch(toWorld(center(), viewRef.current))}
+        onCreateUserMessage={() => {
+          const world = toWorld(center(), viewRef.current);
+          openCreateMessage('user', { x: world.x - 124, y: world.y - 48 });
+        }}
+        onCreateAssistantMessage={() => {
+          const world = toWorld(center(), viewRef.current);
+          openCreateMessage('assistant', { x: world.x - 124, y: world.y - 48 });
+        }}
       />
 
       <GraphContextMenu
@@ -1566,6 +1723,15 @@ export function ConversationGraphView({
         onJump={onJump}
         onPickParent={setPickParent}
         onPickSideRef={setPickSideRef}
+        onCreateMessage={openCreateMessage}
+        onEditMessageContent={(message) => {
+          setMenu(null);
+          setEditingMsgContent({ message, text: message.blocks
+            .filter((block) => block.type === 'text')
+            .map((block) => 'text' in block ? block.text : '')
+            .join('\n')
+            .trim() });
+        }}
         mutate={mutate}
       />
 
@@ -1594,6 +1760,105 @@ export function ConversationGraphView({
             maxLength={160}
             value={editing?.text ?? ''}
             onChange={(event) => setEditing((value) => value && { ...value, text: event.target.value })}
+          />
+        </form>
+      </Modal>
+
+      <Modal
+        open={!!creatingMsg}
+        onOpenChange={(open) => { if (!open && !submitting) setCreatingMsg(null); }}
+        title={creatingMsg?.role === 'assistant' ? '新建助手消息' : '新建用户消息'}
+        busy={submitting}
+        footer={
+          <>
+            <Button variant="ghost" disabled={submitting} onClick={() => setCreatingMsg(null)}>取消</Button>
+            <Button
+              type="submit"
+              form={createMsgForm}
+              variant="primary"
+              loading={submitting}
+              disabled={!creatingMsg?.text.trim()}
+            >
+              创建
+            </Button>
+          </>
+        }
+      >
+        <form
+          id={createMsgForm}
+          className="cg-msg-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitCreatingMessage();
+          }}
+        >
+          <SegmentedControl<'user' | 'assistant'>
+            value={creatingMsg?.role ?? 'user'}
+            ariaLabel="消息角色"
+            disabled={submitting}
+            options={[{ value: 'user', label: '用户' }, { value: 'assistant', label: '助手' }]}
+            onChange={(role) => setCreatingMsg((value) => value && { ...value, role })}
+          />
+          <Textarea
+            aria-label="消息内容"
+            rows={6}
+            autoFocus
+            maxLength={200000}
+            value={creatingMsg?.text ?? ''}
+            disabled={submitting}
+            onChange={(event) => setCreatingMsg((value) => value && { ...value, text: event.target.value })}
+            onKeyDown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                void submitCreatingMessage();
+              }
+            }}
+          />
+        </form>
+      </Modal>
+
+      <Modal
+        open={!!editingMsgContent}
+        onOpenChange={(open) => { if (!open && !submitting) setEditingMsgContent(null); }}
+        title="编辑消息内容"
+        busy={submitting}
+        footer={
+          <>
+            <Button variant="ghost" disabled={submitting} onClick={() => setEditingMsgContent(null)}>取消</Button>
+            <Button
+              type="submit"
+              form={editMsgForm}
+              variant="primary"
+              loading={submitting}
+              disabled={!editingMsgContent || (!editingMsgContent.text.trim() &&
+                !editingMsgContent.message.blocks.some((block) => block.type !== 'text'))}
+            >
+              保存
+            </Button>
+          </>
+        }
+      >
+        <form
+          id={editMsgForm}
+          className="cg-msg-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submitEditedMessage();
+          }}
+        >
+          <Textarea
+            aria-label="编辑消息内容"
+            rows={6}
+            autoFocus
+            value={editingMsgContent?.text ?? ''}
+            disabled={submitting}
+            onChange={(event) => setEditingMsgContent((value) => value && { ...value, text: event.target.value })}
+            onKeyDown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === 'Enter' && !event.nativeEvent.isComposing) {
+                event.preventDefault();
+                void submitEditedMessage();
+              }
+            }}
           />
         </form>
       </Modal>
